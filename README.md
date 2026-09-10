@@ -2,7 +2,7 @@
   <img src="assets/readme/mark.svg" width="80" height="80" alt="Deadbolt logo" />
 </p>
 
-<h1 align="center">Deadbolt</h1>
+<h1 align="center">tf-low</h1>
 
 <p align="center">
   <strong>Durable workflows. Observable recovery.</strong><br />
