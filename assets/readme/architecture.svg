@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="470" viewBox="0 0 1200 470" role="img" aria-labelledby="title desc">
+<title id="title">Deadbolt architecture</title>
+<desc id="desc">Applications and the dashboard connect to the Go control plane. PostgreSQL holds durable state. A transactional outbox feeds NATS wake-up hints back to the control plane. A customer-hosted Go worker connects outbound over HTTPS and runs Node.js tasks that call external services.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10" fill="none" stroke="#8595a9" stroke-width="1.5"/></marker></defs>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif}.title{font-size:18px;fill:#e6edf5;font-weight:600}.sub{font-size:14px;fill:#93a5bb}.label{font-size:13px;fill:#b0bfd0}.line{fill:none;stroke:#66778d;stroke-width:1.5;marker-end:url(#a)}</style>
+<rect x="1" y="1" width="1198" height="468" rx="14" fill="#10161f" stroke="#303d4e"/>
+<text x="30" y="37" class="sub">PLANNED ARCHITECTURE</text>
+<rect x="25" y="61" width="758" height="372" rx="10" fill="#151e29" stroke="#2a3b4e"/>
+<text x="45" y="88" class="label">HOSTED CONTROL PLANE</text>
+<rect x="819" y="61" width="355" height="372" rx="10" fill="#1c201e" stroke="#35463e"/>
+<text x="839" y="88" class="label">CUSTOMER INFRASTRUCTURE</text>
+<g fill="#1c2836" stroke="#3b4e63">
+<rect x="47" y="112" width="197" height="62" rx="8"/>
+<rect x="47" y="200" width="197" height="62" rx="8"/>
+<rect x="302" y="137" width="219" height="113" rx="8" fill="#31251e" stroke="#a67447"/>
+<rect x="576" y="162" width="179" height="72" rx="8"/>
+<rect x="565" y="318" width="201" height="66" rx="8"/>
+<rect x="293" y="318" width="237" height="66" rx="8"/>
+</g>
+<text x="65" y="149" class="title">Application / SDK</text>
+<text x="65" y="237" class="title">Dashboard / CLI</text>
+<text x="326" y="173" class="title">Go control plane</text>
+<text x="326" y="199" class="sub">API · scheduler · engine</text>
+<text x="326" y="222" class="sub">Worker gateway</text>
+<text x="596" y="191" class="title">PostgreSQL</text>
+<text x="596" y="215" class="sub">Durable authority</text>
+<text x="585" y="346" class="title">Transactional</text>
+<text x="585" y="369" class="title">outbox</text>
+<text x="316" y="346" class="title">NATS JetStream</text>
+<text x="316" y="370" class="sub">Wake-up notifications</text>
+<path d="M244 143H272V178H301" class="line"/>
+<path d="M244 231H272V214H301" class="line"/>
+<path d="M521 198H575" class="line"/>
+<path d="M665 234V317" class="line"/>
+<path d="M565 350H531" class="line"/>
+<path d="M411 318V251" class="line"/>
+<text x="677" y="282" class="label">After commit</text>
+<g fill="#1c2a25" stroke="#496555">
+<rect x="846" y="112" width="302" height="68" rx="8"/>
+<rect x="846" y="226" width="302" height="65" rx="8"/>
+<rect x="846" y="336" width="302" height="65" rx="8"/>
+</g>
+<text x="869" y="141" class="title">Self-hosted Go worker</text>
+<text x="869" y="164" class="sub">Leased assignments</text>
+<text x="869" y="253" class="title">Node.js task runner</text>
+<text x="869" y="277" class="sub">Customer task code + secrets</text>
+<text x="869" y="362" class="title">External APIs / services</text>
+<text x="869" y="386" class="sub">Business operations</text>
+<path d="M997 180V225" class="line"/>
+<path d="M997 291V335" class="line"/>
+<path d="M846 126H546V148H522" class="line"/>
+<text x="601" y="115" class="label">Outbound HTTPS</text>
+<text x="31" y="455" class="sub">PostgreSQL decides execution state. Notifications accelerate scheduling. Workers execute the tasks.</text>
+</svg>

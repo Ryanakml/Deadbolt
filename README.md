@@ -77,6 +77,11 @@ Scope labels describe the delivery plan, not currently shipped features.
 
 Deadbolt separates orchestration from execution. The hosted **control plane** decides what can run and records what happened. **Self-hosted workers** execute customer code on customer infrastructure.
 
+![Deadbolt architecture: hosted Go control plane with PostgreSQL and NATS, connected to customer-hosted workers.](assets/readme/architecture.svg)
+
+<details>
+<summary>Architecture diagram source</summary>
+
 ```mermaid
 flowchart LR
     App[Application / SDK] --> CP[Go control plane]
@@ -89,6 +94,8 @@ flowchart LR
     Worker --> Runner[Node.js task runner]
     Runner --> APIs[Customer services / external APIs]
 ```
+
+</details>
 
 - **Declarative workflows.** TypeScript definitions compile to a validated DAG. The engine reads persisted graph state; it does not replay arbitrary JavaScript workflow functions.
 - **PostgreSQL is authoritative.** State changes, execution events, and outbox intents commit together. NATS accelerates notification; database reconciliation keeps work discoverable if notifications disappear.
