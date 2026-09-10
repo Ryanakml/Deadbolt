@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="870" viewBox="0 0 1440 870" role="img" aria-labelledby="title desc">
+<title id="title">Deadbolt Run Inspector — interface concept</title>
+<desc id="desc">A dark workflow dashboard showing a successful search, an analyze task recovering on worker B, and a report waiting on its dependency. Event history and attempt details explain worker lease expiry and reassignment. This is a static design concept.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#171c26"/><stop offset="1" stop-color="#0b0e14"/></linearGradient>
+  <linearGradient id="active" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#30251f"/><stop offset="1" stop-color="#1d1a19"/></linearGradient>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#28313e"/></pattern>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 10 5 0 10" fill="none" stroke="#546171" stroke-width="1.5"/></marker>
+</defs>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif} .mono{font-family:'SFMono-Regular',Consolas,'Liberation Mono',monospace}</style>
+
+<rect x="1" y="1" width="1438" height="868" rx="18" fill="url(#bg)" stroke="#303a49"/>
+<rect x="1" y="1" width="1438" height="61" rx="18" fill="#151a23"/>
+<line x1="1" y1="62" x2="1439" y2="62" stroke="#27303d" stroke-width="1.5"/>
+<circle cx="26" cy="31" r="5" fill="#ef7d75"/>
+<circle cx="47" cy="31" r="5" fill="#d8b265"/>
+<circle cx="68" cy="31" r="5" fill="#76b9a1"/>
+<text x="99" y="37" font-size="13" fill="#a6b2c3" font-weight="600" class="mono">DEADBOLT / EXECUTION WORKSPACE</text>
+<rect x="1193" y="19" width="224" height="26" rx="6" fill="#232a36" stroke="#394354"/>
+<text x="1207" y="37" font-size="12" fill="#c1cbda" font-weight="600" class="mono">INTERFACE CONCEPT</text>
+<rect x="1" y="63" width="208" height="806" rx="0" fill="#10151d"/>
+<line x1="210" y1="63" x2="210" y2="869" stroke="#27303d" stroke-width="1.5"/>
+<rect x="23" y="91" width="32" height="32" rx="9" fill="#fa9c54"/>
+<path d="M40 96 31 109h8l-2 9 12-15h-8l2-7Z" fill="#15191f"/>
+<text x="65" y="115" font-size="25" fill="#f0f3f8" font-weight="650">deadbolt</text>
+<text x="24" y="162" font-size="11" fill="#68788e" font-weight="600" class="mono">WORKSPACE</text>
+<rect x="20" y="177" width="168" height="46" rx="7" fill="#19212c" stroke="#2c3645"/>
+<circle cx="38" cy="200" r="4" fill="#fa9c54"/>
+<text x="51" y="206" font-size="15" fill="#d7deea" font-weight="400">Acme / staging</text>
+<rect x="27" y="248" width="13" height="13" rx="3" fill="none" stroke="#66758a"/>
+<text x="53" y="263" font-size="16" fill="#94a3b8" font-weight="400">Overview</text>
+<rect x="27" y="298" width="13" height="13" rx="3" fill="none" stroke="#66758a"/>
+<text x="53" y="313" font-size="16" fill="#94a3b8" font-weight="400">Workflows</text>
+<rect x="15" y="335" width="181" height="43" rx="7" fill="#2a211d" stroke="#55402f"/>
+<rect x="27" y="348" width="13" height="13" rx="3" fill="none" stroke="#fa9c54"/>
+<text x="53" y="363" font-size="16" fill="#faaf75" font-weight="550">Runs</text>
+<rect x="27" y="398" width="13" height="13" rx="3" fill="none" stroke="#66758a"/>
+<text x="53" y="413" font-size="16" fill="#94a3b8" font-weight="400">Workers</text>
+<rect x="27" y="448" width="13" height="13" rx="3" fill="none" stroke="#66758a"/>
+<text x="53" y="463" font-size="16" fill="#94a3b8" font-weight="400">Approvals</text>
+<line x1="25" y1="507" x2="183" y2="507" stroke="#27303d" stroke-width="1.5"/>
+<text x="24" y="540" font-size="11" fill="#68788e" font-weight="600" class="mono">OBSERVE</text>
+<text x="28" y="579" font-size="16" fill="#b1bdcc" font-weight="400">Events &amp; traces</text>
+<text x="28" y="625" font-size="16" fill="#b1bdcc" font-weight="400">Settings</text>
+<rect x="21" y="766" width="169" height="75" rx="9" fill="#171f2a" stroke="#2b3645"/>
+<circle cx="38" cy="791" r="4" fill="#61d4ad"/>
+<text x="50" y="797" font-size="14" fill="#c0cdda" font-weight="400">2 workers online</text>
+<text x="36" y="821" font-size="12" fill="#8292a8" font-weight="400">Customer-hosted</text>
+<text x="242" y="102" font-size="12" fill="#8292a8" font-weight="600" class="mono">WORKFLOWS  /  RESEARCH-REPORT</text>
+<text x="242" y="146" font-size="32" fill="#f0f4fa" font-weight="650">Run Inspector</text>
+<rect x="475" y="120" width="117" height="30" rx="15" fill="#30251d" stroke="#62462f"/>
+<circle cx="491" cy="135" r="4" fill="#fa9c54"/>
+<text x="503" y="140" font-size="12" fill="#ffc18d" font-weight="650" class="mono">RUNNING</text>
+<text x="242" y="178" font-size="15" fill="#a8b8cb" font-weight="400" class="mono">run_8Fk12</text>
+<text x="377" y="178" font-size="14" fill="#8495ab" font-weight="400">Deployment v18</text>
+<text x="538" y="178" font-size="14" fill="#8495ab" font-weight="400">API trigger</text>
+<rect x="860" y="119" width="87" height="35" rx="7" fill="#1a2230" stroke="#354151"/>
+<text x="881" y="142" font-size="14" fill="#d4dce7" font-weight="400">Pause</text>
+<rect x="959" y="119" width="85" height="35" rx="7" fill="#1a2230" stroke="#354151"/>
+<text x="979" y="142" font-size="14" fill="#d4dce7" font-weight="400">Cancel</text>
+<text x="242" y="223" font-size="15" fill="#f0f4fa" font-weight="550">Graph</text>
+<text x="332" y="223" font-size="15" fill="#8595aa" font-weight="550">Events</text>
+<text x="430" y="223" font-size="15" fill="#8595aa" font-weight="550">Logs</text>
+<text x="513" y="223" font-size="15" fill="#8595aa" font-weight="550">Trace</text>
+<line x1="242" y1="239" x2="1045" y2="239" stroke="#27303d" stroke-width="1.5"/>
+<line x1="242" y1="239" x2="289" y2="239" stroke="#fa9c54" stroke-width="1.5"/>
+<rect x="241" y="258" width="804" height="251" rx="10" fill="#101720" stroke="#283443"/>
+<rect x="242" y="259" width="802" height="249" rx="10" fill="url(#dots)"/>
+<text x="263" y="289" font-size="11" fill="#76879c" font-weight="600" class="mono">EXECUTION GRAPH</text>
+<line x1="477" y1="365" x2="530" y2="365" stroke="#567568" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="762" y1="365" x2="813" y2="365" stroke="#526070" stroke-width="1.5" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+<rect x="263" y="316" width="213" height="108" rx="9" fill="#171f2a" stroke="#354152"/>
+<circle cx="281" cy="338" r="4" fill="#61d4ad"/>
+<text x="293" y="342" font-size="11" fill="#83ddbb" font-weight="600" class="mono">SUCCEEDED</text>
+<text x="280" y="373" font-size="21" fill="#eef2f8" font-weight="550">Search</text>
+<text x="280" y="401" font-size="12" fill="#a0afc2" font-weight="400">Output committed</text>
+<rect x="539" y="316" width="223" height="108" rx="9" fill="url(#active)" stroke="#ba7a44"/>
+<circle cx="557" cy="338" r="4" fill="#fa9c54"/>
+<text x="569" y="342" font-size="11" fill="#ffc18d" font-weight="600" class="mono">RUNNING</text>
+<text x="556" y="373" font-size="21" fill="#eef2f8" font-weight="550">Analyze</text>
+<text x="556" y="401" font-size="12" fill="#a0afc2" font-weight="400">Attempt 2 · worker-b</text>
+<rect x="824" y="316" width="198" height="108" rx="9" fill="#171f2a" stroke="#354152"/>
+<circle cx="842" cy="338" r="4" fill="#69798f"/>
+<text x="854" y="342" font-size="11" fill="#8b9bb0" font-weight="600" class="mono">BLOCKED</text>
+<text x="841" y="373" font-size="21" fill="#eef2f8" font-weight="550">Report</text>
+<text x="841" y="401" font-size="12" fill="#a0afc2" font-weight="400">Waiting for Analyze</text>
+<rect x="265" y="457" width="496" height="30" rx="6" fill="#17261f" stroke="#2e463b"/>
+<text x="278" y="477" font-size="13" fill="#9edabd" font-weight="400">Search retained. Recovery continues from Analyze.</text>
+<text x="242" y="548" font-size="19" fill="#e7edf6" font-weight="600">Execution history</text>
+<text x="909" y="548" font-size="12" fill="#8999ad" font-weight="400" class="mono">5 events</text>
+<rect x="242" y="565" width="803" height="238" rx="10" fill="#121923" stroke="#2b3747"/>
+<rect x="243" y="566" width="801" height="34" rx="9" fill="#1a2330"/>
+<text x="262" y="588" font-size="11" fill="#8193aa" font-weight="600" class="mono">TIME</text>
+<text x="380" y="588" font-size="11" fill="#8193aa" font-weight="600" class="mono">EVENT</text>
+<text x="650" y="588" font-size="11" fill="#8193aa" font-weight="600" class="mono">DETAIL</text>
+<text x="262" y="625" font-size="13" fill="#899bb2" font-weight="400" class="mono">14:22:04</text>
+<circle cx="383" cy="621" r="3" fill="#64d0ac"/>
+<text x="396" y="625" font-size="13" fill="#cad5e5" font-weight="400" class="mono">step.succeeded</text>
+<text x="650" y="625" font-size="13" fill="#a1b0c4" font-weight="400">Search output committed</text>
+<line x1="259" y1="641" x2="1028" y2="641" stroke="#222d3b" stroke-width="1.5"/>
+<text x="262" y="664" font-size="13" fill="#899bb2" font-weight="400" class="mono">14:22:38</text>
+<circle cx="383" cy="660" r="3" fill="#e9b16e"/>
+<text x="396" y="664" font-size="13" fill="#cad5e5" font-weight="400" class="mono">attempt.lost</text>
+<text x="650" y="664" font-size="13" fill="#a1b0c4" font-weight="400">worker-a lease expired</text>
+<line x1="259" y1="680" x2="1028" y2="680" stroke="#222d3b" stroke-width="1.5"/>
+<text x="262" y="703" font-size="13" fill="#899bb2" font-weight="400" class="mono">14:22:39</text>
+<circle cx="383" cy="699" r="3" fill="#a0b3ca"/>
+<text x="396" y="703" font-size="13" fill="#cad5e5" font-weight="400" class="mono">step.ready</text>
+<text x="650" y="703" font-size="13" fill="#a1b0c4" font-weight="400">Analyze queued for retry</text>
+<line x1="259" y1="719" x2="1028" y2="719" stroke="#222d3b" stroke-width="1.5"/>
+<text x="262" y="742" font-size="13" fill="#899bb2" font-weight="400" class="mono">14:22:39</text>
+<circle cx="383" cy="738" r="3" fill="#a0b3ca"/>
+<text x="396" y="742" font-size="13" fill="#cad5e5" font-weight="400" class="mono">attempt.claimed</text>
+<text x="650" y="742" font-size="13" fill="#a1b0c4" font-weight="400">worker-b · ownership epoch 2</text>
+<line x1="259" y1="758" x2="1028" y2="758" stroke="#222d3b" stroke-width="1.5"/>
+<text x="262" y="781" font-size="13" fill="#899bb2" font-weight="400" class="mono">14:22:40</text>
+<circle cx="383" cy="777" r="3" fill="#fa9c54"/>
+<text x="396" y="781" font-size="13" fill="#cad5e5" font-weight="400" class="mono">attempt.started</text>
+<text x="650" y="781" font-size="13" fill="#a1b0c4" font-weight="400">Analyze resumed on worker-b</text>
+<text x="244" y="839" font-size="13" fill="#7f90a7" font-weight="400">Committed state. Inspectable decisions. Explicit recovery.</text>
+<line x1="1072" y1="63" x2="1072" y2="869" stroke="#27303d" stroke-width="1.5"/>
+<text x="1098" y="106" font-size="11" fill="#8595aa" font-weight="600" class="mono">STEP DETAILS</text>
+<text x="1098" y="148" font-size="28" fill="#eef2f8" font-weight="600">Analyze</text>
+<rect x="1098" y="171" width="131" height="28" rx="6" fill="#30251d" stroke="#61452e"/>
+<text x="1110" y="190" font-size="10" fill="#ffc18d" font-weight="600" class="mono">RETRY IN PROGRESS</text>
+<line x1="1098" y1="221" x2="1413" y2="221" stroke="#27303d" stroke-width="1.5"/>
+<text x="1098" y="253" font-size="12" fill="#7e90a7" font-weight="400">Task</text>
+<text x="1098" y="278" font-size="16" fill="#d8e2ef" font-weight="450" class="mono">analyze-pages</text>
+<text x="1098" y="321" font-size="12" fill="#7e90a7" font-weight="400">Attempt</text>
+<text x="1098" y="346" font-size="16" fill="#d8e2ef" font-weight="450" class="mono">2 of 3</text>
+<text x="1098" y="389" font-size="12" fill="#7e90a7" font-weight="400">Worker</text>
+<text x="1098" y="414" font-size="16" fill="#d8e2ef" font-weight="450" class="mono">worker-b</text>
+<text x="1098" y="457" font-size="12" fill="#7e90a7" font-weight="400">Ownership epoch</text>
+<text x="1098" y="482" font-size="16" fill="#d8e2ef" font-weight="450" class="mono">2</text>
+<text x="1098" y="525" font-size="12" fill="#7e90a7" font-weight="400">Recovery policy</text>
+<text x="1098" y="550" font-size="16" fill="#d8e2ef" font-weight="450" class="mono">idempotent</text>
+<text x="1098" y="593" font-size="12" fill="#7e90a7" font-weight="400">Operation ID</text>
+<text x="1098" y="618" font-size="16" fill="#d8e2ef" font-weight="450" class="mono">op_7a82d1…</text>
+<line x1="1098" y1="651" x2="1413" y2="651" stroke="#27303d" stroke-width="1.5"/>
+<rect x="1098" y="674" width="313" height="121" rx="8" fill="#1c221f" stroke="#39493e"/>
+<text x="1115" y="700" font-size="11" fill="#89d7b8" font-weight="650" class="mono">OWNERSHIP PROTECTED</text>
+<text x="1115" y="725" font-size="14" fill="#b4c8bf" font-weight="400">Late results from worker-a</text>
+<text x="1115" y="747" font-size="14" fill="#b4c8bf" font-weight="400">cannot overwrite this attempt.</text>
+<text x="1115" y="774" font-size="12" fill="#819b8e" font-weight="400">Same operation ID across retries.</text>
+<text x="1098" y="838" font-size="11" fill="#64768d" font-weight="550" class="mono">ILLUSTRATIVE DATA</text>
+</svg>

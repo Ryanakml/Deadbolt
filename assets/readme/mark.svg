@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">Deadbolt</title>
+  <desc id="desc">An orange bolt inside a dark rounded lock-shaped frame.</desc>
+  <rect width="96" height="96" rx="25" fill="#11151c"/>
+  <path d="M31 42V31a17 17 0 0 1 34 0v11" fill="none" stroke="#667385" stroke-width="6" stroke-linecap="round"/>
+  <rect x="22" y="38" width="52" height="40" rx="12" fill="#fa9c54"/>
+  <path d="M49 44 37 61h10l-2 12 15-19H49l3-10Z" fill="#11151c"/>
+</svg>

@@ -1,0 +1,16 @@
+# Local operating-system and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local tool output
+node_modules/
+coverage/
+*.log
