@@ -75,6 +75,14 @@ if [[ "$MIGRATOR_DATABASE_URL" == "$DATABASE_URL" ]]; then
   exit 1
 fi
 
+SYSTEM_DATABASE_URL="${SYSTEM_DATABASE_URL:-}"
+if [[ -n "$SYSTEM_DATABASE_URL" ]]; then
+  if [[ "$SYSTEM_DATABASE_URL" == "$DATABASE_URL" || "$SYSTEM_DATABASE_URL" == "$MIGRATOR_DATABASE_URL" ]]; then
+    err "SECURITY VIOLATION: SYSTEM_DATABASE_URL must not be identical to DATABASE_URL or MIGRATOR_DATABASE_URL!"
+    exit 1
+  fi
+fi
+
 if [[ -z "$CANDIDATE_DIGEST" ]]; then
   err "CANDIDATE_DIGEST is required (format: ghcr.io/ryanakml/deadbolt/control-plane@sha256:...)"
   exit 1
@@ -107,6 +115,28 @@ fi
 # 4. Pull candidate immutable image
 log "Step 4: Pulling candidate image by immutable digest: $CANDIDATE_DIGEST"
 docker pull "$CANDIDATE_DIGEST"
+
+# 4b. Bootstrap persistent data services (PostgreSQL, NATS) before migration
+log "Step 4b: Bootstrapping persistent staging data infrastructure (PostgreSQL & NATS)..."
+docker compose -p deadbolt-staging -f "$COMPOSE_FILE" up -d postgres nats
+
+log "Waiting for PostgreSQL service to report healthy..."
+PG_HEALTHY=false
+for i in $(seq 1 30); do
+  STATUS=$(docker inspect --format '{{.State.Health.Status}}' deadbolt-staging-postgres 2>/dev/null || echo "unknown")
+  if [[ "$STATUS" == "healthy" ]]; then
+    PG_HEALTHY=true
+    break
+  fi
+  sleep 2
+done
+
+if [[ "$PG_HEALTHY" != "true" ]]; then
+  err "PostgreSQL failed to report healthy within 60s!"
+  docker compose -p deadbolt-staging -f "$COMPOSE_FILE" logs postgres || true
+  exit 1
+fi
+log "PostgreSQL is healthy and accepting connections."
 
 # 5. Deterministic migration execution via candidate container runner
 log "Step 5: Executing forward schema migrations with advisory lock..."
@@ -191,7 +221,28 @@ if ! echo "$VERSION_RESP" | grep -q "$CANDIDATE_DIGEST"; then
   rollback
   exit 1
 fi
-log "Provenance verified: exact commit and digest match."
+log "Provenance verified: exact commit and digest match in /version."
+
+# 9b. Independent running container image identity inspection (Blueprint §26 & Item 7)
+CONTAINER_NAME="deadbolt-staging-control-plane-${CANDIDATE_SLOT}"
+log "Step 9b: Inspecting running container image identity for $CONTAINER_NAME..."
+RUNNING_IMAGE_ID=$(docker inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
+RUNNING_IMAGE_DECL=$(docker inspect --format '{{index .Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
+REPO_DIGESTS=$(docker inspect --format '{{json .RepoDigests}}' "$RUNNING_IMAGE_ID" 2>/dev/null || echo "[]")
+
+log "Running container image ID: $RUNNING_IMAGE_ID"
+log "Running container declared image: $RUNNING_IMAGE_DECL"
+log "Image RepoDigests: $REPO_DIGESTS"
+
+CANDIDATE_SHA=$(echo "$CANDIDATE_DIGEST" | grep -o 'sha256:[a-f0-9]\{64\}' || true)
+if [[ -n "$CANDIDATE_SHA" ]]; then
+  if ! echo "$RUNNING_IMAGE_DECL $REPO_DIGESTS $RUNNING_IMAGE_ID" | grep -q "$CANDIDATE_SHA"; then
+    err "CONTAINER IMAGE IDENTITY MISMATCH: Expected digest $CANDIDATE_SHA does not match running container image!"
+    rollback
+    exit 1
+  fi
+  log "Independent image identity verification PASSED."
+fi
 
 # 10. Atomic traffic switch: update Caddy upstream
 log "Step 10: Atomically switching Caddy edge route to port $CANDIDATE_PORT..."

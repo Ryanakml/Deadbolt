@@ -111,7 +111,7 @@ services:
 
   # Telemetry Profile Services (Blueprint §25)
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.110.0
+    image: otel/opentelemetry-collector-contrib:0.110.0@sha256:0ed3688bbb02dabc0429ef648ebe3e9c53aca5e7c5a6b1a4a61b9f583b823e36
     container_name: deadbolt-otel-collector
     profiles: ["telemetry"]
     restart: unless-stopped
@@ -122,7 +122,7 @@ services:
       - "127.0.0.1:4318:4318" # OTLP HTTP
 
   prometheus:
-    image: prom/prometheus:v2.54.1
+    image: prom/prometheus:v2.54.1@sha256:f6639335d34a77d9d9db382b92eeb7fc00934be8eae81dbc03b31cfe90411a94
     container_name: deadbolt-prometheus
     profiles: ["telemetry"]
     restart: unless-stopped
@@ -133,7 +133,7 @@ services:
 
   # Fault Injection Profile Services (Blueprint §25 / §26)
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:2.9.0
+    image: ghcr.io/shopify/toxiproxy:2.9.0@sha256:b44c283298cea49e2defaba1b3028783798346f2a926684e3a345fd8441af3b8
     container_name: deadbolt-toxiproxy
     profiles: ["fault"]
     restart: unless-stopped

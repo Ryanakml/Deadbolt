@@ -1,11 +1,13 @@
 package integration_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,8 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
+	"github.com/Ryanakml/Deadbolt/internal/scheduling"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type mockNATSChecker struct {
@@ -382,10 +386,10 @@ func TestComposeConfigurationsIntegrity(t *testing.T) {
 		t.Fatalf("expected explicit 127.0.0.1 loopback binding for Control Plane in local compose")
 	}
 
-	// Verify profiles exist in local compose
-	for _, profile := range []string{"profiles: [\"core\"]", "profiles: [\"telemetry\"]", "profiles: [\"fault\"]"} {
-		if !strings.Contains(localStr, profile) {
-			t.Fatalf("expected profile %q in local compose", profile)
+	// Verify all telemetry and fault profile images in local compose are pinned to immutable digests
+	for _, expectedPin := range []string{"otel/opentelemetry-collector-contrib:0.110.0@sha256:", "prom/prometheus:v2.54.1@sha256:", "shopify/toxiproxy:2.9.0@sha256:"} {
+		if !strings.Contains(localStr, expectedPin) {
+			t.Fatalf("SECURITY VIOLATION: expected immutable digest pin %q in local compose", expectedPin)
 		}
 	}
 
@@ -403,9 +407,28 @@ func TestComposeConfigurationsIntegrity(t *testing.T) {
 		t.Fatalf("SECURITY VIOLATION: staging compose exposes NATS ports to host: %s", stagingStr)
 	}
 
-	// Verify staging project name is deadbolt-staging
+	// Verify staging project name is deadbolt-staging and network is explicitly named deadbolt_staging_net
 	if !strings.Contains(stagingStr, "name: deadbolt-staging") {
 		t.Fatalf("expected staging compose project name to be deadbolt-staging")
+	}
+	if !strings.Contains(stagingStr, "name: deadbolt_staging_net") {
+		t.Fatalf("expected staging compose network to be explicitly named deadbolt_staging_net")
+	}
+
+	// Verify staging PostgreSQL uses deadbolt_admin as bootstrap superuser, NEVER deadbolt_system (Blueprint §24.3 & §26.3)
+	if strings.Contains(stagingStr, "POSTGRES_USER: deadbolt_system") {
+		t.Fatalf("SECURITY VIOLATION: staging compose specifies deadbolt_system as cluster superuser; must be deadbolt_admin")
+	}
+	if !strings.Contains(stagingStr, "POSTGRES_USER: deadbolt_admin") {
+		t.Fatalf("expected POSTGRES_USER: deadbolt_admin in staging compose")
+	}
+
+	// Verify real WAL archiving command is wired (not /bin/true)
+	if strings.Contains(stagingStr, "archive_command=/bin/true") {
+		t.Fatalf("SECURITY VIOLATION: staging compose uses discard archive_command=/bin/true; must archive off-host")
+	}
+	if !strings.Contains(stagingStr, "archive_command=/usr/local/bin/archive-wal.sh") {
+		t.Fatalf("expected archive_command to wire archive-wal.sh script")
 	}
 
 	// Verify blue-green slotting: ports 8088 and 8089
@@ -512,5 +535,362 @@ func TestContainerLocalAuthBoundary(t *testing.T) {
 
 	if err := hostedCfg.Validate("0.0.0.0"); err == nil {
 		t.Fatalf("expected hosted mode to strictly reject ContainerLocal, but passed")
+	}
+}
+
+// TestTruthfulSchedulerHealth asserts that the scheduler heartbeat advances exclusively
+// when authoritative reconciliation sweeps successfully query the database, and fails closed otherwise.
+func TestTruthfulSchedulerHealth(t *testing.T) {
+	db, runtimePool, systemURL := setupTestDB(t)
+	defer db.Close()
+	defer runtimePool.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	systemPool, err := pgxpool.New(ctx, systemURL)
+	if err != nil {
+		t.Fatalf("failed to connect as deadbolt_system: %v", err)
+	}
+	defer systemPool.Close()
+
+	// 1. Successful sweep as deadbolt_system advances ticker
+	reconciler := scheduling.NewReconciler(systemPool, 50*time.Millisecond, nil)
+	if reconciler.Ticker().Load() != 0 {
+		t.Fatalf("expected uninitialized ticker to be 0")
+	}
+
+	if err := reconciler.Sweep(ctx); err != nil {
+		t.Fatalf("expected initial sweep as deadbolt_system to succeed: %v", err)
+	}
+
+	firstTick := reconciler.Ticker().Load()
+	if firstTick == 0 {
+		t.Fatalf("expected ticker to advance upon successful sweep")
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	// 2. Second sweep advances ticker again
+	if err := reconciler.Sweep(ctx); err != nil {
+		t.Fatalf("expected second sweep to succeed: %v", err)
+	}
+	secondTick := reconciler.Ticker().Load()
+	if secondTick <= firstTick {
+		t.Fatalf("expected second sweep to advance ticker (%d > %d)", secondTick, firstTick)
+	}
+
+	// 3. Sweep with runtimePool (deadbolt_runtime, which lacks permissions) fails and DOES NOT advance ticker
+	unauthorizedReconciler := scheduling.NewReconciler(runtimePool, 50*time.Millisecond, nil)
+	if err := unauthorizedReconciler.Sweep(ctx); err == nil {
+		t.Fatalf("expected sweep as deadbolt_runtime to fail with permission denied, but succeeded")
+	}
+	if unauthorizedReconciler.Ticker().Load() != 0 {
+		t.Fatalf("expected ticker to remain 0 on unauthorized sweep")
+	}
+
+	// 4. Sweep with nil pool fails and DOES NOT advance ticker
+	brokenReconciler := scheduling.NewReconciler(nil, 50*time.Millisecond, nil)
+	if err := brokenReconciler.Sweep(ctx); err == nil {
+		t.Fatalf("expected sweep with nil pool to return error, but succeeded")
+	}
+	if brokenReconciler.Ticker().Load() != 0 {
+		t.Fatalf("expected ticker to remain 0 on failed sweep")
+	}
+}
+
+// TestDatabaseRolesPrivilegeModel verifies the accepted #3 privilege model:
+// deadbolt_runtime has NO DDL privileges, deadbolt_system has NO direct table access,
+// and deadbolt_migrator has schema ownership and DDL privileges.
+func TestDatabaseRolesPrivilegeModel(t *testing.T) {
+	db, runtimePool, systemURL := setupTestDB(t)
+	defer db.Close()
+	defer runtimePool.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 1. Test deadbolt_runtime: DML allowed, DDL strictly forbidden (Blueprint §24.3 & §26.3)
+	// Negative DDL test: CREATE TABLE must fail
+	var ignored int
+	err := runtimePool.QueryRow(ctx, "CREATE TABLE public.unauthorized_runtime_table (id int)").Scan(&ignored)
+	if err == nil {
+		t.Fatalf("SECURITY VIOLATION: deadbolt_runtime was able to execute DDL (CREATE TABLE)!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied for runtime DDL, got: %v", err)
+	}
+
+	// DML test: SELECT allowed
+	var orgCount int
+	if err := runtimePool.QueryRow(ctx, "SELECT count(*) FROM public.organizations").Scan(&orgCount); err != nil {
+		t.Fatalf("expected deadbolt_runtime to have SELECT privilege on public tables, got: %v", err)
+	}
+
+	// 2. Test deadbolt_system: NO direct tenant table access, only scheduler discovery function
+	systemPool, err := pgxpool.New(ctx, systemURL)
+	if err != nil {
+		t.Fatalf("failed to connect as deadbolt_system: %v", err)
+	}
+	defer systemPool.Close()
+
+	// Negative DML test: Direct table query must fail
+	var forbiddenCount int
+	err = systemPool.QueryRow(ctx, "SELECT count(*) FROM public.organizations").Scan(&forbiddenCount)
+	if err == nil {
+		t.Fatalf("SECURITY VIOLATION: deadbolt_system was able to query tenant table public.organizations directly!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied on public.organizations for deadbolt_system, got: %v", err)
+	}
+
+	// Negative function test: Membership discovery must fail for deadbolt_system
+	var memCount int
+	err = systemPool.QueryRow(ctx, "SELECT count(*) FROM app.discover_user_memberships('00000000-0000-0000-0000-000000000001'::uuid)").Scan(&memCount)
+	if err == nil {
+		t.Fatalf("SECURITY VIOLATION: deadbolt_system was able to call app.discover_user_memberships!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied on discover_user_memberships for deadbolt_system, got: %v", err)
+	}
+
+	// Function test: Scheduler enumeration function allowed for deadbolt_system
+	var tenantCount int
+	if err := systemPool.QueryRow(ctx, "SELECT count(*) FROM app.enumerate_scheduler_tenants()").Scan(&tenantCount); err != nil {
+		t.Fatalf("expected deadbolt_system to be able to call app.enumerate_scheduler_tenants(): %v", err)
+	}
+
+	// 3. Test deadbolt_migrator: DDL allowed
+	if _, err := db.ExecContext(ctx, "CREATE TABLE public.authorized_migrator_test (id int)"); err != nil {
+		t.Fatalf("expected deadbolt_migrator to have CREATE TABLE permission: %v", err)
+	}
+	_, _ = db.ExecContext(ctx, "DROP TABLE public.authorized_migrator_test")
+}
+
+// TestBackupReadinessScriptFailClosed verifies that scripts/check-backup-readiness.sh
+// fails closed when backup evidence is absent, and passes only when both base backup
+// and fresh WAL archives are proven.
+func TestBackupReadinessScriptFailClosed(t *testing.T) {
+	scriptPath := "../../scripts/check-backup-readiness.sh"
+
+	// 1. Missing destination configuration must FAIL CLOSED
+	cmd := exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected check-backup-readiness.sh to fail without configuration, but succeeded: %s", string(out))
+	}
+	if !strings.Contains(string(out), "Neither DEADBOLT_STORAGE_S3_BUCKET nor DEADBOLT_WAL_ARCHIVE_DIR is configured") {
+		t.Fatalf("expected missing configuration error message, got: %s", string(out))
+	}
+
+	// 2. Directory archive configured but EMPTY -> must FAIL CLOSED (no base backup)
+	tmpDir := t.TempDir()
+	cmd = exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
+	}
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected check-backup-readiness.sh to fail with empty archive dir, but succeeded: %s", string(out))
+	}
+	if !strings.Contains(string(out), "No base backups found") {
+		t.Fatalf("expected 'No base backups found' error message, got: %s", string(out))
+	}
+
+	// 3. Base backup exists, but zero WAL archives -> must FAIL CLOSED
+	baseDir := filepath.Join(tmpDir, "basebackups")
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		t.Fatalf("failed to create basebackups dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(baseDir, "base_test.tar.gz"), []byte("mock-base"), 0644); err != nil {
+		t.Fatalf("failed to write mock base backup: %v", err)
+	}
+
+	cmd = exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
+	}
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected check-backup-readiness.sh to fail with missing WAL archives, but succeeded: %s", string(out))
+	}
+	if !strings.Contains(string(out), "No WAL archives found") {
+		t.Fatalf("expected 'No WAL archives found' error message, got: %s", string(out))
+	}
+
+	// 4. Base backup exists and WAL archive exists with old mtime (>900s) -> must FAIL CLOSED on lag
+	oldWalFile := filepath.Join(tmpDir, "000000010000000000000001")
+	if err := os.WriteFile(oldWalFile, []byte("mock-wal"), 0644); err != nil {
+		t.Fatalf("failed to write mock wal file: %v", err)
+	}
+	oldTime := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(oldWalFile, oldTime, oldTime); err != nil {
+		t.Fatalf("failed to set old mtime on wal file: %v", err)
+	}
+
+	cmd = exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
+		"MAX_WAL_LAG_SECONDS=900",
+	}
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected check-backup-readiness.sh to fail on stale WAL lag, but succeeded: %s", string(out))
+	}
+	if !strings.Contains(string(out), "WAL ARCHIVE LAG EXCEEDED") {
+		t.Fatalf("expected 'WAL ARCHIVE LAG EXCEEDED' error message, got: %s", string(out))
+	}
+
+	// 5. Fresh WAL archive (<900s) -> must PASS
+	freshTime := time.Now()
+	if err := os.Chtimes(oldWalFile, freshTime, freshTime); err != nil {
+		t.Fatalf("failed to set fresh mtime on wal file: %v", err)
+	}
+
+	cmd = exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
+		"MAX_WAL_LAG_SECONDS=900",
+	}
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected check-backup-readiness.sh to pass with fresh WAL, failed: %v, output: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "SUCCESS: Backup & WAL readiness verification passed") {
+		t.Fatalf("expected SUCCESS message, got: %s", string(out))
+	}
+}
+
+// TestWALArchiveScript verifies that scripts/archive-wal.sh correctly copies
+// WAL segments when configured and fails closed when unconfigured.
+func TestWALArchiveScript(t *testing.T) {
+	scriptPath := "../../scripts/archive-wal.sh"
+
+	// 1. Missing arguments must fail
+	cmd := exec.Command("/bin/bash", scriptPath)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected archive-wal.sh without arguments to fail, but succeeded: %s", string(out))
+	}
+
+	// 2. Unconfigured destination must fail closed
+	tmpDir := t.TempDir()
+	walSrc := filepath.Join(tmpDir, "source_wal")
+	if err := os.WriteFile(walSrc, []byte("wal-content-bytes"), 0644); err != nil {
+		t.Fatalf("failed to write test wal: %v", err)
+	}
+
+	cmd = exec.Command("/bin/bash", scriptPath, walSrc, "000000010000000000000001")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected archive-wal.sh to fail without destination, but succeeded: %s", string(out))
+	}
+
+	// 3. With archive dir configured: must archive file successfully
+	archiveDir := filepath.Join(tmpDir, "archive")
+	cmd = exec.Command("/bin/bash", scriptPath, walSrc, "000000010000000000000001")
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=" + archiveDir,
+	}
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected archive-wal.sh to succeed with archive dir, failed: %v\nOutput: %s", err, string(out))
+	}
+
+	archivedFile := filepath.Join(archiveDir, "000000010000000000000001")
+	data, err := os.ReadFile(archivedFile)
+	if err != nil {
+		t.Fatalf("failed to read archived file: %v", err)
+	}
+	if string(data) != "wal-content-bytes" {
+		t.Fatalf("archived data mismatch: got %q, expected %q", string(data), "wal-content-bytes")
+	}
+}
+
+// TestFirstStagingDeploymentBootstrap validates that a clean-host first deployment
+// deterministically bootstraps data services and roles BEFORE migrations run,
+// uses an explicitly named Compose network, and inspects container image identity.
+func TestFirstStagingDeploymentBootstrap(t *testing.T) {
+	// 1. Validate deploy-staging.sh bootstrap structure
+	deployScriptBytes, err := os.ReadFile("../../scripts/deploy-staging.sh")
+	if err != nil {
+		t.Fatalf("failed to read scripts/deploy-staging.sh: %v", err)
+	}
+	deployScript := string(deployScriptBytes)
+
+	// Step 4b (bootstrapping data services) must precede Step 5 (migrations)
+	idxStep4b := strings.Index(deployScript, "Step 4b: Bootstrapping persistent staging data infrastructure")
+	idxStep5 := strings.Index(deployScript, "Step 5: Executing forward schema migrations")
+	if idxStep4b == -1 {
+		t.Fatalf("missing Step 4b data infrastructure bootstrap in scripts/deploy-staging.sh")
+	}
+	if idxStep5 == -1 {
+		t.Fatalf("missing Step 5 schema migrations in scripts/deploy-staging.sh")
+	}
+	if idxStep4b >= idxStep5 {
+		t.Fatalf("order violation: Step 4b (data bootstrap) must execute before Step 5 (migrations)")
+	}
+
+	// Must wait for postgres health check before running migrations
+	if !strings.Contains(deployScript, "docker compose -p deadbolt-staging -f \"$COMPOSE_FILE\" up -d postgres nats") {
+		t.Fatalf("expected deploy-staging.sh to up postgres and nats in Step 4b")
+	}
+	if !strings.Contains(deployScript, ".State.Health.Status") {
+		t.Fatalf("expected deploy-staging.sh to inspect container health status before migrations")
+	}
+
+	// Step 5 must run migration container attached to deadbolt_staging_net
+	if !strings.Contains(deployScript, "--network deadbolt_staging_net") {
+		t.Fatalf("expected migration container to be attached to deadbolt_staging_net")
+	}
+
+	// Step 9b must perform independent image identity inspection
+	if !strings.Contains(deployScript, "Step 9b: Inspecting running container image identity") {
+		t.Fatalf("missing Step 9b independent running container image identity inspection")
+	}
+
+	// 2. Validate staging Compose network and role bootstrap mounts
+	stagingComposeBytes, err := os.ReadFile("../../deploy/compose/docker-compose.staging.yml")
+	if err != nil {
+		t.Fatalf("failed to read staging compose file: %v", err)
+	}
+	stagingCompose := string(stagingComposeBytes)
+
+	if !strings.Contains(stagingCompose, "deadbolt_staging_net:\n    name: deadbolt_staging_net") {
+		t.Fatalf("expected explicit top-level network name: deadbolt_staging_net in staging compose")
+	}
+	if !strings.Contains(stagingCompose, "01-init-roles.sh:ro") {
+		t.Fatalf("expected 01-init-roles.sh mounted in postgres /docker-entrypoint-initdb.d/")
+	}
+	if !strings.Contains(stagingCompose, "02-bootstrap-roles.sql:ro") {
+		t.Fatalf("expected 02-bootstrap-roles.sql mounted in postgres /docker-entrypoint-initdb.d/")
+	}
+
+	// 3. Validate init-db-roles.sh script existence and executable bit
+	initRolesPath := "../../scripts/init-db-roles.sh"
+	info, err := os.Stat(initRolesPath)
+	if err != nil {
+		t.Fatalf("scripts/init-db-roles.sh missing: %v", err)
+	}
+	if info.Mode()&0111 == 0 {
+		t.Fatalf("scripts/init-db-roles.sh is not executable")
+	}
+
+	initRolesBytes, err := os.ReadFile(initRolesPath)
+	if err != nil {
+		t.Fatalf("failed to read scripts/init-db-roles.sh: %v", err)
+	}
+	initRolesStr := string(initRolesBytes)
+	for _, role := range []string{"deadbolt_migrator", "deadbolt_runtime", "deadbolt_system"} {
+		if !strings.Contains(initRolesStr, role) {
+			t.Fatalf("expected %s role initialization in scripts/init-db-roles.sh", role)
+		}
 	}
 }

@@ -22,5 +22,17 @@
   "debian-runtime": {
     "image": "docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
     "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "otel-collector": {
+    "image": "docker.io/otel/opentelemetry-collector-contrib:0.110.0@sha256:0ed3688bbb02dabc0429ef648ebe3e9c53aca5e7c5a6b1a4a61b9f583b823e36",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "prometheus": {
+    "image": "docker.io/prom/prometheus:v2.54.1@sha256:f6639335d34a77d9d9db382b92eeb7fc00934be8eae81dbc03b31cfe90411a94",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "toxiproxy": {
+    "image": "ghcr.io/shopify/toxiproxy:2.9.0@sha256:b44c283298cea49e2defaba1b3028783798346f2a926684e3a345fd8441af3b8",
+    "platforms": ["linux/amd64", "linux/arm64"]
   }
 }

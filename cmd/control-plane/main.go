@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
+	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
 )
 
@@ -201,22 +201,45 @@ func run() error {
 	// Latest expected migration in M0 is 5 (00005_auth_and_sessions.sql)
 	healthChecker := gateway.NewHealthChecker(versionInfo, pool, natsChecker, 5)
 
-	// Wire active scheduler freshness ticker
-	schedulerTick := &atomic.Int64{}
-	schedulerTick.Store(time.Now().UnixNano())
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				schedulerTick.Store(time.Now().UnixNano())
+	// Wire active scheduler freshness ticker through authoritative reconciler sweeps (Blueprint §24.3 & §25.2)
+	systemDBURL := strings.TrimSpace(os.Getenv("SYSTEM_DATABASE_URL"))
+	if systemDBURL == "" {
+		systemDBURL = strings.TrimSpace(os.Getenv("DEADBOLT_SYSTEM_DATABASE_URL"))
+	}
+
+	var systemPool *pgxpool.Pool
+	if systemDBURL != "" {
+		sysPoolConfig, err := pgxpool.ParseConfig(systemDBURL)
+		if err != nil {
+			logger.Printf("[SCHEDULER] Warning: invalid SYSTEM_DATABASE_URL: %v", err)
+		} else {
+			sysPoolConfig.MaxConns = 5
+			sysPoolConfig.MinConns = 1
+			sp, err := pgxpool.NewWithConfig(ctx, sysPoolConfig)
+			if err != nil {
+				logger.Printf("[SCHEDULER] Warning: failed to connect to system database pool: %v", err)
+			} else {
+				systemPool = sp
+				defer systemPool.Close()
+				logger.Printf("System database pool (deadbolt_system) initialized.")
 			}
 		}
-	}()
-	healthChecker.SetSchedulerTicker(schedulerTick, gateway.DefaultSchedulerTimeout)
+	}
+
+	reconcilerPool := systemPool
+	if reconcilerPool == nil {
+		reconcilerPool = pool
+	}
+
+	if reconcilerPool != nil {
+		reconciler := scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
+		healthChecker.SetSchedulerTicker(reconciler.Ticker(), gateway.DefaultSchedulerTimeout)
+		go func() {
+			if err := reconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Printf("[SCHEDULER] Reconciler loop terminated: %v", err)
+			}
+		}()
+	}
 
 	mux := http.NewServeMux()
 	healthChecker.Routes(mux)
