@@ -67,7 +67,11 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		r.logger.Printf("[SCHEDULER] Warning: Initial sweep failed: %v", err)
 	}
 
-	ticker := time.NewTicker(r.sweepInterval)
+	interval := r.sweepInterval
+	if r.ticker.Load() == 0 {
+		interval = 500 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -78,6 +82,10 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			if err := r.Sweep(ctx); err != nil {
 				r.logger.Printf("[SCHEDULER] Error: Sweep iteration failed: %v", err)
 				// Heartbeat intentionally NOT updated on failure
+			} else if interval != r.sweepInterval {
+				// Once initialized, switch ticker to standard sweepInterval
+				interval = r.sweepInterval
+				ticker.Reset(interval)
 			}
 		}
 	}

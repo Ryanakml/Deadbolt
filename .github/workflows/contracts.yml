@@ -98,7 +98,18 @@ jobs:
           # Execute migrations using in-container migrator runner
           docker compose -f deploy/compose/docker-compose.yml --profile core exec -T control-plane /usr/local/bin/control-plane --migrate
           # Verify readyz returned 200 OK after schema is current
-          curl -fs http://127.0.0.1:8080/readyz || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          READYZ_OK=false
+          for i in $(seq 1 15); do
+            if curl -fs http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
+              READYZ_OK=true
+              echo "Local compose control plane is ready!"
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READYZ_OK" != "true" ]; then
+            docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1
+          fi
           # Test stop and start preserves volume persistence
           docker compose -f deploy/compose/docker-compose.yml --profile core stop
           docker compose -f deploy/compose/docker-compose.yml --profile core start
