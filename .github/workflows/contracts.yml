@@ -85,7 +85,7 @@ jobs:
             echo "Stopping workflow runner Postgres service container ($RUNNER_PG) to free port 5432..."
             docker stop "$RUNNER_PG"
           fi
-          docker compose -f deploy/compose/docker-compose.yml --profile core up -d
+          docker compose -f deploy/compose/docker-compose.yml --profile core up -d || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
           for i in $(seq 1 30); do
             if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
               echo "Local compose control plane is alive!"

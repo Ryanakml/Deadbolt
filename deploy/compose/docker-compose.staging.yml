@@ -35,10 +35,11 @@ services:
     volumes:
       - deadbolt_staging_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deadbolt_system -d deadbolt_staging"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "pg_isready -U deadbolt_system"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -46,7 +47,7 @@ services:
           memory: 1024M
 
   nats:
-    image: nats:2@sha256:c50b0a773c6c8d033cad54f7c53cb97fd6e09b3bfc1accda7cd4fa94e19e9ed9
+    image: nats:2-alpine@sha256:ad7a43eb7e3337c3c38ce5d784d1461791f95f730f252d2b25eee699752a0ca3
     container_name: deadbolt-staging-nats
     restart: unless-stopped
     networks:
@@ -59,9 +60,10 @@ services:
       - deadbolt_staging_nats_data:/data
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 4222 || exit 1"]
-      interval: 5s
+      interval: 3s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 10s
     deploy:
       resources:
         limits:

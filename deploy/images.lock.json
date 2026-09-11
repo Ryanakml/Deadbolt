@@ -12,7 +12,7 @@
     "platforms": ["linux/amd64", "linux/arm64"]
   },
   "nats": {
-    "image": "docker.io/library/nats:2@sha256:c50b0a773c6c8d033cad54f7c53cb97fd6e09b3bfc1accda7cd4fa94e19e9ed9",
+    "image": "docker.io/library/nats:2-alpine@sha256:ad7a43eb7e3337c3c38ce5d784d1461791f95f730f252d2b25eee699752a0ca3",
     "platforms": ["linux/amd64", "linux/arm64"]
   },
   "local-object-store": {
