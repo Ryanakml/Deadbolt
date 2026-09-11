@@ -20,7 +20,7 @@
     "platforms": ["linux/amd64", "linux/arm64"]
   },
   "debian-runtime": {
-    "image": "docker.io/library/debian:bookworm-slim@sha256:1a51c4ab0470eee849b8a2b565729259eb64159d80dd6481330a17853dcc969f",
+    "image": "docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
     "platforms": ["linux/amd64", "linux/arm64"]
   }
 }
