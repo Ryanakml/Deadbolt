@@ -141,6 +141,7 @@ CREATE TABLE task_attempts (
     completed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     FOREIGN KEY (organization_id, step_id) REFERENCES run_steps(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, session_id) REFERENCES worker_sessions(organization_id, id) ON DELETE SET NULL,
     UNIQUE (organization_id, id),
     UNIQUE (step_id, attempt_number)
 );
@@ -163,7 +164,8 @@ CREATE TABLE task_leases (
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     FOREIGN KEY (organization_id, step_id) REFERENCES run_steps(organization_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (organization_id, attempt_id) REFERENCES task_attempts(organization_id, id) ON DELETE CASCADE
+    FOREIGN KEY (organization_id, attempt_id) REFERENCES task_attempts(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, session_id) REFERENCES worker_sessions(organization_id, id) ON DELETE CASCADE
 );
 
 ALTER TABLE task_leases ENABLE ROW LEVEL SECURITY;

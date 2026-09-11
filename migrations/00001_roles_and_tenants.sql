@@ -15,6 +15,68 @@ END;
 $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 -- +goose StatementEnd
 
+-- Restricted Discovery Functions (Blueprint §24.3)
+-- Narrowly scoped functions with fixed search_path = app, public, pg_temp, SECURITY DEFINER.
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION app.discover_user_memberships(p_user_id UUID)
+RETURNS TABLE (
+    organization_id UUID,
+    organization_name TEXT,
+    role TEXT,
+    status TEXT
+)
+SECURITY DEFINER
+SET search_path = app, public, pg_temp
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        om.organization_id,
+        o.name AS organization_name,
+        om.role,
+        om.status
+    FROM organization_members om
+    JOIN organizations o ON o.id = om.organization_id
+    WHERE om.user_id = p_user_id
+      AND om.status = 'ACTIVE';
+END;
+$$;
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION app.enumerate_scheduler_tenants()
+RETURNS TABLE (
+    organization_id UUID
+)
+SECURITY DEFINER
+SET search_path = app, public, pg_temp
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT DISTINCT o.id AS organization_id
+    FROM organizations o;
+END;
+$$;
+-- +goose StatementEnd
+
+REVOKE ALL ON FUNCTION app.discover_user_memberships(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.enumerate_scheduler_tenants() FROM PUBLIC;
+
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_runtime') THEN
+        GRANT EXECUTE ON FUNCTION app.current_organization_id() TO deadbolt_runtime;
+        GRANT EXECUTE ON FUNCTION app.discover_user_memberships(UUID) TO deadbolt_runtime;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_system') THEN
+        GRANT EXECUTE ON FUNCTION app.enumerate_scheduler_tenants() TO deadbolt_system;
+    END IF;
+END $$;
+-- +goose StatementEnd
+
 -- 1. Organizations
 CREATE TABLE organizations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -141,4 +203,6 @@ DROP TABLE IF EXISTS environments CASCADE;
 DROP TABLE IF EXISTS projects CASCADE;
 DROP TABLE IF EXISTS organization_members CASCADE;
 DROP TABLE IF EXISTS organizations CASCADE;
+DROP FUNCTION IF EXISTS app.enumerate_scheduler_tenants() CASCADE;
+DROP FUNCTION IF EXISTS app.discover_user_memberships(UUID) CASCADE;
 DROP FUNCTION IF EXISTS app.current_organization_id() CASCADE;

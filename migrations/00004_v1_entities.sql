@@ -179,7 +179,9 @@ CREATE TABLE artifacts (
     status TEXT NOT NULL DEFAULT 'PENDING_UPLOAD' CHECK (status IN ('PENDING_UPLOAD', 'READY', 'DELETING', 'DELETED', 'EXPIRED')),
     expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    FOREIGN KEY (organization_id, environment_id) REFERENCES environments(organization_id, id) ON DELETE CASCADE
+    FOREIGN KEY (organization_id, environment_id) REFERENCES environments(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, run_id) REFERENCES runs(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, step_id) REFERENCES run_steps(organization_id, id) ON DELETE CASCADE
 );
 
 ALTER TABLE artifacts ENABLE ROW LEVEL SECURITY;
