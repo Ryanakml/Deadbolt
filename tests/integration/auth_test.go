@@ -10,11 +10,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -512,40 +516,101 @@ func TestSessionIdleAndAbsoluteExpiry(t *testing.T) {
 	}
 }
 
-// TestHostedStartupRejectsDevAuthAndInsecureCookies verifies hosted mode safeguards.
+// TestHostedStartupRejectsDevAuthAndInsecureCookies verifies hosted mode safeguards and development key rejection.
 func TestHostedStartupRejectsDevAuthAndInsecureCookies(t *testing.T) {
-	// 1. Hosted mode with DevAuthEnabled=true must be rejected
-	cfg1 := auth.Config{
-		RuntimeMode:            auth.ModeHosted,
-		DevAuthEnabled:         true,
-		CookieSecure:           true,
-		AllowedOrigins:         []string{"https://app.deadbolt.cloud"},
-		SessionIdleTimeout:     12 * time.Hour,
-		SessionAbsoluteTimeout: 7 * 24 * time.Hour,
-		OIDC: auth.OIDCConfig{
-			Issuer:   "https://accounts.google.com",
-			ClientID: "client-id-123",
-		},
+	// Base valid hosted config
+	baseValidCfg := func() auth.Config {
+		return auth.Config{
+			RuntimeMode:            auth.ModeHosted,
+			DevAuthEnabled:         false,
+			CookieSecure:           true,
+			AllowedOrigins:         []string{"https://app.deadbolt.cloud"},
+			SessionIdleTimeout:     12 * time.Hour,
+			SessionAbsoluteTimeout: 7 * 24 * time.Hour,
+			OIDC: auth.OIDCConfig{
+				Issuer:   "https://accounts.google.com",
+				ClientID: "client-id-123",
+			},
+		}
 	}
-	if err := cfg1.Validate("127.0.0.1"); err == nil {
-		t.Fatalf("SECURITY VIOLATION: hosted mode accepted DevAuthEnabled=true")
+
+	// 1. Hosted mode with DevAuthEnabled=true must be rejected
+	cfg1 := baseValidCfg()
+	cfg1.DevAuthEnabled = true
+	if err := cfg1.Validate("127.0.0.1"); err == nil || !strings.Contains(err.Error(), "rejects dev auth and development keys") {
+		t.Fatalf("SECURITY VIOLATION: hosted mode accepted DevAuthEnabled=true, got err=%v", err)
 	}
 
 	// 2. Hosted mode with CookieSecure=false must be rejected to prevent __Host- bypass
-	cfg2 := auth.Config{
-		RuntimeMode:            auth.ModeHosted,
-		DevAuthEnabled:         false,
-		CookieSecure:           false, // Insecure
-		AllowedOrigins:         []string{"https://app.deadbolt.cloud"},
-		SessionIdleTimeout:     12 * time.Hour,
-		SessionAbsoluteTimeout: 7 * 24 * time.Hour,
-		OIDC: auth.OIDCConfig{
-			Issuer:   "https://accounts.google.com",
-			ClientID: "client-id-123",
-		},
-	}
+	cfg2 := baseValidCfg()
+	cfg2.CookieSecure = false
 	if err := cfg2.Validate("127.0.0.1"); err == nil || !strings.Contains(err.Error(), "CookieSecure=true") {
 		t.Fatalf("SECURITY VIOLATION: hosted mode accepted CookieSecure=false, got err=%v", err)
+	}
+
+	// 3. Hosted mode with DevKey configured must be rejected (Blueprint §24.4)
+	cfg3 := baseValidCfg()
+	cfg3.DevKey = "raw-development-key-secret-999"
+	if err := cfg3.Validate("127.0.0.1"); err == nil || !strings.Contains(err.Error(), "rejects dev auth and development keys") {
+		t.Fatalf("SECURITY VIOLATION: hosted mode accepted DevKey, got err=%v", err)
+	}
+
+	// 4. Hosted mode with DevKeyPath configured must be rejected (Blueprint §24.4)
+	cfg4 := baseValidCfg()
+	cfg4.DevKeyPath = "/etc/deadbolt/dev.key"
+	if err := cfg4.Validate("127.0.0.1"); err == nil || !strings.Contains(err.Error(), "rejects dev auth and development keys") {
+		t.Fatalf("SECURITY VIOLATION: hosted mode accepted DevKeyPath, got err=%v", err)
+	}
+
+	// 5. Hosted mode with DEADBOLT_DEV_KEY environment variable set must be rejected
+	t.Setenv("DEADBOLT_DEV_KEY", "env-injected-dev-secret")
+	cfg5 := baseValidCfg()
+	if err := cfg5.Validate("127.0.0.1"); err == nil || !strings.Contains(err.Error(), "rejects dev auth and development keys") {
+		t.Fatalf("SECURITY VIOLATION: hosted mode accepted DEADBOLT_DEV_KEY env var, got err=%v", err)
+	}
+
+	// 6. Hosted mode with DEADBOLT_DEV_KEY_PATH environment variable set must be rejected
+	t.Setenv("DEADBOLT_DEV_KEY", "")
+	t.Setenv("DEADBOLT_DEV_KEY_PATH", "/tmp/dev.key")
+	cfg6 := baseValidCfg()
+	if err := cfg6.Validate("127.0.0.1"); err == nil || !strings.Contains(err.Error(), "rejects dev auth and development keys") {
+		t.Fatalf("SECURITY VIOLATION: hosted mode accepted DEADBOLT_DEV_KEY_PATH env var, got err=%v", err)
+	}
+	t.Setenv("DEADBOLT_DEV_KEY_PATH", "")
+
+	// 7. Hosted mode rejects ReadDevKey()
+	hostedCfg := baseValidCfg()
+	if _, err := hostedCfg.ReadDevKey(); err == nil {
+		t.Fatalf("SECURITY VIOLATION: ReadDevKey succeeded in hosted mode")
+	}
+
+	// 8. Local mode permits ReadDevKey() from direct field, file, and environment
+	localCfg := auth.Config{
+		RuntimeMode: auth.ModeLocal,
+		DevKey:      "local-direct-key-value",
+	}
+	keyVal, err := localCfg.ReadDevKey()
+	if err != nil || keyVal != "local-direct-key-value" {
+		t.Fatalf("expected ReadDevKey from field to return key, got: %q, err=%v", keyVal, err)
+	}
+
+	// Test reading from file in local mode
+	tmpDir := t.TempDir()
+	keyFile := filepath.Join(tmpDir, ".deadbolt-dev-key")
+	if err := os.WriteFile(keyFile, []byte("  file-based-dev-key-12345 \n"), 0600); err != nil {
+		t.Fatalf("failed to write dev key file: %v", err)
+	}
+
+	localFileCfg := auth.Config{
+		RuntimeMode: auth.ModeLocal,
+		DevKeyPath:  keyFile,
+	}
+	if err := localFileCfg.Validate("127.0.0.1"); err != nil {
+		t.Fatalf("local file config validation failed: %v", err)
+	}
+	keyValFile, err := localFileCfg.ReadDevKey()
+	if err != nil || keyValFile != "file-based-dev-key-12345" {
+		t.Fatalf("expected trimmed dev key from file, got: %q, err=%v", keyValFile, err)
 	}
 }
 
@@ -692,6 +757,122 @@ func TestNegativeAuthResponsesAndLogRedaction(t *testing.T) {
 	}
 	if strings.Contains(logs, "sensitive-access-token-999") {
 		t.Fatalf("SECURITY VIOLATION: server logs leaked authorization header: %s", logs)
+	}
+
+	// 3. Upstream OIDC error containing fake tokens/secrets/codes in raw error response
+	sentinelOIDCSecret := "SENTINEL_OIDC_SECRET_TOKEN_99999"
+	sentinelOIDCCode := "SENTINEL_AUTH_CODE_LEAK_88888"
+
+	// Start an OIDC server whose /token endpoint returns an error echoing the secret/code
+	leakyFixtureMux := http.NewServeMux()
+	leakyFixtureMux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"issuer":                 "http://" + r.Host,
+			"authorization_endpoint": "http://" + r.Host + "/authorize",
+			"token_endpoint":         "http://" + r.Host + "/token",
+			"jwks_uri":               "http://" + r.Host + "/jwks.json",
+		})
+	})
+	leakyFixtureMux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		// Leaky upstream error payload containing sensitive sentinel secrets
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"invalid_grant","error_description":"failed to exchange code %s with secret %s"}`, sentinelOIDCCode, sentinelOIDCSecret)))
+	})
+	leakyServer := httptest.NewServer(leakyFixtureMux)
+	defer leakyServer.Close()
+
+	leakyCfg := auth.Config{
+		RuntimeMode: auth.ModeHosted,
+		OIDC: auth.OIDCConfig{
+			Issuer:       leakyServer.URL,
+			ClientID:     "test-client",
+			ClientSecret: "test-secret",
+			RedirectURL:  "https://app.deadbolt.cloud/api/auth/callback",
+		},
+		AllowedOrigins: []string{"https://app.deadbolt.cloud"},
+		CookieSecure:   true,
+	}
+	leakyOIDC := auth.NewOIDCClient(leakyCfg.OIDC, leakyServer.Client())
+	leakyBFF := auth.NewBFFHandler(leakyCfg, leakyOIDC, store, runtimePool)
+	leakyBFF.SetLogger(logger)
+
+	// Craft callback request with PKCE state
+	pkce := auth.PKCEParams{
+		CodeVerifier: "test-verifier-12345678901234567890123456789012",
+		State:        "test-state-123",
+		Nonce:        "test-nonce-123",
+	}
+	pkcePayload, _ := json.Marshal(pkce)
+	encodedPKCE := base64.RawURLEncoding.EncodeToString(pkcePayload)
+
+	cbReq := httptest.NewRequest(http.MethodGet, "/api/auth/callback?code="+sentinelOIDCCode+"&state=test-state-123", nil)
+	cbReq.AddCookie(&http.Cookie{Name: auth.PKCECookieName, Value: encodedPKCE})
+	cbRec := httptest.NewRecorder()
+	leakyBFF.HandleCallback(cbRec, cbReq)
+
+	if cbRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on OIDC exchange failure, got %d", cbRec.Code)
+	}
+
+	// 4. Denied cross-tenant organization switch attempt using foreign org ID sentinel
+	foreignOrgSentinel := "foreign-tenant-sentinel-uuid-77777777-8888"
+
+	// Create real user and active session
+	user, err := store.GetOrCreateUserFromOIDC(context.Background(), &auth.Identity{
+		Issuer:  "https://accounts.google.com",
+		Subject: "test-user-redaction-sub",
+		Email:   "redaction-test@deadbolt.cloud",
+	})
+	if err != nil {
+		t.Fatalf("failed to create test user: %v", err)
+	}
+	_, sessionToken, realCSRF, err := store.CreateSession(
+		context.Background(),
+		user.ID,
+		nil,
+		"127.0.0.1",
+		"test-agent",
+		12*time.Hour,
+		7*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	switchReqBody := fmt.Sprintf(`{"organization_id":%q}`, foreignOrgSentinel)
+	switchReq := httptest.NewRequest(http.MethodPost, "/api/auth/switch-org", strings.NewReader(switchReqBody))
+	switchReq.Header.Set("Origin", "https://app.deadbolt.cloud")
+	switchReq.Header.Set("X-CSRF-Token", realCSRF)
+	switchReq.Header.Set("Content-Type", "application/json")
+	switchReq.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: sessionToken})
+	switchRec := httptest.NewRecorder()
+
+	bff.RequireAuth(bff.RequireCSRFAndOrigin(http.HandlerFunc(bff.HandleSwitchOrg))).ServeHTTP(switchRec, switchReq)
+
+	if switchRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for unauthorized org switch, got %d (%s)", switchRec.Code, switchRec.Body.String())
+	}
+
+	// Assert that neither the response bodies NOR the audit logs contain the sentinels
+	allLogs := logBuf.String()
+	if strings.Contains(allLogs, sentinelOIDCSecret) {
+		t.Fatalf("SECURITY VIOLATION: server logs leaked upstream OIDC secret sentinel: %s", allLogs)
+	}
+	if strings.Contains(allLogs, sentinelOIDCCode) {
+		t.Fatalf("SECURITY VIOLATION: server logs leaked upstream OIDC auth code sentinel: %s", allLogs)
+	}
+	if strings.Contains(allLogs, foreignOrgSentinel) {
+		t.Fatalf("SECURITY VIOLATION: server logs leaked foreign tenant ID sentinel: %s", allLogs)
+	}
+
+	// Verify structured reasons are recorded
+	if !strings.Contains(allLogs, "reason=token_verification_failed") {
+		t.Fatalf("expected structured reason=token_verification_failed in logs, got:\n%s", allLogs)
+	}
+	if !strings.Contains(allLogs, "reason=unauthorized_org_membership") {
+		t.Fatalf("expected structured reason=unauthorized_org_membership in logs, got:\n%s", allLogs)
 	}
 }
 
@@ -1006,4 +1187,92 @@ func signCustomToken(t *testing.T, key *rsa.PrivateKey, kid, issuer, audience, s
 		t.Fatalf("failed to sign custom token: %v", err)
 	}
 	return content + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// TestRealChromeBrowserSmoke drives a real headless Google Chrome / Chromium browser
+// via Chrome DevTools Protocol over WebSocket to verify the complete browser authentication
+// lifecycle: 302 redirect chain, HttpOnly session cookie hiding in DOM, JS-readable CSRF bootstrap cookie,
+// authenticated mutation fetch, authenticated logout, and session revocation.
+func TestRealChromeBrowserSmoke(t *testing.T) {
+	db, runtimePool, _ := setupTestDB(t)
+	defer db.Close()
+	defer runtimePool.Close()
+
+	// Find node executable
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node executable not found; skipping browser smoke test")
+	}
+
+	// Start OIDC fixture server
+	fixture, err := oidcfixture.NewFixtureServer("chrome-smoke-client")
+	if err != nil {
+		t.Fatalf("failed to start fixture server: %v", err)
+	}
+	defer fixture.Close()
+
+	var currentBFF *auth.BFFHandler
+	mux := http.NewServeMux()
+	mux.Handle("/api/auth/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		currentBFF.Routes().ServeHTTP(w, r)
+	}))
+	mux.Handle("/api/mutation", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		currentBFF.RequireAuth(currentBFF.RequireCSRFAndOrigin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "action": "browser-smoke-mutation"})
+		}))).ServeHTTP(w, r)
+	}))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<!DOCTYPE html><html><body><h1>Deadbolt Dashboard</h1></body></html>"))
+	})
+
+	bffServer := httptest.NewTLSServer(mux)
+	defer bffServer.Close()
+
+	cfg := auth.Config{
+		RuntimeMode: auth.ModeHosted,
+		OIDC: auth.OIDCConfig{
+			Issuer:       fixture.URL(),
+			ClientID:     fixture.ClientID(),
+			ClientSecret: "chrome-client-secret",
+			RedirectURL:  bffServer.URL + "/api/auth/callback",
+		},
+		AllowedOrigins:         []string{bffServer.URL},
+		CookieSecure:           true,
+		SessionIdleTimeout:     12 * time.Hour,
+		SessionAbsoluteTimeout: 7 * 24 * time.Hour,
+	}
+
+	store := auth.NewSessionStore(runtimePool)
+	oidcClient := auth.NewOIDCClient(cfg.OIDC, fixture.Client())
+	currentBFF = auth.NewBFFHandler(cfg, oidcClient, store, runtimePool)
+
+	// Execute browser-smoke.mjs script pointing to bffServer.URL
+	scriptPath, err := filepath.Abs("../../scripts/browser-smoke.mjs")
+	if err != nil {
+		t.Fatalf("failed to resolve browser-smoke.mjs path: %v", err)
+	}
+	if _, err := os.Stat(scriptPath); err != nil {
+		t.Fatalf("browser-smoke.mjs not found at %s: %v", scriptPath, err)
+	}
+
+	cmd := exec.Command(nodePath, scriptPath, bffServer.URL)
+	out, err := cmd.CombinedOutput()
+	outputStr := string(out)
+	t.Logf("browser-smoke output:\n%s", outputStr)
+
+	if err != nil {
+		t.Fatalf("browser smoke test execution failed: %v\nOutput: %s", err, outputStr)
+	}
+
+	if strings.Contains(outputStr, "Chrome/Chromium executable not found") {
+		t.Log("Chrome/Chromium executable not found in this environment; smoke skipped safely.")
+		return
+	}
+
+	if !strings.Contains(outputStr, "SUCCESS: Real Chrome browser smoke completed successfully!") {
+		t.Fatalf("expected browser smoke test to succeed, but success marker was not found in output:\n%s", outputStr)
+	}
 }

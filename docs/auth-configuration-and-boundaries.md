@@ -101,26 +101,60 @@ The Go BFF implements strict OpenID Connect verification:
 
 ---
 
-## 6. Local Dev Auth Isolation & Production Guardrails
+## 6. Local Dev Auth & Development Key Boundaries (Blueprint §24.4)
 
-To permit frictionless local workstation development without external OIDC dependencies:
+### Development Key Management
 
-- **Explicit Enablement**: `DEV_AUTH_ENABLED=true` and `DEADBOLT_RUNTIME_MODE=local`.
-- **Strict Loopback Binding**: Dev auth endpoints verify that incoming connections originate from loopback addresses (`127.0.0.1`, `::1`). Requests from external interfaces are rejected with `403 Forbidden`. Empty or wildcard listen hosts (`""`, `0.0.0.0`) are strictly rejected during configuration validation.
-- **Hosted Production Safeguard**: If `DEADBOLT_RUNTIME_MODE=hosted` and `DEV_AUTH_ENABLED=true`, the runtime startup rejects configuration immediately.
-- **Warning Banner**: Local dev auth issuance emits prominent console log warnings notifying developers that dev auth is strictly prohibited in production.
+Per Blueprint §24.4:
+
+- Task secrets remain on customer workers; platform secrets use cloud secret manager and envelope encryption with KMS in hosted mode.
+- Local mode uses an explicit development key stored in a gitignored secret file (e.g. `.deadbolt-dev-key` or `dev.key`).
+- Hosted startup strictly rejects any development keys, secret paths, or dev auth flags.
+
+### Configuration Inputs & Environment Variables
+
+| Setting / Env Var                                     | Hosted Mode (`hosted`)                      | Local Mode (`local`)                                               |
+| :---------------------------------------------------- | :------------------------------------------ | :----------------------------------------------------------------- |
+| `Config.DevAuthEnabled` / `DEADBOLT_DEV_AUTH_ENABLED` | **Strictly Rejected** (fatal startup error) | Permitted (strictly requires loopback listen host)                 |
+| `Config.DevKey` / `DEADBOLT_DEV_KEY`                  | **Strictly Rejected** (fatal startup error) | Permitted (resolves development encryption/auth key)               |
+| `Config.DevKeyPath` / `DEADBOLT_DEV_KEY_PATH`         | **Strictly Rejected** (fatal startup error) | Permitted (reads gitignored secret file, e.g. `.deadbolt-dev-key`) |
+| `Config.ReadDevKey()`                                 | Returns error (`prohibited in hosted mode`) | Resolves key from field, file path, or env var                     |
+
+### Strict Loopback Listen Host Validation
+
+When dev auth is enabled in local mode:
+
+- The listen host must be non-empty and resolve strictly to loopback (`127.0.0.1`, `localhost`, `::1`).
+- Empty strings, wildcards (`0.0.0.0`), and remote interfaces (`192.168.x.x`) are rejected at startup.
+- Dev login endpoints check the caller's IP and reject non-loopback requests with `403 Forbidden` (`LOOPBACK_REQUIRED`).
+- Development sessions emit prominent security warning banners in logs.
 
 ---
 
-## 7. Database Privileges & Log Redaction Guarantees
+## 7. Structured Security Log Redaction & Negative Log Isolation
 
-### Schema & Roles (Migration 00005)
+### Security Log Invariants
 
-- `users`, `oidc_identities`, and `auth_sessions` are owned by the migration role.
-- `deadbolt_runtime` is granted minimal required DML (`SELECT`, `INSERT`, `UPDATE`, `DELETE`).
-- `deadbolt_system` has all privileges explicitly revoked (`REVOKE ALL`).
+Issue #4 and Blueprint §24.4 mandate that logs never record Authorization headers, cookies, tokens, signed URLs, secrets, or other-tenant identifiers:
 
-### Negative Responses & Secret Redaction
+1. **Allowlisted Reason Codes**: `LogSecurityEvent` rejects arbitrary string details. All log events record a static, typed `SecurityReason` from an allowlisted classification map (`ReasonTokenVerificationFailed`, `ReasonUnauthorizedOrgMembership`, `ReasonOriginNotAllowlisted`, etc.).
+2. **Upstream OIDC Error Isolation**: When OIDC discovery, JWKS retrieval, or token exchange fails, raw upstream HTTP error response bodies (which might echo authorization codes, client secrets, or tokens) are strictly omitted from logs. The event records only `event=OIDC_EXCHANGE_FAILED reason=token_verification_failed`.
+3. **Cross-Tenant Data Isolation**: When a tenant membership switch is denied (`/api/auth/switch-org`), the requested foreign tenant organization ID is strictly omitted from logs. The event records `event=ORG_SWITCH_DENIED reason=unauthorized_org_membership`.
+4. **Credential Redaction**: Authorization headers (`Bearer ...`), cookie headers (`Cookie`, `Set-Cookie`), and CSRF tokens (`X-CSRF-Token`) are replaced with `[REDACTED]`.
+5. **Sentinel Verification**: Automated integration tests inject sensitive token sentinels (`SENTINEL_OIDC_SECRET_TOKEN_99999`) and foreign tenant UUID sentinels (`foreign-tenant-sentinel-uuid-77777777-8888`), proving they never appear in log buffers or response payloads.
 
-- All authentication error responses return structured, redacted JSON: `{"code": "...", "message": "..."}`.
-- Error payloads, stack traces, and debug logs are stripped of raw tokens, cookies, authorization codes, client secrets, and authorization headers (`[AUTH_SECURITY]` audit logs redact all sensitive credentials).
+---
+
+## 8. Real Browser Session Smoke Test (Headless Chrome via CDP)
+
+To guarantee that authentication behavior is validated against an actual browser engine (and not merely simulated via `http.Client`):
+
+- **Script**: `scripts/browser-smoke.mjs` executes headless Google Chrome / Chromium over the Chrome DevTools Protocol (CDP) via native Node 22 `WebSocket` with zero external npm dependencies.
+- **End-to-End Lifecycle**:
+  1. **Navigation & Redirect Chain**: Navigates to `/api/auth/login`, follows the 302 redirect chain through OIDC fixture `/authorize`, Go BFF `/api/auth/callback`, and lands on the SPA root `/`.
+  2. **Browser Storage Inspection**: Queries CDP `Network.getCookies` to verify real browser cookie storage for `__Host-runtime_session` (`HttpOnly=true, Secure=true`) and `__Host-csrf_token` (`HttpOnly=false, Secure=true`).
+  3. **DOM Masking Enforcement**: Evaluates `document.cookie` inside browser context, confirming that the session cookie is strictly invisible to JavaScript while the CSRF bootstrap cookie is readable.
+  4. **Authenticated Mutation**: Extracts the CSRF token via JavaScript and dispatches an authenticated `POST /api/mutation` fetch request with credentials, verifying `200 OK`.
+  5. **Authenticated Logout & Revocation**: Dispatches `POST /api/auth/logout` fetch request, verifying `204 No Content` and cookie clearing.
+  6. **Revocation Verification**: Dispatches subsequent `GET /api/auth/session` fetch request from the browser, verifying `401 Unauthorized`.
+- **Test Integration**: `TestRealChromeBrowserSmoke` in `tests/integration/auth_test.go` automatically runs this browser engine smoke test when Chrome/Chromium is installed, ensuring continuous automated verification across local and CI environments.

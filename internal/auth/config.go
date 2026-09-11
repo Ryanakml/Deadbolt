@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -49,6 +50,8 @@ type Config struct {
 	OIDC                   OIDCConfig
 	AllowedOrigins         []string
 	DevAuthEnabled         bool
+	DevKey                 string // Explicit development key for local workstation mode (Blueprint §24.4)
+	DevKeyPath             string // Path to gitignored local development key secret file (Blueprint §24.4)
 	CookieSecure           bool
 	SessionIdleTimeout     time.Duration
 	SessionAbsoluteTimeout time.Duration
@@ -80,8 +83,8 @@ func DefaultConfig() Config {
 	}
 }
 
-// Validate verifies configuration boundaries according to Blueprint §22.2 & §24.1.
-// In hosted mode, dev auth is strictly rejected, and CookieSecure must be true.
+// Validate verifies configuration boundaries according to Blueprint §22.2, §24.1 & §24.4.
+// In hosted mode, dev auth and development keys are strictly rejected, and CookieSecure must be true.
 // In local mode, dev auth is permitted only when explicitly bound to loopback.
 func (c *Config) Validate(listenHost string) error {
 	if c.RuntimeMode == "" {
@@ -100,8 +103,11 @@ func (c *Config) Validate(listenHost string) error {
 		if !c.CookieSecure {
 			return errors.New("hosted mode requires CookieSecure=true to enforce __Host- cookie policy")
 		}
-		// Blueprint §22.2: "hosted-mode startup rejects dev auth"
+		// Blueprint §22.2 & §24.4: "hosted-mode startup rejects dev auth and development keys"
 		if c.DevAuthEnabled {
+			return errors.New("hosted startup rejects dev auth and development keys")
+		}
+		if c.DevKey != "" || c.DevKeyPath != "" || os.Getenv("DEADBOLT_DEV_KEY") != "" || os.Getenv("DEADBOLT_DEV_KEY_PATH") != "" {
 			return errors.New("hosted startup rejects dev auth and development keys")
 		}
 		if c.OIDC.Issuer == "" {
@@ -126,10 +132,41 @@ func (c *Config) Validate(listenHost string) error {
 				return fmt.Errorf("dev auth is restricted strictly to loopback binding (got listen host %q)", listenHost)
 			}
 		}
+		if c.DevKeyPath != "" {
+			if _, err := os.Stat(c.DevKeyPath); err != nil {
+				return fmt.Errorf("invalid DevKeyPath: %w", err)
+			}
+		}
 		return nil
 	}
 
 	return fmt.Errorf("unsupported RuntimeMode %q (must be 'hosted' or 'local')", c.RuntimeMode)
+}
+
+// ReadDevKey resolves the development key from DevKey, DevKeyPath, or environment variables.
+// Per Blueprint §24.4, development keys are strictly prohibited in hosted mode.
+func (c *Config) ReadDevKey() (string, error) {
+	if c.RuntimeMode == ModeHosted {
+		return "", errors.New("development keys are strictly prohibited in hosted mode")
+	}
+	if c.DevKey != "" {
+		return strings.TrimSpace(c.DevKey), nil
+	}
+	path := c.DevKeyPath
+	if path == "" {
+		path = os.Getenv("DEADBOLT_DEV_KEY_PATH")
+	}
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("failed to read development key from %q: %w", path, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	if envKey := os.Getenv("DEADBOLT_DEV_KEY"); envKey != "" {
+		return strings.TrimSpace(envKey), nil
+	}
+	return "", nil
 }
 
 // IsOriginAllowed checks whether the specified origin is in the allowed origins list

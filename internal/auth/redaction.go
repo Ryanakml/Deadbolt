@@ -80,8 +80,72 @@ func ClearSessionCookie(w http.ResponseWriter, secure bool) {
 	})
 }
 
+// SecurityReason defines a typed enumeration of safe, allowlisted event reasons.
+// Arbitrary error strings, upstream HTTP response bodies, tokens, secrets,
+// and other-tenant identifiers must never be logged.
+type SecurityReason string
+
+const (
+	ReasonTokenVerificationFailed   SecurityReason = "token_verification_failed"
+	ReasonTokenExchangeFailed       SecurityReason = "token_exchange_failed"
+	ReasonUnauthorizedOrgMembership SecurityReason = "unauthorized_org_membership"
+	ReasonPKCEGenerationFailed      SecurityReason = "pkce_generation_failed"
+	ReasonAuthURLBuildFailed        SecurityReason = "auth_url_build_failed"
+	ReasonMissingCodeOrState        SecurityReason = "missing_code_or_state"
+	ReasonPKCEMissingOrExpired      SecurityReason = "pkce_cookie_missing_or_expired"
+	ReasonPKCEDecodeFailed          SecurityReason = "invalid_cookie_encoding"
+	ReasonPKCEStateMismatch         SecurityReason = "state_mismatch"
+	ReasonUserPersistenceFailed     SecurityReason = "user_persistence_failed"
+	ReasonMembershipDiscoveryFailed SecurityReason = "membership_discovery_failed"
+	ReasonSessionCreationFailed     SecurityReason = "session_creation_failed"
+	ReasonSessionMissing            SecurityReason = "session_missing"
+	ReasonSessionRevocationFailed   SecurityReason = "session_revocation_failed"
+	ReasonSessionRotationFailed     SecurityReason = "session_rotation_failed"
+	ReasonCookieMissing             SecurityReason = "cookie_missing"
+	ReasonSessionRevoked            SecurityReason = "session_revoked"
+	ReasonSessionIdleTimeout        SecurityReason = "session_idle_timeout"
+	ReasonSessionAbsoluteTimeout    SecurityReason = "session_absolute_timeout"
+	ReasonUnrecognizedSession       SecurityReason = "unrecognized_session"
+	ReasonUnauthenticatedMutation   SecurityReason = "unauthenticated_mutation"
+	ReasonOriginNotAllowlisted      SecurityReason = "origin_not_allowlisted"
+	ReasonCSRFValidationFailed      SecurityReason = "csrf_validation_failed"
+	ReasonLoginSuccess              SecurityReason = "login_success"
+	ReasonLogoutSuccess             SecurityReason = "logout_success"
+	ReasonOrgSwitchSuccess          SecurityReason = "org_switch_success"
+)
+
+var allowlistedReasons = map[SecurityReason]bool{
+	ReasonTokenVerificationFailed:   true,
+	ReasonTokenExchangeFailed:       true,
+	ReasonUnauthorizedOrgMembership: true,
+	ReasonPKCEGenerationFailed:      true,
+	ReasonAuthURLBuildFailed:        true,
+	ReasonMissingCodeOrState:        true,
+	ReasonPKCEMissingOrExpired:      true,
+	ReasonPKCEDecodeFailed:          true,
+	ReasonPKCEStateMismatch:         true,
+	ReasonUserPersistenceFailed:     true,
+	ReasonMembershipDiscoveryFailed: true,
+	ReasonSessionCreationFailed:     true,
+	ReasonSessionMissing:            true,
+	ReasonSessionRevocationFailed:   true,
+	ReasonSessionRotationFailed:     true,
+	ReasonCookieMissing:             true,
+	ReasonSessionRevoked:            true,
+	ReasonSessionIdleTimeout:        true,
+	ReasonSessionAbsoluteTimeout:    true,
+	ReasonUnrecognizedSession:       true,
+	ReasonUnauthenticatedMutation:   true,
+	ReasonOriginNotAllowlisted:      true,
+	ReasonCSRFValidationFailed:      true,
+	ReasonLoginSuccess:              true,
+	ReasonLogoutSuccess:             true,
+	ReasonOrgSwitchSuccess:          true,
+}
+
 // LogSecurityEvent writes an audit log entry for authentication events, strictly redacting all sensitive data
-func LogSecurityEvent(logger *log.Logger, event string, r *http.Request, details string) {
+// and enforcing safe, allowlisted reason codes. Raw error bodies, secrets, and other-tenant data are strictly barred.
+func LogSecurityEvent(logger *log.Logger, event string, r *http.Request, reason SecurityReason) {
 	if logger == nil {
 		return
 	}
@@ -93,6 +157,12 @@ func LogSecurityEvent(logger *log.Logger, event string, r *http.Request, details
 		method = r.Method
 		path = r.URL.Path
 	}
-	logger.Printf("[AUTH_SECURITY] event=%s remote_addr=%s method=%s path=%s details=%s",
-		event, remoteAddr, method, path, details)
+
+	safeReason := reason
+	if !allowlistedReasons[reason] {
+		safeReason = "unclassified_security_event"
+	}
+
+	logger.Printf("[AUTH_SECURITY] event=%s reason=%s remote_addr=%s method=%s path=%s",
+		event, safeReason, remoteAddr, method, path)
 }

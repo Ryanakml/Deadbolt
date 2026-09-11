@@ -62,8 +62,8 @@ func (h *BFFHandler) SetLogger(l *log.Logger) {
 	h.logger = l
 }
 
-func (h *BFFHandler) logSecurityEvent(event string, r *http.Request, details string) {
-	LogSecurityEvent(h.logger, event, r, details)
+func (h *BFFHandler) logSecurityEvent(event string, r *http.Request, reason SecurityReason) {
+	LogSecurityEvent(h.logger, event, r, reason)
 }
 
 // SetSessionCookies sets both the HttpOnly session cookie and the readable CSRF bootstrap cookie
@@ -122,7 +122,7 @@ func (h *BFFHandler) CORSMiddleware(next http.Handler) http.Handler {
 
 		if !h.cfg.IsOriginAllowed(origin) {
 			if r.Method == http.MethodOptions {
-				h.logSecurityEvent("CORS_PREFLIGHT_FORBIDDEN", r, fmt.Sprintf("origin %q not allowlisted", origin))
+				h.logSecurityEvent("CORS_PREFLIGHT_FORBIDDEN", r, ReasonOriginNotAllowlisted)
 				WriteSanitizedError(w, http.StatusForbidden, "ORIGIN_FORBIDDEN", fmt.Sprintf("Origin %q is not allowlisted", origin))
 				return
 			}
@@ -157,7 +157,7 @@ func (h *BFFHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 
 	pkce, err := GeneratePKCE()
 	if err != nil {
-		h.logSecurityEvent("LOGIN_INIT_FAILED", r, "failed to generate PKCE params")
+		h.logSecurityEvent("LOGIN_INIT_FAILED", r, ReasonPKCEGenerationFailed)
 		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to initialize auth request")
 		return
 	}
@@ -177,7 +177,7 @@ func (h *BFFHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 
 	authURL, err := h.oidc.BuildAuthorizationURL(r.Context(), pkce)
 	if err != nil {
-		h.logSecurityEvent("OIDC_AUTH_URL_FAILED", r, "failed to build OIDC auth URL")
+		h.logSecurityEvent("OIDC_AUTH_URL_FAILED", r, ReasonAuthURLBuildFailed)
 		WriteSanitizedError(w, http.StatusInternalServerError, "OIDC_ERROR", "Failed to build authorization URL")
 		return
 	}
@@ -195,7 +195,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 	if code == "" || state == "" {
-		h.logSecurityEvent("CALLBACK_INVALID_PARAMS", r, "missing code or state")
+		h.logSecurityEvent("CALLBACK_INVALID_PARAMS", r, ReasonMissingCodeOrState)
 		WriteSanitizedError(w, http.StatusBadRequest, "INVALID_REQUEST", "Missing code or state parameter")
 		return
 	}
@@ -203,7 +203,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Retrieve and clear PKCE cookie
 	pkceCookie, err := r.Cookie(PKCECookieName)
 	if err != nil || pkceCookie.Value == "" {
-		h.logSecurityEvent("CALLBACK_PKCE_MISSING", r, "missing or expired PKCE cookie")
+		h.logSecurityEvent("CALLBACK_PKCE_MISSING", r, ReasonPKCEMissingOrExpired)
 		WriteSanitizedError(w, http.StatusBadRequest, "OIDC_STATE_MISMATCH", "Missing or expired PKCE state")
 		return
 	}
@@ -220,14 +220,14 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	rawPKCE, err := base64.RawURLEncoding.DecodeString(pkceCookie.Value)
 	if err != nil {
-		h.logSecurityEvent("CALLBACK_PKCE_DECODE_FAILED", r, "invalid cookie encoding")
+		h.logSecurityEvent("CALLBACK_PKCE_DECODE_FAILED", r, ReasonPKCEDecodeFailed)
 		WriteSanitizedError(w, http.StatusBadRequest, "OIDC_STATE_MISMATCH", "Invalid authorization cookie format")
 		return
 	}
 
 	var pkce PKCEParams
 	if err := json.Unmarshal(rawPKCE, &pkce); err != nil || pkce.State != state {
-		h.logSecurityEvent("CALLBACK_STATE_MISMATCH", r, "state mismatch or malformed PKCE payload")
+		h.logSecurityEvent("CALLBACK_STATE_MISMATCH", r, ReasonPKCEStateMismatch)
 		WriteSanitizedError(w, http.StatusBadRequest, "OIDC_STATE_MISMATCH", "Invalid authorization state")
 		return
 	}
@@ -235,7 +235,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Exchange code + verifier with OIDC provider
 	identity, err := h.oidc.ExchangeAndVerify(r.Context(), code, pkce.CodeVerifier, pkce.Nonce)
 	if err != nil {
-		h.logSecurityEvent("OIDC_EXCHANGE_FAILED", r, fmt.Sprintf("token verification failed: %v", err))
+		h.logSecurityEvent("OIDC_EXCHANGE_FAILED", r, ReasonTokenVerificationFailed)
 		WriteSanitizedError(w, http.StatusUnauthorized, "OIDC_VERIFICATION_FAILED", "Identity token verification failed")
 		return
 	}
@@ -243,7 +243,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Upsert user and oidc_identities
 	user, err := h.store.GetOrCreateUserFromOIDC(r.Context(), identity)
 	if err != nil {
-		h.logSecurityEvent("USER_UPSERT_FAILED", r, "failed to persist identity")
+		h.logSecurityEvent("USER_UPSERT_FAILED", r, ReasonUserPersistenceFailed)
 		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to persist user identity")
 		return
 	}
@@ -251,7 +251,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Discover user memberships across organizations
 	memberships, err := storage.DiscoverUserMemberships(r.Context(), h.pool, user.ID)
 	if err != nil {
-		h.logSecurityEvent("MEMBERSHIP_DISCOVERY_FAILED", r, "failed to discover user memberships")
+		h.logSecurityEvent("MEMBERSHIP_DISCOVERY_FAILED", r, ReasonMembershipDiscoveryFailed)
 		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to discover user memberships")
 		return
 	}
@@ -265,7 +265,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	userAgent := r.UserAgent()
 
 	// Create new session
-	sess, rawToken, rawCSRF, err := h.store.CreateSession(
+	_, rawToken, rawCSRF, err := h.store.CreateSession(
 		r.Context(),
 		user.ID,
 		defaultOrgID,
@@ -275,7 +275,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		h.cfg.SessionAbsoluteTimeout,
 	)
 	if err != nil {
-		h.logSecurityEvent("SESSION_CREATE_FAILED", r, "failed to create session in DB")
+		h.logSecurityEvent("SESSION_CREATE_FAILED", r, ReasonSessionCreationFailed)
 		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to establish session")
 		return
 	}
@@ -287,7 +287,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// In response header provide CSRF token for single-page dashboard apps
 	w.Header().Set("X-CSRF-Token", rawCSRF)
 
-	h.logSecurityEvent("LOGIN_SUCCESS", r, fmt.Sprintf("user_id=%s session_id=%s", user.ID, sess.ID))
+	h.logSecurityEvent("LOGIN_SUCCESS", r, ReasonLoginSuccess)
 
 	// Redirect to application root or dashboard
 	http.Redirect(w, r, "/", http.StatusFound)
@@ -302,19 +302,19 @@ func (h *BFFHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 
 	sess, ok := SessionFromContext(r.Context())
 	if !ok || sess == nil {
-		h.logSecurityEvent("LOGOUT_UNAUTHENTICATED", r, "logout called without active session")
+		h.logSecurityEvent("LOGOUT_UNAUTHENTICATED", r, ReasonSessionMissing)
 		WriteSanitizedError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Active session required for logout")
 		return
 	}
 
 	// Revoke session in DB
 	if err := h.store.RevokeSession(r.Context(), sess.ID, "LOGOUT"); err != nil {
-		h.logSecurityEvent("LOGOUT_REVOKE_FAILED", r, fmt.Sprintf("failed to revoke session %s: %v", sess.ID, err))
+		h.logSecurityEvent("LOGOUT_REVOKE_FAILED", r, ReasonSessionRevocationFailed)
 		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to revoke session")
 		return
 	}
 
-	h.logSecurityEvent("LOGOUT_SUCCESS", r, fmt.Sprintf("session_id=%s revoked", sess.ID))
+	h.logSecurityEvent("LOGOUT_SUCCESS", r, ReasonLogoutSuccess)
 
 	// Clear session & CSRF cookies cleanly
 	ClearSessionCookies(w, h.cfg)
@@ -449,7 +449,7 @@ func (h *BFFHandler) HandleSwitchOrg(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !targetFound {
-		h.logSecurityEvent("ORG_SWITCH_DENIED", r, fmt.Sprintf("user %s not in org %s", sess.UserID, req.OrganizationID))
+		h.logSecurityEvent("ORG_SWITCH_DENIED", r, ReasonUnauthorizedOrgMembership)
 		WriteSanitizedError(w, http.StatusForbidden, "FORBIDDEN_ORGANIZATION_MEMBERSHIP", "User is not an active member of the requested organization")
 		return
 	}
@@ -469,7 +469,7 @@ func (h *BFFHandler) HandleSwitchOrg(w http.ResponseWriter, r *http.Request) {
 		h.cfg.SessionAbsoluteTimeout,
 	)
 	if err != nil {
-		h.logSecurityEvent("SESSION_ROTATE_FAILED", r, "failed to rotate session in DB")
+		h.logSecurityEvent("SESSION_ROTATE_FAILED", r, ReasonSessionRotationFailed)
 		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to rotate session")
 		return
 	}
@@ -478,7 +478,7 @@ func (h *BFFHandler) HandleSwitchOrg(w http.ResponseWriter, r *http.Request) {
 	maxAge := int(h.cfg.SessionAbsoluteTimeout.Seconds())
 	h.SetSessionCookies(w, rawSessionToken, rawCSRFToken, maxAge)
 
-	h.logSecurityEvent("ORG_SWITCH_SUCCESS", r, fmt.Sprintf("old_session=%s new_session=%s org=%s", sess.ID, newSess.ID, req.OrganizationID))
+	h.logSecurityEvent("ORG_SWITCH_SUCCESS", r, ReasonOrgSwitchSuccess)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-CSRF-Token", rawCSRFToken)
@@ -494,7 +494,7 @@ func (h *BFFHandler) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie(h.cfg.SessionCookieName())
 		if err != nil || cookie.Value == "" {
-			h.logSecurityEvent("AUTH_MISSING_COOKIE", r, fmt.Sprintf("cookie %s missing", h.cfg.SessionCookieName()))
+			h.logSecurityEvent("AUTH_MISSING_COOKIE", r, ReasonCookieMissing)
 			WriteSanitizedError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Missing session cookie")
 			return
 		}
@@ -505,21 +505,21 @@ func (h *BFFHandler) RequireAuth(next http.Handler) http.Handler {
 			ClearSessionCookies(w, h.cfg)
 
 			if errors.Is(err, ErrSessionRevoked) {
-				h.logSecurityEvent("AUTH_SESSION_REVOKED", r, "rejected revoked session")
+				h.logSecurityEvent("AUTH_SESSION_REVOKED", r, ReasonSessionRevoked)
 				WriteSanitizedError(w, http.StatusUnauthorized, "SESSION_REVOKED", "Session has been revoked")
 				return
 			}
 			if errors.Is(err, ErrSessionIdleTimeout) {
-				h.logSecurityEvent("AUTH_SESSION_IDLE_TIMEOUT", r, "session idle timeout")
+				h.logSecurityEvent("AUTH_SESSION_IDLE_TIMEOUT", r, ReasonSessionIdleTimeout)
 				WriteSanitizedError(w, http.StatusUnauthorized, "SESSION_IDLE_TIMEOUT", "Session idle timeout exceeded")
 				return
 			}
 			if errors.Is(err, ErrSessionExpired) {
-				h.logSecurityEvent("AUTH_SESSION_EXPIRED", r, "session absolute expired")
+				h.logSecurityEvent("AUTH_SESSION_EXPIRED", r, ReasonSessionAbsoluteTimeout)
 				WriteSanitizedError(w, http.StatusUnauthorized, "SESSION_EXPIRED", "Session absolute expiration reached")
 				return
 			}
-			h.logSecurityEvent("AUTH_INVALID_SESSION", r, "unrecognized session token")
+			h.logSecurityEvent("AUTH_INVALID_SESSION", r, ReasonUnrecognizedSession)
 			WriteSanitizedError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Invalid session")
 			return
 		}
@@ -541,7 +541,7 @@ func (h *BFFHandler) RequireCSRFAndOrigin(next http.Handler) http.Handler {
 
 		sess, ok := SessionFromContext(r.Context())
 		if !ok || sess == nil {
-			h.logSecurityEvent("MUTATION_AUTH_REQUIRED", r, "unauthenticated mutation attempt")
+			h.logSecurityEvent("MUTATION_AUTH_REQUIRED", r, ReasonUnauthenticatedMutation)
 			WriteSanitizedError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
 			return
 		}
@@ -552,7 +552,7 @@ func (h *BFFHandler) RequireCSRFAndOrigin(next http.Handler) http.Handler {
 			origin = r.Header.Get("Referer")
 		}
 		if origin == "" || !h.cfg.IsOriginAllowed(origin) {
-			h.logSecurityEvent("ORIGIN_FORBIDDEN", r, fmt.Sprintf("rejected origin %q", origin))
+			h.logSecurityEvent("ORIGIN_FORBIDDEN", r, ReasonOriginNotAllowlisted)
 			WriteSanitizedError(w, http.StatusForbidden, "ORIGIN_FORBIDDEN", fmt.Sprintf("Origin %q is not allowlisted", origin))
 			return
 		}
@@ -560,7 +560,7 @@ func (h *BFFHandler) RequireCSRFAndOrigin(next http.Handler) http.Handler {
 		// 2. CSRF Token check
 		csrfToken := r.Header.Get("X-CSRF-Token")
 		if csrfToken == "" || !ValidateCSRFToken(sess, csrfToken) {
-			h.logSecurityEvent("CSRF_VALIDATION_FAILED", r, "invalid or missing X-CSRF-Token")
+			h.logSecurityEvent("CSRF_VALIDATION_FAILED", r, ReasonCSRFValidationFailed)
 			WriteSanitizedError(w, http.StatusForbidden, "CSRF_VALIDATION_FAILED", "Missing or invalid X-CSRF-Token header")
 			return
 		}
