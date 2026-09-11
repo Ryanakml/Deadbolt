@@ -1277,8 +1277,8 @@ func TestRealChromeBrowserSmoke(t *testing.T) {
 		t.Fatalf("browser smoke test execution failed: %v\nOutput: %s", err, outputStr)
 	}
 
-	if strings.Contains(outputStr, "Chrome/Chromium executable not found") {
-		t.Log("Chrome/Chromium executable not found in this environment; smoke skipped safely.")
+	if strings.Contains(outputStr, "Chrome/Chromium executable not found") || strings.Contains(outputStr, "Chrome remote debugging unavailable") {
+		t.Log("Chrome/Chromium headless execution unavailable in this environment; smoke skipped safely.")
 		return
 	}
 
