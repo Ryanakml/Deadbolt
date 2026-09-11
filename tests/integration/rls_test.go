@@ -78,7 +78,8 @@ func TestCleanDatabaseMigrationAsDeadboltMigrator(t *testing.T) {
 }
 
 // TestMigrationAdvisoryLockBlocking verifies single-migrator serialization via pinned session advisory lock.
-// When Migrator A holds the lock, Migrator B is blocked until Migrator A releases it.
+// When an active session holds the advisory lock, Goose migration execution on another runner is blocked
+// and cannot execute migration SQL until the lock is released.
 func TestMigrationAdvisoryLockBlocking(t *testing.T) {
 	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
@@ -89,17 +90,47 @@ func TestMigrationAdvisoryLockBlocking(t *testing.T) {
 
 	ctx := context.Background()
 
+	// 0. Roll down to version 3 so that migration 4 is pending
+	if err := runnerB.DownTo(ctx, 3); err != nil {
+		t.Fatalf("failed to prepare pending migration state: %v", err)
+	}
+	v, err := runnerB.Version(ctx)
+	if err != nil || v != 3 {
+		t.Fatalf("expected initial version 3, got %d (err: %v)", v, err)
+	}
+
 	// 1. Runner A acquires advisory lock
 	if err := runnerA.AcquireAdvisoryLock(ctx); err != nil {
 		t.Fatalf("Runner A failed to acquire advisory lock: %v", err)
 	}
 
-	// 2. Runner B attempts to acquire lock with short timeout -> must time out / be blocked
-	timeoutCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	err := runnerB.AcquireAdvisoryLock(timeoutCtx)
+	// 2. Runner B attempts to run pending Goose migration Up with short timeout -> must time out / be blocked.
+	// This proves that migration execution itself cannot bypass the advisory lock critical section.
+	timeoutCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	err = runnerB.Up(timeoutCtx)
 	cancel()
 	if err == nil {
-		t.Fatalf("CONCURRENCY VIOLATION: Runner B acquired advisory lock while Runner A was holding it!")
+		t.Fatalf("CONCURRENCY VIOLATION: Runner B executed migration Up while Runner A was holding advisory lock!")
+	}
+
+	// Verify that version is STILL 3 (no migration SQL was executed by Runner B)
+	v, err = runnerA.Version(ctx)
+	if err != nil || v != 3 {
+		t.Fatalf("CONCURRENCY VIOLATION: migration SQL executed outside lock; version is %d, expected 3", v)
+	}
+
+	// Also verify DownTo is blocked while Runner A holds the lock
+	timeoutDownCtx, cancelDown := context.WithTimeout(ctx, 1500*time.Millisecond)
+	err = runnerB.DownTo(timeoutDownCtx, 2)
+	cancelDown()
+	if err == nil {
+		t.Fatalf("CONCURRENCY VIOLATION: Runner B executed migration DownTo while Runner A was holding advisory lock!")
+	}
+
+	// Verify that version is STILL 3 (no rollback SQL was executed by Runner B)
+	v, err = runnerA.Version(ctx)
+	if err != nil || v != 3 {
+		t.Fatalf("CONCURRENCY VIOLATION: migration SQL executed outside lock; version is %d, expected 3", v)
 	}
 
 	// 3. Runner A releases lock
@@ -107,16 +138,17 @@ func TestMigrationAdvisoryLockBlocking(t *testing.T) {
 		t.Fatalf("Runner A failed to release advisory lock: %v", err)
 	}
 
-	// 4. Runner B now succeeds immediately in acquiring lock
-	acquireCtx, cancelAcquire := context.WithTimeout(ctx, 2*time.Second)
+	// 4. Runner B now succeeds in running migration Up under its own session advisory lock
+	acquireCtx, cancelAcquire := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelAcquire()
-	if err := runnerB.AcquireAdvisoryLock(acquireCtx); err != nil {
-		t.Fatalf("Runner B failed to acquire advisory lock after Runner A released: %v", err)
+	if err := runnerB.Up(acquireCtx); err != nil {
+		t.Fatalf("Runner B failed to run migration Up after Runner A released: %v", err)
 	}
 
-	// Clean up Runner B
-	if err := runnerB.ReleaseAdvisoryLock(ctx); err != nil {
-		t.Fatalf("Runner B failed to release advisory lock: %v", err)
+	// Verify version is now upgraded to 4
+	v, err = runnerB.Version(ctx)
+	if err != nil || v != 4 {
+		t.Fatalf("expected version 4 after migration Up, got %d (err: %v)", v, err)
 	}
 }
 
@@ -416,6 +448,32 @@ func TestRestrictedDiscoveryFunctions(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("expected permission denied error for deadbolt_system on public.runs, got: %v", err)
+	}
+
+	err = systemPool.QueryRow(ctx, "SELECT count(*) FROM public.organizations").Scan(&forbiddenCount)
+	if err == nil {
+		t.Fatalf("SECURITY VIOLATION: deadbolt_system was able to select from public.organizations!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied error for deadbolt_system on public.organizations, got: %v", err)
+	}
+
+	// 4. Verify deadbolt_runtime CANNOT execute scheduler-only discovery function
+	_, err = storage.EnumerateTenantsForScheduler(ctx, runtimePool)
+	if err == nil {
+		t.Fatalf("SECURITY VIOLATION: deadbolt_runtime was able to execute EnumerateTenantsForScheduler!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied error for deadbolt_runtime on enumerate_scheduler_tenants, got: %v", err)
+	}
+
+	// 5. Verify deadbolt_system CANNOT execute user membership discovery function
+	_, err = storage.DiscoverUserMemberships(ctx, systemPool, targetUser)
+	if err == nil {
+		t.Fatalf("SECURITY VIOLATION: deadbolt_system was able to execute DiscoverUserMemberships!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied error for deadbolt_system on discover_user_memberships, got: %v", err)
 	}
 }
 

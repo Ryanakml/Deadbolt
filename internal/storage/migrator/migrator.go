@@ -9,6 +9,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 )
 
 // MigrationAdvisoryLockID is a constant 64-bit integer used for single-migrator serialization.
@@ -27,6 +28,31 @@ func NewRunner(db *sql.DB, migrationsDir string) *Runner {
 		db:            db,
 		migrationsDir: migrationsDir,
 	}
+}
+
+func (r *Runner) newProvider() (*goose.Provider, error) {
+	if _, err := os.Stat(r.migrationsDir); err != nil {
+		return nil, fmt.Errorf("migrations directory not found at %s: %w", r.migrationsDir, err)
+	}
+
+	sessionLocker, err := lock.NewPostgresSessionLocker(
+		lock.WithLockID(MigrationAdvisoryLockID),
+		lock.WithLockTimeout(1, 60), // retry every 1 second, up to 60 seconds
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create postgres session locker: %w", err)
+	}
+
+	provider, err := goose.NewProvider(
+		goose.DialectPostgres,
+		r.db,
+		os.DirFS(r.migrationsDir),
+		goose.WithSessionLocker(sessionLocker),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize goose provider: %w", err)
+	}
+	return provider, nil
 }
 
 // AcquireAdvisoryLock acquires an exclusive session-level advisory lock on PostgreSQL
@@ -74,68 +100,44 @@ func (r *Runner) ReleaseAdvisoryLock(ctx context.Context) error {
 	return nil
 }
 
-// Up runs all pending migrations under the pinned session advisory lock.
+// Up runs all pending migrations under the session advisory lock using Goose Provider.
+// The session locker guarantees that lock acquisition, migration execution, and release
+// are serialized on the exact same physical database session connection.
 func (r *Runner) Up(ctx context.Context) error {
-	if err := r.AcquireAdvisoryLock(ctx); err != nil {
+	provider, err := r.newProvider()
+	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = r.ReleaseAdvisoryLock(context.Background())
-	}()
 
-	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("failed to set goose dialect: %w", err)
-	}
-
-	if _, err := os.Stat(r.migrationsDir); err != nil {
-		return fmt.Errorf("migrations directory not found at %s: %w", r.migrationsDir, err)
-	}
-
-	if err := goose.UpContext(ctx, r.db, r.migrationsDir); err != nil {
+	if _, err := provider.Up(ctx); err != nil {
 		return fmt.Errorf("goose up failed: %w", err)
 	}
 
 	return nil
 }
 
-// UpTo runs migrations up to a specific version under the pinned session advisory lock.
+// UpTo runs migrations up to a specific version under the session advisory lock.
 func (r *Runner) UpTo(ctx context.Context, version int64) error {
-	if err := r.AcquireAdvisoryLock(ctx); err != nil {
+	provider, err := r.newProvider()
+	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = r.ReleaseAdvisoryLock(context.Background())
-	}()
 
-	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("failed to set goose dialect: %w", err)
-	}
-
-	if _, err := os.Stat(r.migrationsDir); err != nil {
-		return fmt.Errorf("migrations directory not found at %s: %w", r.migrationsDir, err)
-	}
-
-	if err := goose.UpToContext(ctx, r.db, r.migrationsDir, version); err != nil {
+	if _, err := provider.UpTo(ctx, version); err != nil {
 		return fmt.Errorf("goose up-to %d failed: %w", version, err)
 	}
 
 	return nil
 }
 
-// DownTo rolls back migrations down to a specific version under the pinned session advisory lock.
+// DownTo rolls back migrations down to a specific version under the session advisory lock.
 func (r *Runner) DownTo(ctx context.Context, version int64) error {
-	if err := r.AcquireAdvisoryLock(ctx); err != nil {
+	provider, err := r.newProvider()
+	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = r.ReleaseAdvisoryLock(context.Background())
-	}()
 
-	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("failed to set goose dialect: %w", err)
-	}
-
-	if err := goose.DownToContext(ctx, r.db, r.migrationsDir, version); err != nil {
+	if _, err := provider.DownTo(ctx, version); err != nil {
 		return fmt.Errorf("goose down-to %d failed: %w", version, err)
 	}
 
@@ -143,9 +145,10 @@ func (r *Runner) DownTo(ctx context.Context, version int64) error {
 }
 
 // Version returns the current database migration version.
+// Reading the current migration version does not acquire the DDL advisory lock.
 func (r *Runner) Version(ctx context.Context) (int64, error) {
 	if err := goose.SetDialect("postgres"); err != nil {
 		return 0, fmt.Errorf("failed to set goose dialect: %w", err)
 	}
-	return goose.GetDBVersion(r.db)
+	return goose.GetDBVersionContext(ctx, r.db)
 }

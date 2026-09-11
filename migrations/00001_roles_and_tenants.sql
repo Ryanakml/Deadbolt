@@ -61,6 +61,7 @@ END;
 $$;
 -- +goose StatementEnd
 
+REVOKE ALL ON FUNCTION app.current_organization_id() FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.discover_user_memberships(UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.enumerate_scheduler_tenants() FROM PUBLIC;
 
@@ -70,9 +71,11 @@ BEGIN
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_runtime') THEN
         GRANT EXECUTE ON FUNCTION app.current_organization_id() TO deadbolt_runtime;
         GRANT EXECUTE ON FUNCTION app.discover_user_memberships(UUID) TO deadbolt_runtime;
+        REVOKE EXECUTE ON FUNCTION app.enumerate_scheduler_tenants() FROM deadbolt_runtime;
     END IF;
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_system') THEN
         GRANT EXECUTE ON FUNCTION app.enumerate_scheduler_tenants() TO deadbolt_system;
+        REVOKE EXECUTE ON FUNCTION app.discover_user_memberships(UUID) FROM deadbolt_system;
     END IF;
 END $$;
 -- +goose StatementEnd

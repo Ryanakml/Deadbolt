@@ -55,7 +55,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE deadbolt_migrator IN SCHEMA public
 ALTER DEFAULT PRIVILEGES FOR ROLE deadbolt_migrator IN SCHEMA public
     REVOKE ALL ON TABLES FROM deadbolt_system;
 ALTER DEFAULT PRIVILEGES FOR ROLE deadbolt_migrator IN SCHEMA app
-    GRANT EXECUTE ON ROUTINES TO deadbolt_runtime;
+    REVOKE ALL ON ROUTINES FROM PUBLIC;
 
 -- Also set default privileges for admin role if tables are created directly
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
@@ -76,12 +76,15 @@ REVOKE ALL ON ALL TABLES IN SCHEMA public FROM deadbolt_system;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'app' AND p.proname = 'current_organization_id') THEN
+        REVOKE ALL ON FUNCTION app.current_organization_id() FROM PUBLIC;
         GRANT EXECUTE ON FUNCTION app.current_organization_id() TO deadbolt_runtime;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'app' AND p.proname = 'discover_user_memberships') THEN
+        REVOKE ALL ON FUNCTION app.discover_user_memberships(UUID) FROM PUBLIC, deadbolt_system;
         GRANT EXECUTE ON FUNCTION app.discover_user_memberships(UUID) TO deadbolt_runtime;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'app' AND p.proname = 'enumerate_scheduler_tenants') THEN
+        REVOKE ALL ON FUNCTION app.enumerate_scheduler_tenants() FROM PUBLIC, deadbolt_runtime;
         GRANT EXECUTE ON FUNCTION app.enumerate_scheduler_tenants() TO deadbolt_system;
     END IF;
 END $$;

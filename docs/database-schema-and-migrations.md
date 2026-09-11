@@ -87,7 +87,7 @@ Migrations are stored in `migrations/` and executed sequentially using `goose` u
 
 ### Single-Migrator Advisory Lock Serialization
 
-All migrations acquire `SELECT pg_advisory_lock(7142893)` on a dedicated physical session connection in `migrator.Runner`. If another migrator process attempts to migrate concurrently, it blocks until the lock holder releases the advisory lock upon completion or session termination.
+All migrations acquire `SELECT pg_advisory_lock(7142893)` on a dedicated physical session connection in `migrator.Runner` via Goose Provider's `lock.NewPostgresSessionLocker`. Lock acquisition, migration DDL execution, and lock release are strictly serialized through the exact same physical database session. If another migrator process attempts to migrate concurrently, it blocks until the lock holder releases the advisory lock upon completion or session termination.
 
 ---
 
