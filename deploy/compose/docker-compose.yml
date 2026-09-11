@@ -53,7 +53,7 @@ services:
       start_period: 10s
 
   minio:
-    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     container_name: deadbolt-minio
     profiles: ["core"]
     restart: unless-stopped
