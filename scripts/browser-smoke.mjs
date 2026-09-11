@@ -232,17 +232,18 @@ async function runBrowserSmoke(targetBaseUrl) {
       returnByValue: true,
     });
     const domCookieStr = docCookieEval.result.value || "";
+    const sessionCookieLeaked = domCookieStr.includes(sessionCookie.name);
+    const csrfCookieReadable = domCookieStr.includes(csrfCookie.name);
     console.log(
-      `[BROWSER_SMOKE] Step 4: document.cookie readable by browser JS: %q`,
-      domCookieStr,
+      `[BROWSER_SMOKE] Step 4: DOM cookie visibility: csrf_cookie_readable=${csrfCookieReadable}, session_cookie_leaked=${sessionCookieLeaked}`,
     );
 
-    if (domCookieStr.includes(sessionCookie.name)) {
+    if (sessionCookieLeaked) {
       throw new Error(
         `SECURITY VIOLATION: HttpOnly session cookie ${sessionCookie.name} leaked to document.cookie!`,
       );
     }
-    if (!domCookieStr.includes(csrfCookie.name)) {
+    if (!csrfCookieReadable) {
       throw new Error(
         `BOOTSTRAP VIOLATION: Readable CSRF cookie ${csrfCookie.name} not found in document.cookie!`,
       );
@@ -263,7 +264,7 @@ async function runBrowserSmoke(targetBaseUrl) {
       );
     }
     console.log(
-      `[BROWSER_SMOKE] Successfully extracted CSRF token via browser JS: ${csrfToken.slice(0, 8)}...`,
+      `[BROWSER_SMOKE] Successfully extracted CSRF token via browser JS: token_extracted=true, token_len=${csrfToken.length}`,
     );
 
     // Step 5: Execute an authenticated mutating fetch() inside the real browser

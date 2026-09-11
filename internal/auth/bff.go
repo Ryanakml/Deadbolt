@@ -104,7 +104,6 @@ func (h *BFFHandler) Routes() http.Handler {
 	mux.HandleFunc("/api/auth/login", h.HandleLogin)
 	mux.HandleFunc("/api/auth/callback", h.HandleCallback)
 	mux.Handle("/api/auth/session", h.RequireAuth(http.HandlerFunc(h.HandleGetSession)))
-	mux.Handle("/api/auth/csrf", h.RequireAuth(http.HandlerFunc(h.HandleGetCSRF)))
 	mux.Handle("/api/auth/switch-org", h.RequireAuth(h.RequireCSRFAndOrigin(http.HandlerFunc(h.HandleSwitchOrg))))
 	mux.Handle("/api/auth/logout", h.RequireAuth(h.RequireCSRFAndOrigin(http.HandlerFunc(h.HandleLogout))))
 
@@ -319,57 +318,6 @@ func (h *BFFHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	// Clear session & CSRF cookies cleanly
 	ClearSessionCookies(w, h.cfg)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleGetCSRF returns a newly generated CSRF token synchronized with the database session
-func (h *BFFHandler) HandleGetCSRF(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		WriteSanitizedError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Method not allowed")
-		return
-	}
-
-	sess, ok := SessionFromContext(r.Context())
-	if !ok || sess == nil {
-		WriteSanitizedError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Active session required")
-		return
-	}
-
-	rawCSRF, err := GenerateCSRFToken()
-	if err != nil {
-		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to generate CSRF token")
-		return
-	}
-	csrfHash := HashToken(rawCSRF)
-
-	// Update DB session csrf_token_hash
-	_, err = h.pool.Exec(r.Context(), `
-		UPDATE auth_sessions
-		SET csrf_token_hash = $1, last_seen_at = clock_timestamp()
-		WHERE id = $2
-	`, csrfHash, sess.ID)
-	if err != nil {
-		WriteSanitizedError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update CSRF token in session")
-		return
-	}
-	sess.CSRFTokenHash = csrfHash
-
-	// Update readable CSRF cookie
-	maxAge := int(h.cfg.SessionAbsoluteTimeout.Seconds())
-	http.SetCookie(w, &http.Cookie{
-		Name:     h.cfg.CSRFCookieName(),
-		Value:    rawCSRF,
-		Path:     "/",
-		MaxAge:   maxAge,
-		HttpOnly: false,
-		Secure:   h.cfg.CookieSecure,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-CSRF-Token", rawCSRF)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"csrf_token": rawCSRF,
-	})
 }
 
 // HandleGetSession returns current authenticated user and session metadata

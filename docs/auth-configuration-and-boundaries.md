@@ -65,10 +65,11 @@ When developing locally over unencrypted HTTP (`CookieSecure=false`), conforming
 
 ### Browser CSRF Bootstrap Pattern
 
-Because `HandleCallback` redirects top-level navigations to `/`, client-side single-page applications cannot inspect 302 redirect response headers. Deadbolt provides a dual bootstrap mechanism:
+Because `HandleCallback` redirects top-level navigations to `/`, client-side single-page applications cannot inspect 302 redirect response headers. Deadbolt uses a secure, origin-locked readable cookie bootstrap:
 
-1. **Readable Cookie Bootstrap**: The `__Host-csrf_token` (or `deadbolt_local_csrf`) cookie is set during login and session rotation, readable directly by browser JavaScript.
-2. **Protected API Bootstrap Endpoint**: `GET /api/auth/csrf` (guarded by `RequireAuth`) synchronizes and returns a fresh CSRF token.
+1. **Readable Cookie Bootstrap**: During login (`/api/auth/callback` or `/api/auth/dev-login`) and privilege rotation (`/api/auth/switch-org`), the server issues the readable `__Host-csrf_token` (or `deadbolt_local_csrf` in non-secure local mode) cookie with `HttpOnly=false, Secure=true, SameSite=Lax`.
+2. **SPA Context Extraction**: Client-side JavaScript directly reads this token from `document.cookie` (while the browser engine strictly protects the `HttpOnly` session cookie) and attaches it as the `X-CSRF-Token` header on all mutating requests.
+3. **Safe GET Semantics**: All GET endpoints are non-mutating and safe; no state-changing CSRF token mutations occur over GET requests.
 
 ### Mutating Request Enforcement
 

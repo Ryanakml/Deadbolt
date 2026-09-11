@@ -383,32 +383,6 @@ func TestCSRFAndOriginEnforcement(t *testing.T) {
 	if rec4.Code != http.StatusForbidden || !strings.Contains(rec4.Body.String(), "CSRF_VALIDATION_FAILED") {
 		t.Fatalf("expected 403 CSRF_VALIDATION_FAILED, got %d (body: %s)", rec4.Code, rec4.Body.String())
 	}
-
-	// 5. Dedicated CSRF Bootstrap Endpoint: GET /api/auth/csrf
-	csrfReq := httptest.NewRequest(http.MethodGet, "/api/auth/csrf", nil)
-	csrfReq.AddCookie(cookie)
-	csrfRec := httptest.NewRecorder()
-	bff.RequireAuth(http.HandlerFunc(bff.HandleGetCSRF)).ServeHTTP(csrfRec, csrfReq)
-
-	if csrfRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK from GET /api/auth/csrf, got %d (body: %s)", csrfRec.Code, csrfRec.Body.String())
-	}
-	var csrfResp map[string]string
-	if err := json.NewDecoder(csrfRec.Body).Decode(&csrfResp); err != nil || csrfResp["csrf_token"] == "" {
-		t.Fatalf("failed to decode valid csrf token from bootstrap endpoint: %+v", csrfResp)
-	}
-	bootstrappedCSRF := csrfResp["csrf_token"]
-
-	// Verify the newly bootstrapped CSRF token successfully authorizes a subsequent mutation
-	mutReq := httptest.NewRequest(http.MethodPost, "/api/mutation", strings.NewReader(`{}`))
-	mutReq.AddCookie(cookie)
-	mutReq.Header.Set("Origin", "https://app.deadbolt.cloud")
-	mutReq.Header.Set("X-CSRF-Token", bootstrappedCSRF)
-	mutRec := httptest.NewRecorder()
-	targetHandler.ServeHTTP(mutRec, mutReq)
-	if mutRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK with bootstrapped CSRF token, got %d", mutRec.Code)
-	}
 }
 
 // TestCORSAllowlistAndPreflight verifies allowlisted CORS preflight and headers.
@@ -1278,8 +1252,7 @@ func TestRealChromeBrowserSmoke(t *testing.T) {
 	}
 
 	if strings.Contains(outputStr, "Chrome/Chromium executable not found") || strings.Contains(outputStr, "Chrome remote debugging unavailable") {
-		t.Log("Chrome/Chromium headless execution unavailable in this environment; smoke skipped safely.")
-		return
+		t.Skip("Chrome/Chromium headless execution unavailable in this environment; skipping browser smoke test (real browser acceptance evidence recorded separately)")
 	}
 
 	if !strings.Contains(outputStr, "SUCCESS: Real Chrome browser smoke completed successfully!") {
