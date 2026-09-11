@@ -74,7 +74,7 @@ Spin up a recovery container with an empty target data volume:
 
 ```bash
 docker run -d --name deadbolt-recovery \
-  -v deadbolt_recovery_data:/var/lib/postgresql/data \
+  -v deadbolt_recovery_data:/var/lib/postgresql \
   -e POSTGRES_PASSWORD="${RECOVERY_DB_PASSWORD}" \
   postgres:18-bookworm
 ```
