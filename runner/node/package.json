@@ -1,7 +1,7 @@
 {
-  "name": "@runtime/sdk",
+  "name": "@runtime/runner",
   "version": "0.1.0",
-  "description": "Deadbolt TypeScript SDK & Contract Validator",
+  "description": "Deadbolt Node.js task execution runner",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,9 +13,5 @@
   "devDependencies": {
     "@types/node": "24.10.1",
     "typescript": "5.9.3"
-  },
-  "dependencies": {
-    "canonicalize": "5.0.0",
-    "jsonschema": "1.5.0"
   }
 }
