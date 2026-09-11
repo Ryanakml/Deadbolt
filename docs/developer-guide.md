@@ -12,12 +12,12 @@ The goal is simple: when one developer finishes something, they should not need 
 
 We use one `main` branch, short-lived branches for each change, one owner per issue, and cross-review.
 
-| Role | Responsibility |
-|---|---|
-| Developer A | Implements the issue they claimed, runs tests, keeps the PR up to date, and prepares evidence |
-| Developer B | Same as A for their own issue, while also reviewing A's work |
-| Reviewer | Checks behavior, contracts, tenant/permission boundaries, race/failure cases when relevant, migrations, config, rollback, and acceptance |
-| Staging coordinator | The one person currently handling deployment/migration/rollback on shared staging |
+| Role                | Responsibility                                                                                                                           |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Developer A         | Implements the issue they claimed, runs tests, keeps the PR up to date, and prepares evidence                                            |
+| Developer B         | Same as A for their own issue, while also reviewing A's work                                                                             |
+| Reviewer            | Checks behavior, contracts, tenant/permission boundaries, race/failure cases when relevant, migrations, config, rollback, and acceptance |
+| Staging coordinator | The one person currently handling deployment/migration/rollback on shared staging                                                        |
 
 A and B are **not permanent backend/frontend roles**. Ownership can change depending on the issue.
 
@@ -114,15 +114,15 @@ This is the **default execution plan**, not a new dependency graph.
 
 If an issue listed as “next” is not actually Ready according to the GitHub Issue, do not force it. Take another Ready issue from the same milestone.
 
-| Milestone | Developer A | Developer B | Gate |
-|---|---|---|---|
-| M0 | `#1 → #3 → #4 → #5`, then run `#7` | review `#1` → `#2 → #6`, then reproduce/review `#7` | `#7` |
-| M1 | `#8 → #10 → next Ready` | `#9 → #11 → next Ready` | `#16` |
-| M2 | `#17 → #18 → #19 → #20 → #21`, then take whichever of `#23/#24` is Ready | review `#17` → `#22`, then take whichever of `#24/#23` is Ready | `#25` |
-| M3 | `#26 → #27 → #28 → #29` when Ready | `#30`, then review/help the engine track | `#31` |
-| M4 | `#32`, then `#35` when Ready | `#33 → #34`, then help with `#35` | `#36` |
-| M5 | `#37 → #38`, then `#40` when Ready | `#39 → #41`, then help with `#40/#42` | `#43` |
-| M6 | `#44 → #45` | `#46 → #47` | `#49` |
+| Milestone | Developer A                                                              | Developer B                                                     | Gate  |
+| --------- | ------------------------------------------------------------------------ | --------------------------------------------------------------- | ----- |
+| M0        | `#1 → #3 → #4 → #5`, then run `#7`                                       | review `#1` → `#2 → #6`, then reproduce/review `#7`             | `#7`  |
+| M1        | `#8 → #10 → next Ready`                                                  | `#9 → #11 → next Ready`                                         | `#16` |
+| M2        | `#17 → #18 → #19 → #20 → #21`, then take whichever of `#23/#24` is Ready | review `#17` → `#22`, then take whichever of `#24/#23` is Ready | `#25` |
+| M3        | `#26 → #27 → #28 → #29` when Ready                                       | `#30`, then review/help the engine track                        | `#31` |
+| M4        | `#32`, then `#35` when Ready                                             | `#33 → #34`, then help with `#35`                               | `#36` |
+| M5        | `#37 → #38`, then `#40` when Ready                                       | `#39 → #41`, then help with `#40/#42`                           | `#43` |
+| M6        | `#44 → #45`                                                              | `#46 → #47`                                                     | `#49` |
 
 If one developer finishes earlier, ownership can move. The important part is that dependencies stay correct and both developers do not independently change the same foundation.
 
@@ -422,16 +422,16 @@ What is not allowed yet is writing production code for the next milestone, mergi
 
 ## 8. Changes that must be coordinated
 
-| Area | Rule |
-|---|---|
-| `contracts/`, enums, errors, events, Go/TS fixtures | One owner per contract change. Producer and consumer should be reviewed together |
-| `internal/execution/`, claim, lease, fencing, idempotency | Transition/state/lock changes must be coordinated. Do not create two different rule sets |
-| `migrations/`, RLS, shared SQL | Local parallel development is fine, but migration ID/order must be coordinated and merged one by one |
-| `sdk/typescript/`, `runner/node/`, `cmd/worker/` | Can move in parallel after the contract is stable |
-| `apps/dashboard/` | Can work against a stable contract. Mocks are useful for development, but they are not acceptance |
-| root manifest, lockfile, toolchain, shared config | Announce dependency/pin changes. Do not resolve lockfile conflicts blindly |
-| `.github/workflows/`, `deploy/compose/`, staging | One active rollout coordinator |
-| docs/examples/tests | Usually safe in parallel as long as expected results are not changed just to hide a bug |
+| Area                                                      | Rule                                                                                                 |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `contracts/`, enums, errors, events, Go/TS fixtures       | One owner per contract change. Producer and consumer should be reviewed together                     |
+| `internal/execution/`, claim, lease, fencing, idempotency | Transition/state/lock changes must be coordinated. Do not create two different rule sets             |
+| `migrations/`, RLS, shared SQL                            | Local parallel development is fine, but migration ID/order must be coordinated and merged one by one |
+| `sdk/typescript/`, `runner/node/`, `cmd/worker/`          | Can move in parallel after the contract is stable                                                    |
+| `apps/dashboard/`                                         | Can work against a stable contract. Mocks are useful for development, but they are not acceptance    |
+| root manifest, lockfile, toolchain, shared config         | Announce dependency/pin changes. Do not resolve lockfile conflicts blindly                           |
+| `.github/workflows/`, `deploy/compose/`, staging          | One active rollout coordinator                                                                       |
+| docs/examples/tests                                       | Usually safe in parallel as long as expected results are not changed just to hide a bug              |
 
 If a Git conflict happens, do not immediately choose `ours` or `theirs`.
 
@@ -595,12 +595,12 @@ If I finish early, what is the next Ready issue?
 
 A simple board is enough:
 
-| Issue | Milestone | Status | Owner | Dependency | Next |
-|---|---|---|---|---|---|
-| `#N` | Mx | Ready | — | Passed | Can be claimed |
-| `#N` | Mx | In progress | A | Passed | B reviews |
-| `#N` | Mx | Blocked | — | Waiting `#X` | Help remove blocker |
-| `#N` | Mx | Awaiting acceptance | B | Code merged | Wait for staging turn |
+| Issue | Milestone | Status              | Owner | Dependency   | Next                  |
+| ----- | --------- | ------------------- | ----- | ------------ | --------------------- |
+| `#N`  | Mx        | Ready               | —     | Passed       | Can be claimed        |
+| `#N`  | Mx        | In progress         | A     | Passed       | B reviews             |
+| `#N`  | Mx        | Blocked             | —     | Waiting `#X` | Help remove blocker   |
+| `#N`  | Mx        | Awaiting acceptance | B     | Code merged  | Wait for staging turn |
 
 We do not need to assign the entire backlog to A and B upfront.
 

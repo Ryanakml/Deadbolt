@@ -71,7 +71,7 @@ We do not claim superiority over other products without evaluation. The differen
 
 A task may execute more than once. Two processes may even temporarily perform the same work during a network partition. The platform only accepts results from currently valid ownership; this does not automatically cancel external requests made by an older process.
 
-Uncommitted progress may be lost. There is no instruction-pointer recovery in the middle of a task function. If a task is safe to repeat, the next attempt starts that function from the beginning. For long-running work, the developer splits it into smaller tasks with durable outputs or manages application-level checkpoints themselves.
+Uncommitted progress may be lost. There is no instruction-pointer recovery in the middle of a task function. If a task is safe to repeat, the next attempt starts that function from the beginning. For long-running work, the developer splits it into smaller tasks with durable outputs or manages application-level checkpointss themselves.
 
 Inputs and outputs pass through the control plane even though code and secrets remain on customer workers. Customer-hosted execution does not mean all data stays inside the customer network. This must be visible in onboarding and data-handling documentation.
 
