@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -1034,37 +1035,22 @@ func TestBrowserSessionSmokeAndRedirectFlow(t *testing.T) {
 	}
 	defer fixture.Close()
 
-	// 2. Setup dynamic handler so bff configuration can use actual server URL
-	var currentBFF *auth.BFFHandler
+	// 2. Setup TLS listener and BFF handler with known server URL upfront (eliminates closure race)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on loopback: %v", err)
+	}
+	serverURL := "https://" + l.Addr().String()
 
-	mux := http.NewServeMux()
-	mux.Handle("/api/auth/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		currentBFF.Routes().ServeHTTP(w, r)
-	}))
-	mux.Handle("/api/mutation", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		currentBFF.RequireAuth(currentBFF.RequireCSRFAndOrigin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"result": "mutation-successful"})
-		}))).ServeHTTP(w, r)
-	}))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("<html><body>Deadbolt SPA Root</body></html>"))
-	})
-
-	bffServer := httptest.NewTLSServer(mux)
-	defer bffServer.Close()
-
-	// Configure BFF with actual TLS server URL
 	cfg := auth.Config{
 		RuntimeMode: auth.ModeHosted,
 		OIDC: auth.OIDCConfig{
 			Issuer:       fixture.URL(),
 			ClientID:     fixture.ClientID(),
 			ClientSecret: "browser-client-secret",
-			RedirectURL:  bffServer.URL + "/api/auth/callback",
+			RedirectURL:  serverURL + "/api/auth/callback",
 		},
-		AllowedOrigins:         []string{bffServer.URL},
+		AllowedOrigins:         []string{serverURL},
 		CookieSecure:           true,
 		SessionIdleTimeout:     12 * time.Hour,
 		SessionAbsoluteTimeout: 7 * 24 * time.Hour,
@@ -1072,7 +1058,25 @@ func TestBrowserSessionSmokeAndRedirectFlow(t *testing.T) {
 
 	store := auth.NewSessionStore(runtimePool)
 	oidcClient := auth.NewOIDCClient(cfg.OIDC, fixture.Client())
-	currentBFF = auth.NewBFFHandler(cfg, oidcClient, store, runtimePool)
+	bff := auth.NewBFFHandler(cfg, oidcClient, store, runtimePool)
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/auth/", bff.Routes())
+	mux.Handle("/api/mutation", bff.RequireAuth(bff.RequireCSRFAndOrigin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"result": "mutation-successful"})
+	}))))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html><body>Deadbolt SPA Root</body></html>"))
+	})
+
+	bffServer := &httptest.Server{
+		Listener: l,
+		Config:   &http.Server{Handler: mux},
+	}
+	bffServer.StartTLS()
+	defer bffServer.Close()
 
 	// 3. Browser Client with Cookie Jar using bffServer.Client() which trusts the TLS cert
 	browser := bffServer.Client()
@@ -1211,25 +1215,12 @@ func TestRealChromeBrowserSmoke(t *testing.T) {
 	}
 	defer fixture.Close()
 
-	var currentBFF *auth.BFFHandler
-	mux := http.NewServeMux()
-	mux.Handle("/api/auth/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		currentBFF.Routes().ServeHTTP(w, r)
-	}))
-	mux.Handle("/api/mutation", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		currentBFF.RequireAuth(currentBFF.RequireCSRFAndOrigin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "action": "browser-smoke-mutation"})
-		}))).ServeHTTP(w, r)
-	}))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("<!DOCTYPE html><html><body><h1>Deadbolt Dashboard</h1></body></html>"))
-	})
-
-	bffServer := httptest.NewTLSServer(mux)
-	defer bffServer.Close()
+	// Setup TLS listener and BFF handler with known server URL upfront (eliminates closure race)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on loopback: %v", err)
+	}
+	serverURL := "https://" + l.Addr().String()
 
 	cfg := auth.Config{
 		RuntimeMode: auth.ModeHosted,
@@ -1237,9 +1228,9 @@ func TestRealChromeBrowserSmoke(t *testing.T) {
 			Issuer:       fixture.URL(),
 			ClientID:     fixture.ClientID(),
 			ClientSecret: "chrome-client-secret",
-			RedirectURL:  bffServer.URL + "/api/auth/callback",
+			RedirectURL:  serverURL + "/api/auth/callback",
 		},
-		AllowedOrigins:         []string{bffServer.URL},
+		AllowedOrigins:         []string{serverURL},
 		CookieSecure:           true,
 		SessionIdleTimeout:     12 * time.Hour,
 		SessionAbsoluteTimeout: 7 * 24 * time.Hour,
@@ -1247,7 +1238,26 @@ func TestRealChromeBrowserSmoke(t *testing.T) {
 
 	store := auth.NewSessionStore(runtimePool)
 	oidcClient := auth.NewOIDCClient(cfg.OIDC, fixture.Client())
-	currentBFF = auth.NewBFFHandler(cfg, oidcClient, store, runtimePool)
+	bff := auth.NewBFFHandler(cfg, oidcClient, store, runtimePool)
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/auth/", bff.Routes())
+	mux.Handle("/api/mutation", bff.RequireAuth(bff.RequireCSRFAndOrigin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "action": "browser-smoke-mutation"})
+	}))))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<!DOCTYPE html><html><body><h1>Deadbolt Dashboard</h1></body></html>"))
+	})
+
+	bffServer := &httptest.Server{
+		Listener: l,
+		Config:   &http.Server{Handler: mux},
+	}
+	bffServer.StartTLS()
+	defer bffServer.Close()
 
 	// Execute browser-smoke.mjs script pointing to bffServer.URL
 	scriptPath, err := filepath.Abs("../../scripts/browser-smoke.mjs")
