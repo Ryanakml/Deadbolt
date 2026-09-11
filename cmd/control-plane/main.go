@@ -307,15 +307,7 @@ func runMigrations(logger *log.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	logger.Printf("Acquiring migration advisory lock (%d)...", migrator.MigrationAdvisoryLockID)
-	if err := runner.AcquireAdvisoryLock(ctx); err != nil {
-		return fmt.Errorf("failed to acquire migration advisory lock: %w", err)
-	}
-	defer func() {
-		_ = runner.ReleaseAdvisoryLock(context.Background())
-	}()
-
-	logger.Printf("Executing forward schema migrations from %s...", migrationsDir)
+	logger.Printf("Executing forward schema migrations with advisory lock (%d) from %s...", migrator.MigrationAdvisoryLockID, migrationsDir)
 	if err := runner.Up(ctx); err != nil {
 		return fmt.Errorf("migration execution failed: %w", err)
 	}
