@@ -1,0 +1,61 @@
+{
+  "manifestVersion": 1,
+  "name": "linear",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "x": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9
+      }
+    },
+    "required": ["x"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "x": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9
+      }
+    },
+    "required": ["x"],
+    "additionalProperties": false
+  },
+  "nodes": [
+    {
+      "id": "a",
+      "type": "task",
+      "task": "noop",
+      "input": {
+        "x": {
+          "$ref": "run.input",
+          "pointer": "/x"
+        }
+      }
+    },
+    {
+      "id": "b",
+      "type": "task",
+      "task": "noop",
+      "after": ["a"],
+      "input": {
+        "x": {
+          "$ref": "step.output",
+          "stepId": "a",
+          "pointer": "/x"
+        }
+      }
+    }
+  ],
+  "output": {
+    "x": {
+      "$ref": "step.output",
+      "stepId": "b",
+      "pointer": "/x"
+    }
+  }
+}

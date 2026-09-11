@@ -1,0 +1,27 @@
+{
+  "manifestVersion": 1,
+  "name": "cyclic-workflow",
+  "inputSchema": { "type": "object" },
+  "outputSchema": { "type": "object" },
+  "nodes": [
+    {
+      "id": "stepA",
+      "type": "task",
+      "task": "task-a",
+      "after": ["stepC"]
+    },
+    {
+      "id": "stepB",
+      "type": "task",
+      "task": "task-b",
+      "after": ["stepA"]
+    },
+    {
+      "id": "stepC",
+      "type": "task",
+      "task": "task-c",
+      "after": ["stepB"]
+    }
+  ],
+  "output": {}
+}

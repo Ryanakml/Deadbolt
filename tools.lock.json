@@ -1,0 +1,22 @@
+{
+  "sqlc": {
+    "module": "github.com/sqlc-dev/sqlc/cmd/sqlc",
+    "version": "v1.31.1",
+    "purpose": "Generate explicit pgx queries in issue #3; no query/schema is introduced here"
+  },
+  "goose": {
+    "module": "github.com/pressly/goose/v3/cmd/goose",
+    "version": "v3.28.0",
+    "purpose": "Ordered SQL migration runner for issue #3; no migration is introduced here"
+  },
+  "govulncheck": {
+    "module": "golang.org/x/vuln/cmd/govulncheck",
+    "version": "v1.8.0",
+    "purpose": "Go dependency and standard-library vulnerability scan"
+  },
+  "gitleaks": {
+    "module": "github.com/zricethezav/gitleaks/v8",
+    "version": "v8.30.1",
+    "purpose": "Secret scan with redacted output"
+  }
+}

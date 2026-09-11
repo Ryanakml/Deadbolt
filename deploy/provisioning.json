@@ -1,0 +1,106 @@
+{
+  "project": "deadbolt-staging",
+  "deploymentReady": false,
+  "inputs": [
+    {
+      "name": "DEADBOLT_STAGING_DOMAIN",
+      "status": "unresolved",
+      "purpose": "Approved domain and DNS/TLS routing access"
+    },
+    {
+      "name": "DEADBOLT_ARTIFACT_ENDPOINT",
+      "status": "unresolved",
+      "purpose": "Selected external S3-compatible provider endpoint; never FlowDesk MinIO"
+    },
+    {
+      "name": "DEADBOLT_ARTIFACT_BUCKET",
+      "status": "unresolved",
+      "purpose": "Deadbolt-only artifact bucket"
+    },
+    {
+      "name": "DEADBOLT_ARTIFACT_REGION",
+      "status": "unresolved",
+      "purpose": "Region if required by selected provider; provider-specific credential names remain pending"
+    },
+    {
+      "name": "DEADBOLT_DEPLOY_HOST",
+      "status": "unresolved",
+      "purpose": "Private Actions variable for approved EC2 destination"
+    },
+    {
+      "name": "DEADBOLT_DEPLOY_USER",
+      "status": "unresolved",
+      "purpose": "Authorized automated SSH account"
+    },
+    {
+      "name": "DEADBOLT_DEPLOY_SSH_KEY",
+      "status": "unresolved",
+      "purpose": "Actions secret holding deployment private key"
+    },
+    {
+      "name": "DEADBOLT_DEPLOY_KNOWN_HOSTS",
+      "status": "unresolved",
+      "purpose": "Independently trusted host-key record; never trust live ssh-keyscan alone"
+    },
+    {
+      "name": "DEADBOLT_GHCR_PULL_USER",
+      "status": "unresolved",
+      "purpose": "Host pull identity; publication uses scoped workflow GITHUB_TOKEN"
+    },
+    {
+      "name": "DEADBOLT_GHCR_PULL_TOKEN",
+      "status": "unresolved",
+      "purpose": "Host pull-only credential configured privately"
+    },
+    {
+      "name": "DEADBOLT_EDGE_PROCEDURE",
+      "status": "unresolved",
+      "purpose": "Reviewed Caddy configuration, validate/reload procedure and upstream connectivity"
+    },
+    {
+      "name": "DEADBOLT_OIDC_ISSUER",
+      "status": "unresolved",
+      "purpose": "Managed human identity provider meeting OIDC/PKCE/MFA requirements"
+    },
+    {
+      "name": "DEADBOLT_OIDC_CLIENT_ID",
+      "status": "unresolved",
+      "purpose": "Confidential BFF client with approved redirects"
+    },
+    {
+      "name": "DEADBOLT_OIDC_CLIENT_SECRET",
+      "status": "unresolved",
+      "purpose": "BFF client credential in secret manager"
+    },
+    {
+      "name": "DEADBOLT_OIDC_CLI_CLIENT_ID",
+      "status": "unresolved",
+      "purpose": "Public CLI client using PKCE and loopback redirect"
+    },
+    {
+      "name": "DEADBOLT_SECRET_MANAGER",
+      "status": "unresolved",
+      "purpose": "Cloud platform secret-manager selection and workload access"
+    },
+    {
+      "name": "DEADBOLT_KMS_KEY_ID",
+      "status": "unresolved",
+      "purpose": "Platform envelope-encryption key, version and rotation access"
+    },
+    {
+      "name": "DEADBOLT_BACKUP_DESTINATION",
+      "status": "unresolved",
+      "purpose": "Encrypted off-host daily backup and continuous WAL archive destination"
+    },
+    {
+      "name": "DEADBOLT_BACKUP_ACCESS",
+      "status": "unresolved",
+      "purpose": "Provider-specific off-host write/restore identity configured privately"
+    },
+    {
+      "name": "DEADBOLT_RESOURCE_BUDGET",
+      "status": "unresolved",
+      "purpose": "Issue #5 measures headroom, safe retention and non-conflicting connectivity before deployment"
+    }
+  ]
+}

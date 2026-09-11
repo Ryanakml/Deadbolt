@@ -1,0 +1,36 @@
+{
+  "RunStatus": [
+    "QUEUED",
+    "RUNNING",
+    "WAITING",
+    "PAUSING",
+    "PAUSED",
+    "CANCELLING",
+    "SUCCEEDED",
+    "FAILED",
+    "CANCELLED"
+  ],
+  "StepStatus": [
+    "BLOCKED",
+    "READY",
+    "RUNNING",
+    "WAITING",
+    "SUCCEEDED",
+    "FAILED",
+    "CANCELLED",
+    "SKIPPED"
+  ],
+  "AttemptStatus": [
+    "CLAIMED",
+    "RUNNING",
+    "SUCCEEDED",
+    "FAILED",
+    "TIMED_OUT",
+    "LOST",
+    "CANCELLED"
+  ],
+  "ApprovalStatus": ["PENDING", "APPROVED", "REJECTED", "EXPIRED", "CANCELLED"],
+  "TimerStatus": ["PENDING", "FIRED", "CANCELLED"],
+  "WorkerStatus": ["ONLINE", "DRAINING", "OFFLINE", "REVOKED"],
+  "RecoveryMode": ["safe", "idempotent", "reconcile"]
+}

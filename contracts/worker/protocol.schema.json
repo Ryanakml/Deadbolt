@@ -1,0 +1,1017 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runtime.invalid/worker/1",
+  "description": "HTTPS JSON request contracts; Authorization authenticates session scope. Versioned operation envelope prevents ambiguous root validation. No worker transport is implemented in M0. String length is characters; byte budgets are enforced at transport admission.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "ChallengeRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/ChallengeRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "EnrollRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/EnrollRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "SessionRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/SessionRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "PollRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/PollRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "StartRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/StartRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "HeartbeatRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/HeartbeatRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "CompleteRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/CompleteRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "StopAckRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/StopAckRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "const": "LogBatchRequest"
+        },
+        "message": {
+          "$ref": "#/$defs/LogBatchRequest"
+        }
+      },
+      "required": ["operation", "message"],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "ErrorEnvelope": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {
+          "type": "object"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": ["code", "message", "requestId", "details", "retryable"],
+      "additionalProperties": false
+    },
+    "ChallengeRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "publicKey": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["protocolVersion", "requestId"],
+      "additionalProperties": false
+    },
+    "ChallengeResponse": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nonce": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expiresAt": {
+          "type": "string",
+          "minLength": 1,
+          "format": "date-time"
+        }
+      },
+      "required": ["protocolVersion", "requestId", "nonce", "expiresAt"],
+      "additionalProperties": false
+    },
+    "EnrollRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "enrollmentToken": {
+          "type": "string",
+          "minLength": 1
+        },
+        "publicKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nonce": {
+          "type": "string",
+          "minLength": 1
+        },
+        "signature": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "enrollmentToken",
+        "publicKey",
+        "nonce",
+        "signature"
+      ],
+      "additionalProperties": false
+    },
+    "SessionRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nonce": {
+          "type": "string",
+          "minLength": 1
+        },
+        "signature": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "workerId",
+        "nonce",
+        "signature"
+      ],
+      "additionalProperties": false
+    },
+    "SessionResponse": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "environmentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionToken": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expiresAt": {
+          "type": "string",
+          "minLength": 1,
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "workerId",
+        "environmentId",
+        "sessionId",
+        "sessionToken",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    },
+    "PollRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "availableSlots": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "deploymentDigests": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[0-9a-f]{64}$",
+            "not": {
+              "pattern": "[^0-9a-f]"
+            }
+          },
+          "maxItems": 50
+        },
+        "pool": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "workerId",
+        "sessionId",
+        "availableSlots",
+        "deploymentDigests",
+        "pool"
+      ],
+      "additionalProperties": false
+    },
+    "Assignment": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stepId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownershipEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "taskEntrypoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {},
+        "deploymentDigest": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[0-9a-f]{64}$",
+          "not": {
+            "pattern": "[^0-9a-f]"
+          }
+        },
+        "bundleDigest": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[0-9a-f]{64}$",
+          "not": {
+            "pattern": "[^0-9a-f]"
+          }
+        },
+        "operationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "leaseTtlMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "default": 30000
+        },
+        "leaseExpiresAt": {
+          "type": "string",
+          "minLength": 1,
+          "format": "date-time"
+        },
+        "claimStartDeadlineAt": {
+          "type": "string",
+          "minLength": 1,
+          "format": "date-time"
+        },
+        "attemptTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600000
+        },
+        "runDeadlineAt": {
+          "type": "string",
+          "minLength": 1,
+          "format": "date-time"
+        },
+        "traceContext": {
+          "type": "object",
+          "properties": {
+            "traceparent": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tracestate": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["traceparent"],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "runId",
+        "stepId",
+        "attemptId",
+        "ownershipEpoch",
+        "taskEntrypoint",
+        "input",
+        "deploymentDigest",
+        "bundleDigest",
+        "operationId",
+        "leaseTtlMs",
+        "leaseExpiresAt",
+        "claimStartDeadlineAt",
+        "attemptTimeoutMs",
+        "runDeadlineAt",
+        "traceContext"
+      ],
+      "additionalProperties": false
+    },
+    "PollResponse": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assignments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Assignment"
+          },
+          "maxItems": 50
+        }
+      },
+      "required": ["protocolVersion", "requestId", "assignments"],
+      "additionalProperties": false
+    },
+    "StartRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownershipEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "workerId",
+        "sessionId",
+        "attemptId",
+        "ownershipEpoch"
+      ],
+      "additionalProperties": false
+    },
+    "StartResponse": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownershipEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "accepted": {
+          "const": true
+        },
+        "attemptDeadlineAt": {
+          "type": "string",
+          "minLength": 1,
+          "format": "date-time"
+        },
+        "leaseTtlMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "attemptId",
+        "ownershipEpoch",
+        "accepted",
+        "attemptDeadlineAt",
+        "leaseTtlMs"
+      ],
+      "additionalProperties": false
+    },
+    "HeartbeatRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "attemptId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "ownershipEpoch": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "progress": {
+                "type": "object"
+              }
+            },
+            "required": ["attemptId", "ownershipEpoch"],
+            "additionalProperties": false
+          },
+          "maxItems": 50
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "workerId",
+        "sessionId",
+        "attempts"
+      ],
+      "additionalProperties": false
+    },
+    "StopCommand": {
+      "type": "object",
+      "properties": {
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownershipEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "graceTimeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 10000
+        }
+      },
+      "required": ["attemptId", "ownershipEpoch", "reason", "graceTimeoutMs"],
+      "additionalProperties": false
+    },
+    "HeartbeatResponse": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "renewals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "attemptId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "ownershipEpoch": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "leaseTtlMs": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "leaseExpiresAt": {
+                "type": "string",
+                "minLength": 1,
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "attemptId",
+              "ownershipEpoch",
+              "leaseTtlMs",
+              "leaseExpiresAt"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 50
+        },
+        "stops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StopCommand"
+          },
+          "maxItems": 50
+        }
+      },
+      "required": ["protocolVersion", "requestId", "renewals", "stops"],
+      "additionalProperties": false
+    },
+    "TaskError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "effectStatus": {
+          "enum": ["NOT_APPLIED", "UNKNOWN"]
+        },
+        "retryAfter": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["code", "message", "retryable", "effectStatus"],
+      "additionalProperties": false
+    },
+    "CompleteRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "protocolVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workerId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "attemptId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ownershipEpoch": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "outcome": {
+              "const": "SUCCEEDED"
+            },
+            "output": {},
+            "artifactId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "resultDigest": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[0-9a-f]{64}$",
+              "not": {
+                "pattern": "[^0-9a-f]"
+              }
+            }
+          },
+          "required": [
+            "protocolVersion",
+            "requestId",
+            "workerId",
+            "sessionId",
+            "attemptId",
+            "ownershipEpoch",
+            "outcome",
+            "resultDigest"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": ["output"],
+              "not": {
+                "required": ["artifactId"]
+              }
+            },
+            {
+              "required": ["artifactId"],
+              "not": {
+                "required": ["output"]
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "protocolVersion": {
+              "const": 1
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workerId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "attemptId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ownershipEpoch": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "outcome": {
+              "const": "FAILED"
+            },
+            "error": {
+              "$ref": "#/$defs/TaskError"
+            },
+            "resultDigest": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[0-9a-f]{64}$",
+              "not": {
+                "pattern": "[^0-9a-f]"
+              }
+            }
+          },
+          "required": [
+            "protocolVersion",
+            "requestId",
+            "workerId",
+            "sessionId",
+            "attemptId",
+            "ownershipEpoch",
+            "outcome",
+            "error",
+            "resultDigest"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CompleteResponse": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownershipEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "accepted": {
+          "const": true
+        },
+        "resultDigest": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[0-9a-f]{64}$",
+          "not": {
+            "pattern": "[^0-9a-f]"
+          }
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "attemptId",
+        "ownershipEpoch",
+        "accepted",
+        "resultDigest"
+      ],
+      "additionalProperties": false
+    },
+    "StopAckRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownershipEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "processStopped": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "workerId",
+        "sessionId",
+        "attemptId",
+        "ownershipEpoch",
+        "processStopped"
+      ],
+      "additionalProperties": false
+    },
+    "AckResponse": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accepted": {
+          "const": true
+        }
+      },
+      "required": ["protocolVersion", "requestId", "accepted"],
+      "additionalProperties": false
+    },
+    "LogBatchRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workerId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "sequence": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "timestamp": {
+                "type": "string",
+                "minLength": 1,
+                "format": "date-time"
+              },
+              "level": {
+                "enum": ["debug", "info", "warn", "error"]
+              },
+              "message": {
+                "type": "string",
+                "maxLength": 16384
+              }
+            },
+            "required": ["sequence", "timestamp", "level", "message"],
+            "additionalProperties": false
+          },
+          "maxItems": 100
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "workerId",
+        "sessionId",
+        "attemptId",
+        "records"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

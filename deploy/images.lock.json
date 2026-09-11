@@ -1,0 +1,22 @@
+{
+  "go": {
+    "image": "docker.io/library/golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "node": {
+    "image": "docker.io/library/node:24.21.0-bookworm-slim@sha256:2fe369e969550cde8e867afc3fe370b260140cab4a23d467074295b42163d553",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "postgres": {
+    "image": "docker.io/library/postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "nats": {
+    "image": "docker.io/library/nats:2@sha256:c50b0a773c6c8d033cad54f7c53cb97fd6e09b3bfc1accda7cd4fa94e19e9ed9",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "local-object-store": {
+    "image": "docker.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  }
+}

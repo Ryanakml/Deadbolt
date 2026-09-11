@@ -1,0 +1,26 @@
+{
+  "name": "deadbolt",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Durable workflow infrastructure with self-hosted workers",
+  "packageManager": "pnpm@10.24.0",
+  "engines": {
+    "node": "24.21.0",
+    "pnpm": "10.24.0"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm run build && pnpm -r run test",
+    "lint": "prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "pnpm -r run typecheck",
+    "check:config": "node scripts/check-config.mjs",
+    "check:contracts": "node scripts/check-contracts.mjs",
+    "check:parity": "node scripts/check-parity.mjs"
+  },
+  "devDependencies": {
+    "@apidevtools/swagger-parser": "13.0.0",
+    "prettier": "3.6.2",
+    "yaml": "2.9.0"
+  }
+}
