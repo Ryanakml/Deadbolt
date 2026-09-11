@@ -6,6 +6,7 @@ Deadbolt runs on an EC2 `x86_64` host co-located with `flowdesk-staging`. The st
 **GitHub Actions → GHCR (immutable digest `@sha256:...`) → Automated SSH → EC2 Host**.
 
 ### Guiding Principles & Invariants
+
 1. **Strict Co-Tenant Isolation**: FlowDesk containers, images, volumes, and networks must **never** be modified, stopped, deleted, or shared. All Deadbolt operations are strictly scoped to the Compose project `deadbolt-staging` and directory `/opt/deadbolt`.
 2. **Caddy Edge Gateway**: Caddy owns public ports TCP 80/443 and UDP 443. Deadbolt listens only on internal loopback `127.0.0.1:8088` and is reverse-proxied by Caddy.
 3. **No Destructive Database Rollback**: A rollback restores the previous known-good Deadbolt container image and Caddy configuration. It **never** executes down migrations or drops database volumes.
@@ -16,6 +17,7 @@ Deadbolt runs on an EC2 `x86_64` host co-located with `flowdesk-staging`. The st
 ## 2. Environments & Compose Topologies
 
 ### Local Development (`deploy/compose/docker-compose.yml`)
+
 - All service ports bind exclusively to loopback (`127.0.0.1`).
 - Services: PostgreSQL 18, NATS 2.10, MinIO (local dev S3 emulation), Control Plane.
 - Data persistence via named volumes: `deadbolt_postgres_data`, `deadbolt_nats_data`, `deadbolt_minio_data`.
@@ -25,6 +27,7 @@ Deadbolt runs on an EC2 `x86_64` host co-located with `flowdesk-staging`. The st
   ```
 
 ### Staging (`deploy/compose/docker-compose.staging.yml`)
+
 - Compose project: `deadbolt-staging`.
 - Isolated bridge network: `deadbolt_staging_net`.
 - PostgreSQL and NATS have **zero** host port publication (internal network only).
@@ -64,6 +67,7 @@ Automated deployment is executed via `scripts/deploy-staging.sh`:
 ```
 
 ### Deployment Pipeline Stages
+
 1. **Pre-flight Checks**:
    - Validates memory (≥1024 MiB) and disk (≥4096 MiB).
    - Validates FlowDesk co-tenant boundaries.
@@ -109,6 +113,7 @@ If candidate health checks fail or post-deployment smoke tests detect an anomaly
 ```
 
 ### Rollback Contract
+
 - **Restores Previous Binary**: Re-launches the image digest referenced by `/opt/deadbolt/releases/previous`.
 - **Restores Edge Route**: Restores previous Caddyfile snippet if route changes were made.
 - **NEVER Rolls Back Database**: Backward compatibility ensures the previous binary runs safely against the newly migrated schema. Down migrations are **strictly prohibited** during automated rollback.
@@ -129,6 +134,7 @@ Docker image cleanup is executed safely via `scripts/retention.sh`:
 ```
 
 ### Retention Rules
+
 - **Protected Images**:
   - All images tagged or labeled `flowdesk*` (never inspected or deleted).
   - Images currently running on the host.
@@ -146,13 +152,17 @@ Docker image cleanup is executed safely via `scripts/retention.sh`:
 ## 7. Single-Control-Host Limitation & Production Promotion Policy
 
 ### Single-Control-Host Limitation
+
 Staging operates on a single shared EC2 host. Consequently:
+
 - **Blast Radius**: A host kernel panic, OOM killer event, or full disk condition impacts both Deadbolt and FlowDesk. Strict memory/disk budgets mitigate this risk.
 - **High Availability**: Staging has no active-active redundancy. Maintenance windows require coordinated downtime.
 - **Failover**: Recovery relies on cold instance reconstruction from EBS snapshots and S3 WAL backups.
 
 ### Production Promotion Policy
+
 Promotion from Staging to Production requires:
+
 1. **Cumulative §30 Gates Met**:
    - Contract and type checks passed (`pnpm check:contracts`, `pnpm check:parity`).
    - Lint and unit test suites green (`pnpm lint`, `pnpm test`, `go test -race ./...`).
