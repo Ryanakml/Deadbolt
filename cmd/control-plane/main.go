@@ -280,6 +280,9 @@ func runMigrations(logger *log.Logger) error {
 	if migratorDBURL == "" {
 		migratorDBURL = os.Getenv("DEADBOLT_MIGRATOR_DATABASE_URL")
 	}
+	if migratorDBURL == "" && strings.ToLower(strings.TrimSpace(os.Getenv("RUNTIME_MODE"))) == auth.ModeLocal {
+		migratorDBURL = os.Getenv("DATABASE_URL")
+	}
 	if migratorDBURL == "" {
 		return errors.New("MIGRATOR_DATABASE_URL is required for migration execution (DDL privileges)")
 	}

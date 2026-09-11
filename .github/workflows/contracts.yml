@@ -79,6 +79,12 @@ jobs:
           DRY_RUN=true ./scripts/retention.sh
       - name: Clean-clone Local Compose Boot Smoke
         run: |
+          # Free host port 5432 if occupied by workflow runner service container
+          RUNNER_PG=$(docker ps -q --filter "publish=5432")
+          if [ -n "$RUNNER_PG" ]; then
+            echo "Stopping workflow runner Postgres service container ($RUNNER_PG) to free port 5432..."
+            docker stop "$RUNNER_PG"
+          fi
           docker compose -f deploy/compose/docker-compose.yml --profile core up -d
           for i in $(seq 1 30); do
             if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
@@ -87,10 +93,16 @@ jobs:
             fi
             sleep 2
           done
+          # Verify livez returned 200 OK
+          curl -fs http://127.0.0.1:8080/livez || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          # Execute migrations using in-container migrator runner
+          docker compose -f deploy/compose/docker-compose.yml --profile core exec -T control-plane /usr/local/bin/control-plane --migrate
+          # Verify readyz returned 200 OK after schema is current
+          curl -fs http://127.0.0.1:8080/readyz || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
           # Test stop and start preserves volume persistence
           docker compose -f deploy/compose/docker-compose.yml --profile core stop
           docker compose -f deploy/compose/docker-compose.yml --profile core start
-          curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1 || exit 1
+          curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1 || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
           # Explicit clean teardown
           docker compose -f deploy/compose/docker-compose.yml --profile core down -v
       - name: Scan tracked source and history without printing secrets
