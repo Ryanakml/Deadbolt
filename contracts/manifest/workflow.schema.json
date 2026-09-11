@@ -1,43 +1,114 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runtime.deadbolt.dev/schemas/v1/workflow.schema.json",
-  "title": "WorkflowManifest",
-  "description": "Declarative DAG workflow definition manifest",
   "type": "object",
   "properties": {
     "manifestVersion": {
-      "type": "integer",
-      "const": 1,
-      "description": "Manifest schema version"
+      "const": 1
     },
     "name": {
       "type": "string",
       "pattern": "^[a-zA-Z0-9_-]{1,64}$",
-      "description": "Workflow identifier"
+      "not": {
+        "pattern": "[^a-zA-Z0-9_-]"
+      }
     },
     "inputSchema": {
-      "type": "object",
-      "description": "JSON Schema validating top-level run input"
+      "type": "object"
     },
     "outputSchema": {
-      "type": "object",
-      "description": "JSON Schema validating final run output"
+      "type": "object"
     },
     "nodes": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 50,
-      "description": "Ordered nodes in the DAG (max 50 in MVP)",
+      "maxItems": 200,
       "items": {
-        "$ref": "#/$defs/Node"
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+            "not": {
+              "pattern": "[^a-zA-Z0-9_-]"
+            }
+          },
+          "type": {
+            "enum": ["task", "choice", "merge", "approval", "delay"]
+          },
+          "task": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+            "not": {
+              "pattern": "[^a-zA-Z0-9_-]"
+            }
+          },
+          "after": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+              "not": {
+                "pattern": "[^a-zA-Z0-9_-]"
+              }
+            },
+            "uniqueItems": true
+          },
+          "input": {
+            "type": "object"
+          },
+          "sideEffect": {
+            "type": "boolean"
+          },
+          "choice": {
+            "type": "object"
+          },
+          "merge": {
+            "type": "object"
+          },
+          "approval": {
+            "type": "object"
+          },
+          "delayMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": ["id", "type"],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "task"
+                }
+              }
+            },
+            "then": {
+              "required": ["task"],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": ["choice"]
+                  },
+                  {
+                    "required": ["merge"]
+                  },
+                  {
+                    "required": ["approval"]
+                  },
+                  {
+                    "required": ["delayMs"]
+                  }
+                ]
+              }
+            }
+          }
+        ]
       }
     },
     "output": {
-      "type": "object",
-      "description": "Output mapping projecting step outputs to workflow output",
-      "additionalProperties": {
-        "$ref": "#/$defs/OutputReference"
-      }
+      "type": "object"
     }
   },
   "required": [
@@ -49,76 +120,58 @@
     "output"
   ],
   "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runtime.invalid/workflow/1",
   "$defs": {
-    "Node": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "type": "string",
-          "pattern": "^[a-zA-Z0-9_-]{1,64}$",
-          "description": "Unique logical step ID within the workflow"
-        },
-        "type": {
-          "type": "string",
-          "enum": ["task"],
-          "description": "Node type. In MVP, only task is supported."
-        },
-        "task": {
-          "type": "string",
-          "pattern": "^[a-zA-Z0-9_-]{1,64}$",
-          "description": "Referenced task definition name"
-        },
-        "after": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "IDs of predecessor nodes that must succeed before this node"
-        },
-        "input": {
-          "type": "object",
-          "description": "Field-level input mapping descriptors"
-        }
-      },
-      "required": ["id", "type", "task"],
-      "additionalProperties": false
-    },
-    "OutputReference": {
+    "Reference": {
       "type": "object",
       "properties": {
         "$ref": {
-          "type": "string",
-          "enum": ["step.output"]
-        },
-        "stepId": {
-          "type": "string"
-        },
-        "pointer": {
-          "type": "string",
-          "pattern": "^/.*$"
-        }
-      },
-      "required": ["$ref", "stepId", "pointer"],
-      "additionalProperties": false
-    },
-    "InputReference": {
-      "type": "object",
-      "properties": {
-        "$ref": {
-          "type": "string",
           "enum": ["run.input", "step.output"]
         },
         "stepId": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+          "not": {
+            "pattern": "[^a-zA-Z0-9_-]"
+          }
         },
         "pointer": {
           "type": "string",
-          "pattern": "^/.*$"
+          "pattern": "^(?:/(?:[^~]|~[01])*)*$"
         },
         "default": {}
       },
       "required": ["$ref", "pointer"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "$ref": {
+                "const": "step.output"
+              }
+            }
+          },
+          "then": {
+            "required": ["stepId"]
+          },
+          "else": {
+            "not": {
+              "required": ["stepId"]
+            }
+          }
+        }
+      ]
+    },
+    "Literal": {
+      "type": "object",
+      "properties": {
+        "literal": {}
+      },
+      "required": ["literal"],
       "additionalProperties": false
     }
-  }
+  },
+  "description": "Versioned language contract. Control fields are reserved for V1. Executable M0/MVP validation rejects non-linear or non-task graphs; no control execution is enabled."
 }

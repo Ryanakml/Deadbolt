@@ -1,0 +1,9 @@
+docs/blueprint.md
+docs/developer-guide.md
+README.md
+assets/
+pnpm-lock.yaml
+**/dist/
+**/node_modules/
+sdk/typescript/src/schema-data.ts
+sdk/typescript/src/enums.ts

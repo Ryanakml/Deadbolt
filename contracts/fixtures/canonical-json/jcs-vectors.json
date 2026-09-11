@@ -22,11 +22,7 @@
         "y": 1,
         "x": 2
       },
-      "a": [
-        3,
-        2,
-        1
-      ]
+      "a": [3, 2, 1]
     },
     "expectedCanonical": "{\"a\":[3,2,1],\"z\":{\"x\":2,\"y\":1}}",
     "expectedSha256": "00284ff64ddee4ecd1b3c76fde9524200571a90c53d8c79e5e36e08d8d1d7d1c"

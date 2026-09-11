@@ -1,214 +1,209 @@
-export interface WorkflowNode {
-  id: string;
-  type: string;
-  task: string;
-  after?: string[];
-  input?: Record<string, unknown>;
-}
-
-export interface WorkflowManifest {
-  manifestVersion: number;
-  name: string;
-  inputSchema: Record<string, unknown>;
-  outputSchema: Record<string, unknown>;
-  nodes: WorkflowNode[];
-  output: Record<string, unknown>;
-}
-
+import { assertJSON, ContractError, fail, type JSONValue } from "./json.js";
+import { schemas } from "./schema-data.js";
+import {
+  object,
+  validateAgainst,
+  validateSchema,
+  type ObjectValue,
+} from "./schema.js";
+import { pointerParts, reference } from "./mapping.js";
 export interface ValidationError {
   code: string;
   message: string;
   path?: string;
 }
-
 export interface ValidationResult {
   valid: boolean;
   errors: ValidationError[];
 }
-
-const MAX_MVP_NODES = 50;
-const MAX_NESTING_DEPTH = 32;
-const MAX_SCHEMA_SIZE_BYTES = 64 * 1024; // 64 KiB
-
-/**
- * Validates a workflow manifest against DAG structural rules, limits, and capabilities.
- */
-export function validateWorkflowManifest(manifest: unknown): ValidationResult {
-  const errors: ValidationError[] = [];
-
-  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    return {
-      valid: false,
-      errors: [{ code: 'INVALID_MANIFEST', message: 'Workflow manifest must be a non-null object' }],
-    };
+const check = (fn: () => void): ValidationResult => {
+  try {
+    fn();
+    return { valid: true, errors: [] };
+  } catch (e) {
+    if (e instanceof ContractError)
+      return { valid: false, errors: [{ code: e.code, message: e.message }] };
+    throw e;
   }
-
-  const m = manifest as Partial<WorkflowManifest>;
-
-  if (m.manifestVersion !== 1) {
-    errors.push({ code: 'UNSUPPORTED_MANIFEST_VERSION', message: 'manifestVersion must be 1' });
-  }
-
-  if (!m.name || typeof m.name !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(m.name)) {
-    errors.push({ code: 'INVALID_NAME', message: 'name must be a string matching ^[a-zA-Z0-9_-]{1,64}$' });
-  }
-
-  if (!Array.isArray(m.nodes) || m.nodes.length === 0) {
-    errors.push({ code: 'EMPTY_NODES', message: 'Workflow must declare at least one node' });
-    return { valid: false, errors };
-  }
-
-  if (m.nodes.length > MAX_MVP_NODES) {
-    errors.push({
-      code: 'NODE_COUNT_EXCEEDED',
-      message: `Workflow exceeds MVP limit of ${MAX_MVP_NODES} nodes (found ${m.nodes.length})`,
-    });
-  }
-
-  // Check Schema Sizes and Nesting
-  checkSchemaDepthAndSize('inputSchema', m.inputSchema, errors);
-  checkSchemaDepthAndSize('outputSchema', m.outputSchema, errors);
-
-  // Validate Node IDs and MVP capabilities
-  const nodeMap = new Map<string, WorkflowNode>();
-  for (let i = 0; i < m.nodes.length; i++) {
-    const node = m.nodes[i];
-    if (!node.id || typeof node.id !== 'string') {
-      errors.push({ code: 'INVALID_NODE_ID', message: `Node at index ${i} has invalid id` });
-      continue;
-    }
-
-    if (nodeMap.has(node.id)) {
-      errors.push({ code: 'DUPLICATE_NODE_ID', message: `Duplicate node ID "${node.id}" detected` });
-    }
-    nodeMap.set(node.id, node);
-
-    // MVP capability check: only "task" allowed
-    if (node.type !== 'task') {
-      errors.push({
-        code: 'UNSUPPORTED_CAPABILITY',
-        message: `Node type "${node.type}" is unsupported in MVP. Only "task" nodes are permitted.`,
-        path: `/nodes/${node.id}/type`,
-      });
-    }
-
-    if (!node.task || typeof node.task !== 'string') {
-      errors.push({ code: 'MISSING_TASK_REF', message: `Node "${node.id}" must specify task name reference` });
-    }
-  }
-
-  // Validate Dependencies and Graph Acyclicity (DAG check)
-  for (const node of m.nodes) {
-    if (node.after) {
-      for (const depId of node.after) {
-        if (!nodeMap.has(depId)) {
-          errors.push({
-            code: 'MISSING_DEPENDENCY',
-            message: `Node "${node.id}" depends on unknown predecessor "${depId}"`,
-          });
-        }
-        if (depId === node.id) {
-          errors.push({
-            code: 'SELF_DEPENDENCY',
-            message: `Node "${node.id}" cannot depend on itself`,
-          });
-        }
-      }
-    }
-  }
-
-  // Cycle Detection via DFS
-  const cycleDetected = detectCycle(nodeMap);
-  if (cycleDetected) {
-    errors.push({
-      code: 'CYCLE_DETECTED',
-      message: `Workflow DAG contains a cycle: ${cycleDetected.join(' -> ')}`,
-    });
-  }
-
+};
+export function validateTask(task: JSONValue): void {
+  assertJSON(task);
+  if (!validateAgainst(task, schemas["task.schema.json"])) fail("INVALID_TASK");
+  const t = object(task);
+  validateSchema(t.inputSchema, schemas["payload-schema.schema.json"]);
+  validateSchema(t.outputSchema, schemas["payload-schema.schema.json"]);
+  const retry = object(t.retry ?? {});
+  if (Number(retry.initialDelayMs ?? 1000) > Number(retry.maxDelayMs ?? 30000))
+    fail("INVALID_TASK");
+  if (
+    t.recovery === "idempotent" &&
+    Number(t.idempotencyWindowMs) < 5000 + Number(t.timeoutMs ?? 300000)
+  )
+    fail("INVALID_TASK");
+}
+export function normalizeTask(task: JSONValue): ObjectValue {
+  assertJSON(task);
+  validateTask(task);
+  const t = object(task);
   return {
-    valid: errors.length === 0,
-    errors,
+    ...t,
+    timeoutMs: t.timeoutMs ?? 300000,
+    retry: {
+      maxAttempts: 3,
+      initialDelayMs: 1000,
+      maxDelayMs: 30000,
+      ...object(t.retry ?? {}),
+    },
   };
 }
-
-function checkSchemaDepthAndSize(name: string, schema: unknown, errors: ValidationError[]): void {
-  if (!schema || typeof schema !== 'object') {
-    errors.push({ code: 'INVALID_SCHEMA', message: `${name} must be a JSON Schema object` });
-    return;
+function guaranteed(schema: JSONValue, parts: string[]): boolean {
+  if (!parts.length) return true;
+  const s = object(schema);
+  if (s.oneOf)
+    return (s.oneOf as JSONValue[]).every((x) => guaranteed(x, parts));
+  const [key, ...rest] = parts;
+  if (s.type === "object") {
+    const p = object(s.properties ?? {});
+    return (
+      Array.isArray(s.required) &&
+      s.required.includes(key) &&
+      Object.hasOwn(p, key) &&
+      guaranteed(p[key], rest)
+    );
   }
-
-  const jsonStr = JSON.stringify(schema);
-  if (Buffer.byteLength(jsonStr, 'utf8') > MAX_SCHEMA_SIZE_BYTES) {
-    errors.push({
-      code: 'SCHEMA_SIZE_EXCEEDED',
-      message: `${name} exceeds maximum allowed size of 64 KiB`,
-    });
-  }
-
-  const depth = getObjectDepth(schema);
-  if (depth > MAX_NESTING_DEPTH) {
-    errors.push({
-      code: 'SCHEMA_NESTING_EXCEEDED',
-      message: `${name} nesting depth (${depth}) exceeds maximum limit of ${MAX_NESTING_DEPTH}`,
-    });
-  }
+  if (s.type === "array")
+    return (
+      /^(0|[1-9][0-9]*)$/.test(key) &&
+      key === String(Number(key)) &&
+      Number(key) < Number(s.minItems ?? 0) &&
+      !!s.items &&
+      guaranteed(s.items, rest)
+    );
+  return false;
 }
-
-function getObjectDepth(obj: unknown, current = 1): number {
-  if (current > MAX_NESTING_DEPTH + 1) return current;
-  if (!obj || typeof obj !== 'object') return current;
-
-  let maxDepth = current;
-  for (const val of Object.values(obj as Record<string, unknown>)) {
-    if (typeof val === 'object' && val !== null) {
-      const d = getObjectDepth(val, current + 1);
-      if (d > maxDepth) maxDepth = d;
+function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
+  const m = object(manifest);
+  if (m.manifestVersion !== 1) fail("UNSUPPORTED_MANIFEST_VERSION");
+  if (!Array.isArray(m.nodes) || m.nodes.length === 0) fail("EMPTY_NODES");
+  if (m.nodes.length > 50) fail("NODE_COUNT_EXCEEDED");
+  if (!validateAgainst(m, schemas["workflow.schema.json"]))
+    fail("INVALID_MANIFEST");
+  validateSchema(m.inputSchema, schemas["payload-schema.schema.json"]);
+  validateSchema(m.outputSchema, schemas["payload-schema.schema.json"]);
+  const tasks = new Map<string, ObjectValue>();
+  for (const t of definitions) {
+    validateTask(t);
+    const task = object(t);
+    if (tasks.has(String(task.name))) fail("INVALID_TASK");
+    tasks.set(String(task.name), task);
+  }
+  const nodes = m.nodes as ObjectValue[],
+    byId = new Map<string, ObjectValue>(),
+    successors = new Map<string, number>();
+  for (const n of nodes) {
+    const id = String(n.id);
+    if (byId.has(id)) fail("DUPLICATE_NODE_ID");
+    byId.set(id, n);
+    if (n.type !== "task") fail("UNSUPPORTED_CAPABILITY");
+    if (!tasks.has(String(n.task))) fail("MISSING_TASK_REF");
+  }
+  for (const n of nodes)
+    for (const d of (n.after ?? []) as string[]) {
+      if (!byId.has(d)) fail("MISSING_DEPENDENCY");
+      successors.set(d, (successors.get(d) ?? 0) + 1);
     }
-  }
-  return maxDepth;
-}
-
-function detectCycle(nodes: Map<string, WorkflowNode>): string[] | null {
-  const visited = new Set<string>();
-  const recursionStack = new Set<string>();
-  const path: string[] = [];
-
-  for (const nodeId of nodes.keys()) {
-    const cycle = dfs(nodeId, nodes, visited, recursionStack, path);
-    if (cycle) return cycle;
-  }
-
-  return null;
-}
-
-function dfs(
-  nodeId: string,
-  nodes: Map<string, WorkflowNode>,
-  visited: Set<string>,
-  recursionStack: Set<string>,
-  path: string[]
-): string[] | null {
-  if (recursionStack.has(nodeId)) {
-    return [...path, nodeId];
-  }
-  if (visited.has(nodeId)) {
-    return null;
-  }
-
-  visited.add(nodeId);
-  recursionStack.add(nodeId);
-  path.push(nodeId);
-
-  const node = nodes.get(nodeId);
-  if (node && node.after) {
-    for (const depId of node.after) {
-      const cycle = dfs(depId, nodes, visited, recursionStack, path);
-      if (cycle) return cycle;
+  const ancestors = new Map<string, Set<string>>(),
+    visiting = new Set<string>();
+  const visit = (id: string): Set<string> => {
+    if (visiting.has(id)) fail("CYCLE_DETECTED");
+    if (ancestors.has(id)) return ancestors.get(id)!;
+    visiting.add(id);
+    const set = new Set<string>();
+    for (const d of (byId.get(id)!.after ?? []) as string[]) {
+      set.add(d);
+      for (const x of visit(d)) set.add(x);
     }
-  }
-
-  path.pop();
-  recursionStack.delete(nodeId);
-  return null;
+    visiting.delete(id);
+    ancestors.set(id, set);
+    return set;
+  };
+  nodes.forEach((n) => visit(String(n.id)));
+  if (
+    nodes.filter((n) => !(n.after as JSONValue[] | undefined)?.length)
+      .length !== 1 ||
+    nodes.some(
+      (n) =>
+        ((n.after ?? []) as JSONValue[]).length > 1 ||
+        (successors.get(String(n.id)) ?? 0) > 1,
+    )
+  )
+    fail("UNSUPPORTED_CAPABILITY");
+  const used = new Set<string>();
+  const mapping = (
+    v: JSONValue,
+    allowed: Set<string>,
+    isOutput = false,
+  ): void => {
+    if (v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      v.forEach((x) => mapping(x, allowed, isOutput));
+      return;
+    }
+    if (Object.hasOwn(v, "literal")) {
+      if (Object.keys(v).length !== 1) fail("INPUT_MAPPING_ERROR");
+      return;
+    }
+    if (Object.hasOwn(v, "$ref")) {
+      reference(v);
+      let source = m.inputSchema;
+      if (v.$ref === "step.output") {
+        const id = String(v.stepId);
+        if (!allowed.has(id)) fail("INPUT_MAPPING_ERROR");
+        source = tasks.get(String(byId.get(id)!.task))!.outputSchema;
+        if (isOutput) used.add(id);
+      }
+      if (
+        !guaranteed(source, pointerParts(v.pointer)) &&
+        !Object.hasOwn(v, "default")
+      )
+        fail("INPUT_MAPPING_ERROR");
+      return;
+    }
+    Object.values(v).forEach((x) => mapping(x, allowed, isOutput));
+  };
+  nodes.forEach((n) => mapping(n.input ?? {}, ancestors.get(String(n.id))!));
+  mapping(m.output, new Set(byId.keys()), true);
+  for (const n of nodes)
+    if (
+      !successors.has(String(n.id)) &&
+      !used.has(String(n.id)) &&
+      n.sideEffect !== true
+    )
+      fail("ORPHAN_LEAF");
+}
+export function validateWorkflowManifest(
+  manifest: unknown,
+  tasks: unknown = [],
+): ValidationResult {
+  return check(() => {
+    assertJSON(manifest);
+    assertJSON(tasks);
+    if (!Array.isArray(tasks)) fail("INVALID_TASK");
+    workflow(manifest, tasks);
+  });
+}
+export function validateDeployment(value: unknown): ValidationResult {
+  return check(() => {
+    assertJSON(value);
+    if (!validateAgainst(value, schemas["deployment.schema.json"]))
+      fail("INVALID_MANIFEST");
+    const m = object(value),
+      names = new Set<string>();
+    for (const w of m.workflows as JSONValue[]) {
+      const name = String(object(w).name);
+      if (names.has(name)) fail("INVALID_MANIFEST");
+      names.add(name);
+      workflow(w, m.tasks as JSONValue[]);
+    }
+  });
 }

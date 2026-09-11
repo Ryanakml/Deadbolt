@@ -7,10 +7,15 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "node --test tests/canonical.test.js tests/validator.test.js"
+    "test": "node --test tests/*.test.js",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/node": "^20.17.0",
-    "typescript": "^5.6.3"
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "canonicalize": "5.0.0",
+    "jsonschema": "1.5.0"
   }
 }

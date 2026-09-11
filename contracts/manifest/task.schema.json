@@ -1,27 +1,21 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runtime.deadbolt.dev/schemas/v1/task.schema.json",
-  "title": "TaskDefinition",
-  "description": "Definition schema for an individual executable task",
   "type": "object",
   "properties": {
     "name": {
       "type": "string",
       "pattern": "^[a-zA-Z0-9_-]{1,64}$",
-      "description": "Unique task name reference within deployment"
+      "not": {
+        "pattern": "[^a-zA-Z0-9_-]"
+      }
     },
     "inputSchema": {
-      "type": "object",
-      "description": "JSON Schema subset validating task input"
+      "type": "object"
     },
     "outputSchema": {
-      "type": "object",
-      "description": "JSON Schema subset validating task output"
+      "type": "object"
     },
     "recovery": {
-      "type": "string",
-      "enum": ["safe", "idempotent", "reconcile"],
-      "description": "Mandatory failure recovery policy"
+      "enum": ["safe", "idempotent", "reconcile"]
     },
     "retry": {
       "type": "object",
@@ -35,40 +29,45 @@
         "initialDelayMs": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 60000,
+          "maximum": 9007199254740991,
           "default": 1000
         },
         "maxDelayMs": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 300000,
+          "maximum": 9007199254740991,
           "default": 30000
         }
       },
+      "required": [],
       "additionalProperties": false
     },
     "timeoutMs": {
       "type": "integer",
-      "minimum": 1000,
+      "minimum": 1,
       "maximum": 3600000,
-      "default": 300000,
-      "description": "Per-attempt timeout in milliseconds (max 1 hour)"
+      "default": 300000
     },
     "idempotencyWindowMs": {
       "type": "integer",
-      "minimum": 1000,
-      "description": "Deduplication retention window in milliseconds, required if recovery is idempotent"
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "entrypoint": {
+      "type": "string",
+      "minLength": 1
     }
   },
-  "required": [
-    "name",
-    "inputSchema",
-    "outputSchema",
-    "recovery"
-  ],
+  "required": ["name", "inputSchema", "outputSchema", "recovery"],
   "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runtime.invalid/task/1",
   "if": {
-    "properties": { "recovery": { "const": "idempotent" } }
+    "properties": {
+      "recovery": {
+        "const": "idempotent"
+      }
+    }
   },
   "then": {
     "required": ["idempotencyWindowMs"]

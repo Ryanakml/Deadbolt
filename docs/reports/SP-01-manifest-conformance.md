@@ -1,86 +1,71 @@
-# Engineering Spike Report: SP-01 Manifest Conformance
+# SP-01 — executable contract conformance
 
-- **Spike ID:** SP-01
-- **Status:** Completed
-- **Milestone:** M0 (Contracts, workspace, and delivery foundation)
-- **Requirement Traceability:** REQ-EXEC-01 / REQ-DUR-01 / INV-02–10,14
-- **Date:** September 11, 2026
+Scope: issue #2, dependent on repository preparation in #1. Sources: blueprint §§6, 9–10, 12, 14, 20, 33. Requirements: REQ-EXEC-01, REQ-DUR-01. This report concerns contract boundaries; it does not prove database, authorization, worker-process or recovery invariants at runtime.
 
----
+## Candidates and decision
 
-## 1. Objective
+| Candidate                                                     | Evaluation                                                                                                                | Decision                                                                                                                                                    |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Go `encoding/json` alone                                      | `go run ./tests/candidates` checks HTML escaping, supplementary Unicode key ordering, duplicate names and lone surrogates | Rejected as the canonicalization/strict-parser boundary; four adversarial cases disagree with the required contract                                         |
+| JavaScript `JSON.parse` + `JSON.stringify` alone              | `node scripts/check-candidates.mjs` checks key order, duplicates and lone surrogates                                      | Rejected without strict parsing and JCS; three adversarial cases disagree                                                                                   |
+| `canonicalize` 5.0.0 (TypeScript/Node)                        | Shared expected raw-JSON/hash fixtures plus JavaScript-only rejection tests                                               | Selected behind a strict JSON guard; dependency alone permits `toJSON` and non-JSON values, which the guard rejects without invoking accessors              |
+| `cyberphone/json-canonicalization` commit `19d51d7fe467` (Go) | Same raw-JSON/hash fixtures                                                                                               | Selected with a scalar-root adapter, strict Unicode-pair/depth guard and safe-integer check; the upstream parser alone is not the complete product contract |
+| `jsonschema` 1.5.0 (TypeScript/Node)                          | Shared schema, graph and worker fixtures; interpreter code inspected for dynamic code evaluation                          | Selected only for the explicitly constrained common subset. It is not advertised as a general Draft 2020-12 engine                                          |
+| `santhosh-tekuri/jsonschema/v6` 6.0.3 (Go)                    | Same fixtures, Draft 2020-12 selected explicitly                                                                          | Selected with the same subset meta-schema and domain validation                                                                                             |
 
-Validate that:
-1. Manifest schemas and worker gateway protocol schemas adhere strictly to the JSON Schema (Draft 2020-12 subset) specifications.
-2. Canonical JSON serialization and SHA-256 hashing strictly conform to RFC 8785 (JSON Canonicalization Scheme - JCS) across both Go and TypeScript.
-3. Graph validation correctly enforces acyclicity (DAG check), leaf reachability, node limits ($\le 50$ for MVP), schema depth limits ($\le 32$), and rejects unsupported V1 capabilities (`choice`, `merge`, `approval`, `delay`) with code `UNSUPPORTED_CAPABILITY`.
-4. No arbitrary JavaScript execution or `eval` is introduced in the workflow validation engine.
+The chosen libraries are version/checksum locked. The custom layer is limited to product restrictions, mapping/expressions and graph semantics; it does not execute workflow JavaScript. No `eval`, dynamically generated JavaScript validators, network schema loading, clock, randomness or customer task execution is used. Go/TS independently execute the shared fixtures. The `.invalid` schema IDs are identifiers; they are never fetched.
 
----
+Native serializers remain useful after strict parsing for ordinary transport. They are not substituted for JCS. The Go JCS dependency is an older immutable commit rather than a newly invented serializer; future maintenance changes must rerun the corpus. This selection makes no unsupported claim about upstream maintenance guarantees.
 
-## 2. Evaluation & Library Decisions
+## Executable acceptance evidence
 
-| Dimension | TypeScript / Node.js Decision | Go Decision | Rationale |
-|---|---|---|---|
-| **JSON Canonicalization** | Custom zero-dependency RFC 8785 implementation in `@runtime/sdk` | `internal/contracts/canonical.go` using UTF-16 lexicographical sort and IEEE-754 serialization | Avoids heavy dependencies; guarantees identical byte-level SHA-256 digests across languages. |
-| **Hashing Algorithm** | `node:crypto` (`sha256`) | Standard library `crypto/sha256` | Cryptographically proven, deterministic standard. |
-| **DAG & Manifest Validation** | Recursive DFS cycle detection + structural limit enforcement | Graph validation engine | Eliminates arbitrary code replay risks and ensures 100% inspection transparency. |
+The corpus is `contracts/fixtures/conformance.json`. It currently covers:
 
----
+- Canonical request/result/deployment hashes; scalar roots, negative zero, exponent boundaries, safe integers, Unicode ordering and no normalization.
+- Duplicate raw keys including escaped equivalents; invalid Unicode/UTF-8, nonfinite/unsafe values, trailing data, nesting 32/33 and schema size at/over 64 KiB.
+- JSON Pointer root, escaping, array indexes, literal reserved keys, missing vs null, defaults, absent ancestors and inherited-property rejection.
+- All allowed choice operators, strict types, invalid operators/arity, nested Boolean expressions, and no short-circuit hiding of malformed expressions. This is a conformance evaluator, not V1 choice-node execution.
+- Payload schema validation, tagged `oneOf`, bounds, required/extra fields, forbidden schema `$ref`, format/custom/unsupported keywords.
+- Linear graph acceptance, cycle/duplicate/dependency/ancestor/leaf checks, recovery defaults and idempotency-window minimum, malformed nodes, MVP capability rejection, deployment compatibility metadata.
+- Worker request versions, request/session identity and outcome/digest requirements, including negative fixtures.
 
-## 3. Golden Test Fixtures
+Exact commands from the repository root:
 
-Golden fixtures are permanently established in `contracts/fixtures/`:
-- `contracts/fixtures/canonical-json/jcs-vectors.json`:
-  - `empty_object`: `{}` $\rightarrow$ `44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a`
-  - `key_sorting`: `{"b":2,"a":1,"c":3}` $\rightarrow$ `{"a":1,"b":2,"c":3}`
-  - `nested_sorting`: `{"z":{"y":1,"x":2},"a":[3,2,1]}` $\rightarrow$ `{"a":[3,2,1],"z":{"x":2,"y":1}}`
-  - `unicode_and_special`: UTF-8 emoji and accented characters preserved unescaped.
-  - `numbers_and_primitives`: Formats standard integers, floats, booleans, and null.
-- `contracts/fixtures/dag-validation/`:
-  - `valid-linear-workflow.json`: Positive fixture for 3-step linear pipeline.
-  - `invalid-cycle-workflow.json`: Negative fixture detecting circular dependencies (`CYCLE_DETECTED`).
-
----
-
-## 4. Test Evidence & Validation Results
-
-### TypeScript Test Suite
-Command:
-```bash
-pnpm --filter "@runtime/sdk" run test
+```sh
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm test
+pnpm typecheck
+pnpm lint
+go test -race ./...
+go vet ./...
+pnpm check:config
+pnpm check:contracts
+pnpm check:parity
+node scripts/check-candidates.mjs
+go test ./internal/contracts -run '^$' -fuzz FuzzRawJSON -fuzztime 10s
+pnpm audit
+go mod verify
+node scripts/install-tools.mjs gitleaks govulncheck
+bin/gitleaks git --redact --no-banner --log-opts="--all"
+bin/govulncheck ./...
 ```
 
-Results:
-```text
-TAP version 13
-# Subtest: RFC 8785 JSON Canonicalization Scheme matches all golden vectors
-ok 1 - RFC 8785 JSON Canonicalization Scheme matches all golden vectors
-# Subtest: Rejection of invalid non-finite numbers per RFC 8785
-ok 2 - Rejection of invalid non-finite numbers per RFC 8785
-# Subtest: Rejection of undefined values per RFC 8785
-ok 3 - Rejection of undefined values per RFC 8785
-# Subtest: Valid linear workflow passes all validations
-ok 4 - Valid linear workflow passes all validations
-# Subtest: Cyclic workflow is rejected with CYCLE_DETECTED
-ok 5 - Cyclic workflow is rejected with CYCLE_DETECTED
-# Subtest: Non-task node in MVP is rejected with UNSUPPORTED_CAPABILITY
-ok 6 - Non-task node in MVP is rejected with UNSUPPORTED_CAPABILITY
-# Subtest: Excessive node count (>50) is rejected with NODE_COUNT_EXCEEDED
-ok 7 - Excessive node count (>50) is rejected with NODE_COUNT_EXCEEDED
-# Subtest: Deep schema nesting (>32) is rejected with SCHEMA_NESTING_EXCEEDED
-ok 8 - Deep schema nesting (>32) is rejected with SCHEMA_NESTING_EXCEEDED
-1..8
-# tests 8
-# pass 8
-# fail 0
-```
+The PR records the final commit and actual local/hosted results after these checks execute. The previous contributor statement “100% compliance / issue #2 acceptance criteria fulfilled” was removed because eight tests did not establish those claims. A passing corpus is evidence for its cases, not proof that no defect can exist.
 
----
+## Delivery boundaries
 
-## 5. Conclusion & Impact
+- **Implemented:** versioned contracts, Go/TS validation/mapping/hashing, fixtures, workspace preparation and CI definitions.
+- **Automated tests / security scans:** report only the final executed results in PR evidence, including fixture counts and any failures.
+- **Hosted CI:** only a completed run linked to the final head is evidence; workflow files and a CodeRabbit status are not evidence.
+- **Deployed:** no. There is no application image, database migration or runtime deployment in issues #1–#2.
+- **Acceptance:** executable contract acceptance is separate from live runtime acceptance. External staging selections remain unresolved as documented in `deploy/provisioning.json`; dependent deployment/readiness is blocked until supplied.
 
-Spike **SP-01** passed with 100% compliance.
-- All golden test vectors produce identical digests.
-- Boundary limits and capability gates are enforced without arbitrary JS evaluation.
-- Issue #2 acceptance criteria are fulfilled.
+Future control fields do not enable V1 execution. Current/previous-minor compatibility, actual worker auth/fencing, transaction/outbox behavior, object storage and recovery tests belong to their implementing issues. No runtime invariant is claimed proven by a schema file.
+
+## Local execution record — 2026-09-11
+
+On macOS arm64 with Go 1.27.1, Node 24.21.0 and pnpm 10.24.0: frozen install, configuration/pin checks, formatting, typecheck, SDK build/tests (**172 passed**), OpenAPI/schema generation checks, **165 shared expected fixtures with Go/TS parity**, candidate comparisons, Go race tests, vet and module verification passed. The Go parser fuzz run completed **287,232 executions** in about 11 seconds without a failure. This is a bounded fuzz run, not exhaustive proof.
+
+`pnpm audit` and `govulncheck ./...` reported no known vulnerabilities after updating YAML to 2.9.0 and `golang.org/x/text` to 0.39.0. The earlier YAML finding and unused-module x/text finding were fixed rather than waived. Gitleaks scanned a tracked-source snapshot with redacted output and found no leaks; commit-history scanning and hosted CI evidence are recorded in the PR after commit/push.
+
+Registry manifests verified five pinned image indexes for Linux amd64/arm64. Container execution/image scanning was not performed: the local Docker daemon was unavailable, and no runtime Dockerfile/Compose deployment is implemented here. sqlc/goose installation/version execution is additionally checked by hosted CI; their version pins were verified against the published upstream releases locally. External provisioning and live staging acceptance remain unverified, as listed above.

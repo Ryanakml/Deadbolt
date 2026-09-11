@@ -39,7 +39,7 @@
   <br /><sub>Run Inspector — interface concept illustrating the planned recovery experience, not a running application.</sub>
 </p>
 
-> **Repository status:** the product and engineering blueprint is established; implementation has not started. The architecture, stack, interface concept, and SDK example below describe the intended product. There is no installable SDK, released CLI, or production service yet.
+> **Repository status:** the product and engineering blueprint is established; M0 contract implementation is in progress. The architecture, stack, interface concept, and SDK example below describe the intended product. There is no installable SDK, released CLI, or production service yet.
 
 ## The product
 
@@ -217,7 +217,7 @@ Testing, migrations, Docker, CI/CD, security, and observability grow with every 
 
 ## Start here
 
-This repository currently contains the blueprint, collaboration guide, and project presentation assets. To explore the design:
+This repository contains the blueprint, collaboration guide, and M0 executable Go/TypeScript contracts. See the [clean-clone workspace setup](docs/workspace-setup.md) to build and validate the contracts. To explore the design:
 
 ```bash
 git clone https://github.com/Ryanakml/Deadbolt.git

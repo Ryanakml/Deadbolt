@@ -1,99 +1,117 @@
 package contracts
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"sort"
+	jcs "github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
+	"math"
+	"unicode/utf8"
 )
 
-// CanonicalizeFromJSON parses a JSON byte slice and returns its RFC 8785 canonical bytes.
-func CanonicalizeFromJSON(raw []byte) ([]byte, error) {
-	var generic any
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.UseNumber()
-	if err := d.Decode(&generic); err != nil {
-		return nil, fmt.Errorf("invalid json: %w", err)
-	}
-	return CanonicalizeGeneric(generic)
-}
+type Error struct{ Code string }
 
-// CanonicalizeGeneric serializes an unmarshaled JSON value into RFC 8785 canonical bytes.
-func CanonicalizeGeneric(v any) ([]byte, error) {
-	switch val := v.(type) {
-	case nil:
-		return []byte("null"), nil
-	case bool:
-		if val {
-			return []byte("true"), nil
-		}
-		return []byte("false"), nil
+func (e *Error) Error() string  { return e.Code }
+func failure(code string) error { return &Error{code} }
+
+func checkJSON(v any, depth int) error {
+	switch x := v.(type) {
+	case nil, bool:
+		return nil
 	case string:
-		return json.Marshal(val)
-	case json.Number:
-		return []byte(val.String()), nil
+		if !utf8.ValidString(x) {
+			return failure("INVALID_JSON")
+		}
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) || (math.Trunc(x) == x && math.Abs(x) > 9007199254740991) {
+			return failure("INVALID_JSON")
+		}
 	case []any:
-		var buf bytes.Buffer
-		buf.WriteByte('[')
-		for i, item := range val {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			b, err := CanonicalizeGeneric(item)
-			if err != nil {
-				return nil, err
-			}
-			buf.Write(b)
+		if depth >= 32 {
+			return failure("INVALID_JSON")
 		}
-		buf.WriteByte(']')
-		return buf.Bytes(), nil
+		for _, item := range x {
+			if err := checkJSON(item, depth+1); err != nil {
+				return err
+			}
+		}
 	case map[string]any:
-		keys := make([]string, 0, len(val))
-		for k := range val {
-			keys = append(keys, k)
+		if depth >= 32 {
+			return failure("INVALID_JSON")
 		}
-		// RFC 8785 sorts keys lexicographically by UTF-16 code units.
-		// In Go, UTF-8 strings sort identically to UTF-16 code units for BMP code points.
-		sort.Strings(keys)
-
-		var buf bytes.Buffer
-		buf.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				buf.WriteByte(',')
+		for k, item := range x {
+			if !utf8.ValidString(k) {
+				return failure("INVALID_JSON")
 			}
-			kb, err := json.Marshal(k)
-			if err != nil {
-				return nil, err
+			if err := checkJSON(item, depth+1); err != nil {
+				return err
 			}
-			buf.Write(kb)
-			buf.WriteByte(':')
-			vb, err := CanonicalizeGeneric(val[k])
-			if err != nil {
-				return nil, err
-			}
-			buf.Write(vb)
 		}
-		buf.WriteByte('}')
-		return buf.Bytes(), nil
 	default:
-		return json.Marshal(val)
+		return failure("INVALID_JSON")
 	}
+	return nil
 }
 
-// SHA256Hex computes the SHA-256 hex string of canonical bytes.
-func SHA256Hex(data []byte) string {
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
+// ParseJSON checks raw syntax before decoding can discard duplicates or repair Unicode.
+func ParseJSON(raw []byte) (any, error) {
+	if err := rawGuard(raw); err != nil {
+		return nil, err
+	}
+	if !utf8.Valid(raw) {
+		return nil, failure("INVALID_JSON")
+	}
+	canonical, err := transform(raw)
+	if err != nil {
+		return nil, failure("INVALID_JSON")
+	}
+	var v any
+	if json.Unmarshal(canonical, &v) != nil {
+		return nil, failure("INVALID_JSON")
+	}
+	if err = checkJSON(v, 0); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
-
-// Digest computes the canonical form and SHA-256 hash from raw JSON bytes.
+func CanonicalizeFromJSON(raw []byte) ([]byte, error) {
+	if _, err := ParseJSON(raw); err != nil {
+		return nil, err
+	}
+	return transform(raw)
+}
+func CanonicalizeGeneric(v any) ([]byte, error) {
+	if err := checkJSON(v, 0); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, failure("INVALID_JSON")
+	}
+	return transform(raw)
+}
+func SHA256Hex(data []byte) string { h := sha256.Sum256(data); return hex.EncodeToString(h[:]) }
 func Digest(raw []byte) ([]byte, string, error) {
-	canonical, err := CanonicalizeFromJSON(raw)
+	c, err := CanonicalizeFromJSON(raw)
 	if err != nil {
 		return nil, "", err
 	}
-	return canonical, SHA256Hex(canonical), nil
+	return c, SHA256Hex(c), nil
+}
+
+// The upstream implementation accepts object/array roots. A one-element array
+// adapter covers all JSON roots without changing their canonical bytes.
+func transform(raw []byte) ([]byte, error) {
+	if !json.Valid(raw) {
+		return nil, failure("INVALID_JSON")
+	}
+	wrapped := make([]byte, 0, len(raw)+2)
+	wrapped = append(wrapped, '[')
+	wrapped = append(wrapped, raw...)
+	wrapped = append(wrapped, ']')
+	result, err := jcs.Transform(wrapped)
+	if err != nil {
+		return nil, failure("INVALID_JSON")
+	}
+	return result[1 : len(result)-1], nil
 }

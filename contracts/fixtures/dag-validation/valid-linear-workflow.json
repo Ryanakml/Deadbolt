@@ -1,66 +1,61 @@
 {
   "manifestVersion": 1,
-  "name": "research-report",
+  "name": "linear",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "query": { "type": "string" }
+      "x": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9
+      }
     },
-    "required": ["query"],
+    "required": ["x"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "x": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9
+      }
+    },
+    "required": ["x"],
     "additionalProperties": false
   },
   "nodes": [
     {
-      "id": "search",
+      "id": "a",
       "type": "task",
-      "task": "search-web",
+      "task": "noop",
       "input": {
-        "query": {
+        "x": {
           "$ref": "run.input",
-          "pointer": "/query"
+          "pointer": "/x"
         }
       }
     },
     {
-      "id": "analyze",
+      "id": "b",
       "type": "task",
-      "task": "analyze-pages",
-      "after": ["search"],
+      "task": "noop",
+      "after": ["a"],
       "input": {
-        "pages": {
+        "x": {
           "$ref": "step.output",
-          "stepId": "search",
-          "pointer": "/pages"
-        }
-      }
-    },
-    {
-      "id": "report",
-      "type": "task",
-      "task": "generate-report",
-      "after": ["analyze"],
-      "input": {
-        "analysis": {
-          "$ref": "step.output",
-          "stepId": "analyze",
-          "pointer": "/analysis"
+          "stepId": "a",
+          "pointer": "/x"
         }
       }
     }
   ],
   "output": {
-    "reportUrl": {
+    "x": {
       "$ref": "step.output",
-      "stepId": "report",
-      "pointer": "/reportUrl"
+      "stepId": "b",
+      "pointer": "/x"
     }
-  },
-  "outputSchema": {
-    "type": "object",
-    "properties": {
-      "reportUrl": { "type": "string" }
-    },
-    "required": ["reportUrl"],
-    "additionalProperties": false
   }
 }

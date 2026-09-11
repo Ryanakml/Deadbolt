@@ -2,11 +2,13 @@ openapi: 3.1.0
 info:
   title: Deadbolt / tf-low Control Plane API
   version: 1.0.0
-  description: Authoritative REST API for durable workflow execution and observable recovery.
+  description:
+    Versioned target HTTP contracts (M0). No endpoints are implemented
+    by this PR. Authentication, tenant authorization, transactions, and runtime
+    capability gates are implemented by their owning issues.
 servers:
   - url: /v1
     description: Control Plane v1 API
-
 paths:
   /workflows/{name}/runs:
     post:
@@ -23,28 +25,47 @@ paths:
           required: true
           schema:
             type: string
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: &a1
+            type: string
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateRunRequest'
+              $ref: "#/components/schemas/CreateRunRequest"
       responses:
-        '202':
+        "202":
           description: Run accepted and persisted
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Run'
-        '400':
-          $ref: '#/components/responses/ErrorResponse'
-        '409':
-          description: Idempotency conflict or state conflict
-          $ref: '#/components/responses/ErrorResponse'
-        '422':
-          description: Input validation error against workflow schema
-          $ref: '#/components/responses/ErrorResponse'
-
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:create
   /runs/{id}:
     get:
       summary: Retrieve snapshot of a run
@@ -56,15 +77,32 @@ paths:
           schema:
             type: string
       responses:
-        '200':
+        "200":
           description: Snapshot of the run with revision and lastEventSequence
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RunSnapshot'
-        '404':
-          $ref: '#/components/responses/ErrorResponse'
-
+                $ref: "#/components/schemas/RunSnapshot"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:read
   /runs/{id}/events:
     get:
       summary: Get immutable execution events for a run with cursor pagination
@@ -87,13 +125,32 @@ paths:
             default: 50
             maximum: 200
       responses:
-        '200':
+        "200":
           description: List of execution events
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RunEventsResponse'
-
+                $ref: "#/components/schemas/RunEventsResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:read
   /runs/{id}/stream:
     get:
       summary: Stream live run events via Server-Sent Events (SSE)
@@ -109,13 +166,32 @@ paths:
           schema:
             type: string
       responses:
-        '200':
+        "200":
           description: SSE event stream
           content:
             text/event-stream:
               schema:
                 type: string
-
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:read
   /runs/{id}/pause:
     post:
       summary: Request durable pause on a run
@@ -126,23 +202,54 @@ paths:
           required: true
           schema:
             type: string
+        - &a2
+          name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: *a1
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PauseRunRequest'
+              $ref: "#/components/schemas/RevisionCommand"
       responses:
-        '200':
+        "200":
           description: Run pause requested or confirmed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Run'
-        '409':
-          description: Revision conflict or run already terminal
-          $ref: '#/components/responses/ErrorResponse'
-
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:control
+      x-minimum-capability: V1
   /runs/{id}/resume:
     post:
       summary: Resume a paused run
@@ -153,14 +260,48 @@ paths:
           required: true
           schema:
             type: string
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: *a1
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
       responses:
-        '200':
+        "200":
           description: Run resumed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Run'
-
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:control
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionCommand"
+      x-minimum-capability: V1
   /runs/{id}/cancel:
     post:
       summary: Durably cancel an active run
@@ -171,17 +312,47 @@ paths:
           required: true
           schema:
             type: string
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: *a1
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
       responses:
-        '200':
+        "200":
           description: Cancellation initiated
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Run'
-        '409':
-          description: Run already terminal
-          $ref: '#/components/responses/ErrorResponse'
-
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:control
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionCommand"
   /deployments:
     post:
       summary: Register an immutable deployment manifest
@@ -191,24 +362,49 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RegisterDeploymentRequest'
+              $ref: "#/components/schemas/RegisterDeploymentRequest"
       responses:
-        '201':
-          description: Deployment registered
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Deployment'
-        '200':
+        "200":
           description: Deployment already registered (idempotent)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Deployment'
-        '422':
-          description: Invalid manifest schema or graph structure
-          $ref: '#/components/responses/ErrorResponse'
-
+                $ref: "#/components/schemas/Deployment"
+        "201":
+          description: Deployment registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deployment"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: deployments:write
+      parameters:
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: *a1
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
   /workflows/{name}/activate:
     post:
       summary: Set active deployment version for new runs
@@ -219,6 +415,14 @@ paths:
           required: true
           schema:
             type: string
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: *a1
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
       requestBody:
         required: true
         content:
@@ -226,18 +430,47 @@ paths:
             schema:
               type: object
               properties:
-                deploymentId:
-                  type: string
-                expectedRevision:
+                deploymentId: *a1
+                expectedRevision: &a3
                   type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+                allowSingleWorker:
+                  type: boolean
+                  default: false
               required:
                 - deploymentId
+                - expectedRevision
+              additionalProperties: false
       responses:
-        '200':
-          description: Active deployment updated
-        '409':
-          description: Revision conflict
-
+        "200":
+          description:
+            Active pointer updated after environment-specific preflight;
+            existing runs stay pinned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workflow"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: deployments:write
   /reconciliation-cases/{id}/resolve:
     post:
       summary: Authoritative human/application decision for an unknown outcome
@@ -248,18 +481,959 @@ paths:
           required: true
           schema:
             type: string
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema: *a1
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ResolveReconciliationRequest'
+              $ref: "#/components/schemas/ResolveReconciliationRequest"
       responses:
-        '200':
-          description: Hold resolved
-        '409':
-          description: Revision conflict
-
+        "200":
+          description: Decision and audit accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  caseId: *a1
+                  resolved:
+                    const: true
+                  revision: *a3
+                required:
+                  - caseId
+                  - resolved
+                  - revision
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: runs:reconcile
+      security:
+        - BrowserSession: []
+  /runs/{id}/rerun:
+    post:
+      operationId: rerun
+      summary: rerun
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: runs:create
+      x-implemented: false
+      responses:
+        "202":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: &a4
+        - EnvironmentKey: []
+        - BrowserSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                input: {}
+                deploymentId: *a1
+              required:
+                - input
+              additionalProperties: false
+      x-minimum-capability: V1
+  /workflows:
+    get:
+      operationId: listworkflows
+      summary: listworkflows
+      parameters:
+        - name: environment
+          in: query
+          required: true
+          schema: *a1
+        - name: cursor
+          in: query
+          schema: *a1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      x-required-capability: workflows:read
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Workflow"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - items
+                  - nextCursor
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+  /runs:
+    get:
+      operationId: listruns
+      summary: listruns
+      parameters:
+        - name: environment
+          in: query
+          required: true
+          schema: *a1
+        - name: cursor
+          in: query
+          schema: *a1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      x-required-capability: runs:read
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Run"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - items
+                  - nextCursor
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+  /workers:
+    get:
+      operationId: listworkers
+      summary: listworkers
+      parameters:
+        - name: environment
+          in: query
+          required: true
+          schema: *a1
+        - name: cursor
+          in: query
+          schema: *a1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      x-required-capability: workers:read
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Worker"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - items
+                  - nextCursor
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+  /approvals/{id}/decision:
+    post:
+      operationId: decideApproval
+      summary: decideApproval
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: approvals:decide
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: *a1
+                  status:
+                    $ref: "#/components/schemas/ApprovalStatus"
+                  revision: *a3
+                required:
+                  - id
+                  - status
+                  - revision
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security:
+        - BrowserSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                decision:
+                  enum:
+                    - approved
+                    - rejected
+                expectedRevision: *a3
+                comment: *a1
+              required:
+                - decision
+                - expectedRevision
+              additionalProperties: false
+      x-minimum-capability: V1
+  /schedules:
+    get:
+      operationId: listSchedule
+      summary: listSchedule
+      parameters: []
+      x-required-capability: schedules:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Schedule"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - items
+                  - nextCursor
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      x-minimum-capability: V1
+    post:
+      operationId: createSchedule
+      summary: createSchedule
+      parameters:
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: schedules:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Schedule"
+      x-minimum-capability: V1
+  /schedules/{id}:
+    patch:
+      operationId: updateSchedule
+      summary: updateSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: schedules:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedRevision: *a3
+                configuration:
+                  $ref: "#/components/schemas/Schedule"
+              required:
+                - expectedRevision
+                - configuration
+              additionalProperties: false
+      x-minimum-capability: V1
+    delete:
+      operationId: deleteSchedule
+      summary: deleteSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: schedules:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    const: true
+                required:
+                  - deleted
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionCommand"
+      x-minimum-capability: V1
+  /webhook-endpoints:
+    get:
+      operationId: listWebhookEndpoint
+      summary: listWebhookEndpoint
+      parameters: []
+      x-required-capability: webhooks:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WebhookEndpoint"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - items
+                  - nextCursor
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      x-minimum-capability: V1
+    post:
+      operationId: createWebhookEndpoint
+      summary: createWebhookEndpoint
+      parameters:
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: webhooks:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpoint"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEndpoint"
+      x-minimum-capability: V1
+  /webhook-endpoints/{id}:
+    patch:
+      operationId: updateWebhookEndpoint
+      summary: updateWebhookEndpoint
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: webhooks:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpoint"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedRevision: *a3
+                configuration:
+                  $ref: "#/components/schemas/WebhookEndpoint"
+              required:
+                - expectedRevision
+                - configuration
+              additionalProperties: false
+      x-minimum-capability: V1
+    delete:
+      operationId: deleteWebhookEndpoint
+      summary: deleteWebhookEndpoint
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: webhooks:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    const: true
+                required:
+                  - deleted
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionCommand"
+      x-minimum-capability: V1
+  /artifacts:
+    post:
+      operationId: createArtifact
+      summary: createArtifact
+      parameters:
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: artifacts:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: *a1
+                  uploadUrl: *a1
+                  expiresAt:
+                    type: string
+                    format: date-time
+                required:
+                  - id
+                  - uploadUrl
+                  - expiresAt
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                runId: *a1
+                attemptId: *a1
+                ownershipEpoch: *a3
+                sizeBytes:
+                  type: integer
+                  minimum: 0
+                  maximum: 104857600
+                sha256:
+                  type: string
+                  pattern: ^[0-9a-f]{64}$
+              required:
+                - runId
+                - attemptId
+                - ownershipEpoch
+                - sizeBytes
+                - sha256
+              additionalProperties: false
+  /artifacts/{id}/finalize:
+    post:
+      operationId: finalizeArtifact
+      summary: finalizeArtifact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: artifacts:write
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: *a1
+                  status:
+                    const: READY
+                required:
+                  - id
+                  - status
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                attemptId: *a1
+                ownershipEpoch: *a3
+                sha256:
+                  type: string
+                  pattern: ^[0-9a-f]{64}$
+              required:
+                - attemptId
+                - ownershipEpoch
+                - sha256
+              additionalProperties: false
+  /artifacts/{id}:
+    get:
+      operationId: downloadArtifact
+      summary: downloadArtifact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+      x-required-capability: payload:read
+      x-implemented: false
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: *a1
+                  downloadUrl: *a1
+                  expiresAt:
+                    type: string
+                    format: date-time
+                required:
+                  - id
+                  - downloadUrl
+                  - expiresAt
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
 components:
   responses:
     ErrorResponse:
@@ -267,8 +1441,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorEnvelope'
-
+            $ref: "#/components/schemas/ErrorEnvelope"
   schemas:
     RunStatus:
       type: string
@@ -282,7 +1455,6 @@ components:
         - SUCCEEDED
         - FAILED
         - CANCELLED
-
     StepStatus:
       type: string
       enum:
@@ -294,7 +1466,6 @@ components:
         - FAILED
         - CANCELLED
         - SKIPPED
-
     AttemptStatus:
       type: string
       enum:
@@ -305,75 +1476,67 @@ components:
         - TIMED_OUT
         - LOST
         - CANCELLED
-
     RecoveryMode:
       type: string
       enum:
         - safe
         - idempotent
         - reconcile
-
     ErrorEnvelope:
       type: object
       properties:
-        code:
-          type: string
-        message:
-          type: string
-        requestId:
-          type: string
+        code: *a1
+        message: *a1
+        requestId: *a1
         details:
           type: object
-          additionalProperties: true
         retryable:
           type: boolean
       required:
         - code
         - message
         - requestId
+        - details
         - retryable
-
+      additionalProperties: false
     CreateRunRequest:
       type: object
       properties:
-        workflow:
-          type: string
-        environment:
-          type: string
-        input:
-          type: object
-        deploymentId:
-          type: string
+        environment: *a1
+        input: {}
+        deploymentId: *a1
       required:
-        - workflow
         - environment
         - input
-
+      additionalProperties: false
     PauseRunRequest:
-      type: object
-      properties:
-        expectedRevision:
-          type: integer
-      required:
-        - expectedRevision
-
+      $ref: "#/components/schemas/RevisionCommand"
     ResolveReconciliationRequest:
       type: object
       properties:
         action:
           type: string
-          enum: [confirm_succeeded, confirm_not_executed_retry, fail_run]
+          enum:
+            - confirm_succeeded
+            - confirm_not_executed_retry
+            - fail_run
         evidence:
           type: string
-        result:
-          type: object
+        result: {}
         expectedRevision:
           type: integer
       required:
         - action
         - evidence
         - expectedRevision
-
+      allOf:
+        - if:
+            properties:
+              action:
+                const: confirm_succeeded
+          then:
+            required:
+              - result
     Run:
       type: object
       properties:
@@ -390,7 +1553,7 @@ components:
         deploymentId:
           type: string
         status:
-          $ref: '#/components/schemas/RunStatus'
+          $ref: "#/components/schemas/RunStatus"
         reasonCode:
           type: string
         revision:
@@ -408,23 +1571,22 @@ components:
         - status
         - revision
         - createdAt
-
     RunSnapshot:
       allOf:
-        - $ref: '#/components/schemas/Run'
+        - $ref: "#/components/schemas/Run"
         - type: object
           properties:
-            lastEventSequence:
-              type: integer
+            lastEventSequence: *a3
             steps:
               type: array
               items:
-                $ref: '#/components/schemas/RunStep'
-            output:
-              type: object
+                $ref: "#/components/schemas/RunStep"
+            output: {}
             error:
-              $ref: '#/components/schemas/ErrorEnvelope'
-
+              $ref: "#/components/schemas/ErrorEnvelope"
+          required:
+            - lastEventSequence
+            - steps
     RunStep:
       type: object
       properties:
@@ -433,18 +1595,17 @@ components:
         nodeId:
           type: string
         status:
-          $ref: '#/components/schemas/StepStatus'
+          $ref: "#/components/schemas/StepStatus"
         currentEpoch:
           type: integer
         attempts:
           type: array
           items:
-            $ref: '#/components/schemas/TaskAttempt'
+            $ref: "#/components/schemas/TaskAttempt"
       required:
         - id
         - nodeId
         - status
-
     TaskAttempt:
       type: object
       properties:
@@ -453,7 +1614,7 @@ components:
         attemptNumber:
           type: integer
         status:
-          $ref: '#/components/schemas/AttemptStatus'
+          $ref: "#/components/schemas/AttemptStatus"
         workerSessionId:
           type: string
         ownershipEpoch:
@@ -468,33 +1629,39 @@ components:
         - id
         - attemptNumber
         - status
-
     RunEvent:
       type: object
       properties:
-        sequence:
-          type: integer
+        id: *a1
+        runId: *a1
+        sequence: *a3
+        schemaVersion:
+          const: 1
         type:
           type: string
-          description: Lower-case event name (e.g. run.created, step.ready)
+          pattern: ^[a-z]+\.[a-z_]+$
+        requestId: *a1
         payload:
           type: object
         committedAt:
           type: string
           format: date-time
       required:
+        - id
+        - runId
         - sequence
+        - schemaVersion
         - type
         - payload
         - committedAt
-
+      additionalProperties: false
     RunEventsResponse:
       type: object
       properties:
         events:
           type: array
           items:
-            $ref: '#/components/schemas/RunEvent'
+            $ref: "#/components/schemas/RunEvent"
         hasMore:
           type: boolean
         nextCursor:
@@ -502,20 +1669,8 @@ components:
       required:
         - events
         - hasMore
-
     RegisterDeploymentRequest:
-      type: object
-      properties:
-        manifest:
-          type: object
-          description: Full workflow DAG manifest
-        bundleDigest:
-          type: string
-          description: SHA-256 digest of the customer task bundle
-      required:
-        - manifest
-        - bundleDigest
-
+      $ref: ../manifest/deployment.schema.json
     Deployment:
       type: object
       properties:
@@ -527,7 +1682,10 @@ components:
           type: string
         status:
           type: string
-          enum: [REGISTERED, AVAILABLE, ACTIVE]
+          enum:
+            - REGISTERED
+            - AVAILABLE
+            - ACTIVE
         createdAt:
           type: string
           format: date-time
@@ -536,3 +1694,130 @@ components:
         - manifestHash
         - bundleDigest
         - status
+    ApprovalStatus:
+      type: string
+      enum:
+        - PENDING
+        - APPROVED
+        - REJECTED
+        - EXPIRED
+        - CANCELLED
+    TimerStatus:
+      type: string
+      enum:
+        - PENDING
+        - FIRED
+        - CANCELLED
+    WorkerStatus:
+      type: string
+      enum:
+        - ONLINE
+        - DRAINING
+        - OFFLINE
+        - REVOKED
+    RevisionCommand:
+      type: object
+      properties:
+        expectedRevision: *a3
+      required:
+        - expectedRevision
+      additionalProperties: false
+    Workflow:
+      type: object
+      properties:
+        name: *a1
+        activeDeploymentId:
+          type:
+            - string
+            - "null"
+        revision: *a3
+      required:
+        - name
+        - activeDeploymentId
+        - revision
+      additionalProperties: false
+    Worker:
+      type: object
+      properties:
+        id: *a1
+        environmentId: *a1
+        pool: *a1
+        status:
+          $ref: "#/components/schemas/WorkerStatus"
+        deploymentDigests:
+          type: array
+          items: *a1
+      required:
+        - id
+        - environmentId
+        - pool
+        - status
+        - deploymentDigests
+      additionalProperties: false
+    ReconciliationDecision:
+      $ref: "#/components/schemas/ResolveReconciliationRequest"
+    Schedule:
+      type: object
+      properties:
+        id: *a1
+        workflow: *a1
+        environment: *a1
+        cron: *a1
+        timezone:
+          type: string
+          default: UTC
+        deploymentId: *a1
+        overlapPolicy:
+          const: skip-overlap
+        misfirePolicy:
+          const: coalesce-one
+        paused:
+          type: boolean
+        revision: *a3
+      required:
+        - workflow
+        - environment
+        - cron
+        - timezone
+        - overlapPolicy
+        - misfirePolicy
+        - paused
+      additionalProperties: false
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: *a1
+        url:
+          type: string
+          format: uri
+        enabled:
+          type: boolean
+        revision: *a3
+        eventTypes:
+          type: array
+          items:
+            enum:
+              - run.succeeded
+              - run.failed
+              - run.cancelled
+              - approval.requested
+      required:
+        - url
+        - enabled
+        - eventTypes
+      additionalProperties: false
+  securitySchemes:
+    EnvironmentKey:
+      type: http
+      scheme: bearer
+      description:
+        Environment-scoped API key. Scope is authoritative; mismatches are
+        rejected.
+    BrowserSession:
+      type: apiKey
+      in: cookie
+      name: __Host-runtime_session
+      description:
+        Go BFF session; cookie mutations also require CSRF token and Origin
+        validation.
+security: *a4
