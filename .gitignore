@@ -13,6 +13,7 @@ Thumbs.db
 *.pem
 *.key
 *.cert
+.deadbolt-dev-key
 
 # Node.js & TypeScript
 node_modules/
