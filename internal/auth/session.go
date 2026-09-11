@@ -64,6 +64,11 @@ func GenerateRandomToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// GenerateCSRFToken generates a 256-bit cryptographically secure random CSRF token
+func GenerateCSRFToken() (string, error) {
+	return GenerateRandomToken()
+}
+
 // SessionStore handles database persistence for authentication and sessions
 type SessionStore struct {
 	pool *pgxpool.Pool

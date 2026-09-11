@@ -10,8 +10,17 @@ import (
 )
 
 const (
-	// SessionCookieName is the exact __Host- cookie mandated by Blueprint §24.1
+	// SessionCookieName is the exact __Host- cookie mandated by Blueprint §24.1 for secure hosted mode
 	SessionCookieName = "__Host-runtime_session"
+
+	// CSRFCookieName is the readable __Host- cookie for SPA CSRF token bootstrap in secure hosted mode
+	CSRFCookieName = "__Host-csrf_token"
+
+	// LocalSessionCookieName is used when CookieSecure=false in local development (since browsers reject non-secure __Host-)
+	LocalSessionCookieName = "deadbolt_local_session"
+
+	// LocalCSRFCookieName is used when CookieSecure=false in local development
+	LocalCSRFCookieName = "deadbolt_local_csrf"
 
 	// DefaultSessionIdleTimeout is 12 hours (Blueprint §24.1)
 	DefaultSessionIdleTimeout = 12 * time.Hour
@@ -45,6 +54,22 @@ type Config struct {
 	SessionAbsoluteTimeout time.Duration
 }
 
+// SessionCookieName returns the appropriate session cookie name based on CookieSecure
+func (c *Config) SessionCookieName() string {
+	if c.CookieSecure {
+		return SessionCookieName
+	}
+	return LocalSessionCookieName
+}
+
+// CSRFCookieName returns the appropriate CSRF cookie name based on CookieSecure
+func (c *Config) CSRFCookieName() string {
+	if c.CookieSecure {
+		return CSRFCookieName
+	}
+	return LocalCSRFCookieName
+}
+
 // DefaultConfig returns default authentication configuration
 func DefaultConfig() Config {
 	return Config{
@@ -56,8 +81,8 @@ func DefaultConfig() Config {
 }
 
 // Validate verifies configuration boundaries according to Blueprint §22.2 & §24.1.
-// In hosted mode, dev auth is strictly rejected.
-// In local mode, dev auth is permitted only when bound to loopback.
+// In hosted mode, dev auth is strictly rejected, and CookieSecure must be true.
+// In local mode, dev auth is permitted only when explicitly bound to loopback.
 func (c *Config) Validate(listenHost string) error {
 	if c.RuntimeMode == "" {
 		return errors.New("RuntimeMode must be configured ('hosted' or 'local')")
@@ -71,6 +96,10 @@ func (c *Config) Validate(listenHost string) error {
 	}
 
 	if c.RuntimeMode == ModeHosted {
+		// Blueprint §24.1: hosted mode strictly requires Secure cookies for __Host- enforcement
+		if !c.CookieSecure {
+			return errors.New("hosted mode requires CookieSecure=true to enforce __Host- cookie policy")
+		}
 		// Blueprint §22.2: "hosted-mode startup rejects dev auth"
 		if c.DevAuthEnabled {
 			return errors.New("hosted startup rejects dev auth and development keys")
@@ -89,7 +118,11 @@ func (c *Config) Validate(listenHost string) error {
 
 	if c.RuntimeMode == ModeLocal {
 		if c.DevAuthEnabled {
-			if !isLoopbackHost(listenHost) {
+			trimmedHost := strings.TrimSpace(listenHost)
+			if trimmedHost == "" {
+				return errors.New("dev auth requires an explicit loopback listen host (e.g. '127.0.0.1' or 'localhost')")
+			}
+			if !isLoopbackHost(trimmedHost) {
 				return fmt.Errorf("dev auth is restricted strictly to loopback binding (got listen host %q)", listenHost)
 			}
 		}
@@ -121,7 +154,11 @@ func (c *Config) IsOriginAllowed(origin string) bool {
 
 // isLoopbackHost verifies whether the host/IP represents loopback
 func isLoopbackHost(host string) bool {
-	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 		return true
 	}
 

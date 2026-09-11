@@ -321,24 +321,35 @@ func (c *OIDCClient) VerifyIDToken(ctx context.Context, rawJWT, expectedNonce st
 	}
 
 	// 1. Verify Issuer
+	if strings.TrimSpace(claims.Iss) == "" {
+		return nil, errors.New("missing required issuer (iss) claim in ID token")
+	}
 	expectedIssuer := strings.TrimRight(c.cfg.Issuer, "/")
 	tokenIssuer := strings.TrimRight(claims.Iss, "/")
 	if tokenIssuer != expectedIssuer {
 		return nil, fmt.Errorf("issuer mismatch: expected %q, got %q", expectedIssuer, tokenIssuer)
 	}
 
-	// 2. Verify Audience
+	// 2. Verify Subject
+	if strings.TrimSpace(claims.Sub) == "" {
+		return nil, errors.New("missing required subject (sub) claim in ID token")
+	}
+
+	// 3. Verify Audience
 	if !audienceContains(claims.Aud, c.cfg.ClientID) {
 		return nil, fmt.Errorf("audience mismatch: %v does not contain client ID %q", claims.Aud, c.cfg.ClientID)
 	}
 
-	// 3. Verify Expiry (with 1-minute clock skew allowance)
+	// 4. Verify Expiry (mandatory claim with 1-minute clock skew allowance)
+	if claims.Exp <= 0 {
+		return nil, errors.New("missing or invalid expiration (exp) claim in ID token")
+	}
 	now := time.Now().Unix()
-	if claims.Exp != 0 && now > claims.Exp+60 {
+	if now > claims.Exp+60 {
 		return nil, fmt.Errorf("token expired at %s (now: %s)", time.Unix(claims.Exp, 0), time.Unix(now, 0))
 	}
 
-	// 4. Verify Nonce
+	// 5. Verify Nonce
 	if expectedNonce != "" && claims.Nonce != expectedNonce {
 		return nil, fmt.Errorf("nonce mismatch: expected %q, got %q", expectedNonce, claims.Nonce)
 	}

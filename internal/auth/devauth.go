@@ -104,14 +104,23 @@ func (h *DevAuthHandler) HandleDevLogin(w http.ResponseWriter, r *http.Request) 
 	log.Printf("WARNING: Dev auth must NEVER be enabled in production or hosted mode!")
 	log.Printf("==================================================================")
 
-	// Set session cookie
+	// Set session & CSRF cookies (using non-__Host- names if CookieSecure is false)
 	maxAge := int(h.cfg.SessionAbsoluteTimeout.Seconds())
 	http.SetCookie(w, &http.Cookie{
-		Name:     SessionCookieName,
+		Name:     h.cfg.SessionCookieName(),
 		Value:    rawToken,
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: true,
+		Secure:   h.cfg.CookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     h.cfg.CSRFCookieName(),
+		Value:    rawCSRF,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: false,
 		Secure:   h.cfg.CookieSecure,
 		SameSite: http.SameSiteLaxMode,
 	})
