@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,91 +11,76 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
+	"github.com/Ryanakml/Deadbolt/internal/storage/testdb"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-func getTestDatabaseURL() string {
-	if s := os.Getenv("TEST_DATABASE_URL"); s != "" {
-		return s
-	}
-	if s := os.Getenv("DATABASE_URL"); s != "" {
-		return s
-	}
-	return "postgres://localhost:5432/deadbolt_test?sslmode=disable"
-}
-
-func getRoleDatabaseURL(role string) string {
-	if role == "deadbolt_runtime" {
-		if s := os.Getenv("TEST_RUNTIME_DATABASE_URL"); s != "" {
-			return s
-		}
-	}
-	if role == "deadbolt_system" {
-		if s := os.Getenv("TEST_SYSTEM_DATABASE_URL"); s != "" {
-			return s
-		}
-	}
-	baseURL := getTestDatabaseURL()
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return fmt.Sprintf("postgres://%s@localhost:5432/deadbolt_test?sslmode=disable", role)
-	}
-	u.User = url.User(role)
-	return u.String()
-}
-
-func setupTestDB(t *testing.T) (*sql.DB, *pgxpool.Pool) {
+func setupTestDB(t *testing.T) (*sql.DB, *pgxpool.Pool, string) {
 	t.Helper()
-
-	db, err := sql.Open("pgx", getTestDatabaseURL())
-	if err != nil {
-		t.Skipf("PostgreSQL deadbolt_test not available: %v", err)
-	}
-	if err := db.Ping(); err != nil {
-		t.Skipf("PostgreSQL deadbolt_test ping failed: %v", err)
-	}
 
 	migrationsDir, err := filepath.Abs("../../migrations")
 	if err != nil {
 		t.Fatalf("failed to resolve migrations dir: %v", err)
 	}
+	bootstrapPath, err := filepath.Abs("../../scripts/bootstrap-db-roles.sql")
+	if err != nil {
+		t.Fatalf("failed to resolve bootstrap path: %v", err)
+	}
 
-	// 1. Run migrations using migrator runner under advisory lock
+	// 1. Setup isolated database 'deadbolt_integration_test' with admin bootstrap script
+	migratorURL, runtimeURL, systemURL, err := testdb.SetupIsolatedDatabase("deadbolt_integration_test", bootstrapPath)
+	if err != nil {
+		t.Skipf("PostgreSQL isolated database setup skipped: %v", err)
+	}
+
+	// 2. Connect strictly as deadbolt_migrator to run migrations
+	db, err := sql.Open("pgx", migratorURL)
+	if err != nil {
+		t.Fatalf("failed to open db as deadbolt_migrator: %v", err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatalf("failed to ping db as deadbolt_migrator: %v", err)
+	}
+
 	runner := migrator.NewRunner(db, migrationsDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := runner.Up(ctx); err != nil {
-		t.Fatalf("migration failed: %v", err)
-	}
-
-	// 2. Execute bootstrap roles script to ensure deadbolt_runtime and deadbolt_system exist
-	bootstrapPath, err := filepath.Abs("../../scripts/bootstrap-db-roles.sql")
-	if err != nil {
-		t.Fatalf("failed to resolve bootstrap path: %v", err)
-	}
-	bootstrapSQL, err := os.ReadFile(bootstrapPath)
-	if err != nil {
-		t.Fatalf("failed to read bootstrap-db-roles.sql: %v", err)
-	}
-	if _, err := db.Exec(string(bootstrapSQL)); err != nil {
-		t.Fatalf("failed to execute bootstrap-db-roles.sql: %v", err)
+		t.Fatalf("migrations as deadbolt_migrator failed: %v", err)
 	}
 
 	// 3. Connect runtime pool strictly as deadbolt_runtime (no DDL, no BYPASSRLS)
-	runtimePool, err := pgxpool.New(context.Background(), getRoleDatabaseURL("deadbolt_runtime"))
+	runtimePool, err := pgxpool.New(context.Background(), runtimeURL)
 	if err != nil {
 		t.Fatalf("failed to create runtime pgxpool: %v", err)
 	}
 
-	return db, runtimePool
+	return db, runtimePool, systemURL
+}
+
+// TestCleanDatabaseMigrationAsDeadboltMigrator verifies that deadbolt_migrator can
+// successfully apply the entire migration chain from scratch under an advisory lock.
+func TestCleanDatabaseMigrationAsDeadboltMigrator(t *testing.T) {
+	db, runtimePool, _ := setupTestDB(t)
+	defer db.Close()
+	defer runtimePool.Close()
+
+	runner := migrator.NewRunner(db, "../../migrations")
+	v, err := runner.Version(context.Background())
+	if err != nil {
+		t.Fatalf("failed to get migration version: %v", err)
+	}
+	if v != 4 {
+		t.Fatalf("expected latest migration version 4, got %d", v)
+	}
 }
 
 // TestMigrationAdvisoryLockBlocking verifies single-migrator serialization via pinned session advisory lock.
 // When Migrator A holds the lock, Migrator B is blocked until Migrator A releases it.
 func TestMigrationAdvisoryLockBlocking(t *testing.T) {
-	db, runtimePool := setupTestDB(t)
+	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
 
@@ -139,7 +122,7 @@ func TestMigrationAdvisoryLockBlocking(t *testing.T) {
 
 // TestRuntimeNoDDLPrivileges verifies that deadbolt_runtime cannot perform DDL operations.
 func TestRuntimeNoDDLPrivileges(t *testing.T) {
-	db, runtimePool := setupTestDB(t)
+	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
 
@@ -166,7 +149,7 @@ func TestRuntimeNoDDLPrivileges(t *testing.T) {
 
 // TestRLSFailsClosed verifies that queries executed without SET LOCAL app.current_organization_id fail closed (0 rows).
 func TestRLSFailsClosed(t *testing.T) {
-	db, runtimePool := setupTestDB(t)
+	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
 
@@ -197,7 +180,7 @@ func TestRLSFailsClosed(t *testing.T) {
 // When a pooled connection is used by Tenant A, returned to the pool, and then reused,
 // the tenant context does not leak.
 func TestConnectionPoolReuseF27(t *testing.T) {
-	db, runtimePool := setupTestDB(t)
+	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
 
@@ -261,7 +244,7 @@ func TestConnectionPoolReuseF27(t *testing.T) {
 // TestCompositeForeignKeys verifies that foreign-ID substitution across organizations fails
 // across environments, task_attempts, task_leases, and artifacts.
 func TestCompositeForeignKeys(t *testing.T) {
-	db, runtimePool := setupTestDB(t)
+	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
 
@@ -370,12 +353,12 @@ func TestCompositeForeignKeys(t *testing.T) {
 	}
 }
 
-// TestRestrictedDiscoveryFunctions verifies Blueprint §24.3:
-// 1. app.discover_user_memberships: runtime role can execute without tenant context, returning only verified user memberships.
-// 2. app.enumerate_scheduler_tenants: dedicated system role can enumerate tenant IDs.
-// 3. deadbolt_system has NO direct table access on tenant tables (e.g. runs).
+// TestRestrictedDiscoveryFunctions verifies Blueprint §24.3 via the production Go helpers:
+// 1. storage.DiscoverUserMemberships invokes app.discover_user_memberships($1) as deadbolt_runtime without tenant context.
+// 2. storage.EnumerateTenantsForScheduler invokes app.enumerate_scheduler_tenants() as deadbolt_system.
+// 3. deadbolt_system has NO direct table access on tenant tables (e.g. public.runs).
 func TestRestrictedDiscoveryFunctions(t *testing.T) {
-	db, runtimePool := setupTestDB(t)
+	db, runtimePool, systemURL := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
 
@@ -393,54 +376,36 @@ func TestRestrictedDiscoveryFunctions(t *testing.T) {
 	_, _ = db.Exec("INSERT INTO organization_members (organization_id, user_id, role, status) VALUES ($1, $2, 'Developer', 'ACTIVE') ON CONFLICT DO NOTHING", org2, targetUser)
 	_, _ = db.Exec("INSERT INTO organization_members (organization_id, user_id, role, status) VALUES ($1, $2, 'Viewer', 'ACTIVE') ON CONFLICT DO NOTHING", org1, otherUser)
 
-	// 1. Test app.discover_user_memberships as deadbolt_runtime WITHOUT setting tenant context
-	rows, err := runtimePool.Query(ctx, "SELECT organization_id, organization_name, role, status FROM app.discover_user_memberships($1)", targetUser)
+	// 1. Test production Go helper storage.DiscoverUserMemberships using runtimePool without tenant context
+	memberships, err := storage.DiscoverUserMemberships(ctx, runtimePool, targetUser)
 	if err != nil {
-		t.Fatalf("discover_user_memberships failed: %v", err)
+		t.Fatalf("storage.DiscoverUserMemberships failed: %v", err)
 	}
-	defer rows.Close()
-
-	var count int
-	for rows.Next() {
-		var oID, oName, role, status string
-		if err := rows.Scan(&oID, &oName, &role, &status); err != nil {
-			t.Fatalf("scan membership failed: %v", err)
-		}
-		if oID != org1 && oID != org2 {
-			t.Fatalf("unexpected organization in discovery: %v", oID)
-		}
-		if status != "ACTIVE" {
-			t.Fatalf("unexpected non-active status: %v", status)
-		}
-		count++
+	if len(memberships) != 2 {
+		t.Fatalf("expected exactly 2 memberships for target user, got %d", len(memberships))
 	}
-	if count != 2 {
-		t.Fatalf("expected exactly 2 memberships for target user, got %d", count)
+	for _, m := range memberships {
+		if m.OrganizationID != org1 && m.OrganizationID != org2 {
+			t.Fatalf("unexpected organization in discovery: %v", m.OrganizationID)
+		}
+		if m.Status != "ACTIVE" {
+			t.Fatalf("unexpected non-active status: %v", m.Status)
+		}
 	}
 
-	// 2. Test app.enumerate_scheduler_tenants as deadbolt_system
-	systemPool, err := pgxpool.New(ctx, getRoleDatabaseURL("deadbolt_system"))
+	// 2. Test production Go helper storage.EnumerateTenantsForScheduler using dedicated systemPool
+	systemPool, err := pgxpool.New(ctx, systemURL)
 	if err != nil {
 		t.Fatalf("failed to connect as deadbolt_system: %v", err)
 	}
 	defer systemPool.Close()
 
-	enumRows, err := systemPool.Query(ctx, "SELECT organization_id FROM app.enumerate_scheduler_tenants()")
+	tenants, err := storage.EnumerateTenantsForScheduler(ctx, systemPool)
 	if err != nil {
-		t.Fatalf("deadbolt_system failed to call enumerate_scheduler_tenants: %v", err)
+		t.Fatalf("storage.EnumerateTenantsForScheduler failed as deadbolt_system: %v", err)
 	}
-	defer enumRows.Close()
-
-	var tenantCount int
-	for enumRows.Next() {
-		var id string
-		if err := enumRows.Scan(&id); err != nil {
-			t.Fatalf("scan tenant failed: %v", err)
-		}
-		tenantCount++
-	}
-	if tenantCount < 2 {
-		t.Fatalf("expected at least 2 tenants enumerated, got %d", tenantCount)
+	if len(tenants) < 2 {
+		t.Fatalf("expected at least 2 tenants enumerated, got %d", len(tenants))
 	}
 
 	// 3. Verify deadbolt_system CANNOT query tenant tables directly
@@ -454,10 +419,13 @@ func TestRestrictedDiscoveryFunctions(t *testing.T) {
 	}
 }
 
-// TestMigrationUpgradePreservesDataAndRLS verifies upgrading an existing database
-// from migration version 2 with existing data up to version 4 preserves data and RLS integrity.
-func TestMigrationUpgradePreservesDataAndRLS(t *testing.T) {
-	db, runtimePool := setupTestDB(t)
+// TestIntermediateMigrationStepUpgradeSafety verifies forward migration safety.
+// Note: Deadbolt M0 establishes the initial repository database baseline; no prior production
+// release exists. To verify forward migration-chain safety and non-destructive schema evolution,
+// this test verifies that intermediate migration states (e.g. schema version 2) can hold populated
+// tenant data and subsequently be upgraded to latest version 4 with 100% data preservation and RLS integrity.
+func TestIntermediateMigrationStepUpgradeSafety(t *testing.T) {
+	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
 
@@ -474,7 +442,7 @@ func TestMigrationUpgradePreservesDataAndRLS(t *testing.T) {
 		t.Fatalf("expected version 2 after down-to, got %d (err: %v)", v, err)
 	}
 
-	// 2. Insert data into version 2 schema (organizations, projects, environments, deployments, workflows)
+	// 2. Insert data into version 2 schema (organizations, projects, environments, deployments, workflow_definitions)
 	upgradeOrgID := "90000000-0000-0000-0000-000000000001"
 	upgradeProjectID := "91000000-0000-0000-0000-000000000001"
 	upgradeEnvID := "92000000-0000-0000-0000-000000000001"
@@ -497,7 +465,7 @@ func TestMigrationUpgradePreservesDataAndRLS(t *testing.T) {
 		}
 	}
 
-	// 3. Migrate forward to latest version 4
+	// 3. Migrate forward to latest version 4 as deadbolt_migrator
 	if err := runner.Up(ctx); err != nil {
 		t.Fatalf("failed to migrate from version 2 to latest: %v", err)
 	}

@@ -17,7 +17,7 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_DB: deadbolt_test
+          POSTGRES_DB: postgres
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: password
           POSTGRES_HOST_AUTH_METHOD: trust
@@ -29,8 +29,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      TEST_DATABASE_URL: postgres://postgres@localhost:5432/deadbolt_test?sslmode=disable
-      DATABASE_URL: postgres://postgres@localhost:5432/deadbolt_test?sslmode=disable
+      TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres?sslmode=disable
+      DATABASE_URL: postgres://postgres@localhost:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -14,37 +13,38 @@ import (
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
+	"github.com/Ryanakml/Deadbolt/internal/storage/testdb"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-func getTestDatabaseURL() string {
-	if s := os.Getenv("TEST_DATABASE_URL"); s != "" {
-		return s
-	}
-	if s := os.Getenv("DATABASE_URL"); s != "" {
-		return s
-	}
-	return "postgres://localhost:5432/deadbolt_test?sslmode=disable"
-}
-
 func setupSP02DB(t *testing.T) (*sql.DB, *pgxpool.Pool) {
 	t.Helper()
-
-	connStr := getTestDatabaseURL()
-	db, err := sql.Open("pgx", connStr)
-	if err != nil {
-		t.Skipf("PostgreSQL not available: %v", err)
-	}
-	if err := db.Ping(); err != nil {
-		t.Skipf("PostgreSQL ping failed: %v", err)
-	}
 
 	migrationsDir, err := filepath.Abs("../../../migrations")
 	if err != nil {
 		t.Fatalf("failed to resolve migrations dir: %v", err)
+	}
+	bootstrapPath, err := filepath.Abs("../../../scripts/bootstrap-db-roles.sql")
+	if err != nil {
+		t.Fatalf("failed to resolve bootstrap path: %v", err)
+	}
+
+	// 1. Setup isolated database 'deadbolt_sp02_test' with admin bootstrap script
+	migratorURL, runtimeURL, _, err := testdb.SetupIsolatedDatabase("deadbolt_sp02_test", bootstrapPath)
+	if err != nil {
+		t.Skipf("PostgreSQL isolated db setup failed: %v", err)
+	}
+
+	// 2. Connect strictly as deadbolt_migrator to run migrations under advisory lock
+	db, err := sql.Open("pgx", migratorURL)
+	if err != nil {
+		t.Fatalf("failed to open migrator db: %v", err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatalf("failed to ping migrator db: %v", err)
 	}
 
 	runner := migrator.NewRunner(db, migrationsDir)
@@ -52,10 +52,11 @@ func setupSP02DB(t *testing.T) (*sql.DB, *pgxpool.Pool) {
 	defer cancel()
 
 	if err := runner.Up(ctx); err != nil {
-		t.Fatalf("migrations failed: %v", err)
+		t.Fatalf("migrations as deadbolt_migrator failed: %v", err)
 	}
 
-	config, err := pgxpool.ParseConfig(connStr)
+	// 3. Connect runtime pool strictly as deadbolt_runtime (no DDL, subject to RLS)
+	config, err := pgxpool.ParseConfig(runtimeURL)
 	if err != nil {
 		t.Fatalf("failed to parse pool config: %v", err)
 	}
@@ -63,7 +64,7 @@ func setupSP02DB(t *testing.T) (*sql.DB, *pgxpool.Pool) {
 
 	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
-		t.Fatalf("failed to create pgxpool: %v", err)
+		t.Fatalf("failed to create runtime pgxpool: %v", err)
 	}
 
 	return db, pool
@@ -137,7 +138,7 @@ func seedSP02Environment(t *testing.T, db *sql.DB, testPrefix int, orgID, projec
 }
 
 // TestClaimContentionAndPrescribedLockOrder executes the SP-02 claim contention validation:
-//  1. Candidate Discovery: Non-locking scan of eligible READY steps.
+//  1. Candidate Discovery: Non-locking scan of eligible READY steps under tenant context.
 //  2. Prescribed Authoritative Lock Order:
 //     environment_admissions (FOR UPDATE)
 //     -> runs (FOR UPDATE)
@@ -177,6 +178,21 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 	var wg sync.WaitGroup
 	startSignal := make(chan struct{})
 
+	classifyErr := func(op string, err error) bool {
+		if err == nil {
+			return false
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			atomic.AddInt64(&deadlockErrors, 1)
+			t.Errorf("%s deadlock detected (40P01): %v", op, err)
+		} else {
+			atomic.AddInt64(&unexpectedErrors, 1)
+			t.Errorf("%s unexpected database error: %v", op, err)
+		}
+		return true
+	}
+
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
 		workerIdx := w
@@ -189,28 +205,34 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 			for {
 				start := time.Now()
 
-				// Step 1: Candidate Discovery (Non-locking scan)
+				// Step 1: Candidate Discovery (Non-locking scan within tenant context)
 				var candidateStepID, candidateRunID string
-				err := pool.QueryRow(ctx, `
+				scanConn, err := pool.Acquire(ctx)
+				if err != nil {
+					classifyErr("candidate acquire", err)
+					break
+				}
+				_, err = scanConn.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, false)", orgID)
+				if err != nil {
+					classifyErr("candidate set_config", err)
+					scanConn.Release()
+					break
+				}
+				err = scanConn.QueryRow(ctx, `
 					SELECT id, run_id
 					FROM run_steps
 					WHERE environment_id = $1 AND state = 'READY'
 					ORDER BY eligible_at ASC, id ASC
 					LIMIT 1
 				`, envID).Scan(&candidateStepID, &candidateRunID)
+				scanConn.Release()
 
 				if err != nil {
 					if err == pgx.ErrNoRows {
 						// No more ready work candidates
 						break
 					}
-					var pgErr *pgconn.PgError
-					if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
-						atomic.AddInt64(&deadlockErrors, 1)
-					} else {
-						atomic.AddInt64(&unexpectedErrors, 1)
-						t.Errorf("candidate query unexpected error: %v", err)
-					}
+					classifyErr("candidate scan", err)
 					break
 				}
 
@@ -223,14 +245,21 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 					resultError
 				)
 
-				res, txErr := func() (claimResult, error) {
+				res := func() claimResult {
 					tx, err := pool.Begin(ctx)
 					if err != nil {
-						return resultError, err
+						classifyErr("claim tx begin", err)
+						return resultError
 					}
 					defer func() {
 						_ = tx.Rollback(ctx)
 					}()
+
+					// Set tenant context for this transaction
+					if _, err := tx.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, true)", orgID); err != nil {
+						classifyErr("claim tx set_config", err)
+						return resultError
+					}
 
 					// 2a. Environment admission lock (concurrency quota)
 					var maxConc int
@@ -241,7 +270,8 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 						FOR UPDATE
 					`, envID).Scan(&maxConc)
 					if err != nil {
-						return resultError, fmt.Errorf("admission lock failed: %w", err)
+						classifyErr("claim admission lock", err)
+						return resultError
 					}
 
 					// 2b. Run row lock
@@ -254,12 +284,15 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 						FOR UPDATE
 					`, candidateRunID).Scan(&runRevision, &runStatus)
 					if err != nil {
-						return resultError, fmt.Errorf("run lock failed: %w", err)
+						if err == pgx.ErrNoRows {
+							return resultStale
+						}
+						classifyErr("claim run lock", err)
+						return resultError
 					}
 
-					// If run is no longer RUNNING, candidate is stale
 					if runStatus != "RUNNING" {
-						return resultStale, nil
+						return resultStale
 					}
 
 					// 2c. Step row lock
@@ -273,13 +306,16 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 						FOR UPDATE
 					`, candidateStepID).Scan(&stepState, &currentEpoch, &nextAttemptNum)
 					if err != nil {
-						return resultError, fmt.Errorf("step lock failed: %w", err)
+						if err == pgx.ErrNoRows {
+							return resultStale
+						}
+						classifyErr("claim step lock", err)
+						return resultError
 					}
 
 					// 2d. Revalidate step state: must still be READY
 					if stepState != "READY" {
-						// Another worker claimed or updated this step concurrently
-						return resultStale, nil
+						return resultStale
 					}
 
 					// 2e. Update step to RUNNING with epoch increment
@@ -294,7 +330,8 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 						WHERE id = $1
 					`, candidateStepID, newEpoch)
 					if err != nil {
-						return resultError, fmt.Errorf("step update failed: %w", err)
+						classifyErr("claim step update", err)
+						return resultError
 					}
 
 					// 2f. Insert task_attempts
@@ -305,7 +342,8 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 						RETURNING id
 					`, orgID, candidateStepID, newAttempt, sessionID, newEpoch).Scan(&attemptID)
 					if err != nil {
-						return resultError, fmt.Errorf("attempt insert failed: %w", err)
+						classifyErr("claim attempt insert", err)
+						return resultError
 					}
 
 					// 2g. Insert task_leases
@@ -314,29 +352,19 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 						VALUES ($1, $2, $3, $4, $5, clock_timestamp() + interval '30 seconds')
 					`, candidateStepID, orgID, attemptID, sessionID, newEpoch)
 					if err != nil {
-						return resultError, fmt.Errorf("lease insert failed: %w", err)
+						classifyErr("claim lease insert", err)
+						return resultError
 					}
 
 					if err := tx.Commit(ctx); err != nil {
-						return resultError, err
+						classifyErr("claim tx commit", err)
+						return resultError
 					}
 
-					return resultSuccess, nil
+					return resultSuccess
 				}()
 
 				elapsed := time.Since(start)
-
-				if txErr != nil {
-					var pgErr *pgconn.PgError
-					if errors.As(txErr, &pgErr) && pgErr.Code == "40P01" {
-						atomic.AddInt64(&deadlockErrors, 1)
-						t.Errorf("DEADLOCK 40P01 detected during claim: %v", txErr)
-					} else {
-						atomic.AddInt64(&unexpectedErrors, 1)
-						t.Errorf("unexpected claim error: %v", txErr)
-					}
-					continue
-				}
 
 				if res == resultStale {
 					atomic.AddInt64(&staleCandidateRetries, 1)
@@ -365,22 +393,17 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 	t.Logf("  Unexpected DB errors: %d", unexpectedErrors)
 
 	// INVARIANT VERIFICATIONS:
-	// 1. Zero deadlocks
 	if deadlockErrors > 0 {
 		t.Fatalf("DEADLOCK VIOLATION: %d deadlocks (40P01) encountered!", deadlockErrors)
 	}
-
-	// 2. Zero unexpected errors
 	if unexpectedErrors > 0 {
 		t.Fatalf("UNEXPECTED ERROR VIOLATION: %d unexpected DB errors encountered!", unexpectedErrors)
 	}
-
-	// 3. Exactly all steps claimed
 	if claimedCount != int64(totalSteps) {
 		t.Fatalf("CLAIM COUNT MISMATCH: expected %d claimed, got %d", totalSteps, claimedCount)
 	}
 
-	// 4. Verify INV-03: exactly one lease and one attempt per step in DB
+	// Verify INV-03: exactly one lease and one attempt per step in DB
 	var leaseCount, attemptCount int
 	err := db.QueryRow("SELECT count(*) FROM task_leases WHERE organization_id = $1", orgID).Scan(&leaseCount)
 	if err != nil || leaseCount != totalSteps {
@@ -409,7 +432,8 @@ func TestClaimContentionAndPrescribedLockOrder(t *testing.T) {
 // Path 1: Task Claimers (admission -> run -> step -> attempt/lease)
 // Path 2: Task Completers (run -> step -> lease delete -> succeed attempt)
 // Path 3: Reconciler / Observer (run -> steps in ascending order)
-// Verifies that strict lock ordering prevents deadlocks across conflicting paths.
+// Verifies that strict lock ordering prevents deadlocks across conflicting paths and that
+// NO unexpected errors are silently swallowed.
 func TestMixedPathContention(t *testing.T) {
 	db, pool := setupSP02DB(t)
 	defer db.Close()
@@ -432,8 +456,24 @@ func TestMixedPathContention(t *testing.T) {
 	var claimedCount int64
 	var completedCount int64
 	var reconcilerScans int64
+	var staleCandidateRetries int64
 	var deadlockErrors int64
 	var unexpectedErrors int64
+
+	classifyErr := func(op string, err error) bool {
+		if err == nil {
+			return false
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			atomic.AddInt64(&deadlockErrors, 1)
+			t.Errorf("%s deadlock detected (40P01): %v", op, err)
+		} else {
+			atomic.AddInt64(&unexpectedErrors, 1)
+			t.Errorf("%s unexpected database error: %v", op, err)
+		}
+		return true
+	}
 
 	var wg sync.WaitGroup
 	startSignal := make(chan struct{})
@@ -455,43 +495,73 @@ func TestMixedPathContention(t *testing.T) {
 				default:
 				}
 
-				// Non-locking candidate discovery
+				// Non-locking candidate discovery under tenant context
+				scanConn, err := pool.Acquire(ctx)
+				if err != nil {
+					classifyErr("mixed claim acquire", err)
+					return
+				}
+				_, err = scanConn.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, false)", orgID)
+				if err != nil {
+					classifyErr("mixed claim set_config", err)
+					scanConn.Release()
+					return
+				}
 				var candidateStepID, candidateRunID string
-				err := pool.QueryRow(ctx, `
+				err = scanConn.QueryRow(ctx, `
 					SELECT id, run_id
 					FROM run_steps
 					WHERE environment_id = $1 AND state = 'READY'
 					ORDER BY eligible_at ASC, id ASC
 					LIMIT 1
 				`, envID).Scan(&candidateStepID, &candidateRunID)
+				scanConn.Release()
 
 				if err != nil {
 					if err == pgx.ErrNoRows {
-						// Check if all steps completed
 						if atomic.LoadInt64(&completedCount) >= int64(totalSteps) {
 							return
 						}
 						time.Sleep(5 * time.Millisecond)
 						continue
 					}
-					var pgErr *pgconn.PgError
-					if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
-						atomic.AddInt64(&deadlockErrors, 1)
-					}
+					classifyErr("mixed claim candidate scan", err)
 					return
 				}
 
 				// Authoritative claim: admission -> run -> step
 				tx, err := pool.Begin(ctx)
 				if err != nil {
+					classifyErr("mixed claim tx begin", err)
+					return
+				}
+
+				if _, err := tx.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, true)", orgID); err != nil {
+					classifyErr("mixed claim tx set_config", err)
+					_ = tx.Rollback(ctx)
 					return
 				}
 
 				var maxConc int
-				_ = tx.QueryRow(ctx, "SELECT max_concurrency FROM environment_admissions WHERE environment_id = $1 FOR UPDATE", envID).Scan(&maxConc)
+				err = tx.QueryRow(ctx, "SELECT max_concurrency FROM environment_admissions WHERE environment_id = $1 FOR UPDATE", envID).Scan(&maxConc)
+				if err != nil {
+					classifyErr("mixed claim admission lock", err)
+					_ = tx.Rollback(ctx)
+					return
+				}
 
 				var runStatus string
-				_ = tx.QueryRow(ctx, "SELECT status FROM runs WHERE id = $1 FOR UPDATE", candidateRunID).Scan(&runStatus)
+				err = tx.QueryRow(ctx, "SELECT status FROM runs WHERE id = $1 FOR UPDATE", candidateRunID).Scan(&runStatus)
+				if err != nil {
+					if err == pgx.ErrNoRows {
+						_ = tx.Rollback(ctx)
+						atomic.AddInt64(&staleCandidateRetries, 1)
+						continue
+					}
+					classifyErr("mixed claim run lock", err)
+					_ = tx.Rollback(ctx)
+					return
+				}
 
 				var stepState string
 				var epoch int64
@@ -503,8 +573,20 @@ func TestMixedPathContention(t *testing.T) {
 					FOR UPDATE
 				`, candidateStepID).Scan(&stepState, &epoch, &nextAttempt)
 
-				if err != nil || stepState != "READY" || runStatus != "RUNNING" {
+				if err != nil {
+					if err == pgx.ErrNoRows {
+						_ = tx.Rollback(ctx)
+						atomic.AddInt64(&staleCandidateRetries, 1)
+						continue
+					}
+					classifyErr("mixed claim step lock", err)
 					_ = tx.Rollback(ctx)
+					return
+				}
+
+				if stepState != "READY" || runStatus != "RUNNING" {
+					_ = tx.Rollback(ctx)
+					atomic.AddInt64(&staleCandidateRetries, 1)
 					continue
 				}
 
@@ -518,8 +600,9 @@ func TestMixedPathContention(t *testing.T) {
 					WHERE id = $1
 				`, candidateStepID, newEpoch)
 				if err != nil {
+					classifyErr("mixed claim step update", err)
 					_ = tx.Rollback(ctx)
-					continue
+					return
 				}
 
 				var attemptID string
@@ -529,8 +612,9 @@ func TestMixedPathContention(t *testing.T) {
 					RETURNING id
 				`, orgID, candidateStepID, nextAttempt, sessionID, newEpoch).Scan(&attemptID)
 				if err != nil {
+					classifyErr("mixed claim attempt insert", err)
 					_ = tx.Rollback(ctx)
-					continue
+					return
 				}
 
 				_, err = tx.Exec(ctx, `
@@ -538,18 +622,16 @@ func TestMixedPathContention(t *testing.T) {
 					VALUES ($1, $2, $3, $4, $5, clock_timestamp() + interval '30 seconds')
 				`, candidateStepID, orgID, attemptID, sessionID, newEpoch)
 				if err != nil {
+					classifyErr("mixed claim lease insert", err)
 					_ = tx.Rollback(ctx)
-					continue
+					return
 				}
 
-				if err := tx.Commit(ctx); err == nil {
-					atomic.AddInt64(&claimedCount, 1)
-				} else {
-					var pgErr *pgconn.PgError
-					if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
-						atomic.AddInt64(&deadlockErrors, 1)
-					}
+				if err := tx.Commit(ctx); err != nil {
+					classifyErr("mixed claim tx commit", err)
+					return
 				}
+				atomic.AddInt64(&claimedCount, 1)
 			}
 		}()
 	}
@@ -569,15 +651,27 @@ func TestMixedPathContention(t *testing.T) {
 				default:
 				}
 
-				// Find a running step candidate
+				// Find a running step candidate under tenant context
+				scanConn, err := pool.Acquire(ctx)
+				if err != nil {
+					classifyErr("mixed complete acquire", err)
+					return
+				}
+				_, err = scanConn.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, false)", orgID)
+				if err != nil {
+					classifyErr("mixed complete set_config", err)
+					scanConn.Release()
+					return
+				}
 				var stepID, runID string
 				var epoch int64
-				err := pool.QueryRow(ctx, `
+				err = scanConn.QueryRow(ctx, `
 					SELECT id, run_id, current_epoch
 					FROM run_steps
 					WHERE environment_id = $1 AND state = 'RUNNING'
 					LIMIT 1
 				`, envID).Scan(&stepID, &runID, &epoch)
+				scanConn.Release()
 
 				if err != nil {
 					if err == pgx.ErrNoRows {
@@ -587,59 +681,85 @@ func TestMixedPathContention(t *testing.T) {
 						time.Sleep(5 * time.Millisecond)
 						continue
 					}
+					classifyErr("mixed complete candidate scan", err)
 					return
 				}
 
 				// Authoritative completion transaction: run FOR UPDATE -> step FOR UPDATE
 				tx, err := pool.Begin(ctx)
 				if err != nil {
+					classifyErr("mixed complete tx begin", err)
+					return
+				}
+
+				if _, err := tx.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, true)", orgID); err != nil {
+					classifyErr("mixed complete tx set_config", err)
+					_ = tx.Rollback(ctx)
 					return
 				}
 
 				var runRev int64
 				err = tx.QueryRow(ctx, "SELECT revision FROM runs WHERE id = $1 FOR UPDATE", runID).Scan(&runRev)
 				if err != nil {
+					if err == pgx.ErrNoRows {
+						_ = tx.Rollback(ctx)
+						atomic.AddInt64(&staleCandidateRetries, 1)
+						continue
+					}
+					classifyErr("mixed complete run lock", err)
 					_ = tx.Rollback(ctx)
-					continue
+					return
 				}
 
 				var stepState string
 				var stepEpoch int64
 				err = tx.QueryRow(ctx, "SELECT state, current_epoch FROM run_steps WHERE id = $1 FOR UPDATE", stepID).Scan(&stepState, &stepEpoch)
-				if err != nil || stepState != "RUNNING" {
+				if err != nil {
+					if err == pgx.ErrNoRows {
+						_ = tx.Rollback(ctx)
+						atomic.AddInt64(&staleCandidateRetries, 1)
+						continue
+					}
+					classifyErr("mixed complete step lock", err)
 					_ = tx.Rollback(ctx)
+					return
+				}
+
+				if stepState != "RUNNING" {
+					_ = tx.Rollback(ctx)
+					atomic.AddInt64(&staleCandidateRetries, 1)
 					continue
 				}
 
 				// Delete active lease
 				_, err = tx.Exec(ctx, "DELETE FROM task_leases WHERE step_id = $1", stepID)
 				if err != nil {
+					classifyErr("mixed complete lease delete", err)
 					_ = tx.Rollback(ctx)
-					continue
+					return
 				}
 
 				// Mark step succeeded
 				_, err = tx.Exec(ctx, "UPDATE run_steps SET state = 'SUCCEEDED', updated_at = clock_timestamp() WHERE id = $1", stepID)
 				if err != nil {
+					classifyErr("mixed complete step update", err)
 					_ = tx.Rollback(ctx)
-					continue
+					return
 				}
 
 				// Mark attempt succeeded
 				_, err = tx.Exec(ctx, "UPDATE task_attempts SET status = 'SUCCEEDED', completed_at = clock_timestamp() WHERE step_id = $1 AND epoch = $2", stepID, stepEpoch)
 				if err != nil {
+					classifyErr("mixed complete attempt update", err)
 					_ = tx.Rollback(ctx)
-					continue
+					return
 				}
 
-				if err := tx.Commit(ctx); err == nil {
-					atomic.AddInt64(&completedCount, 1)
-				} else {
-					var pgErr *pgconn.PgError
-					if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
-						atomic.AddInt64(&deadlockErrors, 1)
-					}
+				if err := tx.Commit(ctx); err != nil {
+					classifyErr("mixed complete tx commit", err)
+					return
 				}
+				atomic.AddInt64(&completedCount, 1)
 			}
 		}()
 	}
@@ -665,31 +785,54 @@ func TestMixedPathContention(t *testing.T) {
 					func() {
 						tx, err := pool.Begin(ctx)
 						if err != nil {
+							classifyErr("reconciler tx begin", err)
 							return
 						}
 						defer func() {
 							_ = tx.Rollback(ctx)
 						}()
 
+						if _, err := tx.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, true)", orgID); err != nil {
+							classifyErr("reconciler tx set_config", err)
+							return
+						}
+
 						// Lock run
 						var rev int64
 						err = tx.QueryRow(ctx, "SELECT revision FROM runs WHERE id = $1 FOR UPDATE", runID).Scan(&rev)
 						if err != nil {
+							if err == pgx.ErrNoRows {
+								return
+							}
+							classifyErr("reconciler run lock", err)
 							return
 						}
 
 						// Lock steps belonging to this run in deterministic ASCENDING order
 						rows, err := tx.Query(ctx, "SELECT id, state FROM run_steps WHERE run_id = $1 ORDER BY id ASC FOR UPDATE", runID)
 						if err != nil {
-							var pgErr *pgconn.PgError
-							if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
-								atomic.AddInt64(&deadlockErrors, 1)
+							classifyErr("reconciler step query lock", err)
+							return
+						}
+						for rows.Next() {
+							var sID, sState string
+							if err := rows.Scan(&sID, &sState); err != nil {
+								classifyErr("reconciler row scan", err)
+								rows.Close()
+								return
 							}
+						}
+						if err := rows.Err(); err != nil {
+							classifyErr("reconciler rows iteration", err)
+							rows.Close()
 							return
 						}
 						rows.Close()
 
-						_ = tx.Commit(ctx)
+						if err := tx.Commit(ctx); err != nil {
+							classifyErr("reconciler tx commit", err)
+							return
+						}
 						atomic.AddInt64(&reconcilerScans, 1)
 					}()
 
@@ -731,13 +874,16 @@ func TestMixedPathContention(t *testing.T) {
 	t.Logf("  Total steps completed: %d / %d", completedCount, totalSteps)
 	t.Logf("  Total claim operations: %d", claimedCount)
 	t.Logf("  Total reconciler scans: %d", reconcilerScans)
+	t.Logf("  Stale candidate retries: %d", staleCandidateRetries)
 	t.Logf("  Deadlock errors (40P01): %d", deadlockErrors)
 	t.Logf("  Unexpected errors: %d", unexpectedErrors)
 
 	if deadlockErrors > 0 {
 		t.Fatalf("DEADLOCK DETECTED in mixed-path contention: %d occurrences", deadlockErrors)
 	}
-
+	if unexpectedErrors > 0 {
+		t.Fatalf("UNEXPECTED ERROR DETECTED in mixed-path contention: %d occurrences", unexpectedErrors)
+	}
 	if completedCount != int64(totalSteps) {
 		t.Fatalf("COMPLETION MISMATCH: expected %d completed, got %d", totalSteps, completedCount)
 	}
