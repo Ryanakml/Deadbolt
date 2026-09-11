@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runtime.deadbolt.dev/schemas/v1/worker-protocol.schema.json",
+  "title": "WorkerProtocol",
+  "description": "Schemas for communication between Control Plane Gateway and Worker Agent",
+  "type": "object",
+  "properties": {
+    "protocolVersion": {
+      "type": "integer",
+      "const": 1
+    }
+  },
+  "$defs": {
+    "PollRequest": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": { "type": "integer", "const": 1 },
+        "workerId": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "availableSlots": { "type": "integer", "minimum": 1 },
+        "bundleDigests": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["protocolVersion", "workerId", "sessionId", "availableSlots", "bundleDigests"],
+      "additionalProperties": false
+    },
+    "Assignment": {
+      "type": "object",
+      "properties": {
+        "runId": { "type": "string" },
+        "stepId": { "type": "string" },
+        "attemptId": { "type": "string" },
+        "task": { "type": "string" },
+        "input": { "type": "object" },
+        "bundleDigest": { "type": "string" },
+        "operationId": { "type": "string" },
+        "ownershipEpoch": { "type": "integer" },
+        "leaseTtlMs": { "type": "integer", "default": 30000 },
+        "deadlineAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["runId", "stepId", "attemptId", "task", "input", "bundleDigest", "operationId", "ownershipEpoch", "leaseTtlMs"],
+      "additionalProperties": false
+    },
+    "StartRequest": {
+      "type": "object",
+      "properties": {
+        "attemptId": { "type": "string" },
+        "ownershipEpoch": { "type": "integer" }
+      },
+      "required": ["attemptId", "ownershipEpoch"],
+      "additionalProperties": false
+    },
+    "HeartbeatRequest": {
+      "type": "object",
+      "properties": {
+        "attemptId": { "type": "string" },
+        "ownershipEpoch": { "type": "integer" },
+        "progress": { "type": "object" }
+      },
+      "required": ["attemptId", "ownershipEpoch"],
+      "additionalProperties": false
+    },
+    "CompleteRequest": {
+      "type": "object",
+      "properties": {
+        "attemptId": { "type": "string" },
+        "ownershipEpoch": { "type": "integer" },
+        "outcome": {
+          "type": "string",
+          "enum": ["SUCCEEDED", "FAILED"]
+        },
+        "output": { "type": "object" },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "effectStatus": {
+              "type": "string",
+              "enum": ["NOT_APPLIED", "APPLIED", "UNKNOWN"]
+            }
+          },
+          "required": ["code", "message"]
+        },
+        "resultDigest": { "type": "string" }
+      },
+      "required": ["attemptId", "ownershipEpoch", "outcome"],
+      "additionalProperties": false
+    },
+    "StopCommand": {
+      "type": "object",
+      "properties": {
+        "attemptId": { "type": "string" },
+        "reason": { "type": "string" },
+        "graceTimeoutMs": { "type": "integer", "default": 10000 }
+      },
+      "required": ["attemptId", "reason"],
+      "additionalProperties": false
+    }
+  }
+}

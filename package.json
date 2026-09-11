@@ -1,0 +1,17 @@
+{
+  "name": "deadbolt",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Durable workflow infrastructure with self-hosted workers",
+  "packageManager": "pnpm@10.24.0",
+  "engines": {
+    "node": ">=20.18.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter \"@runtime/*\" run build",
+    "test": "pnpm --filter \"@runtime/*\" run test",
+    "lint": "pnpm --filter \"@runtime/*\" run lint",
+    "typecheck": "pnpm --filter \"@runtime/*\" run typecheck"
+  }
+}

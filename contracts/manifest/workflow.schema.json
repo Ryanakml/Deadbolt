@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runtime.deadbolt.dev/schemas/v1/workflow.schema.json",
+  "title": "WorkflowManifest",
+  "description": "Declarative DAG workflow definition manifest",
+  "type": "object",
+  "properties": {
+    "manifestVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+      "description": "Workflow identifier"
+    },
+    "inputSchema": {
+      "type": "object",
+      "description": "JSON Schema validating top-level run input"
+    },
+    "outputSchema": {
+      "type": "object",
+      "description": "JSON Schema validating final run output"
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "description": "Ordered nodes in the DAG (max 50 in MVP)",
+      "items": {
+        "$ref": "#/$defs/Node"
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "Output mapping projecting step outputs to workflow output",
+      "additionalProperties": {
+        "$ref": "#/$defs/OutputReference"
+      }
+    }
+  },
+  "required": [
+    "manifestVersion",
+    "name",
+    "inputSchema",
+    "outputSchema",
+    "nodes",
+    "output"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "Node": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+          "description": "Unique logical step ID within the workflow"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["task"],
+          "description": "Node type. In MVP, only task is supported."
+        },
+        "task": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+          "description": "Referenced task definition name"
+        },
+        "after": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "IDs of predecessor nodes that must succeed before this node"
+        },
+        "input": {
+          "type": "object",
+          "description": "Field-level input mapping descriptors"
+        }
+      },
+      "required": ["id", "type", "task"],
+      "additionalProperties": false
+    },
+    "OutputReference": {
+      "type": "object",
+      "properties": {
+        "$ref": {
+          "type": "string",
+          "enum": ["step.output"]
+        },
+        "stepId": {
+          "type": "string"
+        },
+        "pointer": {
+          "type": "string",
+          "pattern": "^/.*$"
+        }
+      },
+      "required": ["$ref", "stepId", "pointer"],
+      "additionalProperties": false
+    },
+    "InputReference": {
+      "type": "object",
+      "properties": {
+        "$ref": {
+          "type": "string",
+          "enum": ["run.input", "step.output"]
+        },
+        "stepId": {
+          "type": "string"
+        },
+        "pointer": {
+          "type": "string",
+          "pattern": "^/.*$"
+        },
+        "default": {}
+      },
+      "required": ["$ref", "pointer"],
+      "additionalProperties": false
+    }
+  }
+}

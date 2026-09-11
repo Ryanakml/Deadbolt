@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runtime.deadbolt.dev/schemas/v1/task.schema.json",
+  "title": "TaskDefinition",
+  "description": "Definition schema for an individual executable task",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+      "description": "Unique task name reference within deployment"
+    },
+    "inputSchema": {
+      "type": "object",
+      "description": "JSON Schema subset validating task input"
+    },
+    "outputSchema": {
+      "type": "object",
+      "description": "JSON Schema subset validating task output"
+    },
+    "recovery": {
+      "type": "string",
+      "enum": ["safe", "idempotent", "reconcile"],
+      "description": "Mandatory failure recovery policy"
+    },
+    "retry": {
+      "type": "object",
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        },
+        "initialDelayMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000,
+          "default": 1000
+        },
+        "maxDelayMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300000,
+          "default": 30000
+        }
+      },
+      "additionalProperties": false
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 3600000,
+      "default": 300000,
+      "description": "Per-attempt timeout in milliseconds (max 1 hour)"
+    },
+    "idempotencyWindowMs": {
+      "type": "integer",
+      "minimum": 1000,
+      "description": "Deduplication retention window in milliseconds, required if recovery is idempotent"
+    }
+  },
+  "required": [
+    "name",
+    "inputSchema",
+    "outputSchema",
+    "recovery"
+  ],
+  "additionalProperties": false,
+  "if": {
+    "properties": { "recovery": { "const": "idempotent" } }
+  },
+  "then": {
+    "required": ["idempotencyWindowMs"]
+  }
+}

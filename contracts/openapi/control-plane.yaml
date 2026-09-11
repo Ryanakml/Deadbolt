@@ -1,0 +1,538 @@
+openapi: 3.1.0
+info:
+  title: Deadbolt / tf-low Control Plane API
+  version: 1.0.0
+  description: Authoritative REST API for durable workflow execution and observable recovery.
+servers:
+  - url: /v1
+    description: Control Plane v1 API
+
+paths:
+  /workflows/{name}/runs:
+    post:
+      summary: Create and enqueue a new workflow run
+      operationId: createRun
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRunRequest'
+      responses:
+        '202':
+          description: Run accepted and persisted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          description: Idempotency conflict or state conflict
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          description: Input validation error against workflow schema
+          $ref: '#/components/responses/ErrorResponse'
+
+  /runs/{id}:
+    get:
+      summary: Retrieve snapshot of a run
+      operationId: getRun
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Snapshot of the run with revision and lastEventSequence
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunSnapshot'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /runs/{id}/events:
+    get:
+      summary: Get immutable execution events for a run with cursor pagination
+      operationId: getRunEvents
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+      responses:
+        '200':
+          description: List of execution events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunEventsResponse'
+
+  /runs/{id}/stream:
+    get:
+      summary: Stream live run events via Server-Sent Events (SSE)
+      operationId: streamRunEvents
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Last-Event-ID
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /runs/{id}/pause:
+    post:
+      summary: Request durable pause on a run
+      operationId: pauseRun
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseRunRequest'
+      responses:
+        '200':
+          description: Run pause requested or confirmed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '409':
+          description: Revision conflict or run already terminal
+          $ref: '#/components/responses/ErrorResponse'
+
+  /runs/{id}/resume:
+    post:
+      summary: Resume a paused run
+      operationId: resumeRun
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Run resumed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+
+  /runs/{id}/cancel:
+    post:
+      summary: Durably cancel an active run
+      operationId: cancelRun
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cancellation initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '409':
+          description: Run already terminal
+          $ref: '#/components/responses/ErrorResponse'
+
+  /deployments:
+    post:
+      summary: Register an immutable deployment manifest
+      operationId: registerDeployment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterDeploymentRequest'
+      responses:
+        '201':
+          description: Deployment registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '200':
+          description: Deployment already registered (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '422':
+          description: Invalid manifest schema or graph structure
+          $ref: '#/components/responses/ErrorResponse'
+
+  /workflows/{name}/activate:
+    post:
+      summary: Set active deployment version for new runs
+      operationId: activateDeployment
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                deploymentId:
+                  type: string
+                expectedRevision:
+                  type: integer
+              required:
+                - deploymentId
+      responses:
+        '200':
+          description: Active deployment updated
+        '409':
+          description: Revision conflict
+
+  /reconciliation-cases/{id}/resolve:
+    post:
+      summary: Authoritative human/application decision for an unknown outcome
+      operationId: resolveReconciliation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveReconciliationRequest'
+      responses:
+        '200':
+          description: Hold resolved
+        '409':
+          description: Revision conflict
+
+components:
+  responses:
+    ErrorResponse:
+      description: Standard error envelope
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  schemas:
+    RunStatus:
+      type: string
+      enum:
+        - QUEUED
+        - RUNNING
+        - WAITING
+        - PAUSING
+        - PAUSED
+        - CANCELLING
+        - SUCCEEDED
+        - FAILED
+        - CANCELLED
+
+    StepStatus:
+      type: string
+      enum:
+        - BLOCKED
+        - READY
+        - RUNNING
+        - WAITING
+        - SUCCEEDED
+        - FAILED
+        - CANCELLED
+        - SKIPPED
+
+    AttemptStatus:
+      type: string
+      enum:
+        - CLAIMED
+        - RUNNING
+        - SUCCEEDED
+        - FAILED
+        - TIMED_OUT
+        - LOST
+        - CANCELLED
+
+    RecoveryMode:
+      type: string
+      enum:
+        - safe
+        - idempotent
+        - reconcile
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        requestId:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+        retryable:
+          type: boolean
+      required:
+        - code
+        - message
+        - requestId
+        - retryable
+
+    CreateRunRequest:
+      type: object
+      properties:
+        workflow:
+          type: string
+        environment:
+          type: string
+        input:
+          type: object
+        deploymentId:
+          type: string
+      required:
+        - workflow
+        - environment
+        - input
+
+    PauseRunRequest:
+      type: object
+      properties:
+        expectedRevision:
+          type: integer
+      required:
+        - expectedRevision
+
+    ResolveReconciliationRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [confirm_succeeded, confirm_not_executed_retry, fail_run]
+        evidence:
+          type: string
+        result:
+          type: object
+        expectedRevision:
+          type: integer
+      required:
+        - action
+        - evidence
+        - expectedRevision
+
+    Run:
+      type: object
+      properties:
+        id:
+          type: string
+        organizationId:
+          type: string
+        projectId:
+          type: string
+        environmentId:
+          type: string
+        workflowName:
+          type: string
+        deploymentId:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        reasonCode:
+          type: string
+        revision:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        deadlineAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - workflowName
+        - deploymentId
+        - status
+        - revision
+        - createdAt
+
+    RunSnapshot:
+      allOf:
+        - $ref: '#/components/schemas/Run'
+        - type: object
+          properties:
+            lastEventSequence:
+              type: integer
+            steps:
+              type: array
+              items:
+                $ref: '#/components/schemas/RunStep'
+            output:
+              type: object
+            error:
+              $ref: '#/components/schemas/ErrorEnvelope'
+
+    RunStep:
+      type: object
+      properties:
+        id:
+          type: string
+        nodeId:
+          type: string
+        status:
+          $ref: '#/components/schemas/StepStatus'
+        currentEpoch:
+          type: integer
+        attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskAttempt'
+      required:
+        - id
+        - nodeId
+        - status
+
+    TaskAttempt:
+      type: object
+      properties:
+        id:
+          type: string
+        attemptNumber:
+          type: integer
+        status:
+          $ref: '#/components/schemas/AttemptStatus'
+        workerSessionId:
+          type: string
+        ownershipEpoch:
+          type: integer
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - attemptNumber
+        - status
+
+    RunEvent:
+      type: object
+      properties:
+        sequence:
+          type: integer
+        type:
+          type: string
+          description: Lower-case event name (e.g. run.created, step.ready)
+        payload:
+          type: object
+        committedAt:
+          type: string
+          format: date-time
+      required:
+        - sequence
+        - type
+        - payload
+        - committedAt
+
+    RunEventsResponse:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunEvent'
+        hasMore:
+          type: boolean
+        nextCursor:
+          type: integer
+      required:
+        - events
+        - hasMore
+
+    RegisterDeploymentRequest:
+      type: object
+      properties:
+        manifest:
+          type: object
+          description: Full workflow DAG manifest
+        bundleDigest:
+          type: string
+          description: SHA-256 digest of the customer task bundle
+      required:
+        - manifest
+        - bundleDigest
+
+    Deployment:
+      type: object
+      properties:
+        id:
+          type: string
+        manifestHash:
+          type: string
+        bundleDigest:
+          type: string
+        status:
+          type: string
+          enum: [REGISTERED, AVAILABLE, ACTIVE]
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - manifestHash
+        - bundleDigest
+        - status

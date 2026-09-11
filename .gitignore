@@ -1,19 +1,49 @@
-# Local operating-system and editor files
+# Operating system & IDE
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
+*.swp
+*.swo
 
-# Local credentials and environment configuration
+# Credentials and secrets
 .env
 .env.*
 !.env.example
 *.pem
 *.key
+*.cert
 
-# Local tool output
+# Node.js & TypeScript
 node_modules/
+dist/
+build/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+
+# Go
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Testing & Coverage
 coverage/
+.nyc_output/
 *.log
 
+# Docker / Local data volumes
+data/
+minio-data/
+postgres-data/
 
+# Repository specific
 /non_pushable_docs

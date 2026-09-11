@@ -1,0 +1,66 @@
+{
+  "manifestVersion": 1,
+  "name": "research-report",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string" }
+    },
+    "required": ["query"],
+    "additionalProperties": false
+  },
+  "nodes": [
+    {
+      "id": "search",
+      "type": "task",
+      "task": "search-web",
+      "input": {
+        "query": {
+          "$ref": "run.input",
+          "pointer": "/query"
+        }
+      }
+    },
+    {
+      "id": "analyze",
+      "type": "task",
+      "task": "analyze-pages",
+      "after": ["search"],
+      "input": {
+        "pages": {
+          "$ref": "step.output",
+          "stepId": "search",
+          "pointer": "/pages"
+        }
+      }
+    },
+    {
+      "id": "report",
+      "type": "task",
+      "task": "generate-report",
+      "after": ["analyze"],
+      "input": {
+        "analysis": {
+          "$ref": "step.output",
+          "stepId": "analyze",
+          "pointer": "/analysis"
+        }
+      }
+    }
+  ],
+  "output": {
+    "reportUrl": {
+      "$ref": "step.output",
+      "stepId": "report",
+      "pointer": "/reportUrl"
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "reportUrl": { "type": "string" }
+    },
+    "required": ["reportUrl"],
+    "additionalProperties": false
+  }
+}

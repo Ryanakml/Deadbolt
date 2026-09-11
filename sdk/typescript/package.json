@@ -1,0 +1,16 @@
+{
+  "name": "@runtime/sdk",
+  "version": "0.1.0",
+  "description": "Deadbolt TypeScript SDK & Contract Validator",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test tests/canonical.test.js tests/validator.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "typescript": "^5.6.3"
+  }
+}
