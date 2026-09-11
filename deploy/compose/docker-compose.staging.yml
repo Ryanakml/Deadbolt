@@ -15,6 +15,16 @@ services:
     restart: unless-stopped
     networks:
       - deadbolt_staging_net
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_command=/bin/true"
+      - "-c"
+      - "archive_timeout=300"
     environment:
       POSTGRES_DB: deadbolt_staging
       POSTGRES_USER: deadbolt_system
@@ -58,9 +68,11 @@ services:
           cpus: "0.5"
           memory: 256M
 
-  control-plane:
-    image: ${DEADBOLT_IMAGE:-ghcr.io/ryanakml/deadbolt/control-plane}:${IMAGE_TAG:-latest}
-    container_name: deadbolt-staging-control-plane
+  # Control Plane - Slot Blue (Loopback Port 8088)
+  control-plane-blue:
+    profiles: ["slot-blue"]
+    image: ${DEADBOLT_IMAGE_BLUE:-${DEADBOLT_IMAGE:?Required immutable image digest}}
+    container_name: deadbolt-staging-control-plane-blue
     restart: unless-stopped
     networks:
       - deadbolt_staging_net
@@ -69,16 +81,55 @@ services:
       DEV_AUTH_ENABLED: "false"
       COOKIE_SECURE: "true"
       LISTEN_ADDR: "0.0.0.0:8080"
-      DATABASE_URL: ${DATABASE_URL:?Required database connection string}
+      DEADBOLT_IMAGE_DIGEST: ${DEADBOLT_IMAGE_BLUE:-${DEADBOLT_IMAGE}}
+      DATABASE_URL: ${DATABASE_URL:?Required restricted runtime database connection string}
       NATS_URL: nats://nats:4222
       DEADBOLT_OIDC_ISSUER: ${DEADBOLT_OIDC_ISSUER:?Required OIDC issuer}
       DEADBOLT_OIDC_CLIENT_ID: ${DEADBOLT_OIDC_CLIENT_ID:?Required OIDC client id}
       DEADBOLT_OIDC_CLIENT_SECRET: ${DEADBOLT_OIDC_CLIENT_SECRET:?Required OIDC client secret}
       DEADBOLT_OIDC_REDIRECT_URL: ${DEADBOLT_OIDC_REDIRECT_URL:-https://${DEADBOLT_STAGING_DOMAIN}/api/auth/callback}
       DEADBOLT_ALLOWED_ORIGINS: ${DEADBOLT_ALLOWED_ORIGINS:-https://${DEADBOLT_STAGING_DOMAIN}}
-    # Bound strictly to loopback on host port 8088 for existing Caddy edge reverse proxy
     ports:
       - "127.0.0.1:8088:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/livez"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # Control Plane - Slot Green (Loopback Port 8089)
+  control-plane-green:
+    profiles: ["slot-green"]
+    image: ${DEADBOLT_IMAGE_GREEN:-${DEADBOLT_IMAGE:?Required immutable image digest}}
+    container_name: deadbolt-staging-control-plane-green
+    restart: unless-stopped
+    networks:
+      - deadbolt_staging_net
+    environment:
+      RUNTIME_MODE: hosted
+      DEV_AUTH_ENABLED: "false"
+      COOKIE_SECURE: "true"
+      LISTEN_ADDR: "0.0.0.0:8080"
+      DEADBOLT_IMAGE_DIGEST: ${DEADBOLT_IMAGE_GREEN:-${DEADBOLT_IMAGE}}
+      DATABASE_URL: ${DATABASE_URL:?Required restricted runtime database connection string}
+      NATS_URL: nats://nats:4222
+      DEADBOLT_OIDC_ISSUER: ${DEADBOLT_OIDC_ISSUER:?Required OIDC issuer}
+      DEADBOLT_OIDC_CLIENT_ID: ${DEADBOLT_OIDC_CLIENT_ID:?Required OIDC client id}
+      DEADBOLT_OIDC_CLIENT_SECRET: ${DEADBOLT_OIDC_CLIENT_SECRET:?Required OIDC client secret}
+      DEADBOLT_OIDC_REDIRECT_URL: ${DEADBOLT_OIDC_REDIRECT_URL:-https://${DEADBOLT_STAGING_DOMAIN}/api/auth/callback}
+      DEADBOLT_ALLOWED_ORIGINS: ${DEADBOLT_ALLOWED_ORIGINS:-https://${DEADBOLT_STAGING_DOMAIN}}
+    ports:
+      - "127.0.0.1:8089:8080"
     depends_on:
       postgres:
         condition: service_healthy

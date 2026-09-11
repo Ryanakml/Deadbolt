@@ -39,10 +39,17 @@ func (h *DevAuthHandler) HandleDevLogin(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 2. Strict loopback boundary check
-	if !isLoopbackHost(r.RemoteAddr) {
-		WriteSanitizedError(w, http.StatusForbidden, "LOOPBACK_REQUIRED", "Dev auth is restricted strictly to loopback callers")
-		return
+	// 2. Strict loopback / container-local boundary check
+	if !h.cfg.ContainerLocal {
+		if !isLoopbackHost(r.RemoteAddr) {
+			WriteSanitizedError(w, http.StatusForbidden, "LOOPBACK_REQUIRED", "Dev auth is restricted strictly to loopback callers")
+			return
+		}
+	} else {
+		if !isPrivateNetworkHost(r.RemoteAddr) {
+			WriteSanitizedError(w, http.StatusForbidden, "LOOPBACK_REQUIRED", "Dev auth is restricted to loopback and container-local callers")
+			return
+		}
 	}
 
 	var req struct {

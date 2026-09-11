@@ -29,10 +29,10 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
 
       - name: Log in to GitHub Container Registry (GHCR)
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.3.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -40,7 +40,7 @@ jobs:
 
       - name: Generate Docker Metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.7.0
         with:
           images: ghcr.io/${{ github.repository }}/control-plane
           tags: |
@@ -49,7 +49,7 @@ jobs:
 
       - name: Build and Push Linux amd64 Control Plane Image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.15.0
         with:
           context: .
           file: deploy/Dockerfile.control-plane
@@ -123,5 +123,5 @@ jobs:
             migrations \
             "$DEPLOY_USER@$DEPLOY_HOST:/opt/deadbolt/"
 
-          # Trigger remote deployment orchestration
-          $SSH_CMD "cd /opt/deadbolt && DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"
+          # Trigger remote deployment orchestration with explicit host configuration source
+          $SSH_CMD "cd /opt/deadbolt && DEADBOLT_CONFIG_FILE='/etc/deadbolt/staging.env' DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"

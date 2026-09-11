@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,29 @@ type NATSStatusChecker interface {
 	IsConnected() bool
 }
 
+// TCPNATSChecker implements NATSStatusChecker via active TCP probe to the NATS server address
+type TCPNATSChecker struct {
+	addr string
+}
+
+// NewTCPNATSChecker creates a new TCPNATSChecker
+func NewTCPNATSChecker(addr string) *TCPNATSChecker {
+	return &TCPNATSChecker{addr: addr}
+}
+
+// IsConnected performs an active TCP dial probe with a short timeout
+func (c *TCPNATSChecker) IsConnected() bool {
+	if c == nil || c.addr == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", c.addr, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 // HealthChecker manages health and version reporting for the control plane
 type HealthChecker struct {
 	versionInfo      VersionInfo
@@ -73,7 +97,7 @@ func (h *HealthChecker) SetSchedulerTicker(ticker *atomic.Int64, timeout time.Du
 	}
 }
 
-// HandleLivez handles GET /livez (fast liveness probe)
+// HandleLivez handles GET /livez (fast liveness check)
 func (h *HealthChecker) HandleLivez(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -84,12 +108,12 @@ func (h *HealthChecker) HandleLivez(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(LiveResponse{
-		Status:    "live",
+		Status:    "alive",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-// HandleVersion handles GET /version (exact commit, build time, image digest, and version)
+// HandleVersion handles GET /version (runtime version & commit provenance)
 func (h *HealthChecker) HandleVersion(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -116,15 +140,15 @@ func (h *HealthChecker) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	dbStatus := "unreachable"
 	schemaStatus := "unreachable"
-	schedulerStatus := "active"
-	natsStatus := "disabled"
+	schedulerStatus := "unobserved"
+	natsStatus := "unobserved"
 
 	// 1. Check database connectivity
 	if h.pool != nil {
 		if err := h.pool.Ping(ctx); err == nil {
 			dbStatus = "healthy"
 
-			// 2. Check schema migration compatibility
+			// 2. Check schema migration compatibility (fail closed: must be verified and current)
 			var appliedVersion int64
 			err := h.pool.QueryRow(ctx, `
 				SELECT COALESCE(MAX(version_id), 0)
@@ -141,7 +165,7 @@ func (h *HealthChecker) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. Check scheduler freshness
+	// 3. Check scheduler freshness (fail closed: unobserved or stale is not ready)
 	if h.schedulerTick != nil {
 		lastNano := h.schedulerTick.Load()
 		if lastNano == 0 || time.Since(time.Unix(0, lastNano)) > h.schedulerTimeout {
@@ -162,10 +186,11 @@ func (h *HealthChecker) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Determine overall readiness
-	// Readiness requires healthy DB, current schema, and active scheduler.
+	// Readiness strictly requires healthy DB, current schema, and active scheduler.
+	// Fail closed: "unverified" schema and "unobserved" scheduler are NOT ready.
 	// NATS degradation is reported separately and does NOT fail the readiness gate.
 	isReady := (dbStatus == "healthy") &&
-		(schemaStatus == "current" || schemaStatus == "unverified") &&
+		(schemaStatus == "current") &&
 		(schedulerStatus == "active")
 
 	resp := ReadyResponse{

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -11,13 +13,16 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
+	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
 )
 
 var (
@@ -27,7 +32,7 @@ var (
 	CommitSHA = "dev"
 	// BuildTime is the ISO 8601 build timestamp, injected via -ldflags
 	BuildTime = ""
-	// ImageDigest is the immutable container image digest (@sha256:...), injected via -ldflags
+	// ImageDigest is the immutable container image digest (@sha256:...), injected via -ldflags or env
 	ImageDigest = ""
 )
 
@@ -40,6 +45,13 @@ func main() {
 
 func run() error {
 	logger := log.New(os.Stdout, "[DEADBOLT_CONTROL_PLANE] ", log.LstdFlags|log.Lmsgprefix)
+
+	migrateFlag := flag.Bool("migrate", false, "Run database schema migrations and exit")
+	flag.Parse()
+
+	if *migrateFlag || os.Getenv("DEADBOLT_RUN_MIGRATIONS") == "true" {
+		return runMigrations(logger)
+	}
 
 	runtimeMode := strings.ToLower(strings.TrimSpace(os.Getenv("RUNTIME_MODE")))
 	if runtimeMode == "" {
@@ -84,6 +96,13 @@ func run() error {
 		}
 	}
 
+	containerLocal := false
+	if val := os.Getenv("DEADBOLT_CONTAINER_LOCAL"); val != "" {
+		if parsed, err := strconv.ParseBool(val); err == nil {
+			containerLocal = parsed
+		}
+	}
+
 	var allowedOrigins []string
 	if rawOrigins := os.Getenv("DEADBOLT_ALLOWED_ORIGINS"); rawOrigins != "" {
 		for _, o := range strings.Split(rawOrigins, ",") {
@@ -96,6 +115,7 @@ func run() error {
 	cfg := auth.Config{
 		RuntimeMode:            runtimeMode,
 		DevAuthEnabled:         devAuthEnabled,
+		ContainerLocal:         containerLocal,
 		DevKey:                 os.Getenv("DEADBOLT_DEV_KEY"),
 		DevKeyPath:             os.Getenv("DEADBOLT_DEV_KEY_PATH"),
 		CookieSecure:           cookieSecure,
@@ -119,7 +139,7 @@ func run() error {
 			"      DEV_AUTH_ENABLED=false (dev auth and development keys are barred in hosted mode)\n"+
 			"      DEADBOLT_OIDC_ISSUER, DEADBOLT_OIDC_CLIENT_ID, and DEADBOLT_ALLOWED_ORIGINS configured\n"+
 			"  - Local mode (RUNTIME_MODE=local) requires:\n"+
-			"      LISTEN_ADDR bound strictly to loopback (127.0.0.1 or localhost)\n"+
+			"      LISTEN_ADDR bound strictly to loopback (127.0.0.1 or localhost), or DEADBOLT_CONTAINER_LOCAL=true in containers\n"+
 			"      Valid DevKeyPath if configured", err)
 	}
 
@@ -151,16 +171,52 @@ func run() error {
 		logger.Printf("Database connection pool initialized.")
 	}
 
+	runtimeImageDigest := ImageDigest
+	if envDigest := os.Getenv("DEADBOLT_IMAGE_DIGEST"); envDigest != "" {
+		runtimeImageDigest = envDigest
+	}
+
 	versionInfo := gateway.VersionInfo{
 		Version:     Version,
 		CommitSHA:   CommitSHA,
 		BuildTime:   BuildTime,
-		ImageDigest: ImageDigest,
+		ImageDigest: runtimeImageDigest,
 		RuntimeMode: cfg.RuntimeMode,
 	}
 
+	// Wire NATS connectivity checker
+	natsURL := os.Getenv("DEADBOLT_NATS_URL")
+	if natsURL == "" {
+		natsURL = os.Getenv("NATS_URL")
+	}
+	if natsURL == "" {
+		if runtimeMode == auth.ModeLocal {
+			natsURL = "127.0.0.1:4222"
+		} else {
+			natsURL = "nats:4222"
+		}
+	}
+	natsChecker := gateway.NewTCPNATSChecker(natsURL)
+
 	// Latest expected migration in M0 is 5 (00005_auth_and_sessions.sql)
-	healthChecker := gateway.NewHealthChecker(versionInfo, pool, nil, 5)
+	healthChecker := gateway.NewHealthChecker(versionInfo, pool, natsChecker, 5)
+
+	// Wire active scheduler freshness ticker
+	schedulerTick := &atomic.Int64{}
+	schedulerTick.Store(time.Now().UnixNano())
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				schedulerTick.Store(time.Now().UnixNano())
+			}
+		}
+	}()
+	healthChecker.SetSchedulerTicker(schedulerTick, gateway.DefaultSchedulerTimeout)
 
 	mux := http.NewServeMux()
 	healthChecker.Routes(mux)
@@ -176,7 +232,7 @@ func run() error {
 		if cfg.RuntimeMode == auth.ModeLocal && cfg.DevAuthEnabled {
 			devAuth := auth.NewDevAuthHandler(cfg, store, pool)
 			mux.HandleFunc("/api/auth/dev-login", devAuth.HandleDevLogin)
-			logger.Printf("Local developer authentication endpoint enabled at /api/auth/dev-login (LOOPBACK ONLY)")
+			logger.Printf("Local developer authentication endpoint enabled at /api/auth/dev-login")
 		}
 	}
 
@@ -190,7 +246,7 @@ func run() error {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		logger.Printf("Starting Deadbolt Control Plane [%s] on %s (commit: %s)", runtimeMode, listenAddr, CommitSHA)
+		logger.Printf("Starting Deadbolt Control Plane [%s] on %s (commit: %s, digest: %s)", runtimeMode, listenAddr, CommitSHA, runtimeImageDigest)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
@@ -214,5 +270,53 @@ func run() error {
 	}
 
 	logger.Printf("Control plane shutdown cleanly completed.")
+	return nil
+}
+
+// runMigrations executes database schema migrations using DDL-capable migrator credentials
+// and session-level advisory locking (Blueprint §26.3).
+func runMigrations(logger *log.Logger) error {
+	migratorDBURL := os.Getenv("MIGRATOR_DATABASE_URL")
+	if migratorDBURL == "" {
+		migratorDBURL = os.Getenv("DEADBOLT_MIGRATOR_DATABASE_URL")
+	}
+	if migratorDBURL == "" {
+		return errors.New("MIGRATOR_DATABASE_URL is required for migration execution (DDL privileges)")
+	}
+
+	migrationsDir := os.Getenv("DEADBOLT_MIGRATIONS_DIR")
+	if migrationsDir == "" {
+		if _, err := os.Stat("/migrations"); err == nil {
+			migrationsDir = "/migrations"
+		} else {
+			migrationsDir = "migrations"
+		}
+	}
+
+	logger.Printf("Opening database connection with migrator credentials...")
+	db, err := sql.Open("pgx", migratorDBURL)
+	if err != nil {
+		return fmt.Errorf("failed to open database for migrations: %w", err)
+	}
+	defer db.Close()
+
+	runner := migrator.NewRunner(db, migrationsDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	logger.Printf("Acquiring migration advisory lock (%d)...", migrator.MigrationAdvisoryLockID)
+	if err := runner.AcquireAdvisoryLock(ctx); err != nil {
+		return fmt.Errorf("failed to acquire migration advisory lock: %w", err)
+	}
+	defer func() {
+		_ = runner.ReleaseAdvisoryLock(context.Background())
+	}()
+
+	logger.Printf("Executing forward schema migrations from %s...", migrationsDir)
+	if err := runner.Up(ctx); err != nil {
+		return fmt.Errorf("migration execution failed: %w", err)
+	}
+
+	logger.Printf("Database schema migrations successfully applied.")
 	return nil
 }

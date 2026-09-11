@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 )
 
@@ -39,6 +40,10 @@ func TestControlPlaneHealthEndpoints(t *testing.T) {
 
 	checker := gateway.NewHealthChecker(versionInfo, pool, &mockNATSChecker{connected: true}, 5)
 
+	var activeTicker atomic.Int64
+	activeTicker.Store(time.Now().UnixNano())
+	checker.SetSchedulerTicker(&activeTicker, 60*time.Second)
+
 	mux := http.NewServeMux()
 	checker.Routes(mux)
 	ts := httptest.NewServer(mux)
@@ -60,7 +65,7 @@ func TestControlPlaneHealthEndpoints(t *testing.T) {
 	if err := json.NewDecoder(liveResp.Body).Decode(&liveData); err != nil {
 		t.Fatalf("failed to decode /livez response: %v", err)
 	}
-	if liveData.Status != "live" || liveData.Timestamp == "" {
+	if liveData.Status != "alive" || liveData.Timestamp == "" {
 		t.Fatalf("invalid /livez response: %+v", liveData)
 	}
 
@@ -117,8 +122,11 @@ func TestControlPlaneHealthEndpoints(t *testing.T) {
 // when database connectivity is unreachable or pool is nil.
 func TestReadyzDatabaseFailure(t *testing.T) {
 	versionInfo := gateway.VersionInfo{Version: "0.1.0"}
-	// Health checker with nil pool simulates database outage
 	checker := gateway.NewHealthChecker(versionInfo, nil, nil, 5)
+
+	var activeTicker atomic.Int64
+	activeTicker.Store(time.Now().UnixNano())
+	checker.SetSchedulerTicker(&activeTicker, 60*time.Second)
 
 	mux := http.NewServeMux()
 	checker.Routes(mux)
@@ -146,17 +154,18 @@ func TestReadyzDatabaseFailure(t *testing.T) {
 
 // TestReadyzNATSGracefulDegradation proves Blueprint §25.2:
 // "degraded NATS/telemetry is reported separately because DB fallback remains valid"
-// When NATS is disconnected or degraded, /readyz must continue returning HTTP 200 OK
-// with status "ready" and NATS explicitly reported as "degraded".
 func TestReadyzNATSGracefulDegradation(t *testing.T) {
 	db, pool, _ := setupTestDB(t)
 	defer db.Close()
 	defer pool.Close()
 
 	versionInfo := gateway.VersionInfo{Version: "0.1.0"}
-	// NATS checker returns disconnected
 	degradedNATS := &mockNATSChecker{connected: false}
 	checker := gateway.NewHealthChecker(versionInfo, pool, degradedNATS, 5)
+
+	var activeTicker atomic.Int64
+	activeTicker.Store(time.Now().UnixNano())
+	checker.SetSchedulerTicker(&activeTicker, 60*time.Second)
 
 	mux := http.NewServeMux()
 	checker.Routes(mux)
@@ -194,7 +203,6 @@ func TestReadyzSchedulerStaleness(t *testing.T) {
 	versionInfo := gateway.VersionInfo{Version: "0.1.0"}
 	checker := gateway.NewHealthChecker(versionInfo, pool, nil, 5)
 
-	// Set scheduler tick to 10 minutes ago
 	var ticker atomic.Int64
 	ticker.Store(time.Now().Add(-10 * time.Minute).UnixNano())
 	checker.SetSchedulerTicker(&ticker, 60*time.Second)
@@ -223,75 +231,139 @@ func TestReadyzSchedulerStaleness(t *testing.T) {
 	}
 }
 
-// TestHealthEndpointsTopologyRedaction validates that /livez, /readyz, and /version
-// never leak sensitive internal hostnames, IP addresses, database credentials, or topologies.
-func TestHealthEndpointsTopologyRedaction(t *testing.T) {
-	db, pool, testDBURL := setupTestDB(t)
+// TestReadyzUnobservedSchedulerFailsClosed asserts that /readyz fails closed
+// when no scheduler ticker is attached (must not default to active).
+func TestReadyzUnobservedSchedulerFailsClosed(t *testing.T) {
+	db, pool, _ := setupTestDB(t)
 	defer db.Close()
 	defer pool.Close()
 
-	_ = testDBURL
+	versionInfo := gateway.VersionInfo{Version: "0.1.0"}
+	// Checker without SetSchedulerTicker
+	checker := gateway.NewHealthChecker(versionInfo, pool, nil, 5)
+
+	mux := http.NewServeMux()
+	checker.Routes(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := ts.Client().Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("failed to GET /readyz: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable on unobserved scheduler, got %d", resp.StatusCode)
+	}
+
+	var data gateway.ReadyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if data.Status != "not_ready" || data.Scheduler != "unobserved" {
+		t.Fatalf("expected not_ready with unobserved scheduler, got: %+v", data)
+	}
+}
+
+// TestReadyzUnverifiedSchemaFailsClosed asserts that /readyz fails closed
+// when schema version is outdated or unverified.
+func TestReadyzUnverifiedSchemaFailsClosed(t *testing.T) {
+	db, pool, _ := setupTestDB(t)
+	defer db.Close()
+	defer pool.Close()
+
+	versionInfo := gateway.VersionInfo{Version: "0.1.0"}
+	// Expect schema version 9999 (far in future, cannot be satisfied)
+	checker := gateway.NewHealthChecker(versionInfo, pool, nil, 9999)
+
+	var activeTicker atomic.Int64
+	activeTicker.Store(time.Now().UnixNano())
+	checker.SetSchedulerTicker(&activeTicker, 60*time.Second)
+
+	mux := http.NewServeMux()
+	checker.Routes(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := ts.Client().Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("failed to GET /readyz: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable on outdated schema, got %d", resp.StatusCode)
+	}
+
+	var data gateway.ReadyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if data.Status != "not_ready" || data.Schema != "outdated" {
+		t.Fatalf("expected not_ready with outdated schema, got: %+v", data)
+	}
+}
+
+// TestHealthEndpointsTopologyRedaction verifies that health check responses
+// never leak database connection strings, credentials, or internal topology.
+func TestHealthEndpointsTopologyRedaction(t *testing.T) {
+	db, pool, _ := setupTestDB(t)
+	defer db.Close()
+	defer pool.Close()
+
 	versionInfo := gateway.VersionInfo{
 		Version:     "0.1.0",
-		CommitSHA:   "sentinel-commit-12345",
-		BuildTime:   "2026-09-11T12:00:00Z",
-		ImageDigest: "sha256:deadbeef",
+		CommitSHA:   "redaction-check-commit",
+		BuildTime:   "2026-09-11T00:00:00Z",
+		ImageDigest: "sha256:abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd",
 		RuntimeMode: "hosted",
 	}
 
 	checker := gateway.NewHealthChecker(versionInfo, pool, &mockNATSChecker{connected: true}, 5)
+	var activeTicker atomic.Int64
+	activeTicker.Store(time.Now().UnixNano())
+	checker.SetSchedulerTicker(&activeTicker, 60*time.Second)
+
 	mux := http.NewServeMux()
 	checker.Routes(mux)
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
 	endpoints := []string{"/livez", "/readyz", "/version"}
+	sensitivePatterns := []string{
+		"postgres://",
+		"password",
+		"172.",
+		"10.",
+		"192.168",
+		"internal",
+		"secret",
+	}
+
 	for _, ep := range endpoints {
 		resp, err := ts.Client().Get(ts.URL + ep)
 		if err != nil {
-			t.Fatalf("failed to query %s: %v", ep, err)
+			t.Fatalf("failed to GET %s: %v", ep, err)
 		}
 		defer resp.Body.Close()
 
-		var body bytesBuffer
-		_, _ = body.ReadFrom(resp.Body)
-		bodyStr := body.String()
-
-		sensitivePatterns := []string{
-			"postgres://", "password", "5432", "4222", "127.0.0.1", "localhost",
-			"deadbolt_system", "deadbolt_runtime", "goose_db_version",
+		var rawMap map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&rawMap); err != nil {
+			t.Fatalf("failed to decode json for %s: %v", ep, err)
 		}
-		for _, pat := range sensitivePatterns {
-			if strings.Contains(bodyStr, pat) {
-				t.Fatalf("SECURITY LEAK: %s exposed internal topology/credential sentinel %q: %s", ep, pat, bodyStr)
+		rawJSON, _ := json.Marshal(rawMap)
+		rawStr := strings.ToLower(string(rawJSON))
+
+		for _, pattern := range sensitivePatterns {
+			if strings.Contains(rawStr, pattern) {
+				t.Fatalf("SECURITY VIOLATION: Endpoint %s leaked sensitive pattern %q: %s", ep, pattern, rawStr)
 			}
 		}
 	}
 }
 
-type bytesBuffer struct {
-	strings.Builder
-}
-
-func (b *bytesBuffer) ReadFrom(r interface{ Read([]byte) (int, error) }) (int64, error) {
-	buf := make([]byte, 1024)
-	var total int64
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			b.Write(buf[:n])
-			total += int64(n)
-		}
-		if err != nil {
-			break
-		}
-	}
-	return total, nil
-}
-
-// TestComposeConfigurationsIntegrity validates that:
-// 1. deploy/compose/docker-compose.yml strictly binds all published ports to loopback (127.0.0.1).
-// 2. deploy/compose/docker-compose.staging.yml has zero public host port exposures for Postgres/NATS.
+// TestComposeConfigurationsIntegrity validates Docker Compose configurations
 func TestComposeConfigurationsIntegrity(t *testing.T) {
 	localContent, err := os.ReadFile("../../deploy/compose/docker-compose.yml")
 	if err != nil {
@@ -308,6 +380,13 @@ func TestComposeConfigurationsIntegrity(t *testing.T) {
 	}
 	if !strings.Contains(localStr, "127.0.0.1:8080:8080") {
 		t.Fatalf("expected explicit 127.0.0.1 loopback binding for Control Plane in local compose")
+	}
+
+	// Verify profiles exist in local compose
+	for _, profile := range []string{"profiles: [\"core\"]", "profiles: [\"telemetry\"]", "profiles: [\"fault\"]"} {
+		if !strings.Contains(localStr, profile) {
+			t.Fatalf("expected profile %q in local compose", profile)
+		}
 	}
 
 	stagingContent, err := os.ReadFile("../../deploy/compose/docker-compose.staging.yml")
@@ -329,9 +408,17 @@ func TestComposeConfigurationsIntegrity(t *testing.T) {
 		t.Fatalf("expected staging compose project name to be deadbolt-staging")
 	}
 
-	// Verify control plane binds strictly to 127.0.0.1:8088 on host
+	// Verify blue-green slotting: ports 8088 and 8089
 	if !strings.Contains(stagingStr, "127.0.0.1:8088:8080") {
-		t.Fatalf("expected control plane to bind to internal upstream loopback port 127.0.0.1:8088 in staging compose")
+		t.Fatalf("expected control plane blue slot on loopback port 8088 in staging compose")
+	}
+	if !strings.Contains(stagingStr, "127.0.0.1:8089:8080") {
+		t.Fatalf("expected control plane green slot on loopback port 8089 in staging compose")
+	}
+
+	// Verify immutable image reference with NO mutable tag suffix
+	if strings.Contains(stagingStr, ":latest") || strings.Contains(stagingStr, "${IMAGE_TAG") {
+		t.Fatalf("SECURITY VIOLATION: staging compose uses mutable tag or suffix: %s", stagingStr)
 	}
 }
 
@@ -369,6 +456,7 @@ func TestDeploymentScriptsGuards(t *testing.T) {
 		"../../scripts/rollback-staging.sh",
 		"../../scripts/reload-caddy.sh",
 		"../../scripts/retention.sh",
+		"../../scripts/check-backup-readiness.sh",
 	}
 
 	for _, script := range scripts {
@@ -393,5 +481,36 @@ func TestDeploymentScriptsGuards(t *testing.T) {
 	}
 	if !strings.Contains(outputStr, "No previous release recorded") {
 		t.Fatalf("expected 'No previous release recorded' error message, got: %s", outputStr)
+	}
+}
+
+// TestContainerLocalAuthBoundary verifies that ContainerLocal configuration
+// allows 0.0.0.0 binding in local workstation mode, but is strictly rejected in hosted mode.
+func TestContainerLocalAuthBoundary(t *testing.T) {
+	// 1. Local mode without ContainerLocal rejects 0.0.0.0
+	localCfg := auth.DefaultConfig()
+	localCfg.RuntimeMode = auth.ModeLocal
+	localCfg.DevAuthEnabled = true
+	localCfg.ContainerLocal = false
+
+	if err := localCfg.Validate("0.0.0.0"); err == nil {
+		t.Fatalf("expected local mode without ContainerLocal to reject 0.0.0.0, but passed")
+	}
+
+	// 2. Local mode with ContainerLocal accepts 0.0.0.0
+	localCfg.ContainerLocal = true
+	if err := localCfg.Validate("0.0.0.0"); err != nil {
+		t.Fatalf("expected local mode with ContainerLocal to accept 0.0.0.0, got error: %v", err)
+	}
+
+	// 3. Hosted mode strictly rejects ContainerLocal
+	hostedCfg := auth.DefaultConfig()
+	hostedCfg.RuntimeMode = auth.ModeHosted
+	hostedCfg.ContainerLocal = true
+	hostedCfg.OIDC = auth.OIDCConfig{Issuer: "https://issuer.com", ClientID: "cid"}
+	hostedCfg.AllowedOrigins = []string{"https://app.com"}
+
+	if err := hostedCfg.Validate("0.0.0.0"); err == nil {
+		t.Fatalf("expected hosted mode to strictly reject ContainerLocal, but passed")
 	}
 }

@@ -13,6 +13,7 @@ services:
   postgres:
     image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
     container_name: deadbolt-postgres
+    profiles: ["core"]
     restart: unless-stopped
     networks:
       - deadbolt_network
@@ -33,6 +34,7 @@ services:
   nats:
     image: nats:2@sha256:c50b0a773c6c8d033cad54f7c53cb97fd6e09b3bfc1accda7cd4fa94e19e9ed9
     container_name: deadbolt-nats
+    profiles: ["core"]
     restart: unless-stopped
     networks:
       - deadbolt_network
@@ -51,6 +53,7 @@ services:
   minio:
     image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     container_name: deadbolt-minio
+    profiles: ["core"]
     restart: unless-stopped
     networks:
       - deadbolt_network
@@ -75,12 +78,14 @@ services:
       dockerfile: deploy/Dockerfile.control-plane
     image: deadbolt-control-plane:local
     container_name: deadbolt-control-plane
+    profiles: ["core"]
     restart: unless-stopped
     networks:
       - deadbolt_network
     environment:
       RUNTIME_MODE: local
       DEV_AUTH_ENABLED: "true"
+      DEADBOLT_CONTAINER_LOCAL: "true"
       COOKIE_SECURE: "false"
       LISTEN_ADDR: "0.0.0.0:8080"
       DATABASE_URL: postgres://deadbolt_system:localdevpassword@postgres:5432/deadbolt?sslmode=disable
@@ -100,3 +105,36 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # Telemetry Profile Services (Blueprint §25)
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.110.0
+    container_name: deadbolt-otel-collector
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    ports:
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: deadbolt-prometheus
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  # Fault Injection Profile Services (Blueprint §25 / §26)
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: deadbolt-toxiproxy
+    profiles: ["fault"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    ports:
+      - "127.0.0.1:8474:8474" # Toxiproxy API

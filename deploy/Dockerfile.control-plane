@@ -27,7 +27,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     ./cmd/control-plane
 
 # Stage 2: Minimal, secure non-root runtime image
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim@sha256:1a51c4ab0470eee849b8a2b565729259eb64159d80dd6481330a17853dcc969f
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

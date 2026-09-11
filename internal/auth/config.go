@@ -50,6 +50,7 @@ type Config struct {
 	OIDC                   OIDCConfig
 	AllowedOrigins         []string
 	DevAuthEnabled         bool
+	ContainerLocal         bool   // Explicitly permits container-local binding (e.g. Docker Compose) in local mode
 	DevKey                 string // Explicit development key for local workstation mode (Blueprint §24.4)
 	DevKeyPath             string // Path to gitignored local development key secret file (Blueprint §24.4)
 	CookieSecure           bool
@@ -84,8 +85,8 @@ func DefaultConfig() Config {
 }
 
 // Validate verifies configuration boundaries according to Blueprint §22.2, §24.1 & §24.4.
-// In hosted mode, dev auth and development keys are strictly rejected, and CookieSecure must be true.
-// In local mode, dev auth is permitted only when explicitly bound to loopback.
+// In hosted mode, dev auth, development keys, and container-local modes are strictly rejected, and CookieSecure must be true.
+// In local mode, dev auth is permitted when bound to loopback or when explicitly configured as ContainerLocal.
 func (c *Config) Validate(listenHost string) error {
 	if c.RuntimeMode == "" {
 		return errors.New("RuntimeMode must be configured ('hosted' or 'local')")
@@ -106,6 +107,9 @@ func (c *Config) Validate(listenHost string) error {
 		// Blueprint §22.2 & §24.4: "hosted-mode startup rejects dev auth and development keys"
 		if c.DevAuthEnabled {
 			return errors.New("hosted startup rejects dev auth and development keys")
+		}
+		if c.ContainerLocal || os.Getenv("DEADBOLT_CONTAINER_LOCAL") == "true" {
+			return errors.New("hosted startup rejects ContainerLocal configuration")
 		}
 		if c.DevKey != "" || c.DevKeyPath != "" || os.Getenv("DEADBOLT_DEV_KEY") != "" || os.Getenv("DEADBOLT_DEV_KEY_PATH") != "" {
 			return errors.New("hosted startup rejects dev auth and development keys")
@@ -128,7 +132,7 @@ func (c *Config) Validate(listenHost string) error {
 			if trimmedHost == "" {
 				return errors.New("dev auth requires an explicit loopback listen host (e.g. '127.0.0.1' or 'localhost')")
 			}
-			if !isLoopbackHost(trimmedHost) {
+			if !c.ContainerLocal && !isLoopbackHost(trimmedHost) {
 				return fmt.Errorf("dev auth is restricted strictly to loopback binding (got listen host %q)", listenHost)
 			}
 		}
@@ -211,6 +215,29 @@ func isLoopbackHost(host string) bool {
 
 	ip := net.ParseIP(host)
 	if ip != nil && ip.IsLoopback() {
+		return true
+	}
+
+	return false
+}
+
+// isPrivateNetworkHost verifies whether the host/IP represents a private network or loopback address
+func isPrivateNetworkHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if isLoopbackHost(host) {
+		return true
+	}
+
+	h, _, err := net.SplitHostPort(host)
+	if err == nil {
+		host = h
+	}
+
+	ip := net.ParseIP(host)
+	if ip != nil && (ip.IsPrivate() || ip.IsLoopback()) {
 		return true
 	}
 

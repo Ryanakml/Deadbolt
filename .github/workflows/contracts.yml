@@ -67,13 +67,32 @@ jobs:
       - name: Verify control plane Dockerfile builds
         run: |
           docker build -f deploy/Dockerfile.control-plane --build-arg COMMIT_SHA="${{ github.sha }}" -t deadbolt-control-plane:test .
-      - name: Validate Docker Compose and Deployment Automation
+      - name: Validate Docker Compose and Profiles
         run: |
-          docker compose -f deploy/compose/docker-compose.yml config --quiet
-          DEADBOLT_DB_SYSTEM_PASSWORD=mock DATABASE_URL=postgres://u:p@h/d DEADBOLT_OIDC_ISSUER=https://i DEADBOLT_OIDC_CLIENT_ID=id DEADBOLT_OIDC_CLIENT_SECRET=s DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud docker compose -f deploy/compose/docker-compose.staging.yml config --quiet
+          docker compose -f deploy/compose/docker-compose.yml --profile core config --quiet
+          docker compose -f deploy/compose/docker-compose.yml --profile telemetry config --quiet
+          docker compose -f deploy/compose/docker-compose.yml --profile fault config --quiet
+          DEADBOLT_DB_SYSTEM_PASSWORD=mock DATABASE_URL=postgres://runtime:mock@localhost:5432/mock MIGRATOR_DATABASE_URL=postgres://migrator:mock@localhost:5432/mock DEADBOLT_IMAGE=ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_OIDC_ISSUER=https://i DEADBOLT_OIDC_CLIENT_ID=id DEADBOLT_OIDC_CLIENT_SECRET=s DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud docker compose -f deploy/compose/docker-compose.staging.yml --profile slot-blue --profile slot-green config --quiet
           DRY_RUN=true ./scripts/reload-caddy.sh
+          DRY_RUN=true ./scripts/check-backup-readiness.sh
           DRY_RUN=true ./scripts/deploy-staging.sh
           DRY_RUN=true ./scripts/retention.sh
+      - name: Clean-clone Local Compose Boot Smoke
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml --profile core up -d
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
+              echo "Local compose control plane is alive!"
+              break
+            fi
+            sleep 2
+          done
+          # Test stop and start preserves volume persistence
+          docker compose -f deploy/compose/docker-compose.yml --profile core stop
+          docker compose -f deploy/compose/docker-compose.yml --profile core start
+          curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1 || exit 1
+          # Explicit clean teardown
+          docker compose -f deploy/compose/docker-compose.yml --profile core down -v
       - name: Scan tracked source and history without printing secrets
         run: |
           bin/gitleaks git --redact --no-banner --log-opts="--all"
