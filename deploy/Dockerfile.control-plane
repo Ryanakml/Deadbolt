@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+
+# Stage 1: Build control plane binary using pinned Go image
+FROM docker.io/library/golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS builder
+
+WORKDIR /src
+
+# Download and cache Go dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source trees
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY contracts/ contracts/
+COPY migrations/ migrations/
+
+ARG VERSION="0.1.0"
+ARG COMMIT_SHA="unknown"
+ARG BUILD_TIME=""
+ARG IMAGE_DIGEST=""
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -trimpath \
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.CommitSHA=${COMMIT_SHA} -X main.BuildTime=${BUILD_TIME} -X main.ImageDigest=${IMAGE_DIGEST}" \
+    -o /bin/control-plane \
+    ./cmd/control-plane
+
+# Stage 2: Minimal, secure non-root runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 10001 deadbolt && \
+    useradd -u 10001 -g deadbolt -s /bin/false -M deadbolt
+
+USER 10001:10001
+
+COPY --from=builder /bin/control-plane /usr/local/bin/control-plane
+COPY --from=builder /src/migrations /migrations
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD curl -fs http://127.0.0.1:8080/livez || exit 1
+
+ENTRYPOINT ["/usr/local/bin/control-plane"]

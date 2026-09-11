@@ -1,0 +1,127 @@
+name: Staging Immutable Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: staging-deploy-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build & Publish Immutable GHCR Artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-ref: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/control-plane
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and Push Linux amd64 Control Plane Image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.control-plane
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=0.1.0
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.meta.outputs.version }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record Immutable Digest Output
+        run: |
+          echo "Published immutable control-plane artifact: ghcr.io/${{ github.repository }}/control-plane@${{ steps.build.outputs.digest }}"
+
+  deploy-staging:
+    name: Deploy to Shared EC2 Staging
+    needs: build-and-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Check Staging Provisioning Readiness
+        id: prov-check
+        run: |
+          if [[ -z "${{ secrets.DEADBOLT_DEPLOY_HOST }}" || -z "${{ secrets.DEADBOLT_DEPLOY_SSH_KEY }}" ]]; then
+            echo "PROVISIONING_PENDING=true" >> "$GITHUB_OUTPUT"
+            echo "Staging EC2 destination secrets (DEADBOLT_DEPLOY_HOST, DEADBOLT_DEPLOY_SSH_KEY) are not yet configured."
+            echo "Artifact ghcr.io/${{ github.repository }}/control-plane@${{ needs.build-and-publish.outputs.image-digest }} was published successfully with full provenance."
+            echo "Awaiting private configuration channel provisioning per deploy/provisioning.json."
+          else
+            echo "PROVISIONING_PENDING=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH and Execute Staging Deployment
+        if: steps.prov-check.outputs.PROVISIONING_PENDING == 'false'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEADBOLT_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEADBOLT_DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_KEY: ${{ secrets.DEADBOLT_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEADBOLT_DEPLOY_KNOWN_HOSTS }}
+          IMAGE_DIGEST: ghcr.io/${{ github.repository }}/control-plane@${{ needs.build-and-publish.outputs.image-digest }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          if [[ -n "$KNOWN_HOSTS" ]]; then
+            echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+            chmod 644 ~/.ssh/known_hosts
+          else
+            echo "Strict host-key verification requires DEADBOLT_DEPLOY_KNOWN_HOSTS; skipping untrusted deployment."
+            exit 1
+          fi
+
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes $DEPLOY_USER@$DEPLOY_HOST"
+
+          # Sync deployment scripts and Compose definitions to release target
+          rsync -avz -e "ssh -i ~/.ssh/deploy_key" \
+            deploy \
+            scripts \
+            migrations \
+            "$DEPLOY_USER@$DEPLOY_HOST:/opt/deadbolt/"
+
+          # Trigger remote deployment orchestration
+          $SSH_CMD "cd /opt/deadbolt && DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"

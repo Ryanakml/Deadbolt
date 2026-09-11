@@ -1,0 +1,10 @@
+# Deadbolt Control Plane Staging Route Snippet (Issue #5)
+# Reverse proxies traffic from the host Caddy edge to Deadbolt loopback port 8088.
+{$DEADBOLT_STAGING_DOMAIN} {
+    reverse_proxy 127.0.0.1:8088 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

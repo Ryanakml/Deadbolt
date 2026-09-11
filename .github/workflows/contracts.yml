@@ -64,6 +64,16 @@ jobs:
       - run: bin/sqlc version
       - run: bin/goose -version
       - run: bin/govulncheck ./...
+      - name: Verify control plane Dockerfile builds
+        run: |
+          docker build -f deploy/Dockerfile.control-plane --build-arg COMMIT_SHA="${{ github.sha }}" -t deadbolt-control-plane:test .
+      - name: Validate Docker Compose and Deployment Automation
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml config --quiet
+          DEADBOLT_DB_SYSTEM_PASSWORD=mock DATABASE_URL=postgres://u:p@h/d DEADBOLT_OIDC_ISSUER=https://i DEADBOLT_OIDC_CLIENT_ID=id DEADBOLT_OIDC_CLIENT_SECRET=s DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud docker compose -f deploy/compose/docker-compose.staging.yml config --quiet
+          DRY_RUN=true ./scripts/reload-caddy.sh
+          DRY_RUN=true ./scripts/deploy-staging.sh
+          DRY_RUN=true ./scripts/retention.sh
       - name: Scan tracked source and history without printing secrets
         run: |
           bin/gitleaks git --redact --no-banner --log-opts="--all"

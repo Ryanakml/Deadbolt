@@ -1,0 +1,102 @@
+name: deadbolt
+
+networks:
+  deadbolt_network:
+    driver: bridge
+
+volumes:
+  deadbolt_postgres_data:
+  deadbolt_nats_data:
+  deadbolt_minio_data:
+
+services:
+  postgres:
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    container_name: deadbolt-postgres
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    environment:
+      POSTGRES_DB: deadbolt
+      POSTGRES_USER: deadbolt_system
+      POSTGRES_PASSWORD: localdevpassword
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - deadbolt_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deadbolt_system -d deadbolt"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2@sha256:c50b0a773c6c8d033cad54f7c53cb97fd6e09b3bfc1accda7cd4fa94e19e9ed9
+    container_name: deadbolt-nats
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - deadbolt_nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4222 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    container_name: deadbolt-minio
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: deadbolt
+      MINIO_ROOT_PASSWORD: localdevpassword
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - deadbolt_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.control-plane
+    image: deadbolt-control-plane:local
+    container_name: deadbolt-control-plane
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    environment:
+      RUNTIME_MODE: local
+      DEV_AUTH_ENABLED: "true"
+      COOKIE_SECURE: "false"
+      LISTEN_ADDR: "0.0.0.0:8080"
+      DATABASE_URL: postgres://deadbolt_system:localdevpassword@postgres:5432/deadbolt?sslmode=disable
+      NATS_URL: nats://nats:4222
+      DEADBOLT_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/livez"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
