@@ -62,3 +62,17 @@ for (const name of [
 console.log(
   "OpenAPI, canonical enums, worker request metadata and generated schema consistency passed",
 );
+for (const [route, method] of [
+  ["/deployments", "post"],
+  ["/workflows/{name}/activate", "post"],
+  ["/schedules", "get"],
+  ["/webhook-endpoints", "get"],
+  ["/webhook-endpoints", "post"],
+]) {
+  assert(
+    source.paths[route][method].parameters.some(
+      (p) => p.name === "environment" && p.in === "query" && p.required,
+    ),
+    `Missing environment selector: ${route}`,
+  );
+}

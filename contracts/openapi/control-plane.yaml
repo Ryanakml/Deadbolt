@@ -405,6 +405,15 @@ paths:
           description:
             Required together with an allowed Origin for BrowserSession
             authentication; not used for bearer keys.
+        - name: environment
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description:
+            Select a verified member environment for browser sessions. Must
+            match authoritative environment scope for an API key.
   /workflows/{name}/activate:
     post:
       summary: Set active deployment version for new runs
@@ -423,6 +432,15 @@ paths:
           description:
             Required together with an allowed Origin for BrowserSession
             authentication; not used for bearer keys.
+        - name: environment
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description:
+            Select a verified member environment for browser sessions. Must
+            match authoritative environment scope for an API key.
       requestBody:
         required: true
         content:
@@ -846,7 +864,16 @@ paths:
     get:
       operationId: listSchedule
       summary: listSchedule
-      parameters: []
+      parameters:
+        - name: environment
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description:
+            Select a verified member environment for browser sessions. Must
+            match authoritative environment scope for an API key.
       x-required-capability: schedules:write
       x-implemented: false
       responses:
@@ -1048,7 +1075,16 @@ paths:
     get:
       operationId: listWebhookEndpoint
       summary: listWebhookEndpoint
-      parameters: []
+      parameters:
+        - name: environment
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description:
+            Select a verified member environment for browser sessions. Must
+            match authoritative environment scope for an API key.
       x-required-capability: webhooks:write
       x-implemented: false
       responses:
@@ -1100,6 +1136,15 @@ paths:
           in: header
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
+        - name: environment
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+          description:
+            Select a verified member environment for browser sessions. Must
+            match authoritative environment scope for an API key.
       x-required-capability: webhooks:write
       x-implemented: false
       responses:
