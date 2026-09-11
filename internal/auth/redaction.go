@@ -8,11 +8,11 @@ import (
 
 // RedactedHeaders lists headers that must never be exposed or logged in plain text
 var RedactedHeaders = map[string]bool{
-	"authorization":         true,
-	"cookie":                true,
-	"set-cookie":            true,
-	"x-csrf-token":          true,
-	"idempotency-key":       false, // safe
+	"authorization":   true,
+	"cookie":          true,
+	"set-cookie":      true,
+	"x-csrf-token":    true,
+	"idempotency-key": false, // safe
 }
 
 // ErrorResponse represents a sanitized standard error payload

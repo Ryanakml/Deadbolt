@@ -23,7 +23,6 @@ func TestOIDCLoginAndSessionLifecycle(t *testing.T) {
 	defer db.Close()
 	defer runtimePool.Close()
 
-
 	// 1. Start local OIDC fixture server
 	fixture, err := oidcfixture.NewFixtureServer("deadbolt-dashboard-client")
 	if err != nil {

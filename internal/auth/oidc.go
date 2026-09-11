@@ -307,14 +307,14 @@ func (c *OIDCClient) VerifyIDToken(ctx context.Context, rawJWT, expectedNonce st
 		return nil, fmt.Errorf("invalid JWT payload encoding: %w", err)
 	}
 	var claims struct {
-		Iss   string `json:"iss"`
-		Sub   string `json:"sub"`
+		Iss   string      `json:"iss"`
+		Sub   string      `json:"sub"`
 		Aud   interface{} `json:"aud"`
-		Exp   int64  `json:"exp"`
-		Nbf   int64  `json:"nbf"`
-		Nonce string `json:"nonce"`
-		Email string `json:"email"`
-		Name  string `json:"name"`
+		Exp   int64       `json:"exp"`
+		Nbf   int64       `json:"nbf"`
+		Nonce string      `json:"nonce"`
+		Email string      `json:"email"`
+		Name  string      `json:"name"`
 	}
 	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
 		return nil, fmt.Errorf("failed to parse JWT claims: %w", err)
