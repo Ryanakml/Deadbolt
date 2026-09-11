@@ -27,18 +27,20 @@ Spike SP-03 evaluates and resolves the architectural uncertainties surrounding w
 
 In accordance with Blueprint §12.3 and §33, three runner packaging candidates were evaluated:
 
-| Candidate | Packaging Model | Native Dependency Support | Contention & Isolation Behavior | Architectural Assessment |
-| :--- | :--- | :--- | :--- | :--- |
-| **A. Unbundled Global Scripts** | Global system Node.js executes task files directly from local disk. | Relies on global or unscoped `node_modules`; breaks across versions. | High risk of environment contamination and dependency pollution across tasks. | **Rejected:** Violates immutability (`INV-07`) and reproducible deployment. |
-| **B. Monolithic Single-Binary Runner (e.g. Bun / SEA / pkg)** | Node runtime bundled into a single standalone binary per task. | Difficult to compile native C++ addons (`sharp`, `pg-native`) for multi-arch targets (`amd64`/`arm64`). | High disk footprint ($\sim 80\text{MB}$ per task deployment); opaque debugging. | **Rejected:** Prohibitive storage overhead and poor native dependency compatibility. |
-| **C. Pinned Runtime with Versioned Immutable Bundle (Selected)** | Dedicated worker runner package (`@runtime/runner` / `runner/node`) executing versioned, SHA-256 verified task bundles. | Native dependencies compiled for target architecture and verified against manifest `targetArch`. | Clean process-per-attempt isolation, dedicated IPC channel, allowlisted environment. | **Selected Architecture:** Fully conforms to Blueprint §12.3, §22.3, and `REQ-VERSION-01`. |
+| Candidate                                                        | Packaging Model                                                                                                         | Native Dependency Support                                                                               | Contention & Isolation Behavior                                                      | Architectural Assessment                                                                   |
+| :--------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------- |
+| **A. Unbundled Global Scripts**                                  | Global system Node.js executes task files directly from local disk.                                                     | Relies on global or unscoped `node_modules`; breaks across versions.                                    | High risk of environment contamination and dependency pollution across tasks.        | **Rejected:** Violates immutability (`INV-07`) and reproducible deployment.                |
+| **B. Monolithic Single-Binary Runner (e.g. Bun / SEA / pkg)**    | Node runtime bundled into a single standalone binary per task.                                                          | Difficult to compile native C++ addons (`sharp`, `pg-native`) for multi-arch targets (`amd64`/`arm64`). | High disk footprint ($\sim 80\text{MB}$ per task deployment); opaque debugging.      | **Rejected:** Prohibitive storage overhead and poor native dependency compatibility.       |
+| **C. Pinned Runtime with Versioned Immutable Bundle (Selected)** | Dedicated worker runner package (`@runtime/runner` / `runner/node`) executing versioned, SHA-256 verified task bundles. | Native dependencies compiled for target architecture and verified against manifest `targetArch`.        | Clean process-per-attempt isolation, dedicated IPC channel, allowlisted environment. | **Selected Architecture:** Fully conforms to Blueprint §12.3, §22.3, and `REQ-VERSION-01`. |
 
 ---
 
 ## 3. Process Group Management & Signal Semantics
 
 ### POSIX Process Group Termination
+
 On Linux/macOS, the supervisor launches the runner child process with `Setpgid: true` via `syscall.SysProcAttr`. This creates a process group ID matching the child PID:
+
 1. **Graceful Abort (`SIGTERM`):** Sent to `-pgid` (`syscall.Kill(-pgid, syscall.SIGTERM)`).
 2. **Grace Timer:** A 10-second timer (`GracePeriod`) monitors the process group.
 3. **Forced Termination (`SIGKILL`):** If the process or any spawned grandchild remains active when the grace period expires, `SIGKILL` is issued to `-pgid`.
@@ -65,6 +67,7 @@ sequenceDiagram
 ```
 
 ### Windows Process Tree Handling
+
 On Windows, process group termination is executed via recursive process tree termination (`taskkill /F /T /PID`), terminating the parent runner and all grandchild child processes spawned by it.
 
 ---
@@ -74,18 +77,21 @@ On Windows, process group termination is executed via recursive process tree ter
 Validation tests were executed via `tests/spikes/sp03/process_test.go` and `runner/node/tests/runner.test.js`:
 
 ### Benchmark 1: Start ACK Gating (`TestSP03_StartAckGating`)
+
 - **Objective:** Verify that task handlers never execute without control plane approval.
 - **Measurements:**
   - Control plane rejection (`409 STALE_OWNERSHIP`): Child process execution was blocked 100% of the time (0 task handlers invoked).
   - Control plane approval (`200 OK`): Execution proceeded normally to `SUCCEEDED` status.
 
 ### Benchmark 2: Monotonic Conservative Lease Budget (`TestSP03_MonotonicLeaseBudgetSafety`)
+
 - **Objective:** Verify conservative lease deadline gating per Blueprint §13.1.
 - **Measurements:**
   - Lease duration $< 2.5\text{s}$ (safety margin $2.0\text{s}$ + estimated RTT $0.5\text{s}$): Execution rejected immediately with `ErrInsufficientLeaseTTL`.
   - Lease renewal to $20\text{s}$: Execution allowed immediately.
 
 ### Benchmark 3: Structured Result Channel vs. Stdout Noise (`TestSP03_StructuredResultChannelIsolation`)
+
 - **Objective:** Verify that arbitrary stdout/stderr output is never parsed as completion.
 - **Workload:** Task emitted adversarial stdout strings: `{"status": "FAILED", "error": "FAKE_ERROR_ON_STDOUT"}` and unstructured diagnostic bytes.
 - **Result:**
@@ -94,6 +100,7 @@ Validation tests were executed via `tests/spikes/sp03/process_test.go` and `runn
   - Log buffers: All adversarial stdout/stderr bytes captured cleanly in `ExecutionLogs` without corrupting the result.
 
 ### Benchmark 4: Child Environment Sanitization (`TestSP03_EnvironmentSanitizationAndAllowlist`)
+
 - **Objective:** Verify secret isolation between worker agent and child runner.
 - **Input:** Parent environment populated with `DEADBOLT_AGENT_TOKEN`, `DATABASE_URL`, `SECRET_KEY`, and `DEADBOLT_SESSION_KEY`.
 - **Result:**
@@ -101,6 +108,7 @@ Validation tests were executed via `tests/spikes/sp03/process_test.go` and `runn
   - Injected task-declared variables: `CUSTOM_CONFIG=allowlisted_value` present and verified.
 
 ### Benchmark 5: Process Group Graceful & Forced Shutdown (`TestSP03_ProcessGroupShutdownWithinGrace`)
+
 - **Objective:** Verify hung processes are terminated within grace period via SIGKILL.
 - **Workload:** Node task with infinite loop ignoring SIGTERM with $1.5\text{s}$ grace period.
 - **Result:**
@@ -109,6 +117,7 @@ Validation tests were executed via `tests/spikes/sp03/process_test.go` and `runn
   - Leaked processes: **0**.
 
 ### Benchmark 6: Crash Soak Stress Test (`TestSP03_CrashSoakAndNoLeakedProcesses`)
+
 - **Objective:** Verify zero process leaks or file descriptor exhaustion under rapid cycles.
 - **Workload:** 20 rapid sequential executions of task attempts with dynamic result channels.
 - **Result:**
