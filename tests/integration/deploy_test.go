@@ -1500,30 +1500,36 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 		t.Fatalf("failed to copy base backup tarball: %v, %s", err, string(out))
 	}
 
-	// Insert second record and switch WAL segment to verify replay
+	// Switch WAL after base backup so future writes are in a fresh WAL segment
+	if out, err := exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-c", "SELECT pg_switch_wal();").CombinedOutput(); err != nil {
+		t.Fatalf("failed to switch initial wal: %v, %s", err, string(out))
+	}
+
+	// Insert second record into new WAL segment and switch WAL to archive it
 	walSQL := "INSERT INTO drill_verification VALUES (2, 'wal_replayed_record'); SELECT pg_switch_wal();"
 	if out, err := exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-c", walSQL).CombinedOutput(); err != nil {
 		t.Fatalf("failed to insert wal record: %v, %s", err, string(out))
 	}
 
-	// Poll until the switched WAL segment is archived into archiveDir
+	// Poll until at least two WAL segments are archived in archiveDir
 	walArchived := false
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 40; i++ {
+		walCount := 0
 		entries, _ := os.ReadDir(archiveDir)
 		for _, e := range entries {
 			if !e.IsDir() && len(e.Name()) == 24 {
-				walArchived = true
-				break
+				walCount++
 			}
 		}
-		if walArchived {
+		if walCount >= 2 {
+			walArchived = true
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !walArchived {
 		logs, _ := exec.Command("docker", "logs", sourceContainer).CombinedOutput()
-		t.Fatalf("expected switched WAL segment to be archived in %s; source logs:\n%s", archiveDir, string(logs))
+		t.Fatalf("expected at least 2 switched WAL segments to be archived in %s; source logs:\n%s", archiveDir, string(logs))
 	}
 
 	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()

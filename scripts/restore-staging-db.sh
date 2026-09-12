@@ -122,7 +122,10 @@ cleanup() {
     log "Cleaning up isolated recovery drill container and temporary files..."
     docker rm -f "$DRILL_CONTAINER_NAME" 2>/dev/null || true
   fi
-  rm -rf "$TMP_DIR"
+  if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
+    docker run --rm -v "${TMP_DIR}":/cleanup alpine rm -rf /cleanup/* 2>/dev/null || true
+    rm -rf "$TMP_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -273,6 +276,10 @@ if [[ "$MODE" == "drill" ]]; then
   if docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "\dt drill_verification" 2>/dev/null | grep -q "drill_verification"; then
     VERIFIED_COUNT=$(docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT count(*) FROM drill_verification WHERE id = 2;" 2>/dev/null || echo "0")
     log "Smoke check passed: Verified WAL replayed record ($VERIFIED_COUNT replayed record(s) found)."
+    if [[ "$VERIFIED_COUNT" -lt 1 ]]; then
+      err "RECOVERY DRILL FAILED: Verification record (id=2) from replayed WAL was not found in recovered database!"
+      exit 1
+    fi
   fi
 
   log "================================================================================"
