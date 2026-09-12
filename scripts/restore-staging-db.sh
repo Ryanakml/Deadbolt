@@ -278,6 +278,7 @@ if [[ "$MODE" == "drill" ]]; then
     log "Smoke check passed: Verified WAL replayed record ($VERIFIED_COUNT replayed record(s) found)."
     if [[ "$VERIFIED_COUNT" -lt 1 ]]; then
       err "RECOVERY DRILL FAILED: Verification record (id=2) from replayed WAL was not found in recovered database!"
+      docker logs "$DRILL_CONTAINER_NAME" | tail -n 50 || true
       exit 1
     fi
   fi
