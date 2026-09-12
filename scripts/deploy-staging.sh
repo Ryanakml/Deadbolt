@@ -184,10 +184,15 @@ if [[ -n "$SYSTEM_DATABASE_URL" ]]; then
   fi
 fi
 
-if [[ -z "$CANDIDATE_DIGEST" ]]; then
+if [[ ! "$CANDIDATE_DIGEST" =~ ^.+@sha256:[a-f0-9]{64}$ ]]; then
   err "CANDIDATE_DIGEST is required (format: ghcr.io/ryanakml/deadbolt/control-plane@sha256:...)"
   exit 1
 fi
+
+# Compose interpolates every service before selecting postgres/nats or an inactive
+# slot. Keep the exact candidate available as the immutable fallback for both slots.
+DEADBOLT_IMAGE="$CANDIDATE_DIGEST"
+export DEADBOLT_IMAGE
 
 DEADBOLT_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
 if [[ -z "$DEADBOLT_POSTGRES_IMAGE" ]]; then

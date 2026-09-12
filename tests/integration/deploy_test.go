@@ -1113,6 +1113,9 @@ func TestClusterBootstrapAndPromotionSequencing(t *testing.T) {
 	if !strings.Contains(bootstrapStr, "docker compose -p deadbolt-staging -f \"$COMPOSE_FILE\" up -d postgres nats") {
 		t.Fatalf("expected bootstrap script to up data infrastructure")
 	}
+	if !strings.Contains(bootstrapStr, "CALLER_CONTROL_PLANE_IMAGE") || !strings.Contains(bootstrapStr, "DEADBOLT_IMAGE is required as an immutable control-plane reference") {
+		t.Fatalf("standalone bootstrap must explicitly require an immutable control-plane image for Compose interpolation")
+	}
 	if !strings.Contains(bootstrapStr, "./scripts/bootstrap-initial-backup.sh") {
 		t.Fatalf("expected bootstrap script to run initial base backup and wal switch")
 	}
@@ -1132,6 +1135,36 @@ func TestClusterBootstrapAndPromotionSequencing(t *testing.T) {
 	}
 	if !strings.Contains(deployStr, "PASSWORD CONSISTENCY FAILURE") {
 		t.Fatalf("expected deploy-staging.sh to enforce password consistency between URLs and secrets")
+	}
+	if !strings.Contains(deployStr, "DEADBOLT_IMAGE=\"$CANDIDATE_DIGEST\"") || !strings.Contains(deployStr, "export DEADBOLT_IMAGE") {
+		t.Fatalf("deploy-staging.sh must export the immutable candidate image before bootstrap and slot Compose calls")
+	}
+}
+
+// TestStagingComposeCandidateImageInterpolation verifies that Compose can parse the
+// full model for bootstrap or either slot when only the immutable global candidate
+// fallback is supplied. Compose validates all services even for `up postgres nats`.
+func TestStagingComposeCandidateImageInterpolation(t *testing.T) {
+	candidate := "ghcr.io/ryanakml/deadbolt/control-plane@sha256:" + strings.Repeat("1", 64)
+	postgres := "ghcr.io/ryanakml/deadbolt/postgres@sha256:" + strings.Repeat("2", 64)
+	cmd := exec.Command("docker", "compose", "-f", "../../deploy/compose/docker-compose.staging.yml", "--profile", "slot-blue", "--profile", "slot-green", "config", "--quiet")
+	cmd.Env = append(os.Environ(),
+		"DEADBOLT_IMAGE="+candidate,
+		"DEADBOLT_POSTGRES_IMAGE="+postgres,
+		"DEADBOLT_DB_ADMIN_PASSWORD=mock_admin_password",
+		"DEADBOLT_MIGRATOR_PASSWORD=mock_migrator_password",
+		"DEADBOLT_RUNTIME_PASSWORD=mock_runtime_password",
+		"DEADBOLT_SYSTEM_PASSWORD=mock_system_password",
+		"DATABASE_URL=postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock",
+		"SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system_password@localhost:5432/mock",
+		"DEADBOLT_OIDC_ISSUER=https://mock-issuer.example",
+		"DEADBOLT_OIDC_CLIENT_ID=mock-client-id",
+		"DEADBOLT_OIDC_CLIENT_SECRET=mock-client-secret",
+		"DEADBOLT_STAGING_DOMAIN=staging.example.test",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected bootstrap/blue-green Compose interpolation with immutable candidate to succeed: %v\n%s", err, out)
 	}
 }
 

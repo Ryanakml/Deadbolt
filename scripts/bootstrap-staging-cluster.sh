@@ -47,6 +47,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 
 CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
+CALLER_CONTROL_PLANE_IMAGE="${DEADBOLT_IMAGE:-}"
 RELEASE_DIR="${RELEASE_DIR:-/opt/deadbolt/releases}"
 POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
 PREVIOUS_POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image.previous"
@@ -110,7 +111,11 @@ if [[ -n "$CALLER_POSTGRES_IMAGE" ]]; then
 elif [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" && -f "$POSTGRES_IMAGE_FILE" ]]; then
   DEADBOLT_POSTGRES_IMAGE=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
 fi
+if [[ -n "$CALLER_CONTROL_PLANE_IMAGE" ]]; then
+  DEADBOLT_IMAGE="$CALLER_CONTROL_PLANE_IMAGE"
+fi
 export DEADBOLT_POSTGRES_IMAGE
+export DEADBOLT_IMAGE
 
 # 2. Strict password and URL validation (no repository-known defaults permitted)
 for var in DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DATABASE_URL MIGRATOR_DATABASE_URL SYSTEM_DATABASE_URL; do
@@ -123,6 +128,11 @@ done
 
 if [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" ]]; then
   err "DEADBOLT_POSTGRES_IMAGE is required (format: ghcr.io/ryanakml/deadbolt/postgres@sha256:...)"
+  exit 1
+fi
+
+if [[ ! "${DEADBOLT_IMAGE:-}" =~ ^.+@sha256:[a-f0-9]{64}$ ]]; then
+  err "DEADBOLT_IMAGE is required as an immutable control-plane reference (format: ghcr.io/ryanakml/deadbolt/control-plane@sha256:...)"
   exit 1
 fi
 
