@@ -1750,6 +1750,49 @@ func TestRollbackStagingConfigurationAndSafetyGuards(t *testing.T) {
 	}
 }
 
+func TestRollbackStagingImmutableEdgeSafety(t *testing.T) {
+	scriptBytes, err := os.ReadFile("../../scripts/rollback-staging.sh")
+	if err != nil {
+		t.Fatalf("read rollback script: %v", err)
+	}
+	script := string(scriptBytes)
+	for _, token := range []string{
+		"DEADBOLT_IMAGE=\"$PREV_IMAGE\"",
+		"RESTORE VERSION MISMATCH",
+		"RESTORE CONTAINER IDENTITY MISMATCH",
+		"wait_for_candidate_edge_smoke \"$DEADBOLT_STAGING_DOMAIN\" \"$PREV_IMAGE\"",
+		"restore_edge_route_before_stopping_candidate \"$OLD_PORT\" true",
+	} {
+		if !strings.Contains(script, token) {
+			t.Fatalf("rollback safety contract missing %q", token)
+		}
+	}
+	if strings.Index(script, "wait_for_candidate_edge_smoke") > strings.Index(script, "stop \"control-plane-$OLD_SLOT\"") {
+		t.Fatal("rollback must prove the public edge before stopping the former current slot")
+	}
+
+	previous := "ghcr.io/ryanakml/deadbolt/control-plane@sha256:" + strings.Repeat("3", 64)
+	postgres := "ghcr.io/ryanakml/deadbolt/postgres@sha256:" + strings.Repeat("4", 64)
+	cmd := exec.Command("docker", "compose", "-f", "../../deploy/compose/docker-compose.staging.yml", "--profile", "slot-blue", "--profile", "slot-green", "config", "--quiet")
+	cmd.Env = append(os.Environ(),
+		"DEADBOLT_IMAGE="+previous,
+		"DEADBOLT_POSTGRES_IMAGE="+postgres,
+		"DEADBOLT_DB_ADMIN_PASSWORD=mock_admin_password",
+		"DEADBOLT_MIGRATOR_PASSWORD=mock_migrator_password",
+		"DEADBOLT_RUNTIME_PASSWORD=mock_runtime_password",
+		"DEADBOLT_SYSTEM_PASSWORD=mock_system_password",
+		"DATABASE_URL=postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock",
+		"SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system_password@localhost:5432/mock",
+		"DEADBOLT_OIDC_ISSUER=https://mock-issuer.example",
+		"DEADBOLT_OIDC_CLIENT_ID=mock-client-id",
+		"DEADBOLT_OIDC_CLIENT_SECRET=mock-client-secret",
+		"DEADBOLT_STAGING_DOMAIN=staging.example.test",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rollback Compose interpolation with only immutable previous image must succeed: %v\n%s", err, out)
+	}
+}
+
 func TestStagingConfigPermissionContract(t *testing.T) {
 	helperPath, err := filepath.Abs("../../scripts/lib/config-permissions.sh")
 	if err != nil {

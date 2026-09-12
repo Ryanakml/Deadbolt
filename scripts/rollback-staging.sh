@@ -13,6 +13,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/config-permissions.sh
 source "${SCRIPT_DIR}/lib/config-permissions.sh"
+# shellcheck source=lib/edge-smoke.sh
+source "${SCRIPT_DIR}/lib/edge-smoke.sh"
+# shellcheck source=lib/edge-smoke-rollback.sh
+source "${SCRIPT_DIR}/lib/edge-smoke-rollback.sh"
 
 RELEASE_DIR="${RELEASE_DIR:-/opt/deadbolt/releases}"
 CURRENT_RELEASE_FILE="${RELEASE_DIR}/current"
@@ -120,6 +124,14 @@ if [[ -z "$PREV_IMAGE" ]]; then
   err "Previous release record is empty. Cannot perform rollback."
   exit 1
 fi
+if [[ ! "$PREV_IMAGE" =~ ^.+@sha256:[a-f0-9]{64}$ ]]; then
+  err "Previous release must be an immutable control-plane reference (@sha256:...)."
+  exit 1
+fi
+
+# Compose interpolates both slots even when only the restore slot is started.
+DEADBOLT_IMAGE="$PREV_IMAGE"
+export DEADBOLT_IMAGE
 
 log "Previous image to restore: $PREV_IMAGE"
 
@@ -133,10 +145,12 @@ if [[ "$CURRENT_SLOT" == "blue" ]]; then
   RESTORE_SLOT="green"
   RESTORE_PORT="8089"
   OLD_SLOT="blue"
+  OLD_PORT="8088"
 else
   RESTORE_SLOT="blue"
   RESTORE_PORT="8088"
   OLD_SLOT="green"
+  OLD_PORT="8089"
 fi
 
 log "Launching rollback instance into slot: $RESTORE_SLOT (port $RESTORE_PORT)..."
@@ -168,19 +182,57 @@ fi
 
 log "Readiness verified on restored container."
 
+# Prove local version and independently inspected container identity before traffic moves.
+RESTORED_VERSION=$(curl -fsSL "http://127.0.0.1:${RESTORE_PORT}/version" 2>/dev/null || echo "{}")
+if [[ "$RESTORED_VERSION" != *"$PREV_IMAGE"* ]]; then
+  err "RESTORE VERSION MISMATCH: /version does not contain $PREV_IMAGE."
+  exit 1
+fi
+RESTORE_CONTAINER="deadbolt-staging-control-plane-${RESTORE_SLOT}"
+PREV_SHA=$(echo "$PREV_IMAGE" | grep -o 'sha256:[a-f0-9]\{64\}' || true)
+RESTORE_IMAGE_ID=$(docker inspect --format '{{.Image}}' "$RESTORE_CONTAINER" 2>/dev/null || true)
+RESTORE_IMAGE_DECL=$(docker inspect --format '{{index .Config.Image}}' "$RESTORE_CONTAINER" 2>/dev/null || true)
+RESTORE_REPO_DIGESTS=$(docker inspect --format '{{json .RepoDigests}}' "$RESTORE_IMAGE_ID" 2>/dev/null || echo "[]")
+if [[ -z "$PREV_SHA" || "$RESTORE_IMAGE_DECL $RESTORE_REPO_DIGESTS $RESTORE_IMAGE_ID" != *"$PREV_SHA"* ]]; then
+  err "RESTORE CONTAINER IDENTITY MISMATCH: restored container does not match $PREV_IMAGE."
+  exit 1
+fi
+log "Restored local version and container image identity verified."
+
 # Reload Caddy edge to point to restored port
 if [[ -f "scripts/reload-caddy.sh" ]]; then
   log "Switching Caddy edge route to port $RESTORE_PORT..."
   export DEADBOLT_UPSTREAM_PORT="$RESTORE_PORT"
   export DEADBOLT_STAGING_DOMAIN="$DEADBOLT_STAGING_DOMAIN"
-  ./scripts/reload-caddy.sh "$RESTORE_PORT"
+  if ! ./scripts/reload-caddy.sh "$RESTORE_PORT"; then
+    err "Caddy switch to restored release failed; preserving current slot $OLD_SLOT."
+    exit 1
+  fi
 fi
 
-# Stop the faulty container in old slot
-log "Stopping faulty container in slot: $OLD_SLOT..."
+# Keep the current release alive until HTTPS/TLS edge verification proves the restore.
+rollback() {
+  err "Rollback edge gate failed; stopping unproven restored slot $RESTORE_SLOT."
+  docker compose -p deadbolt-staging -f "$COMPOSE_FILE" stop "control-plane-$RESTORE_SLOT" || true
+}
+CANDIDATE_SLOT="$RESTORE_SLOT"
+CANDIDATE_PORT="$RESTORE_PORT"
+if ! wait_for_candidate_edge_smoke "$DEADBOLT_STAGING_DOMAIN" "$PREV_IMAGE"; then
+  err "Rollback edge smoke failed; restoring current route before touching current slot."
+  if ! restore_edge_route_before_stopping_candidate "$OLD_PORT" true; then
+    exit 1
+  fi
+  exit 1
+fi
+
+# Stop the former current container only after public edge proof.
+log "Stopping former current container in slot: $OLD_SLOT..."
 docker compose -p deadbolt-staging -f "$COMPOSE_FILE" stop "control-plane-$OLD_SLOT" || true
 
 # Update release pointers
+if [[ -f "$CURRENT_RELEASE_FILE" ]]; then
+  cp "$CURRENT_RELEASE_FILE" "$PREVIOUS_RELEASE_FILE"
+fi
 echo "$RESTORE_SLOT" > "$ACTIVE_SLOT_FILE"
 echo "$PREV_IMAGE" > "$CURRENT_RELEASE_FILE"
 
