@@ -1479,7 +1479,7 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 	sourceReady := false
 	for i := 0; i < 30; i++ {
 		time.Sleep(1 * time.Second)
-		if exec.Command("docker", "exec", sourceContainer, "pg_isready", "-U", "deadbolt_admin", "-d", "deadbolt_staging").Run() == nil {
+		if exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-c", "SELECT 1").Run() == nil {
 			sourceReady = true
 			break
 		}
@@ -2093,7 +2093,7 @@ func TestDatabasePointInTimeRecoveryDrillRemoteS3(t *testing.T) {
 	sourceReady := false
 	for i := 0; i < 30; i++ {
 		time.Sleep(1 * time.Second)
-		if exec.Command("docker", "exec", sourceContainer, "pg_isready", "-U", "deadbolt_admin", "-d", "deadbolt_staging").Run() == nil {
+		if exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-c", "SELECT 1").Run() == nil {
 			sourceReady = true
 			break
 		}
