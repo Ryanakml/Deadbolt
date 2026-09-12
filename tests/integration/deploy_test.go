@@ -1440,9 +1440,13 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 
 	t.Log("Docker daemon is available: executing live container recovery drill...")
 	archiveDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(archiveDir, "basebackups"), 0755); err != nil {
+	if err := os.Chmod(archiveDir, 0777); err != nil {
+		t.Fatalf("failed to chmod archive directory: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(archiveDir, "basebackups"), 0777); err != nil {
 		t.Fatalf("failed to create basebackups directory: %v", err)
 	}
+	_ = os.Chmod(filepath.Join(archiveDir, "basebackups"), 0777)
 
 	sourceContainer := "deadbolt-test-drill-source"
 	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
@@ -1504,16 +1508,22 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 
 	// Poll until the switched WAL segment is archived into archiveDir
 	walArchived := false
-	for i := 0; i < 20; i++ {
-		matches, _ := filepath.Glob(filepath.Join(archiveDir, "0000*"))
-		if len(matches) > 0 {
-			walArchived = true
+	for i := 0; i < 30; i++ {
+		entries, _ := os.ReadDir(archiveDir)
+		for _, e := range entries {
+			if !e.IsDir() && len(e.Name()) == 24 {
+				walArchived = true
+				break
+			}
+		}
+		if walArchived {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !walArchived {
-		t.Fatalf("expected switched WAL segment to be archived in %s", archiveDir)
+		logs, _ := exec.Command("docker", "logs", sourceContainer).CombinedOutput()
+		t.Fatalf("expected switched WAL segment to be archived in %s; source logs:\n%s", archiveDir, string(logs))
 	}
 
 	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
