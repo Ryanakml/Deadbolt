@@ -18,14 +18,14 @@ Deadbolt maintains an independent database persistence layer on PostgreSQL 18. I
 
 PostgreSQL 18 is configured to ship closed WAL segments directly to the external S3 bucket under the prefix `s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/`.
 
-- **Archive Command Configuration (`deploy/postgres/postgresql.conf`)**:
+- **Archive Command Configuration (`deploy/compose/docker-compose.staging.yml`)**:
   ```ini
   wal_level = replica
   archive_mode = on
   archive_command = '/usr/local/bin/archive-wal.sh %p %f'
   archive_timeout = 300
   ```
-- **Archiver Implementation**: Uses `deploy/postgres/archive-wal.sh` running in the hardened PostgreSQL image (`deploy/Dockerfile.postgres`). Uploads segments via `aws s3 cp` with retry backoff and fallback local spooling (`/var/lib/postgresql/wal_archive_spool`).
+- **Archiver Implementation**: Uses `scripts/archive-wal.sh`, mounted into the hardened PostgreSQL image (`deploy/Dockerfile.postgres`). It uploads closed segments via `aws s3 cp` to the dedicated bucket or the explicit archive directory.
 
 ### 2.2 Nightly Base Backups & Retention
 
@@ -33,15 +33,16 @@ Nightly physical base backups are created using `scripts/take-base-backup.sh`, s
 
 - Destination: `s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/base_<TIMESTAMP>.tar.gz`
 - Bounded Retention: Strict 14-backup retention policy (`RETENTION_COUNT=14`). Backups older than the 14 most recent backups are automatically purged from S3 and local storage.
-- Immediate WAL checkpointing and sync via `pg_backup_stop(wait_for_archive => true)`.
+- Each backup script forces a WAL switch and verifies the exact completed segment appears in the configured archive destination.
 
 ### 2.3 Volume Independence
 
 - Database files reside in the dedicated Docker named volume `deadbolt_staging_postgres_data`.
 - Default staging database: `deadbolt_staging`.
 - Administrative user: `deadbolt_admin`.
-- Application user: `deadbolt_app`.
+- Runtime application user: `deadbolt_runtime`.
 - Migration user: `deadbolt_migrator`.
+- System function-caller user: `deadbolt_system`.
 - This volume is never touched, pruned, or shared across projects or with FlowDesk.
 
 ### 2.4 Fresh-Host Cluster Bootstrap & Baseline Backups
@@ -65,19 +66,11 @@ The cluster initialization workflow in `scripts/bootstrap-staging-cluster.sh` es
 Before every candidate deployment, the deployment script executes a backup readiness check:
 
 ```bash
-# 1. Verify S3 bucket access and credentials
-aws s3 ls "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/" --summarize
-
-# 2. Check that the most recent WAL archive is less than 15 minutes old
-LATEST_WAL=$(aws s3 ls "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/" | sort | tail -n 1)
-echo "Latest archived WAL: ${LATEST_WAL}"
-
-# 3. Check base backup existence within the last 24 hours
-LATEST_BASE=$(aws s3 ls "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/" | sort | tail -n 1)
-echo "Latest base backup: ${LATEST_BASE}"
+# Run the same fail-closed gate used by candidate promotion.
+cd /opt/deadbolt && ./scripts/check-backup-readiness.sh
 ```
 
-If the S3 backup target is unreachable or the latest backup is stale, deployment halts to prevent running migrations without recoverable state.
+The gate verifies S3 access, a fresh base backup, and encryption. It then creates a uniquely named PostgreSQL restore point with `pg_create_restore_point(...)` (internal WAL activity only), forces a WAL switch, and polls for that exact completed segment in the dedicated archive within a bounded timeout. It verifies encryption for the exact probe object. This avoids treating the age of the latest archived object as transport lag on an idle database. Any missing probe segment or encryption evidence fails closed.
 
 ---
 

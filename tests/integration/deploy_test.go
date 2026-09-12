@@ -584,6 +584,25 @@ exit 1
 	}
 }
 
+func TestStagingRunbooksMatchRetentionAndWALProbeContracts(t *testing.T) {
+	deploymentRunbook, err := os.ReadFile("../../docs/runbooks/deployment-and-staging.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment := string(deploymentRunbook)
+	if strings.Contains(deployment, "retention.sh --dry-run") || !strings.Contains(deployment, "DRY_RUN=true ./scripts/retention.sh") {
+		t.Fatal("retention runbook must use the supported DRY_RUN=true invocation")
+	}
+	backupRunbook, err := os.ReadFile("../../docs/runbooks/backup-and-disaster-recovery.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup := string(backupRunbook)
+	if strings.Contains(backup, "most recent WAL archive is less than 15 minutes old") || !strings.Contains(backup, "exact completed segment") || !strings.Contains(backup, "pg_create_restore_point") {
+		t.Fatal("backup runbook must document the active exact WAL probe, not object-age freshness")
+	}
+}
+
 // TestDeploymentScriptsGuards asserts that deployment, rollback, and caddy reload
 // scripts exist, have execute permissions, and enforce safety guards when invoked.
 func TestDeploymentScriptsGuards(t *testing.T) {

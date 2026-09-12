@@ -69,7 +69,7 @@ df -m /
 # 3. Verify FlowDesk containers are healthy and undisturbed
 docker ps --filter "name=flowdesk" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-# 4. Verify external S3 backup readiness, archive lag, and SSE encryption
+# 4. Verify external S3 backup readiness, exact WAL archive probe, and SSE encryption
 /opt/deadbolt/scripts/check-backup-readiness.sh
 ```
 
@@ -85,7 +85,7 @@ On a fresh host where the Deadbolt PostgreSQL cluster has not yet been initializ
 
 1. Data services must be started first with dedicated database roles (`deadbolt_admin`, `deadbolt_migrator`, `deadbolt_runtime`, `deadbolt_system`).
 2. An initial physical base backup and WAL segment switch must be performed via `scripts/bootstrap-initial-backup.sh`.
-3. Fail-closed backup readiness (`scripts/check-backup-readiness.sh`) must verify base backup existence, WAL archive lag, and ServerSideEncryption policy.
+3. Fail-closed backup readiness (`scripts/check-backup-readiness.sh`) must verify base backup existence, an active exact WAL archive probe, and ServerSideEncryption policy.
 4. Only after backup recoverability is proven can forward schema migrations and candidate promotion proceed.
 
 Run standalone bootstrap:
@@ -220,7 +220,7 @@ Docker image cleanup is executed safely via `scripts/retention.sh`:
 
 ```bash
 # Preview retention cleanup (dry run)
-/opt/deadbolt/scripts/retention.sh --dry-run
+cd /opt/deadbolt && DRY_RUN=true ./scripts/retention.sh
 
 # Apply retention policy
 /opt/deadbolt/scripts/retention.sh
@@ -229,12 +229,11 @@ Docker image cleanup is executed safely via `scripts/retention.sh`:
 ### Retention Rules
 
 - **Protected Images**:
-  - All images tagged or labeled `flowdesk*` (never inspected or deleted).
-  - Images currently running on the host.
-  - The currently active Deadbolt image (`/opt/deadbolt/releases/current`).
-  - The previous Deadbolt image retained for the rollback window (`/opt/deadbolt/releases/previous`).
+  - Image IDs resolved from immutable current and previous Deadbolt release digests.
+  - Image IDs used by every running `deadbolt-staging` container.
+  - FlowDesk images, containers, volumes, and networks are never targeted.
 - **Eligible for Cleanup**:
-  - Older Deadbolt images exceeding the retention count (`RETENTION_COUNT=3`).
+  - Unprotected local image IDs whose `RepoDigest` is an immutable `ghcr.io/ryanakml/deadbolt/control-plane@sha256:...` reference.
 - **Strict Prohibitions**:
   - `docker system prune` is **strictly forbidden**.
   - `docker image prune -a` is **strictly forbidden**.
