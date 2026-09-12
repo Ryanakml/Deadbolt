@@ -6,6 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=lib/config-permissions.sh
+source "${SCRIPT_DIR}/lib/config-permissions.sh"
 
 RELEASE_DIR="${DEADBOLT_RELEASE_DIR:-/opt/deadbolt/releases}"
 ACTIVE_UPSTREAM_FILE="${RELEASE_DIR}/active_upstream_port"
@@ -26,10 +28,7 @@ if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
   CONFIG_FILE="/opt/deadbolt/config/staging.env"
 fi
 if [[ -f "$CONFIG_FILE" ]]; then
-  PERMS=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%Op" "$CONFIG_FILE" 2>/dev/null || echo "600")
-  if [[ "$PERMS" =~ [4567]$ ]]; then
-    err "SECURITY VIOLATION: Configuration file $CONFIG_FILE is world-readable ($PERMS)!"
-    err "Remediation: chmod 600 $CONFIG_FILE"
+  if ! validate_staging_config_permissions "$CONFIG_FILE"; then
     exit 1
   fi
   set -a

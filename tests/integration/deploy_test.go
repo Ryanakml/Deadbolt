@@ -1548,8 +1548,8 @@ func TestRollbackStagingConfigurationAndSafetyGuards(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected rollback-staging.sh to reject world-readable config, but succeeded: %s", string(out))
 	}
-	if !strings.Contains(string(out), "is world-readable") {
-		t.Fatalf("expected world-readable error message, got: %s", string(out))
+	if !strings.Contains(string(out), "must not grant world access") {
+		t.Fatalf("expected world-access error message, got: %s", string(out))
 	}
 
 	// 3. DRY RUN mode with Compose validation -> must pass
@@ -1561,6 +1561,101 @@ func TestRollbackStagingConfigurationAndSafetyGuards(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "DRY RUN passed") {
 		t.Fatalf("expected DRY RUN success message, got: %s", string(out))
+	}
+}
+
+func TestStagingConfigPermissionContract(t *testing.T) {
+	helperPath, err := filepath.Abs("../../scripts/lib/config-permissions.sh")
+	if err != nil {
+		t.Fatalf("resolve config permissions helper: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+		want bool
+	}{
+		{name: "group readable deploy config accepted", mode: 0640, want: true},
+		{name: "group writable deploy config rejected", mode: 0660, want: false},
+		{name: "world readable deploy config rejected", mode: 0644, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "staging.env")
+			if err := os.WriteFile(configPath, []byte("SECRET=value\n"), tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(configPath, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/bash", "-c", fmt.Sprintf("source %q; validate_staging_config_permissions %q", helperPath, configPath))
+			out, err := cmd.CombinedOutput()
+			if (err == nil) != tc.want {
+				t.Fatalf("permission validation success=%t, want %t: %s", err == nil, tc.want, out)
+			}
+		})
+	}
+}
+
+// TestEdgeSmokeRollbackRouteRestorationInvariant proves that a failed edge smoke never
+// stops the candidate until Caddy restoration succeeds. This is deliberately a shell-level
+// test of the helper used by deploy-staging.sh so the dangerous ordering cannot regress.
+func TestEdgeSmokeRollbackRouteRestorationInvariant(t *testing.T) {
+	helperPath, err := filepath.Abs("../../scripts/lib/edge-smoke-rollback.sh")
+	if err != nil {
+		t.Fatalf("resolve edge rollback helper: %v", err)
+	}
+	deployBytes, err := os.ReadFile("../../scripts/deploy-staging.sh")
+	if err != nil {
+		t.Fatalf("read deploy script: %v", err)
+	}
+	if !strings.Contains(string(deployBytes), "restore_edge_route_before_stopping_candidate \"$OLD_PORT\"") || strings.Contains(string(deployBytes), "./scripts/reload-caddy.sh \"$OLD_PORT\" || true") {
+		t.Fatal("deploy-staging.sh must use the authoritative route-restoration helper without suppressing failure")
+	}
+
+	for _, tc := range []struct {
+		name            string
+		reloadExit      int
+		wantRollback    bool
+		wantExit        int
+		wantRouteFailed bool
+	}{
+		{name: "restore failure preserves candidate", reloadExit: 1, wantRollback: false, wantExit: 1, wantRouteFailed: true},
+		{name: "restore success stops candidate", reloadExit: 0, wantRollback: true, wantExit: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			reloadPath := filepath.Join(workDir, "reload-caddy")
+			if err := os.WriteFile(reloadPath, []byte(fmt.Sprintf("#!/usr/bin/env bash\nexit %d\n", tc.reloadExit)), 0755); err != nil {
+				t.Fatal(err)
+			}
+			statePath := filepath.Join(workDir, "candidate-state")
+			harness := fmt.Sprintf(`
+set -u -o pipefail
+OLD_SLOT=blue
+CANDIDATE_SLOT=green
+err() { echo "ERROR:$*" >&2; }
+rollback() { echo stopped > %q; }
+source %q
+restore_edge_route_before_stopping_candidate 8088
+`, statePath, helperPath)
+			cmd := exec.Command("/bin/bash", "-c", harness)
+			cmd.Env = append(os.Environ(), "DEADBOLT_CADDY_RELOAD_SCRIPT="+reloadPath)
+			out, err := cmd.CombinedOutput()
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				if exitErr.ExitCode() != tc.wantExit {
+					t.Fatalf("expected exit %d, got %d: %s", tc.wantExit, exitErr.ExitCode(), out)
+				}
+			} else if err != nil || tc.wantExit != 0 {
+				t.Fatalf("expected exit %d, got %v: %s", tc.wantExit, err, out)
+			}
+			_, rollbackErr := os.Stat(statePath)
+			if tc.wantRollback != (rollbackErr == nil) {
+				t.Fatalf("candidate stop=%t, want %t; output: %s", rollbackErr == nil, tc.wantRollback, out)
+			}
+			if tc.wantRouteFailed && !strings.Contains(string(out), "ROUTE RESTORATION FAILED") {
+				t.Fatalf("expected loud route-restoration failure, got: %s", out)
+			}
+		})
 	}
 }
 

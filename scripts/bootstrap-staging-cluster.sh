@@ -11,6 +11,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/config-permissions.sh
+source "${SCRIPT_DIR}/lib/config-permissions.sh"
+
 DRY_RUN="${DRY_RUN:-false}"
 COMPOSE_FILE="deploy/compose/docker-compose.staging.yml"
 
@@ -90,9 +94,7 @@ if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
 fi
 
 if [[ -f "$CONFIG_FILE" ]]; then
-  PERMS=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%Op" "$CONFIG_FILE" 2>/dev/null || echo "600")
-  if [[ "$PERMS" =~ [4567]$ ]]; then
-    err "SECURITY VIOLATION: Configuration file $CONFIG_FILE is world-readable ($PERMS)!"
+  if ! validate_staging_config_permissions "$CONFIG_FILE"; then
     exit 1
   fi
   log "Loading configuration from $CONFIG_FILE..."
@@ -216,4 +218,3 @@ mv -f "${BOOTSTRAP_MARKER_FILE}.tmp" "$BOOTSTRAP_MARKER_FILE"
 log "Durable bootstrap marker written to: $BOOTSTRAP_MARKER_FILE"
 
 log "SUCCESS: Clean staging cluster data infrastructure, backup baseline, and recurring maintenance established."
-

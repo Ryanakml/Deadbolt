@@ -10,6 +10,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/config-permissions.sh
+source "${SCRIPT_DIR}/lib/config-permissions.sh"
+
 RELEASE_DIR="${RELEASE_DIR:-/opt/deadbolt/releases}"
 CURRENT_RELEASE_FILE="${RELEASE_DIR}/current"
 PREVIOUS_RELEASE_FILE="${RELEASE_DIR}/previous"
@@ -62,10 +66,7 @@ if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
 fi
 
 if [[ -f "$CONFIG_FILE" ]]; then
-  PERMS=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%Op" "$CONFIG_FILE" 2>/dev/null || echo "600")
-  if [[ "$PERMS" =~ [4567]$ ]]; then
-    err "SECURITY VIOLATION: Configuration file $CONFIG_FILE is world-readable ($PERMS)!"
-    err "Remediation: chmod 600 $CONFIG_FILE"
+  if ! validate_staging_config_permissions "$CONFIG_FILE"; then
     exit 1
   fi
   log "Loading host configuration from $CONFIG_FILE..."

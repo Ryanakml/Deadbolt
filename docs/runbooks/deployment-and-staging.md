@@ -102,6 +102,19 @@ Or pass `--bootstrap` directly to the automated deployment script:
 
 ### Staging Database Secret Model & Zero-Default Policy
 
+### Deploy-user Secret-File Permission Contract
+
+GitHub Actions connects as the non-root deployment account. Before the first deployment, provision the secret path with a dedicated group and add **only** that account to it:
+
+```bash
+sudo groupadd --force deadbolt-deploy
+sudo usermod -aG deadbolt-deploy <automated-deploy-user>
+sudo install -d -o root -g deadbolt-deploy -m 750 /etc/deadbolt
+sudo install -o root -g deadbolt-deploy -m 640 /path/to/approved/staging.env /etc/deadbolt/staging.env
+```
+
+The directory must remain `root:deadbolt-deploy` mode `750`; `staging.env` must remain `root:deadbolt-deploy` mode `640`. The scripts reject world access and group-writable files, and enforce this exact ownership/mode contract for `/etc/deadbolt/staging.env`. Do not use `644`, and do not grant the deploy account a root shell merely to read configuration.
+
 All database credentials in `deploy/compose/docker-compose.staging.yml` are strictly required with **zero repository-known fallback defaults**:
 
 - `DEADBOLT_DB_ADMIN_PASSWORD`: Superuser password used solely during cluster init and base backups.
@@ -124,7 +137,7 @@ Automated deployment is executed via `scripts/deploy-staging.sh`:
 
 1. **Configuration Loading & Security Checks**:
    - Sources configuration from `/etc/deadbolt/staging.env`.
-   - Rejects world-readable configuration files (`chmod 600` enforced).
+   - Enforces the deploy-user permission contract above (`root:deadbolt-deploy` directory `750`; config `640`) and rejects world access or group writes.
    - Validates password consistency between connection URLs and secret variables.
    - Enforces `MIGRATOR_DATABASE_URL != DATABASE_URL` and `SYSTEM_DATABASE_URL != DATABASE_URL`.
      1b. **Fresh-Host First Deploy Detection**:
@@ -172,7 +185,7 @@ Automated deployment is executed via `scripts/deploy-staging.sh`:
    - If edge smoke fails:
      - Restores previous Deadbolt snippet.
      - Reloads Caddy container to point back to previous slot.
-     - Stops candidate slot container; leaves active slot alive and completely unharmed.
+     - Verifies route restoration before stopping the candidate slot container; if restoration fails, preserves both slots and exits failed for operator recovery.
      - Never touches FlowDesk containers or routes.
 10. **Decommission Old Slot & Update State**:
     - Stops previous slot container.

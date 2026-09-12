@@ -6,6 +6,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/config-permissions.sh
+source "${SCRIPT_DIR}/lib/config-permissions.sh"
+# shellcheck source=lib/edge-smoke-rollback.sh
+source "${SCRIPT_DIR}/lib/edge-smoke-rollback.sh"
+
 DRY_RUN="${DRY_RUN:-false}"
 RELEASE_DIR="${DEADBOLT_RELEASE_DIR:-/opt/deadbolt/releases}"
 BOOTSTRAP_MARKER_FILE="${RELEASE_DIR}/bootstrap_complete"
@@ -102,11 +108,7 @@ if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
 fi
 
 if [[ -f "$CONFIG_FILE" ]]; then
-  # Verify secure permissions (must not be world-readable)
-  PERMS=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%Op" "$CONFIG_FILE" 2>/dev/null || echo "600")
-  if [[ "$PERMS" =~ [4567]$ ]]; then
-    err "SECURITY VIOLATION: Configuration file $CONFIG_FILE is world-readable ($PERMS)!"
-    err "Remediation: chmod 600 $CONFIG_FILE"
+  if ! validate_staging_config_permissions "$CONFIG_FILE"; then
     exit 1
   fi
   log "Loading host configuration from $CONFIG_FILE..."
@@ -405,10 +407,10 @@ log "Step 11: Smokin edge route via Caddy..."
 EDGE_VERSION=$(curl -fsSL "https://${DEADBOLT_STAGING_DOMAIN}/version" 2>/dev/null || curl -fsSL --resolve "${DEADBOLT_STAGING_DOMAIN}:443:127.0.0.1" "https://${DEADBOLT_STAGING_DOMAIN}/version" 2>/dev/null || echo "{}")
 if ! echo "$EDGE_VERSION" | grep -q "$CANDIDATE_DIGEST"; then
   err "EDGE SMOKE FAILED: Caddy edge is not serving candidate image digest!"
-  # Rollback Caddy route to old port
-  export DEADBOLT_UPSTREAM_PORT="$OLD_PORT"
-  ./scripts/reload-caddy.sh "$OLD_PORT" || true
-  rollback
+  # Route restoration is authoritative: never stop a candidate Caddy may still route to.
+  if ! restore_edge_route_before_stopping_candidate "$OLD_PORT"; then
+    exit 1
+  fi
   exit 1
 fi
 
@@ -436,4 +438,3 @@ EOF
 fi
 
 log "SUCCESS: Staging deployment completed. Active slot: $CANDIDATE_SLOT (port $CANDIDATE_PORT)."
-
