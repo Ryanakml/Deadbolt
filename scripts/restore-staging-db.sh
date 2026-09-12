@@ -152,10 +152,16 @@ if [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" && -z "$S3_BUCKET" ]]; then
 fi
 
 # 3. Extract base backup into temporary staging directory
-TARGET_DATA_DIR="${TMP_DIR}/recovered_data"
+# In PostgreSQL 18+, Docker images store database data in /var/lib/postgresql/18/docker,
+# and the container volume is mounted at /var/lib/postgresql.
+RECOVERED_ROOT="${TMP_DIR}/recovered_root"
+TARGET_DATA_DIR="${RECOVERED_ROOT}/18/docker"
 mkdir -p "$TARGET_DATA_DIR"
 log "Extracting base backup tarball into $TARGET_DATA_DIR..."
 tar -xzf "$BASE_TARBALL" -C "$TARGET_DATA_DIR"
+chmod 755 "$TMP_DIR"
+chmod 755 "$RECOVERED_ROOT"
+chmod 755 "${RECOVERED_ROOT}/18"
 chmod 700 "$TARGET_DATA_DIR"
 
 # 4. Configure restore_command and recovery.signal for PostgreSQL 18
@@ -201,8 +207,10 @@ if [[ "$MODE" == "drill" ]]; then
     run -d
     --name "$DRILL_CONTAINER_NAME"
     --network none
-    -v "$TARGET_DATA_DIR":/var/lib/postgresql/data
+    -v "$RECOVERED_ROOT":/var/lib/postgresql
+    -e PGDATA=/var/lib/postgresql/18/docker
     -e POSTGRES_PASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}"
+    -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}"
     -e POSTGRES_USER="deadbolt_admin"
     -e POSTGRES_DB="deadbolt_staging"
   )
@@ -232,7 +240,7 @@ if [[ "$MODE" == "drill" ]]; then
   log "Waiting for PostgreSQL archive recovery and promotion..."
   PROMOTED=false
   for i in $(seq 1 45); do
-    STATUS=$(docker exec "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT pg_is_in_recovery();" 2>/dev/null || echo "starting")
+    STATUS=$(docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT pg_is_in_recovery();" 2>/dev/null || echo "starting")
     if [[ "$STATUS" == "f" ]]; then
       PROMOTED=true
       log "Recovery completed! PostgreSQL promoted to primary ready state."
@@ -251,16 +259,20 @@ if [[ "$MODE" == "drill" ]]; then
 
   # Execute smoke queries
   log "Executing smoke validation queries on restored database..."
-  QUERY_RES=$(docker exec "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT 1;" 2>/dev/null || echo "")
+  QUERY_RES=$(docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT 1;" 2>/dev/null || echo "")
   if [[ "$QUERY_RES" != "1" ]]; then
     err "RECOVERY DRILL FAILED: Smoke query SELECT 1 returned unexpected result: '$QUERY_RES'!"
     exit 1
   fi
 
   log "Smoke check passed: SELECT 1 succeeded."
-  if docker exec "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "\dt goose_db_version" 2>/dev/null | grep -q "goose_db_version"; then
-    MIGRATIONS=$(docker exec "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT count(*) FROM goose_db_version;" 2>/dev/null || echo "0")
+  if docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "\dt goose_db_version" 2>/dev/null | grep -q "goose_db_version"; then
+    MIGRATIONS=$(docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT count(*) FROM goose_db_version;" 2>/dev/null || echo "0")
     log "Smoke check passed: Verified schema version history ($MIGRATIONS applied migrations found)."
+  fi
+  if docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "\dt drill_verification" 2>/dev/null | grep -q "drill_verification"; then
+    VERIFIED_COUNT=$(docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT count(*) FROM drill_verification WHERE id = 2;" 2>/dev/null || echo "0")
+    log "Smoke check passed: Verified WAL replayed record ($VERIFIED_COUNT replayed record(s) found)."
   fi
 
   log "================================================================================"
@@ -289,7 +301,7 @@ elif [[ "$MODE" == "destructive" ]]; then
   log "Replacing persistent data in $LIVE_VOLUME_NAME with recovered state..."
   docker run --rm \
     -v "${LIVE_VOLUME_NAME}":/dest \
-    -v "$TARGET_DATA_DIR":/src \
+    -v "$RECOVERED_ROOT":/src \
     alpine sh -c "rm -rf /dest/* && cp -a /src/* /dest/ && chown -R 999:999 /dest"
 
   log "Restarting staging PostgreSQL container..."
@@ -298,7 +310,7 @@ elif [[ "$MODE" == "destructive" ]]; then
   log "Waiting for staging PostgreSQL to complete archive recovery..."
   PROMOTED=false
   for i in $(seq 1 60); do
-    STATUS=$(docker exec "$LIVE_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT pg_is_in_recovery();" 2>/dev/null || echo "starting")
+    STATUS=$(docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD}" "$LIVE_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT pg_is_in_recovery();" 2>/dev/null || echo "starting")
     if [[ "$STATUS" == "f" ]]; then
       PROMOTED=true
       break

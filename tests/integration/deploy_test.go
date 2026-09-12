@@ -1502,7 +1502,20 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 		t.Fatalf("failed to insert wal record: %v, %s", err, string(out))
 	}
 
-	time.Sleep(2 * time.Second)
+	// Poll until the switched WAL segment is archived into archiveDir
+	walArchived := false
+	for i := 0; i < 20; i++ {
+		matches, _ := filepath.Glob(filepath.Join(archiveDir, "0000*"))
+		if len(matches) > 0 {
+			walArchived = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !walArchived {
+		t.Fatalf("expected switched WAL segment to be archived in %s", archiveDir)
+	}
+
 	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
 
 	// Execute restore-staging-db.sh in default --drill mode
@@ -1519,6 +1532,9 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 	}
 	if !strings.Contains(string(drillOut), "ISOLATED RECOVERY DRILL COMPLETED SUCCESSFULLY") {
 		t.Fatalf("expected successful drill marker, got: %s", string(drillOut))
+	}
+	if !strings.Contains(string(drillOut), "Verified WAL replayed record") {
+		t.Fatalf("expected replayed WAL verification, got: %s", string(drillOut))
 	}
 	t.Log("Live container restore drill passed: WAL archives successfully replayed to consistent primary state.")
 }
