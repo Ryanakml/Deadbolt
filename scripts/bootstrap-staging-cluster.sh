@@ -31,6 +31,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
   DATABASE_URL="postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock" \
   MIGRATOR_DATABASE_URL="postgres://deadbolt_migrator:mock_migrator_password@localhost:5432/mock" \
   SYSTEM_DATABASE_URL="postgres://deadbolt_system:mock_system_password@localhost:5432/mock" \
+  DEADBOLT_POSTGRES_IMAGE="ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee" \
   DEADBOLT_IMAGE="ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee" \
   DEADBOLT_OIDC_ISSUER="https://mock-issuer.com" \
   DEADBOLT_OIDC_CLIENT_ID="mock_client_id" \
@@ -69,19 +70,46 @@ for var in DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIM
   fi
 done
 
+DEADBOLT_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
+if [[ -z "$DEADBOLT_POSTGRES_IMAGE" ]]; then
+  err "DEADBOLT_POSTGRES_IMAGE is required (format: ghcr.io/ryanakml/deadbolt/postgres@sha256:...)"
+  exit 1
+fi
+
+# Validate database connection URL against expected username and password
+validate_db_url() {
+  local url_name="$1"
+  local url_val="$2"
+  local expected_user="$3"
+  local expected_pass="$4"
+
+  local stripped="${url_val#*://}"
+  if [[ "$stripped" != *"@"* ]]; then
+    err "PASSWORD CONSISTENCY FAILURE: Malformed database URL $url_name lacks user:password authority!"
+    exit 1
+  fi
+  local userinfo="${stripped%%@*}"
+  local user="${userinfo%%:*}"
+  local pass="${userinfo#*:}"
+
+  if [[ "$user" != "$expected_user" ]]; then
+    err "PASSWORD CONSISTENCY FAILURE: $url_name user is '$user', expected '$expected_user'!"
+    exit 1
+  fi
+
+  local decoded_pass
+  decoded_pass=$(printf '%b' "${pass//%/\\x}" 2>/dev/null || echo "$pass")
+
+  if [[ "$pass" != "$expected_pass" && "$decoded_pass" != "$expected_pass" ]]; then
+    err "PASSWORD CONSISTENCY FAILURE: Password in $url_name does not match $expected_user role password!"
+    exit 1
+  fi
+}
+
 # Validate password consistency between URLs and role passwords
-if [[ "$MIGRATOR_DATABASE_URL" != *":${DEADBOLT_MIGRATOR_PASSWORD}@"* ]]; then
-  err "PASSWORD CONSISTENCY FAILURE: Password in MIGRATOR_DATABASE_URL does not match DEADBOLT_MIGRATOR_PASSWORD!"
-  exit 1
-fi
-if [[ "$DATABASE_URL" != *":${DEADBOLT_RUNTIME_PASSWORD}@"* ]]; then
-  err "PASSWORD CONSISTENCY FAILURE: Password in DATABASE_URL does not match DEADBOLT_RUNTIME_PASSWORD!"
-  exit 1
-fi
-if [[ "$SYSTEM_DATABASE_URL" != *":${DEADBOLT_SYSTEM_PASSWORD}@"* ]]; then
-  err "PASSWORD CONSISTENCY FAILURE: Password in SYSTEM_DATABASE_URL does not match DEADBOLT_SYSTEM_PASSWORD!"
-  exit 1
-fi
+validate_db_url "MIGRATOR_DATABASE_URL" "$MIGRATOR_DATABASE_URL" "deadbolt_migrator" "$DEADBOLT_MIGRATOR_PASSWORD"
+validate_db_url "DATABASE_URL" "$DATABASE_URL" "deadbolt_runtime" "$DEADBOLT_RUNTIME_PASSWORD"
+validate_db_url "SYSTEM_DATABASE_URL" "$SYSTEM_DATABASE_URL" "deadbolt_system" "$DEADBOLT_SYSTEM_PASSWORD"
 
 if [[ -z "${DEADBOLT_STORAGE_S3_BUCKET:-}" && -z "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
   err "Neither DEADBOLT_STORAGE_S3_BUCKET nor DEADBOLT_WAL_ARCHIVE_DIR is configured for backups!"
@@ -89,8 +117,11 @@ if [[ -z "${DEADBOLT_STORAGE_S3_BUCKET:-}" && -z "${DEADBOLT_WAL_ARCHIVE_DIR:-}"
 fi
 
 # 3. Bootstrap data infrastructure: PostgreSQL & NATS
+log "Pulling immutable postgres image by digest: $DEADBOLT_POSTGRES_IMAGE"
+docker pull "$DEADBOLT_POSTGRES_IMAGE"
+
 log "Bootstrapping data infrastructure (PostgreSQL & NATS)..."
-docker compose -p deadbolt-staging -f "$COMPOSE_FILE" up -d --build postgres nats
+docker compose -p deadbolt-staging -f "$COMPOSE_FILE" up -d postgres nats
 
 log "Waiting for PostgreSQL service to report healthy..."
 PG_HEALTHY=false
@@ -118,4 +149,10 @@ log "Establishing first verified base backup and WAL archive..."
 log "Running fail-closed backup readiness verification..."
 ./scripts/check-backup-readiness.sh
 
-log "SUCCESS: Clean staging cluster data infrastructure and backup baseline established."
+# 6. Install scheduled daily base backup cron with bounded 14-day retention
+log "Configuring scheduled daily base backup maintenance (14-day retention)..."
+if [[ -f "./scripts/setup-backup-cron.sh" ]]; then
+  ./scripts/setup-backup-cron.sh || true
+fi
+
+log "SUCCESS: Clean staging cluster data infrastructure, backup baseline, and recurring maintenance established."

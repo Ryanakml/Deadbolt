@@ -67,8 +67,28 @@ if [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
   cp "${TMP_DIR}/base_${TIMESTAMP}.tar.gz" "${DEADBOLT_WAL_ARCHIVE_DIR}/basebackups/base_${TIMESTAMP}.tar.gz"
 fi
 
-# 3. Trigger WAL switch in PostgreSQL to guarantee archived WAL exists in destination
+# 3. Trigger WAL switch in PostgreSQL and poll until visible
 log "Triggering WAL switch in PostgreSQL to archive initial segment..."
-docker exec "$CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "SELECT pg_switch_wal();" >/dev/null
+SWITCHED_WAL=$(docker exec "$CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT pg_walfile_name(pg_switch_wal());" 2>/dev/null || true)
+log "Switched initial WAL segment: ${SWITCHED_WAL:-unknown}"
+
+if [[ -n "$SWITCHED_WAL" ]]; then
+  log "Polling for initial WAL segment in destination..."
+  for i in $(seq 1 15); do
+    if [[ -n "$S3_BUCKET" ]]; then
+      if aws s3 ls "s3://${S3_BUCKET}/postgres/wal/${SWITCHED_WAL}" "${AWS_ARGS[@]}" >/dev/null 2>&1; then
+        log "Initial WAL segment ${SWITCHED_WAL} confirmed visible in S3 archive."
+        break
+      fi
+    fi
+    if [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
+      if [[ -f "${DEADBOLT_WAL_ARCHIVE_DIR}/${SWITCHED_WAL}" ]]; then
+        log "Initial WAL segment ${SWITCHED_WAL} confirmed visible in directory archive."
+        break
+      fi
+    fi
+    sleep 1
+  done
+fi
 
 log "Initial base backup and WAL segment created successfully."

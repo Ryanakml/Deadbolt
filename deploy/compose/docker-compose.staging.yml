@@ -11,10 +11,7 @@ volumes:
 
 services:
   postgres:
-    build:
-      context: ../..
-      dockerfile: deploy/Dockerfile.postgres
-    image: ${DEADBOLT_POSTGRES_IMAGE:-deadbolt-staging-postgres:18}
+    image: ${DEADBOLT_POSTGRES_IMAGE:?Required immutable postgres image digest}
     container_name: deadbolt-staging-postgres
     restart: unless-stopped
     networks:

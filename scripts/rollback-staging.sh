@@ -87,7 +87,7 @@ log "Readiness verified on restored container."
 if [[ -f "scripts/reload-caddy.sh" ]]; then
   log "Switching Caddy edge route to port $RESTORE_PORT..."
   export DEADBOLT_UPSTREAM_PORT="$RESTORE_PORT"
-  ./scripts/reload-caddy.sh
+  ./scripts/reload-caddy.sh "$RESTORE_PORT"
 fi
 
 # Stop the faulty container in old slot

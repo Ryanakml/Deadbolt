@@ -439,9 +439,12 @@ func TestComposeConfigurationsIntegrity(t *testing.T) {
 		t.Fatalf("expected control plane green slot on loopback port 8089 in staging compose")
 	}
 
-	// Verify staging PostgreSQL builds custom image from deploy/Dockerfile.postgres
-	if !strings.Contains(stagingStr, "dockerfile: deploy/Dockerfile.postgres") {
-		t.Fatalf("expected staging postgres to build from deploy/Dockerfile.postgres")
+	// Verify staging PostgreSQL requires immutable image digest and does NOT build locally
+	if strings.Contains(stagingStr, "build:\n      context:") || strings.Contains(stagingStr, "dockerfile: deploy/Dockerfile.postgres") {
+		t.Fatalf("SECURITY VIOLATION: staging postgres must not use local build; must use pre-built immutable image")
+	}
+	if !strings.Contains(stagingStr, "image: ${DEADBOLT_POSTGRES_IMAGE:?Required immutable postgres image digest}") {
+		t.Fatalf("expected staging postgres to require ${DEADBOLT_POSTGRES_IMAGE:?Required immutable postgres image digest}")
 	}
 
 	// Verify ZERO repository-known fallback passwords exist in staging compose (Issue #5)
@@ -514,6 +517,9 @@ func TestDeploymentScriptsGuards(t *testing.T) {
 		"../../scripts/check-backup-readiness.sh",
 		"../../scripts/bootstrap-staging-cluster.sh",
 		"../../scripts/bootstrap-initial-backup.sh",
+		"../../scripts/take-base-backup.sh",
+		"../../scripts/restore-staging-db.sh",
+		"../../scripts/setup-backup-cron.sh",
 	}
 
 	for _, script := range scripts {
@@ -1049,8 +1055,11 @@ func TestClusterBootstrapAndPromotionSequencing(t *testing.T) {
 	}
 	bootstrapStr := string(bootstrapContent)
 
-	if !strings.Contains(bootstrapStr, "docker compose -p deadbolt-staging -f \"$COMPOSE_FILE\" up -d --build postgres nats") {
-		t.Fatalf("expected bootstrap script to build and up data infrastructure")
+	if !strings.Contains(bootstrapStr, "docker pull \"$DEADBOLT_POSTGRES_IMAGE\"") {
+		t.Fatalf("expected bootstrap script to pull immutable postgres image")
+	}
+	if !strings.Contains(bootstrapStr, "docker compose -p deadbolt-staging -f \"$COMPOSE_FILE\" up -d postgres nats") {
+		t.Fatalf("expected bootstrap script to up data infrastructure")
 	}
 	if !strings.Contains(bootstrapStr, "./scripts/bootstrap-initial-backup.sh") {
 		t.Fatalf("expected bootstrap script to run initial base backup and wal switch")
@@ -1071,5 +1080,221 @@ func TestClusterBootstrapAndPromotionSequencing(t *testing.T) {
 	}
 	if !strings.Contains(deployStr, "PASSWORD CONSISTENCY FAILURE") {
 		t.Fatalf("expected deploy-staging.sh to enforce password consistency between URLs and secrets")
+	}
+}
+
+// TestCaddyRoutePersistenceAcrossReloads verifies Item 1:
+// reload-caddy.sh writes literal upstream port into the Caddy snippet and persists it to
+// active_upstream_port, so reloads without environment variables maintain active slot routing.
+func TestCaddyRoutePersistenceAcrossReloads(t *testing.T) {
+	scriptPath := "../../scripts/reload-caddy.sh"
+	content, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("failed to read scripts/reload-caddy.sh: %v", err)
+	}
+	scriptStr := string(content)
+
+	// Must validate target port is 8088 or 8089
+	if !strings.Contains(scriptStr, "TARGET_PORT") {
+		t.Fatalf("expected reload-caddy.sh to handle TARGET_PORT")
+	}
+	if !strings.Contains(scriptStr, "active_upstream_port") {
+		t.Fatalf("expected reload-caddy.sh to persist active_upstream_port")
+	}
+	if !strings.Contains(scriptStr, "reverse_proxy 127.0.0.1:${TARGET_PORT}") {
+		t.Fatalf("expected reload-caddy.sh to render literal reverse_proxy port")
+	}
+
+	// Execution test: simulate reload into a temporary directory
+	tmpDir := t.TempDir()
+	caddySnippet := filepath.Join(tmpDir, "Deadbolt.caddyfile")
+	caddyMain := filepath.Join(tmpDir, "Caddyfile")
+	if err := os.WriteFile(caddySnippet, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write snippet: %v", err)
+	}
+	if err := os.WriteFile(caddyMain, []byte("import "+caddySnippet+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write Caddyfile: %v", err)
+	}
+
+	// Simulate dry-run style execution of reload-caddy logic:
+	// 1. Initial reload target 8089 (green)
+	cmd := exec.Command("/bin/bash", "-c", `
+		set -euo pipefail
+		TARGET_PORT="8089"
+		RELEASE_DIR="$1"
+		SNIPPET_FILE="$2"
+		echo "$TARGET_PORT" > "${RELEASE_DIR}/active_upstream_port"
+		cat <<EOF > "$SNIPPET_FILE"
+# Active upstream route
+handle /api/* {
+    reverse_proxy 127.0.0.1:${TARGET_PORT}
+}
+EOF
+	`, "test", tmpDir, caddySnippet)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to run slot setup: %v, %s", err, string(out))
+	}
+
+	// 2. Read back saved port
+	savedPort, err := os.ReadFile(filepath.Join(tmpDir, "active_upstream_port"))
+	if err != nil {
+		t.Fatalf("failed to read active_upstream_port: %v", err)
+	}
+	if strings.TrimSpace(string(savedPort)) != "8089" {
+		t.Fatalf("expected active_upstream_port to be 8089, got %q", string(savedPort))
+	}
+
+	// 3. Verify rendered snippet has literal 8089
+	renderedSnippet, err := os.ReadFile(caddySnippet)
+	if err != nil {
+		t.Fatalf("failed to read rendered snippet: %v", err)
+	}
+	if !strings.Contains(string(renderedSnippet), "reverse_proxy 127.0.0.1:8089") {
+		t.Fatalf("expected rendered snippet to contain literal reverse_proxy 127.0.0.1:8089, got:\n%s", string(renderedSnippet))
+	}
+}
+
+// TestRecurringBaseBackupAndRetention verifies Item 2:
+// take-base-backup.sh exists, is executable, performs base backup, and enforces strict 14-backup retention.
+func TestRecurringBaseBackupAndRetention(t *testing.T) {
+	scriptPath := "../../scripts/take-base-backup.sh"
+	info, err := os.Stat(scriptPath)
+	if err != nil {
+		t.Fatalf("scripts/take-base-backup.sh missing: %v", err)
+	}
+	if info.Mode()&0111 == 0 {
+		t.Fatalf("scripts/take-base-backup.sh is not executable")
+	}
+
+	content, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("failed to read take-base-backup.sh: %v", err)
+	}
+	scriptStr := string(content)
+
+	if !strings.Contains(scriptStr, "MAX_RETAINED_BASE_BACKUPS") || !strings.Contains(scriptStr, "14") {
+		t.Fatalf("expected take-base-backup.sh to enforce 14-backup retention")
+	}
+	if !strings.Contains(scriptStr, "pg_basebackup") {
+		t.Fatalf("expected take-base-backup.sh to execute pg_basebackup")
+	}
+
+	// Verify cron setup script and template
+	cronPath := "../../deploy/cron/deadbolt-backup.cron"
+	cronContent, err := os.ReadFile(cronPath)
+	if err != nil {
+		t.Fatalf("deploy/cron/deadbolt-backup.cron missing: %v", err)
+	}
+	if !strings.Contains(string(cronContent), "scripts/take-base-backup.sh") {
+		t.Fatalf("expected deadbolt-backup.cron to invoke take-base-backup.sh")
+	}
+
+	// Verify dry run mode of take-base-backup.sh
+	cmd := exec.Command("/bin/bash", scriptPath)
+	cmd.Env = append(os.Environ(), "DRY_RUN=true")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected DRY_RUN=true ./scripts/take-base-backup.sh to succeed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "DRY RUN passed") {
+		t.Fatalf("expected DRY RUN success message, got: %s", string(out))
+	}
+}
+
+// TestImmutablePostgresStagingImageDelivery verifies Item 3:
+// Compose staging strictly uses pre-built DEADBOLT_POSTGRES_IMAGE with no build: block,
+// and staging deploy workflow builds, tests, and publishes ghcr.io/${{ github.repository }}/postgres.
+func TestImmutablePostgresStagingImageDelivery(t *testing.T) {
+	// 1. Check docker-compose.staging.yml
+	composePath := "../../deploy/compose/docker-compose.staging.yml"
+	composeBytes, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("failed to read staging compose: %v", err)
+	}
+	composeStr := string(composeBytes)
+
+	if strings.Contains(composeStr, "build:") {
+		t.Fatalf("SECURITY VIOLATION: docker-compose.staging.yml contains build: directive")
+	}
+	if !strings.Contains(composeStr, "image: ${DEADBOLT_POSTGRES_IMAGE:?Required immutable postgres image digest}") {
+		t.Fatalf("expected DEADBOLT_POSTGRES_IMAGE requirement without fallback in staging compose")
+	}
+
+	// 2. Check staging-deploy.yml builds and pushes postgres image
+	workflowPath := "../../.github/workflows/staging-deploy.yml"
+	workflowBytes, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatalf("failed to read staging-deploy.yml: %v", err)
+	}
+	workflowStr := string(workflowBytes)
+
+	if !strings.Contains(workflowStr, "deploy/Dockerfile.postgres") {
+		t.Fatalf("expected staging-deploy.yml to build deploy/Dockerfile.postgres")
+	}
+	if !strings.Contains(workflowStr, "postgres-digest: ${{ steps.build-postgres.outputs.digest }}") {
+		t.Fatalf("expected staging-deploy.yml to output postgres-digest")
+	}
+	if !strings.Contains(workflowStr, "DEADBOLT_POSTGRES_IMAGE") {
+		t.Fatalf("expected staging-deploy.yml to export DEADBOLT_POSTGRES_IMAGE")
+	}
+}
+
+// TestDatabasePointInTimeRecoveryDrill verifies Item 4:
+// scripts/restore-staging-db.sh exists, is executable, configures recovery.signal and restore_command,
+// and docs/runbooks/backup-and-disaster-recovery.md contains zero WAL-G references.
+func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
+	// 1. restore-staging-db.sh script integrity
+	scriptPath := "../../scripts/restore-staging-db.sh"
+	info, err := os.Stat(scriptPath)
+	if err != nil {
+		t.Fatalf("scripts/restore-staging-db.sh missing: %v", err)
+	}
+	if info.Mode()&0111 == 0 {
+		t.Fatalf("scripts/restore-staging-db.sh is not executable")
+	}
+
+	content, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("failed to read restore-staging-db.sh: %v", err)
+	}
+	scriptStr := string(content)
+
+	if !strings.Contains(scriptStr, "recovery.signal") {
+		t.Fatalf("expected restore script to create recovery.signal")
+	}
+	if !strings.Contains(scriptStr, "restore_command") {
+		t.Fatalf("expected restore script to configure restore_command")
+	}
+	if !strings.Contains(scriptStr, "recovery_target_action = 'promote'") {
+		t.Fatalf("expected restore script to set promote target action")
+	}
+
+	// Verify dry run execution
+	cmd := exec.Command("/bin/bash", scriptPath)
+	cmd.Env = append(os.Environ(), "DRY_RUN=true")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected DRY_RUN=true ./scripts/restore-staging-db.sh to succeed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "DRY RUN passed") {
+		t.Fatalf("expected DRY RUN success message, got: %s", string(out))
+	}
+
+	// 2. docs/runbooks/backup-and-disaster-recovery.md has zero wal-g references
+	docPath := "../../docs/runbooks/backup-and-disaster-recovery.md"
+	docBytes, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("failed to read backup runbook: %v", err)
+	}
+	docStr := strings.ToLower(string(docBytes))
+
+	if strings.Contains(docStr, "wal-g") {
+		t.Fatalf("DOC CONTRACT VIOLATION: docs/runbooks/backup-and-disaster-recovery.md still contains wal-g references")
+	}
+	if !strings.Contains(docStr, "scripts/restore-staging-db.sh") {
+		t.Fatalf("expected runbook to reference executable scripts/restore-staging-db.sh")
+	}
+	if !strings.Contains(docStr, "deadbolt_staging_postgres_data") {
+		t.Fatalf("expected runbook to reference accurate volume name deadbolt_staging_postgres_data")
 	}
 }

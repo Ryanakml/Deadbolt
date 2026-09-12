@@ -16,28 +16,33 @@ Deadbolt maintains an independent database persistence layer on PostgreSQL 18. I
 
 ### 2.1 Continuous WAL Archiving
 
-PostgreSQL is configured to ship closed WAL segments directly to the external S3 bucket under the prefix `s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/`.
+PostgreSQL 18 is configured to ship closed WAL segments directly to the external S3 bucket under the prefix `s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/`.
 
-- **Archive Command Configuration (`postgresql.conf`)**:
+- **Archive Command Configuration (`deploy/postgres/postgresql.conf`)**:
   ```ini
   wal_level = replica
   archive_mode = on
-  archive_command = 'envdir /etc/wal-e.d/env wal-g wal-push %p'
+  archive_command = '/usr/local/bin/archive-wal.sh %p %f'
   archive_timeout = 300
   ```
+- **Archiver Implementation**: Uses `deploy/postgres/archive-wal.sh` running in the hardened PostgreSQL image (`deploy/Dockerfile.postgres`). Uploads segments via `aws s3 cp` with retry backoff and fallback local spooling (`/var/lib/postgresql/wal_archive_spool`).
 
-### 2.2 Nightly Base Backups
+### 2.2 Nightly Base Backups & Retention
 
-Nightly full physical base backups are triggered via cron and pushed to:
-`s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/`.
+Nightly physical base backups are created using `scripts/take-base-backup.sh`, scheduled via cron (`deploy/cron/deadbolt-backup.cron` & `scripts/setup-backup-cron.sh`):
 
-- Retention: Last 14 daily base backups retained.
-- WAL segments corresponding to retained base backups are protected from deletion.
+- Destination: `s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/base_<TIMESTAMP>.tar.gz`
+- Bounded Retention: Strict 14-backup retention policy (`RETENTION_COUNT=14`). Backups older than the 14 most recent backups are automatically purged from S3 and local storage.
+- Immediate WAL checkpointing and sync via `pg_backup_stop(wait_for_archive => true)`.
 
 ### 2.3 Volume Independence
 
-- Database files reside in the dedicated Docker named volume `deadbolt_postgres_data`.
-- This volume is never touched, pruned, or shared across projects.
+- Database files reside in the dedicated Docker named volume `deadbolt_staging_postgres_data`.
+- Default staging database: `deadbolt_staging`.
+- Administrative user: `deadbolt_admin`.
+- Application user: `deadbolt_app`.
+- Migration user: `deadbolt_migrator`.
+- This volume is never touched, pruned, or shared across projects or with FlowDesk.
 
 ---
 
@@ -64,69 +69,83 @@ If the S3 backup target is unreachable or the latest backup is stale, deployment
 
 ## 4. Disaster Recovery & Restore Drill Procedure
 
-A disaster recovery drill must be executed periodically on an isolated environment (never on the live staging host).
+Deadbolt provides an executable disaster recovery script: `scripts/restore-staging-db.sh`.
+A disaster recovery drill must be executed periodically on an isolated environment (never blindly overwriting live production).
 
-### Step-by-Step Restoration (PITR)
+### Automated Restore Script Execution
 
-#### Step 1: Provision Clean Recovery Container
-
-Spin up a recovery container with an empty target data volume:
+To perform a restore drill or full disaster recovery:
 
 ```bash
-docker run -d --name deadbolt-recovery \
-  -v deadbolt_recovery_data:/var/lib/postgresql \
-  -e POSTGRES_PASSWORD="${RECOVERY_DB_PASSWORD}" \
-  postgres:18-bookworm
+# Optional PITR target timestamp (e.g. '2026-09-12 04:00:00 UTC')
+DEADBOLT_RECOVERY_TARGET_TIME="2026-09-12 04:00:00 UTC" ./scripts/restore-staging-db.sh
 ```
 
-#### Step 2: Fetch Base Backup
+### Manual Step-by-Step Restoration (PITR via AWS CLI)
 
-Stop PostgreSQL in the recovery container and extract the base backup into the data directory:
+#### Step 1: Provision Clean Recovery Workspace
+
+Fetch the latest physical base backup from S3:
 
 ```bash
-docker stop deadbolt-recovery
-wal-g backup-fetch /var/lib/postgresql/data LATEST
+TMP_DIR=$(mktemp -d)
+LATEST_BASE=$(aws s3 ls "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/" | grep -E '\.tar\.gz$' | tail -n 1 | awk '{print $4}')
+aws s3 cp "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/${LATEST_BASE}" "${TMP_DIR}/base.tar.gz"
+mkdir -p "${TMP_DIR}/recovered_data"
+tar -xzf "${TMP_DIR}/base.tar.gz" -C "${TMP_DIR}/recovered_data"
 ```
 
-#### Step 3: Configure Recovery Signal & WAL Replay
+#### Step 2: Configure Recovery Signal & WAL Replay for PostgreSQL 18
 
-Create `/var/lib/postgresql/data/recovery.signal` and configure `restore_command`:
+Create `recovery.signal` and configure `restore_command` in `postgresql.auto.conf`:
 
 ```bash
-touch /var/lib/postgresql/data/recovery.signal
-cat <<EOF >> /var/lib/postgresql/data/postgresql.auto.conf
-restore_command = 'wal-g wal-fetch %f %p'
-recovery_target_time = '2026-09-11 12:00:00 UTC'
+touch "${TMP_DIR}/recovered_data/recovery.signal"
+cat <<EOF >> "${TMP_DIR}/recovered_data/postgresql.auto.conf"
+restore_command = 'aws s3 cp s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/%f %p'
 recovery_target_action = 'promote'
+recovery_target_time = '2026-09-12 04:00:00 UTC'
 EOF
 ```
 
-#### Step 4: Start Instance & Verify Schema
+#### Step 3: Swap Staging Data Volume
 
-Start the container and monitor recovery logs:
+Stop the staging postgres container and copy the extracted recovery state into the staging volume:
 
 ```bash
-docker start deadbolt-recovery
-docker logs -f deadbolt-recovery
+docker compose -f deploy/compose/docker-compose.staging.yml stop postgres
+docker run --rm -v deadbolt_staging_postgres_data:/dest -v "${TMP_DIR}/recovered_data":/src alpine sh -c "rm -rf /dest/* && cp -a /src/* /dest/"
+docker compose -f deploy/compose/docker-compose.staging.yml up -d postgres
 ```
 
-Verify that PostgreSQL logs indicate: `database system was not properly shut down; automatic recovery in progress`, followed by `consistent recovery state reached` and `database system is ready to accept connections`.
+#### Step 4: Monitor Recovery Logs
+
+Monitor PostgreSQL container logs during replay:
+
+```bash
+docker compose -f deploy/compose/docker-compose.staging.yml logs -f postgres
+```
+
+Verify that PostgreSQL logs indicate:
+
+1. `starting archive recovery`
+2. `restored log file ... from archive`
+3. `recovery stopping at ..., reached recovery target time`
+4. `archive recovery complete; database system is ready to accept connections`
 
 #### Step 5: Smoke Check Restored Data
 
-Run verification queries:
+Run verification queries against `deadbolt_staging`:
 
 ```bash
-docker exec -i deadbolt-recovery psql -U deadbolt -d deadbolt_control_plane -c \
+docker exec -i deadbolt-staging-postgres psql -U deadbolt_admin -d deadbolt_staging -c \
   "SELECT version_id, is_applied FROM goose_db_version ORDER BY id DESC LIMIT 5;"
 ```
 
-#### Step 6: Cleanup Recovery Container
+#### Step 6: Cleanup Temporary Files
 
 ```bash
-docker stop deadbolt-recovery
-docker rm deadbolt-recovery
-docker volume rm deadbolt_recovery_data
+rm -rf "$TMP_DIR"
 ```
 
 ---

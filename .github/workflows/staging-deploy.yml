@@ -21,6 +21,7 @@ jobs:
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
       image-ref: ${{ steps.meta.outputs.tags }}
+      postgres-digest: ${{ steps.build-postgres.outputs.digest }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -64,9 +65,35 @@ jobs:
           provenance: mode=max
           sbom: true
 
-      - name: Record Immutable Digest Output
+      - name: Record Immutable Control Plane Digest Output
         run: |
           echo "Published immutable control-plane artifact: ghcr.io/${{ github.repository }}/control-plane@${{ steps.build.outputs.digest }}"
+
+      - name: Generate Docker Metadata for Postgres
+        id: meta-postgres
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.7.0
+        with:
+          images: ghcr.io/${{ github.repository }}/postgres
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and Push Linux amd64 Postgres Archiver Image
+        id: build-postgres
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.15.0
+        with:
+          context: .
+          file: deploy/Dockerfile.postgres
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-postgres.outputs.tags }}
+          labels: ${{ steps.meta-postgres.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record Immutable Postgres Digest Output
+        run: |
+          echo "Published immutable postgres artifact: ghcr.io/${{ github.repository }}/postgres@${{ steps.build-postgres.outputs.digest }}"
 
   deploy-staging:
     name: Deploy to Shared EC2 Staging
@@ -99,6 +126,7 @@ jobs:
           DEPLOY_KEY: ${{ secrets.DEADBOLT_DEPLOY_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.DEADBOLT_DEPLOY_KNOWN_HOSTS }}
           IMAGE_DIGEST: ghcr.io/${{ github.repository }}/control-plane@${{ needs.build-and-publish.outputs.image-digest }}
+          POSTGRES_DIGEST: ghcr.io/${{ github.repository }}/postgres@${{ needs.build-and-publish.outputs.postgres-digest }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
           mkdir -p ~/.ssh
@@ -124,4 +152,4 @@ jobs:
             "$DEPLOY_USER@$DEPLOY_HOST:/opt/deadbolt/"
 
           # Trigger remote deployment orchestration with explicit host configuration source
-          $SSH_CMD "cd /opt/deadbolt && DEADBOLT_CONFIG_FILE='/etc/deadbolt/staging.env' DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"
+          $SSH_CMD "cd /opt/deadbolt && DEADBOLT_CONFIG_FILE='/etc/deadbolt/staging.env' DEADBOLT_POSTGRES_IMAGE='$POSTGRES_DIGEST' DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"

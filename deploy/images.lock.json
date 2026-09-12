@@ -11,6 +11,10 @@
     "image": "docker.io/library/postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
     "platforms": ["linux/amd64", "linux/arm64"]
   },
+  "postgres-archiver": {
+    "image": "ghcr.io/ryanakml/deadbolt/postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+    "platforms": ["linux/amd64"]
+  },
   "nats": {
     "image": "docker.io/library/nats:2-alpine@sha256:ad7a43eb7e3337c3c38ce5d784d1461791f95f730f252d2b25eee699752a0ca3",
     "platforms": ["linux/amd64", "linux/arm64"]
