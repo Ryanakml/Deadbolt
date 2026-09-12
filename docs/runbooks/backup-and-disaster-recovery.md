@@ -70,15 +70,35 @@ If the S3 backup target is unreachable or the latest backup is stale, deployment
 ## 4. Disaster Recovery & Restore Drill Procedure
 
 Deadbolt provides an executable disaster recovery script: `scripts/restore-staging-db.sh`.
-A disaster recovery drill must be executed periodically on an isolated environment (never blindly overwriting live production).
+In adherence to architectural invariants, the tool provides two distinct, explicitly guarded operational modes:
 
-### Automated Restore Script Execution
+1. **Safe Isolated Recovery Drill (Default)**:
+   - Evaluates recoverability without stopping live services or altering persistent staging state.
+   - Spins up an isolated recovery container (`deadbolt-recovery-drill-postgres`) attached to `--network none` and an ephemeral volume.
+   - Replays WAL archives up to the specified target time (or latest), verifies database promotion, runs smoke queries, and cleans up.
+   - Live staging services (`deadbolt-staging-postgres`) and data volume (`deadbolt_staging_postgres_data`) remain 100% untouched.
 
-To perform a restore drill or full disaster recovery:
+2. **Destructive Disaster Recovery (Live Cluster)**:
+   - For real disaster recovery when active staging persistence must be replaced.
+   - Requires explicit `--destructive-staging-restore` flag and `FORCE_RESTORE=true` environment variable.
+
+### Automated Execution
+
+#### A. Running Safe Isolated Recovery Drill (Default)
 
 ```bash
-# Optional PITR target timestamp (e.g. '2026-09-12 04:00:00 UTC')
-DEADBOLT_RECOVERY_TARGET_TIME="2026-09-12 04:00:00 UTC" ./scripts/restore-staging-db.sh
+# Run isolated drill against latest base backup + WAL archive
+./scripts/restore-staging-db.sh
+
+# Or drill recovery to a specific point in time:
+DEADBOLT_RECOVERY_TARGET_TIME="2026-09-12 04:00:00 UTC" ./scripts/restore-staging-db.sh --drill
+```
+
+#### B. Executing Live Disaster Recovery (Destructive)
+
+```bash
+# Explicit destructive restoration into active staging volume
+FORCE_RESTORE=true ./scripts/restore-staging-db.sh --destructive-staging-restore
 ```
 
 ### Manual Step-by-Step Restoration (PITR via AWS CLI)
@@ -93,6 +113,7 @@ LATEST_BASE=$(aws s3 ls "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups
 aws s3 cp "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/${LATEST_BASE}" "${TMP_DIR}/base.tar.gz"
 mkdir -p "${TMP_DIR}/recovered_data"
 tar -xzf "${TMP_DIR}/base.tar.gz" -C "${TMP_DIR}/recovered_data"
+chmod 700 "${TMP_DIR}/recovered_data"
 ```
 
 #### Step 2: Configure Recovery Signal & WAL Replay for PostgreSQL 18
@@ -108,9 +129,7 @@ recovery_target_time = '2026-09-12 04:00:00 UTC'
 EOF
 ```
 
-#### Step 3: Swap Staging Data Volume
-
-Stop the staging postgres container and copy the extracted recovery state into the staging volume:
+#### Step 3: Swap Staging Data Volume (Destructive Recovery Only)
 
 ```bash
 docker compose -f deploy/compose/docker-compose.staging.yml stop postgres

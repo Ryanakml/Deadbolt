@@ -25,9 +25,36 @@ if [[ "$TARGET_PORT" != "8088" && "$TARGET_PORT" != "8089" ]]; then
   exit 1
 fi
 
+# Deterministic host configuration loading if DEADBOLT_STAGING_DOMAIN is not provided
+if [[ -z "${DEADBOLT_STAGING_DOMAIN:-}" ]]; then
+  CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
+  if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
+    CONFIG_FILE="/opt/deadbolt/config/staging.env"
+  fi
+  if [[ -f "$CONFIG_FILE" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    set +a
+  fi
+fi
+
+if [[ "$DRY_RUN" != "true" && -z "${DEADBOLT_STAGING_DOMAIN:-}" ]]; then
+  echo "[CADDY_EDGE_ERROR] Required DEADBOLT_STAGING_DOMAIN is missing or empty! Zero invented fallback domains permitted." >&2
+  exit 1
+fi
+
 render_snippet() {
   local target_file="$1"
-  local domain="${DEADBOLT_STAGING_DOMAIN:-staging.deadbolt.cloud}"
+  local domain="${DEADBOLT_STAGING_DOMAIN:-}"
+  if [[ -z "$domain" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      domain="staging-dryrun.internal"
+    else
+      echo "[CADDY_EDGE_ERROR] DEADBOLT_STAGING_DOMAIN is required to render Caddy snippet!" >&2
+      exit 1
+    fi
+  fi
   cat <<EOF > "$target_file"
 # Deadbolt Control Plane Staging Route Snippet (Issue #5)
 # Persisted active upstream route: literal loopback port ${TARGET_PORT}
@@ -99,18 +126,27 @@ fi
 TIMESTAMP="$(date +%Y%m%d%H%M%S)"
 BACKUP_FILE="${CADDYFILE}.bak.${TIMESTAMP}"
 SNIPPET_BACKUP="${ABS_SNIPPET_FILE}.bak.${TIMESTAMP}"
+UPSTREAM_BACKUP="${ACTIVE_UPSTREAM_FILE}.bak.${TIMESTAMP}"
 
-log "Backing up current Caddyfile to: $BACKUP_FILE"
+log "Backing up current Caddyfile and route state..."
 cp "$CADDYFILE" "$BACKUP_FILE"
 if [[ -f "$ABS_SNIPPET_FILE" ]]; then
   cp "$ABS_SNIPPET_FILE" "$SNIPPET_BACKUP"
 fi
+if [[ -f "$ACTIVE_UPSTREAM_FILE" ]]; then
+  cp "$ACTIVE_UPSTREAM_FILE" "$UPSTREAM_BACKUP"
+fi
 
 rollback() {
-  err "Reload failed! Rolling back to: $BACKUP_FILE"
+  err "Reload failed! Rolling back Caddy configuration and upstream state..."
   cp "$BACKUP_FILE" "$CADDYFILE"
   if [[ -f "$SNIPPET_BACKUP" ]]; then
     cp "$SNIPPET_BACKUP" "$ABS_SNIPPET_FILE"
+  fi
+  if [[ -f "$UPSTREAM_BACKUP" ]]; then
+    cp "$UPSTREAM_BACKUP" "$ACTIVE_UPSTREAM_FILE"
+  else
+    rm -f "$ACTIVE_UPSTREAM_FILE"
   fi
   caddy reload --config "$CADDYFILE" --adapter caddyfile || true
   err "Rollback completed."
@@ -119,10 +155,6 @@ rollback() {
 # Render managed snippet with literal validated upstream port
 mkdir -p "$(dirname "$ABS_SNIPPET_FILE")"
 render_snippet "$ABS_SNIPPET_FILE"
-
-# Persist active upstream port to release state
-mkdir -p "$RELEASE_DIR"
-echo "$TARGET_PORT" > "$ACTIVE_UPSTREAM_FILE"
 
 # Remove legacy relative import if present to ensure clean merged config
 sed -i.tmp "\|import deploy/caddy/Deadbolt.caddyfile|d" "$CADDYFILE" 2>/dev/null || true
@@ -150,5 +182,10 @@ if ! caddy reload --config "$CADDYFILE" --adapter caddyfile; then
   rollback
   exit 1
 fi
+
+# Persist active upstream port to release state ONLY after successful reload
+mkdir -p "$RELEASE_DIR"
+echo "$TARGET_PORT" > "$ACTIVE_UPSTREAM_FILE"
+rm -f "$UPSTREAM_BACKUP" 2>/dev/null || true
 
 log "Caddy reload successfully completed with Deadbolt staging upstream persisted to port $TARGET_PORT."

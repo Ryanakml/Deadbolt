@@ -1,6 +1,6 @@
-# Deadbolt Control Plane Staging Route Snippet (Issue #5)
-# Managed configuration state: active upstream port rendered with literal port
-{$DEADBOLT_STAGING_DOMAIN:staging.deadbolt.cloud} {
+# deploy/caddy/Deadbolt.caddyfile
+# Managed reverse proxy snippet for Deadbolt Milestone 0 Staging
+{$DEADBOLT_STAGING_DOMAIN} {
     reverse_proxy 127.0.0.1:8088 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}

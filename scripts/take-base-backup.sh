@@ -108,11 +108,12 @@ if [[ -n "$SWITCHED_WAL" ]]; then
     fi
     sleep 1
   done
-  if [[ "$WAL_VISIBLE" == "true" ]]; then
-    log "Switched WAL segment ${SWITCHED_WAL} confirmed visible in archive."
-  else
-    log "Warning: Switched WAL segment not yet confirmed in archive after 15s; continuous archiving will deliver it."
+  if [[ "$WAL_VISIBLE" != "true" ]]; then
+    err "BACKUP VERIFICATION FAILURE: Switched WAL segment ${SWITCHED_WAL} not confirmed visible in destination archive after 15s polling!"
+    err "PostgreSQL continuous archiver may be stalled or failing off-host transport."
+    exit 1
   fi
+  log "Switched WAL segment ${SWITCHED_WAL} confirmed visible in archive."
 fi
 
 # 5. Bounded retention pruning: retain latest MAX_RETAINED_BASE_BACKUPS (default 14)
@@ -146,4 +147,11 @@ if [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
   fi
 fi
 
-log "SUCCESS: Physical base backup and bounded retention completed successfully."
+# 6. Verify recoverability boundary via check-backup-readiness.sh (fail-closed)
+READINESS_SCRIPT="$(dirname "$0")/check-backup-readiness.sh"
+if [[ -f "$READINESS_SCRIPT" ]]; then
+  log "Executing fail-closed backup readiness verification..."
+  "$READINESS_SCRIPT"
+fi
+
+log "SUCCESS: Physical base backup, bounded retention, and readiness verification completed successfully."

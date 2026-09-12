@@ -149,10 +149,8 @@ log "Establishing first verified base backup and WAL archive..."
 log "Running fail-closed backup readiness verification..."
 ./scripts/check-backup-readiness.sh
 
-# 6. Install scheduled daily base backup cron with bounded 14-day retention
-log "Configuring scheduled daily base backup maintenance (14-day retention)..."
-if [[ -f "./scripts/setup-backup-cron.sh" ]]; then
-  ./scripts/setup-backup-cron.sh || true
-fi
+# 6. Install and verify scheduled daily base backup cron with bounded 14-day retention
+log "Configuring and verifying scheduled daily base backup maintenance (14-day retention)..."
+./scripts/setup-backup-cron.sh
 
 log "SUCCESS: Clean staging cluster data infrastructure, backup baseline, and recurring maintenance established."

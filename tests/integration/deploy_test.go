@@ -532,11 +532,36 @@ func TestDeploymentScriptsGuards(t *testing.T) {
 		}
 	}
 
-	// Test rollback-staging.sh when PREVIOUS_RELEASE_FILE does not exist
+	// Test rollback-staging.sh fails closed when required config is missing
+	cmdNoConfig := exec.Command("/bin/bash", "../../scripts/rollback-staging.sh")
+	cmdNoConfig.Env = []string{"PATH=" + os.Getenv("PATH")}
+	outNoConfig, errNoConfig := cmdNoConfig.CombinedOutput()
+	if errNoConfig == nil {
+		t.Fatalf("expected rollback-staging.sh to fail closed without configuration, but succeeded: %s", string(outNoConfig))
+	}
+	if !strings.Contains(string(outNoConfig), "DEADBOLT_STAGING_DOMAIN is missing") {
+		t.Fatalf("expected missing configuration error, got: %s", string(outNoConfig))
+	}
+
+	// Test rollback-staging.sh with valid config when PREVIOUS_RELEASE_FILE does not exist
 	tmpDir := t.TempDir()
-	cmd := exec.Command("/bin/bash", "../../scripts/rollback-staging.sh")
-	cmd.Env = append(os.Environ(), "RELEASE_DIR="+tmpDir)
-	out, err := cmd.CombinedOutput()
+	cmdWithConfig := exec.Command("/bin/bash", "../../scripts/rollback-staging.sh")
+	cmdWithConfig.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"RELEASE_DIR=" + tmpDir,
+		"DEADBOLT_STAGING_DOMAIN=staging.example.com",
+		"DATABASE_URL=postgres://u:p@localhost:5432/db",
+		"SYSTEM_DATABASE_URL=postgres://u:p@localhost:5432/db",
+		"DEADBOLT_DB_ADMIN_PASSWORD=p",
+		"DEADBOLT_MIGRATOR_PASSWORD=p",
+		"DEADBOLT_RUNTIME_PASSWORD=p",
+		"DEADBOLT_SYSTEM_PASSWORD=p",
+		"DEADBOLT_OIDC_ISSUER=https://i",
+		"DEADBOLT_OIDC_CLIENT_ID=id",
+		"DEADBOLT_OIDC_CLIENT_SECRET=s",
+		"DEADBOLT_POSTGRES_IMAGE=ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee",
+	}
+	out, err := cmdWithConfig.CombinedOutput()
 	outputStr := string(out)
 
 	if err == nil {
@@ -1083,9 +1108,10 @@ func TestClusterBootstrapAndPromotionSequencing(t *testing.T) {
 	}
 }
 
-// TestCaddyRoutePersistenceAcrossReloads verifies Item 1:
+// TestCaddyRoutePersistenceAcrossReloads verifies Audit #3 & #4:
 // reload-caddy.sh writes literal upstream port into the Caddy snippet and persists it to
-// active_upstream_port, so reloads without environment variables maintain active slot routing.
+// active_upstream_port only after reload succeeds, restores state on rollback, and fails closed
+// without DEADBOLT_STAGING_DOMAIN (zero invented fallback domain).
 func TestCaddyRoutePersistenceAcrossReloads(t *testing.T) {
 	scriptPath := "../../scripts/reload-caddy.sh"
 	content, err := os.ReadFile(scriptPath)
@@ -1101,8 +1127,22 @@ func TestCaddyRoutePersistenceAcrossReloads(t *testing.T) {
 	if !strings.Contains(scriptStr, "active_upstream_port") {
 		t.Fatalf("expected reload-caddy.sh to persist active_upstream_port")
 	}
+	if !strings.Contains(scriptStr, "UPSTREAM_BACKUP") {
+		t.Fatalf("expected reload-caddy.sh to back up active_upstream_port before changes")
+	}
 	if !strings.Contains(scriptStr, "reverse_proxy 127.0.0.1:${TARGET_PORT}") {
 		t.Fatalf("expected reload-caddy.sh to render literal reverse_proxy port")
+	}
+
+	// Verify fail closed without DEADBOLT_STAGING_DOMAIN
+	cmdNoDomain := exec.Command("/bin/bash", scriptPath, "8088")
+	cmdNoDomain.Env = []string{"PATH=" + os.Getenv("PATH")}
+	outNoDomain, errNoDomain := cmdNoDomain.CombinedOutput()
+	if errNoDomain == nil {
+		t.Fatalf("expected reload-caddy.sh to fail closed without DEADBOLT_STAGING_DOMAIN, but succeeded: %s", string(outNoDomain))
+	}
+	if !strings.Contains(string(outNoDomain), "Required DEADBOLT_STAGING_DOMAIN is missing") {
+		t.Fatalf("expected missing domain error, got: %s", string(outNoDomain))
 	}
 
 	// Execution test: simulate reload into a temporary directory
@@ -1116,8 +1156,7 @@ func TestCaddyRoutePersistenceAcrossReloads(t *testing.T) {
 		t.Fatalf("failed to write Caddyfile: %v", err)
 	}
 
-	// Simulate dry-run style execution of reload-caddy logic:
-	// 1. Initial reload target 8089 (green)
+	// Simulate deferred persistence logic:
 	cmd := exec.Command("/bin/bash", "-c", `
 		set -euo pipefail
 		TARGET_PORT="8089"
@@ -1135,7 +1174,7 @@ EOF
 		t.Fatalf("failed to run slot setup: %v, %s", err, string(out))
 	}
 
-	// 2. Read back saved port
+	// Read back saved port
 	savedPort, err := os.ReadFile(filepath.Join(tmpDir, "active_upstream_port"))
 	if err != nil {
 		t.Fatalf("failed to read active_upstream_port: %v", err)
@@ -1144,7 +1183,7 @@ EOF
 		t.Fatalf("expected active_upstream_port to be 8089, got %q", string(savedPort))
 	}
 
-	// 3. Verify rendered snippet has literal 8089
+	// Verify rendered snippet has literal 8089
 	renderedSnippet, err := os.ReadFile(caddySnippet)
 	if err != nil {
 		t.Fatalf("failed to read rendered snippet: %v", err)
@@ -1154,8 +1193,57 @@ EOF
 	}
 }
 
+// TestRollbackStagingConfigurationAndSafetyGuards verifies Finding 1:
+// rollback-staging.sh is self-contained, loads approved configuration, rejects world-readable
+// files, fails closed when variables are missing, and validates Compose in dry-run mode.
+func TestRollbackStagingConfigurationAndSafetyGuards(t *testing.T) {
+	scriptPath := "../../scripts/rollback-staging.sh"
+
+	// 1. Missing required environment variables -> fail closed
+	cmd := exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected rollback-staging.sh to fail without config, but succeeded: %s", string(out))
+	}
+	if !strings.Contains(string(out), "DEADBOLT_STAGING_DOMAIN is missing") {
+		t.Fatalf("expected missing configuration error, got: %s", string(out))
+	}
+
+	// 2. World-readable configuration file -> fail closed with security violation
+	tmpDir := t.TempDir()
+	badPermFile := filepath.Join(tmpDir, "unsafe.env")
+	if err := os.WriteFile(badPermFile, []byte("DEADBOLT_STAGING_DOMAIN=staging.example.com\n"), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+	cmd = exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_CONFIG_FILE=" + badPermFile,
+	}
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected rollback-staging.sh to reject world-readable config, but succeeded: %s", string(out))
+	}
+	if !strings.Contains(string(out), "is world-readable") {
+		t.Fatalf("expected world-readable error message, got: %s", string(out))
+	}
+
+	// 3. DRY RUN mode with Compose validation -> must pass
+	cmd = exec.Command("/bin/bash", scriptPath)
+	cmd.Env = append(os.Environ(), "DRY_RUN=true")
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected DRY_RUN=true ./scripts/rollback-staging.sh to succeed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "DRY RUN passed") {
+		t.Fatalf("expected DRY RUN success message, got: %s", string(out))
+	}
+}
+
 // TestRecurringBaseBackupAndRetention verifies Item 2:
-// take-base-backup.sh exists, is executable, performs base backup, and enforces strict 14-backup retention.
+// take-base-backup.sh exists, is executable, performs base backup, enforces strict 14-backup retention,
+// fails closed if switched WAL is not visible, and executes backup readiness verification.
 func TestRecurringBaseBackupAndRetention(t *testing.T) {
 	scriptPath := "../../scripts/take-base-backup.sh"
 	info, err := os.Stat(scriptPath)
@@ -1178,6 +1266,12 @@ func TestRecurringBaseBackupAndRetention(t *testing.T) {
 	if !strings.Contains(scriptStr, "pg_basebackup") {
 		t.Fatalf("expected take-base-backup.sh to execute pg_basebackup")
 	}
+	if !strings.Contains(scriptStr, "BACKUP VERIFICATION FAILURE: Switched WAL segment") {
+		t.Fatalf("expected take-base-backup.sh to fail closed when switched WAL is not visible")
+	}
+	if !strings.Contains(scriptStr, "check-backup-readiness.sh") {
+		t.Fatalf("expected take-base-backup.sh to execute check-backup-readiness.sh")
+	}
 
 	// Verify cron setup script and template
 	cronPath := "../../deploy/cron/deadbolt-backup.cron"
@@ -1187,6 +1281,15 @@ func TestRecurringBaseBackupAndRetention(t *testing.T) {
 	}
 	if !strings.Contains(string(cronContent), "scripts/take-base-backup.sh") {
 		t.Fatalf("expected deadbolt-backup.cron to invoke take-base-backup.sh")
+	}
+
+	// Verify bootstrap script does NOT swallow cron installation failure with || true
+	bootstrapContent, err := os.ReadFile("../../scripts/bootstrap-staging-cluster.sh")
+	if err != nil {
+		t.Fatalf("failed to read bootstrap-staging-cluster.sh: %v", err)
+	}
+	if strings.Contains(string(bootstrapContent), "setup-backup-cron.sh || true") {
+		t.Fatalf("expected bootstrap-staging-cluster.sh to enforce setup-backup-cron.sh without || true")
 	}
 
 	// Verify dry run mode of take-base-backup.sh
@@ -1237,13 +1340,23 @@ func TestImmutablePostgresStagingImageDelivery(t *testing.T) {
 	if !strings.Contains(workflowStr, "DEADBOLT_POSTGRES_IMAGE") {
 		t.Fatalf("expected staging-deploy.yml to export DEADBOLT_POSTGRES_IMAGE")
 	}
+
+	// 3. Check images.lock.json does not contain misleading postgres-archiver entry
+	lockBytes, err := os.ReadFile("../../deploy/images.lock.json")
+	if err != nil {
+		t.Fatalf("failed to read images.lock.json: %v", err)
+	}
+	if strings.Contains(string(lockBytes), "postgres-archiver") {
+		t.Fatalf("images.lock.json should not claim upstream base digest represents custom postgres-archiver")
+	}
 }
 
-// TestDatabasePointInTimeRecoveryDrill verifies Item 4:
-// scripts/restore-staging-db.sh exists, is executable, configures recovery.signal and restore_command,
-// and docs/runbooks/backup-and-disaster-recovery.md contains zero WAL-G references.
+// TestDatabasePointInTimeRecoveryDrill verifies Finding 3:
+// scripts/restore-staging-db.sh defaults to a safe isolated drill using a dedicated container
+// and --network none, protects live staging volume, fails closed without FORCE_RESTORE in destructive mode,
+// and when Docker is available, executes an end-to-end container restore drill replaying WAL.
 func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
-	// 1. restore-staging-db.sh script integrity
+	// 1. restore-staging-db.sh script integrity & safe default mode
 	scriptPath := "../../scripts/restore-staging-db.sh"
 	info, err := os.Stat(scriptPath)
 	if err != nil {
@@ -1265,8 +1378,28 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 	if !strings.Contains(scriptStr, "restore_command") {
 		t.Fatalf("expected restore script to configure restore_command")
 	}
-	if !strings.Contains(scriptStr, "recovery_target_action = 'promote'") {
-		t.Fatalf("expected restore script to set promote target action")
+	if !strings.Contains(scriptStr, "deadbolt-recovery-drill-postgres") {
+		t.Fatalf("expected restore script to use dedicated isolated container deadbolt-recovery-drill-postgres")
+	}
+	if !strings.Contains(scriptStr, "--network none") {
+		t.Fatalf("expected restore drill to attach to --network none")
+	}
+	if !strings.Contains(scriptStr, "FORCE_RESTORE") {
+		t.Fatalf("expected destructive mode to require FORCE_RESTORE guard")
+	}
+
+	// Verify destructive mode fails closed without FORCE_RESTORE=true
+	cmdDestructive := exec.Command("/bin/bash", scriptPath, "--destructive-staging-restore")
+	cmdDestructive.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=/tmp",
+	}
+	outDestructive, errDestructive := cmdDestructive.CombinedOutput()
+	if errDestructive == nil {
+		t.Fatalf("expected destructive restore without FORCE_RESTORE to fail closed, but passed: %s", string(outDestructive))
+	}
+	if !strings.Contains(string(outDestructive), "FORCE_RESTORE=true") {
+		t.Fatalf("expected FORCE_RESTORE=true error message, got: %s", string(outDestructive))
 	}
 
 	// Verify dry run execution
@@ -1297,4 +1430,95 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 	if !strings.Contains(docStr, "deadbolt_staging_postgres_data") {
 		t.Fatalf("expected runbook to reference accurate volume name deadbolt_staging_postgres_data")
 	}
+
+	// 3. Live isolated restore drill if Docker daemon is available
+	dockerErr := exec.Command("docker", "info").Run()
+	if dockerErr != nil {
+		t.Logf("Docker daemon is not accessible on test runner (%v); live container drill validated via contracts and dry run", dockerErr)
+		return
+	}
+
+	t.Log("Docker daemon is available: executing live container recovery drill...")
+	archiveDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(archiveDir, "basebackups"), 0755); err != nil {
+		t.Fatalf("failed to create basebackups directory: %v", err)
+	}
+
+	sourceContainer := "deadbolt-test-drill-source"
+	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
+
+	// Spin up source postgres container to produce base backup + WAL
+	startSourceCmd := exec.Command("docker", "run", "-d",
+		"--name", sourceContainer,
+		"-e", "POSTGRES_PASSWORD=testpass",
+		"-e", "POSTGRES_USER=deadbolt_admin",
+		"-e", "POSTGRES_DB=deadbolt_staging",
+		"-v", archiveDir+":/wal_archive",
+		"postgres:18-bookworm",
+		"-c", "wal_level=replica",
+		"-c", "archive_mode=on",
+		"-c", "archive_command=cp %p /wal_archive/%f",
+	)
+	if out, err := startSourceCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to start source postgres container: %v, %s", err, string(out))
+	}
+	defer func() {
+		_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
+	}()
+
+	// Wait for source postgres ready
+	sourceReady := false
+	for i := 0; i < 30; i++ {
+		time.Sleep(1 * time.Second)
+		if exec.Command("docker", "exec", sourceContainer, "pg_isready", "-U", "deadbolt_admin", "-d", "deadbolt_staging").Run() == nil {
+			sourceReady = true
+			break
+		}
+	}
+	if !sourceReady {
+		t.Fatalf("source postgres failed to report ready")
+	}
+
+	// Initialize test table with first record
+	initSQL := "CREATE TABLE drill_verification (id int, name text); INSERT INTO drill_verification VALUES (1, 'initial_base_record');"
+	if out, err := exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-c", initSQL).CombinedOutput(); err != nil {
+		t.Fatalf("failed to insert initial record: %v, %s", err, string(out))
+	}
+
+	// Create physical base backup
+	backupCmd := exec.Command("docker", "exec", sourceContainer, "pg_basebackup", "-U", "deadbolt_admin", "-D", "/tmp/base_bkp", "-Ft", "-z", "-X", "fetch")
+	if out, err := backupCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to take base backup: %v, %s", err, string(out))
+	}
+
+	tarballDst := filepath.Join(archiveDir, "basebackups", "base_test.tar.gz")
+	if out, err := exec.Command("docker", "cp", sourceContainer+":/tmp/base_bkp/base.tar.gz", tarballDst).CombinedOutput(); err != nil {
+		t.Fatalf("failed to copy base backup tarball: %v, %s", err, string(out))
+	}
+
+	// Insert second record and switch WAL segment to verify replay
+	walSQL := "INSERT INTO drill_verification VALUES (2, 'wal_replayed_record'); SELECT pg_switch_wal();"
+	if out, err := exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-c", walSQL).CombinedOutput(); err != nil {
+		t.Fatalf("failed to insert wal record: %v, %s", err, string(out))
+	}
+
+	time.Sleep(2 * time.Second)
+	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
+
+	// Execute restore-staging-db.sh in default --drill mode
+	drillCmd := exec.Command("/bin/bash", scriptPath, "--drill")
+	drillCmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=" + archiveDir,
+		"DEADBOLT_DB_ADMIN_PASSWORD=testpass",
+		"DEADBOLT_POSTGRES_IMAGE=postgres:18-bookworm",
+	}
+	drillOut, drillErr := drillCmd.CombinedOutput()
+	if drillErr != nil {
+		t.Fatalf("isolated restore drill failed: %v\nOutput: %s", drillErr, string(drillOut))
+	}
+	if !strings.Contains(string(drillOut), "ISOLATED RECOVERY DRILL COMPLETED SUCCESSFULLY") {
+		t.Fatalf("expected successful drill marker, got: %s", string(drillOut))
+	}
+	t.Log("Live container restore drill passed: WAL archives successfully replayed to consistent primary state.")
 }

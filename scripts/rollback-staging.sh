@@ -6,6 +6,7 @@
 # 1. Scope strictly to project `deadbolt-staging`. NEVER touch FlowDesk containers/networks/volumes.
 # 2. Database state is preserved; down migrations are NEVER executed.
 # 3. Uses blue/green slotting: gates restored instance before switching edge route.
+# 4. Self-contained: loads and validates approved host configuration; zero domain fallbacks.
 
 set -euo pipefail
 
@@ -14,6 +15,13 @@ CURRENT_RELEASE_FILE="${RELEASE_DIR}/current"
 PREVIOUS_RELEASE_FILE="${RELEASE_DIR}/previous"
 ACTIVE_SLOT_FILE="${RELEASE_DIR}/active_slot"
 COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose/docker-compose.staging.yml}"
+DRY_RUN="${DRY_RUN:-false}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [[ ! -f "$COMPOSE_FILE" && -f "${REPO_ROOT}/${COMPOSE_FILE}" ]]; then
+  COMPOSE_FILE="${REPO_ROOT}/${COMPOSE_FILE}"
+fi
 
 log() {
   echo "[$(date '+%Y-%m-%dT%H:%M:%SZ')] [ROLLBACK] $*"
@@ -23,8 +31,58 @@ err() {
   echo "[$(date '+%Y-%m-%dT%H:%M:%SZ')] [ROLLBACK ERROR] $*" >&2
 }
 
+if [[ "$DRY_RUN" == "true" ]]; then
+  log "DRY RUN mode: verifying rollback prerequisites and Compose configuration..."
+  DEADBOLT_DB_ADMIN_PASSWORD="mock_admin_password" \
+  DEADBOLT_MIGRATOR_PASSWORD="mock_migrator_password" \
+  DEADBOLT_RUNTIME_PASSWORD="mock_runtime_password" \
+  DEADBOLT_SYSTEM_PASSWORD="mock_system_password" \
+  DATABASE_URL="postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock" \
+  MIGRATOR_DATABASE_URL="postgres://deadbolt_migrator:mock_migrator_password@localhost:5432/mock" \
+  SYSTEM_DATABASE_URL="postgres://deadbolt_system:mock_system_password@localhost:5432/mock" \
+  DEADBOLT_POSTGRES_IMAGE="ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee" \
+  DEADBOLT_IMAGE="ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee" \
+  DEADBOLT_OIDC_ISSUER="https://mock-issuer.com" \
+  DEADBOLT_OIDC_CLIENT_ID="mock_client_id" \
+  DEADBOLT_OIDC_CLIENT_SECRET="mock_client_secret" \
+  DEADBOLT_STAGING_DOMAIN="staging.deadbolt.cloud" \
+  docker compose -f "$COMPOSE_FILE" --profile slot-blue --profile slot-green config --quiet || { err "Staging Compose validation failed"; exit 1; }
+  log "DRY RUN passed: Rollback configuration and Compose syntax are valid."
+  exit 0
+fi
+
 log "Starting on-demand staging rollback..."
 
+# 1. Deterministic host configuration loading
+CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
+if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
+  CONFIG_FILE="/opt/deadbolt/config/staging.env"
+fi
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  PERMS=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%Op" "$CONFIG_FILE" 2>/dev/null || echo "600")
+  if [[ "$PERMS" =~ [4567]$ ]]; then
+    err "SECURITY VIOLATION: Configuration file $CONFIG_FILE is world-readable ($PERMS)!"
+    err "Remediation: chmod 600 $CONFIG_FILE"
+    exit 1
+  fi
+  log "Loading host configuration from $CONFIG_FILE..."
+  set -a
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  set +a
+fi
+
+# 2. Strict validation of required staging variables (no invented domain or default passwords)
+for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL SYSTEM_DATABASE_URL DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_POSTGRES_IMAGE; do
+  if [[ -z "${!var:-}" ]]; then
+    err "Required configuration variable $var is missing or empty!"
+    err "Configure in $CONFIG_FILE or via environment. Rollback cannot proceed without valid staging configuration."
+    exit 1
+  fi
+done
+
+# 3. Check recorded previous release
 if [[ ! -f "$PREVIOUS_RELEASE_FILE" ]]; then
   err "No previous release recorded at $PREVIOUS_RELEASE_FILE. Cannot perform rollback."
   exit 1
@@ -87,6 +145,7 @@ log "Readiness verified on restored container."
 if [[ -f "scripts/reload-caddy.sh" ]]; then
   log "Switching Caddy edge route to port $RESTORE_PORT..."
   export DEADBOLT_UPSTREAM_PORT="$RESTORE_PORT"
+  export DEADBOLT_STAGING_DOMAIN="$DEADBOLT_STAGING_DOMAIN"
   ./scripts/reload-caddy.sh "$RESTORE_PORT"
 fi
 
