@@ -1465,7 +1465,7 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 		"postgres:18-bookworm",
 		"-c", "wal_level=replica",
 		"-c", "archive_mode=on",
-		"-c", "archive_command=cp %p /wal_archive/%f",
+		"-c", "archive_command=cp %p /wal_archive/%f && chmod 666 /wal_archive/%f",
 	)
 	if out, err := startSourceCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to start source postgres container: %v, %s", err, string(out))
@@ -1772,6 +1772,13 @@ exit 1
 		t.Fatalf("failed to write mock crontab: %v", err)
 	}
 
+	// Add mock sudo to simulate non-privileged user even on systems with passwordless sudo
+	mockSudoScript := "#!/usr/bin/env bash\nexit 1\n"
+	mockSudoPath := filepath.Join(mockBin, "sudo")
+	if err := os.WriteFile(mockSudoPath, []byte(mockSudoScript), 0755); err != nil {
+		t.Fatalf("failed to write mock sudo: %v", err)
+	}
+
 	// Run setup-backup-cron.sh with mock crontab in PATH and non-writable CRON_DEST
 	cmd := exec.Command("/bin/bash", cronScriptPath)
 	cmd.Env = []string{
@@ -2071,7 +2078,7 @@ func TestDatabasePointInTimeRecoveryDrillRemoteS3(t *testing.T) {
 		"postgres:18-bookworm",
 		"-c", "wal_level=replica",
 		"-c", "archive_mode=on",
-		"-c", "archive_command=cp %p /wal_archive/%f",
+		"-c", "archive_command=cp %p /wal_archive/%f && chmod 666 /wal_archive/%f",
 	)
 	if out, err := startSourceCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to start source postgres container: %v, %s", err, string(out))
@@ -2130,6 +2137,9 @@ func TestDatabasePointInTimeRecoveryDrillRemoteS3(t *testing.T) {
 		t.Fatalf("expected switched WAL %s to be archived locally", switchedWal)
 	}
 	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
+
+	// Ensure all files written by Docker container in localArchiveDir are readable by non-root test runner
+	_ = exec.Command("docker", "run", "--rm", "-v", localArchiveDir+":/data", "alpine", "chmod", "-R", "a+rw", "/data").Run()
 
 	// Upload real base backup and WAL to mock S3 server objects
 	baseBytes, err := os.ReadFile(localBaseTarball)

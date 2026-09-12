@@ -37,14 +37,16 @@ if [[ -w "/etc/cron.d" || ( -f "$CRON_DEST" && -w "$CRON_DEST" ) ]]; then
   cp "$CRON_SRC" "$CRON_DEST"
   chmod 644 "$CRON_DEST"
   INSTALLED=true
-# 2. Try passwordless sudo if available
-elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+# 2. Try passwordless sudo if available and destination directory exists
+elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null && [[ -d "$(dirname "$CRON_DEST")" ]]; then
   log "Installing Deadbolt backup cron via sudo to $CRON_DEST..."
-  sudo cp "$CRON_SRC" "$CRON_DEST"
-  sudo chmod 644 "$CRON_DEST"
-  INSTALLED=true
-# 3. Fallback to user crontab if crontab command is available
-elif command -v crontab &>/dev/null; then
+  if sudo cp "$CRON_SRC" "$CRON_DEST" 2>/dev/null && sudo chmod 644 "$CRON_DEST" 2>/dev/null; then
+    INSTALLED=true
+  fi
+fi
+
+# 3. Fallback to user crontab if not installed and crontab command is available
+if [[ "$INSTALLED" != "true" ]] && command -v crontab &>/dev/null; then
   log "Installing Deadbolt backup schedule into current user crontab..."
   USER_LOG_DIR="${HOME:-/tmp}/.deadbolt/logs"
   mkdir -p "$USER_LOG_DIR"
