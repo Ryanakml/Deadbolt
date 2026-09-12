@@ -8,6 +8,15 @@ CADDYFILE="${CADDY_CONFIG_PATH:-/etc/caddy/Caddyfile}"
 SNIPPET_FILE="${DEADBOLT_CADDYFILE_SNIPPET:-deploy/caddy/Deadbolt.caddyfile}"
 DRY_RUN="${DRY_RUN:-false}"
 
+# Resolve absolute path for snippet file to prevent Caddy relative import errors (Issue #5)
+if [[ -f "$SNIPPET_FILE" ]]; then
+  ABS_SNIPPET_FILE="$(cd "$(dirname "$SNIPPET_FILE")" && pwd)/$(basename "$SNIPPET_FILE")"
+elif [[ "$SNIPPET_FILE" = /* ]]; then
+  ABS_SNIPPET_FILE="$SNIPPET_FILE"
+else
+  ABS_SNIPPET_FILE="$(pwd)/$SNIPPET_FILE"
+fi
+
 log() {
   echo "[CADDY_EDGE] $*"
 }
@@ -17,12 +26,30 @@ err() {
 }
 
 if [[ "$DRY_RUN" == "true" ]]; then
-  log "DRY RUN: Verifying Caddy snippet syntax..."
-  if [[ ! -f "$SNIPPET_FILE" ]]; then
-    err "Snippet file not found: $SNIPPET_FILE"
+  log "DRY RUN: Verifying Caddy snippet and merged configuration..."
+  if [[ ! -f "$ABS_SNIPPET_FILE" ]]; then
+    err "Snippet file not found: $ABS_SNIPPET_FILE"
     exit 1
   fi
-  log "Snippet syntax check passed."
+  if command -v caddy &>/dev/null; then
+    TMP_CADDY=$(mktemp)
+    trap 'rm -f "$TMP_CADDY"' EXIT
+    if [[ -f "$CADDYFILE" ]]; then
+      cp "$CADDYFILE" "$TMP_CADDY"
+    else
+      echo ":80 {}" > "$TMP_CADDY"
+    fi
+    if ! grep -q "$ABS_SNIPPET_FILE" "$TMP_CADDY"; then
+      echo "import ${ABS_SNIPPET_FILE}" >> "$TMP_CADDY"
+    fi
+    if ! caddy validate --config "$TMP_CADDY" --adapter caddyfile 2>/dev/null; then
+      err "DRY RUN: Merged Caddy configuration validation failed!"
+      exit 1
+    fi
+    log "DRY RUN: Merged Caddy configuration validation passed."
+  else
+    log "DRY RUN: Snippet syntax check passed ($ABS_SNIPPET_FILE)."
+  fi
   exit 0
 fi
 
@@ -31,8 +58,8 @@ if [[ ! -f "$CADDYFILE" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$SNIPPET_FILE" ]]; then
-  err "Deadbolt Caddy snippet not found at: $SNIPPET_FILE"
+if [[ ! -f "$ABS_SNIPPET_FILE" ]]; then
+  err "Deadbolt Caddy snippet not found at: $ABS_SNIPPET_FILE"
   exit 1
 fi
 
@@ -51,28 +78,32 @@ cp "$CADDYFILE" "$BACKUP_FILE"
 rollback() {
   err "Reload failed! Rolling back to: $BACKUP_FILE"
   cp "$BACKUP_FILE" "$CADDYFILE"
-  caddy reload --config "$CADDYFILE" || true
+  caddy reload --config "$CADDYFILE" --adapter caddyfile || true
   err "Rollback completed."
 }
 
-# Check if snippet import already exists
-IMPORT_LINE="import ${SNIPPET_FILE}"
-if ! grep -q "$SNIPPET_FILE" "$CADDYFILE"; then
-  log "Appending Deadbolt snippet import to: $CADDYFILE"
+# Remove legacy relative import if present to ensure clean merged config
+sed -i.tmp "\|import deploy/caddy/Deadbolt.caddyfile|d" "$CADDYFILE" 2>/dev/null || true
+rm -f "${CADDYFILE}.tmp" 2>/dev/null || true
+
+# Append absolute snippet import if not already present
+IMPORT_LINE="import ${ABS_SNIPPET_FILE}"
+if ! grep -q "$ABS_SNIPPET_FILE" "$CADDYFILE"; then
+  log "Appending Deadbolt absolute snippet import to: $CADDYFILE"
   echo "" >> "$CADDYFILE"
   echo "# Deadbolt Staging Route" >> "$CADDYFILE"
   echo "$IMPORT_LINE" >> "$CADDYFILE"
 fi
 
-log "Validating proposed Caddy configuration..."
-if ! caddy validate --config "$CADDYFILE"; then
-  err "Caddy validation failed! Aborting reload."
+log "Validating exact merged Caddy configuration..."
+if ! caddy validate --config "$CADDYFILE" --adapter caddyfile; then
+  err "Caddy validation failed on merged configuration! Aborting reload."
   rollback
   exit 1
 fi
 
 log "Executing safe Caddy zero-downtime reload..."
-if ! caddy reload --config "$CADDYFILE"; then
+if ! caddy reload --config "$CADDYFILE" --adapter caddyfile; then
   err "Caddy reload execution failed!"
   rollback
   exit 1

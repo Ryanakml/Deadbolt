@@ -439,6 +439,38 @@ func TestComposeConfigurationsIntegrity(t *testing.T) {
 		t.Fatalf("expected control plane green slot on loopback port 8089 in staging compose")
 	}
 
+	// Verify staging PostgreSQL builds custom image from deploy/Dockerfile.postgres
+	if !strings.Contains(stagingStr, "dockerfile: deploy/Dockerfile.postgres") {
+		t.Fatalf("expected staging postgres to build from deploy/Dockerfile.postgres")
+	}
+
+	// Verify ZERO repository-known fallback passwords exist in staging compose (Issue #5)
+	for _, forbiddenFallback := range []string{":-migrator_secure_pass", ":-runtime_secure_pass", ":-system_secure_pass", "DEADBOLT_DB_ADMIN_PASSWORD:-"} {
+		if strings.Contains(stagingStr, forbiddenFallback) {
+			t.Fatalf("SECURITY VIOLATION: staging compose contains default fallback password %q", forbiddenFallback)
+		}
+	}
+
+	// Verify all staging database credentials are strictly required
+	for _, requiredVar := range []string{
+		"DEADBOLT_DB_ADMIN_PASSWORD:?",
+		"DEADBOLT_MIGRATOR_PASSWORD:?",
+		"DEADBOLT_RUNTIME_PASSWORD:?",
+		"DEADBOLT_SYSTEM_PASSWORD:?",
+		"SYSTEM_DATABASE_URL:?",
+	} {
+		if !strings.Contains(stagingStr, requiredVar) {
+			t.Fatalf("expected strictly required credential %q in staging compose", requiredVar)
+		}
+	}
+
+	// Verify S3 storage endpoint and SSE configuration passed to postgres
+	for _, s3Var := range []string{"DEADBOLT_STORAGE_S3_ENDPOINT", "DEADBOLT_STORAGE_S3_SSE", "AWS_ENDPOINT_URL"} {
+		if !strings.Contains(stagingStr, s3Var) {
+			t.Fatalf("expected S3 storage configuration variable %q in staging compose postgres service", s3Var)
+		}
+	}
+
 	// Verify immutable image reference with NO mutable tag suffix
 	if strings.Contains(stagingStr, ":latest") || strings.Contains(stagingStr, "${IMAGE_TAG") {
 		t.Fatalf("SECURITY VIOLATION: staging compose uses mutable tag or suffix: %s", stagingStr)
@@ -480,6 +512,8 @@ func TestDeploymentScriptsGuards(t *testing.T) {
 		"../../scripts/reload-caddy.sh",
 		"../../scripts/retention.sh",
 		"../../scripts/check-backup-readiness.sh",
+		"../../scripts/bootstrap-staging-cluster.sh",
+		"../../scripts/bootstrap-initial-backup.sh",
 	}
 
 	for _, script := range scripts {
@@ -892,5 +926,150 @@ func TestFirstStagingDeploymentBootstrap(t *testing.T) {
 		if !strings.Contains(initRolesStr, role) {
 			t.Fatalf("expected %s role initialization in scripts/init-db-roles.sh", role)
 		}
+	}
+}
+
+// TestPostgresDockerfileAudited verifies that deploy/Dockerfile.postgres is pinned to the
+// audited postgres base from deploy/images.lock.json and installs awscli and curl (Item 2).
+func TestPostgresDockerfileAudited(t *testing.T) {
+	dockerfilePath := "../../deploy/Dockerfile.postgres"
+	content, err := os.ReadFile(dockerfilePath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", dockerfilePath, err)
+	}
+	contentStr := string(content)
+
+	expectedBase := "postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
+	if !strings.Contains(contentStr, expectedBase) {
+		t.Fatalf("expected Dockerfile.postgres to use pinned base %s", expectedBase)
+	}
+
+	for _, tool := range []string{"awscli", "curl", "ca-certificates"} {
+		if !strings.Contains(contentStr, tool) {
+			t.Fatalf("expected Dockerfile.postgres to install %s for deterministic S3 WAL archiving", tool)
+		}
+	}
+}
+
+// TestDatabaseRolesInitScriptFailsWithoutPasswords verifies that scripts/init-db-roles.sh
+// fails closed when required role passwords are not supplied (Item 3).
+func TestDatabaseRolesInitScriptFailsWithoutPasswords(t *testing.T) {
+	cmd := exec.Command("/bin/bash", "../../scripts/init-db-roles.sh")
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"POSTGRES_USER=test_admin",
+		"POSTGRES_DB=test_db",
+	}
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected init-db-roles.sh to fail without passwords, but passed: %s", string(out))
+	}
+	if !strings.Contains(string(out), "Required DEADBOLT_MIGRATOR_PASSWORD") {
+		t.Fatalf("expected missing password error, got: %s", string(out))
+	}
+}
+
+// TestCaddyAbsoluteSnippetImportAndMergedValidation verifies that scripts/reload-caddy.sh
+// uses absolute snippet import paths and performs exact merged validation (Item 4).
+func TestCaddyAbsoluteSnippetImportAndMergedValidation(t *testing.T) {
+	content, err := os.ReadFile("../../scripts/reload-caddy.sh")
+	if err != nil {
+		t.Fatalf("failed to read scripts/reload-caddy.sh: %v", err)
+	}
+	scriptStr := string(content)
+
+	if !strings.Contains(scriptStr, "ABS_SNIPPET_FILE") {
+		t.Fatalf("expected reload-caddy.sh to resolve ABS_SNIPPET_FILE")
+	}
+	if !strings.Contains(scriptStr, "import ${ABS_SNIPPET_FILE}") {
+		t.Fatalf("expected reload-caddy.sh to import absolute snippet path")
+	}
+	if !strings.Contains(scriptStr, "caddy validate --config \"$CADDYFILE\" --adapter caddyfile") {
+		t.Fatalf("expected reload-caddy.sh to validate exact merged Caddyfile with --adapter caddyfile")
+	}
+	if !strings.Contains(scriptStr, "import deploy/caddy/Deadbolt.caddyfile") {
+		t.Fatalf("expected reload-caddy.sh to clean up legacy relative imports")
+	}
+}
+
+// TestS3WALArchiveAndBackupS3Options verifies that archive-wal.sh and bootstrap-initial-backup.sh
+// support custom endpoints, regions, and SSE encryption (Item 2 & Item 5).
+func TestS3WALArchiveAndBackupS3Options(t *testing.T) {
+	for _, script := range []string{"../../scripts/archive-wal.sh", "../../scripts/bootstrap-initial-backup.sh"} {
+		content, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", script, err)
+		}
+		scriptStr := string(content)
+
+		for _, opt := range []string{"--endpoint-url", "--region", "--sse"} {
+			if !strings.Contains(scriptStr, opt) {
+				t.Fatalf("expected %s to support S3 option %s", script, opt)
+			}
+		}
+	}
+}
+
+// TestBackupReadinessEncryptionVerification verifies that check-backup-readiness.sh
+// inspects ServerSideEncryption and fails closed if unencrypted (Item 5).
+func TestBackupReadinessEncryptionVerification(t *testing.T) {
+	content, err := os.ReadFile("../../scripts/check-backup-readiness.sh")
+	if err != nil {
+		t.Fatalf("failed to read scripts/check-backup-readiness.sh: %v", err)
+	}
+	scriptStr := string(content)
+
+	if !strings.Contains(scriptStr, "ServerSideEncryption") {
+		t.Fatalf("expected check-backup-readiness.sh to inspect ServerSideEncryption")
+	}
+	if !strings.Contains(scriptStr, "get-bucket-encryption") {
+		t.Fatalf("expected check-backup-readiness.sh to verify get-bucket-encryption")
+	}
+	if !strings.Contains(scriptStr, "ENCRYPTION POLICY VIOLATION") {
+		t.Fatalf("expected check-backup-readiness.sh to fail closed on encryption violation")
+	}
+}
+
+// TestClusterBootstrapAndPromotionSequencing verifies that bootstrap-staging-cluster.sh
+// exists, is executable, and deploy-staging.sh enforces password consistency and bootstrap mode (Item 1 & Item 3).
+func TestClusterBootstrapAndPromotionSequencing(t *testing.T) {
+	// 1. bootstrap-staging-cluster.sh
+	bootstrapPath := "../../scripts/bootstrap-staging-cluster.sh"
+	info, err := os.Stat(bootstrapPath)
+	if err != nil {
+		t.Fatalf("scripts/bootstrap-staging-cluster.sh missing: %v", err)
+	}
+	if info.Mode()&0111 == 0 {
+		t.Fatalf("scripts/bootstrap-staging-cluster.sh is not executable")
+	}
+
+	bootstrapContent, err := os.ReadFile(bootstrapPath)
+	if err != nil {
+		t.Fatalf("failed to read bootstrap script: %v", err)
+	}
+	bootstrapStr := string(bootstrapContent)
+
+	if !strings.Contains(bootstrapStr, "docker compose -p deadbolt-staging -f \"$COMPOSE_FILE\" up -d --build postgres nats") {
+		t.Fatalf("expected bootstrap script to build and up data infrastructure")
+	}
+	if !strings.Contains(bootstrapStr, "./scripts/bootstrap-initial-backup.sh") {
+		t.Fatalf("expected bootstrap script to run initial base backup and wal switch")
+	}
+	if !strings.Contains(bootstrapStr, "./scripts/check-backup-readiness.sh") {
+		t.Fatalf("expected bootstrap script to verify backup readiness")
+	}
+
+	// 2. deploy-staging.sh password consistency verification
+	deployContent, err := os.ReadFile("../../scripts/deploy-staging.sh")
+	if err != nil {
+		t.Fatalf("failed to read deploy-staging.sh: %v", err)
+	}
+	deployStr := string(deployContent)
+
+	if !strings.Contains(deployStr, "BOOTSTRAP_MODE") {
+		t.Fatalf("expected deploy-staging.sh to support BOOTSTRAP_MODE")
+	}
+	if !strings.Contains(deployStr, "PASSWORD CONSISTENCY FAILURE") {
+		t.Fatalf("expected deploy-staging.sh to enforce password consistency between URLs and secrets")
 	}
 }

@@ -49,7 +49,7 @@ Deadbolt runs on an EC2 `x86_64` host co-located with `flowdesk-staging`. The st
 
 ## 3. Pre-Deployment Headroom & Backup Verification
 
-Before initiating deployment, verify resource headroom, co-tenant isolation, and backup readiness:
+Before initiating normal deployment, verify resource headroom, co-tenant isolation, and backup readiness:
 
 ```bash
 # 1. Check available RAM (minimum 1024 MB required for candidate launch)
@@ -61,7 +61,7 @@ df -m /
 # 3. Verify FlowDesk containers are healthy and undisturbed
 docker ps --filter "name=flowdesk" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-# 4. Verify external S3 backup readiness and archive lag
+# 4. Verify external S3 backup readiness, archive lag, and SSE encryption
 /opt/deadbolt/scripts/check-backup-readiness.sh
 ```
 
@@ -69,7 +69,42 @@ If memory, disk, or backup readiness falls below threshold, deployment is halted
 
 ---
 
-## 4. Deployment Workflow
+## 4. Fresh Cluster Bootstrap vs. Candidate Promotion
+
+### Clean Host Cluster Bootstrap (`scripts/bootstrap-staging-cluster.sh`)
+
+On a fresh host where the Deadbolt PostgreSQL cluster has not yet been initialized:
+
+1. Data services must be started first with dedicated database roles (`deadbolt_admin`, `deadbolt_migrator`, `deadbolt_runtime`, `deadbolt_system`).
+2. An initial physical base backup and WAL segment switch must be performed via `scripts/bootstrap-initial-backup.sh`.
+3. Fail-closed backup readiness (`scripts/check-backup-readiness.sh`) must verify base backup existence, WAL archive lag, and ServerSideEncryption policy.
+4. Only after backup recoverability is proven can forward schema migrations and candidate promotion proceed.
+
+Run standalone bootstrap:
+
+```bash
+/opt/deadbolt/scripts/bootstrap-staging-cluster.sh
+```
+
+Or pass `--bootstrap` directly to the automated deployment script:
+
+```bash
+/opt/deadbolt/scripts/deploy-staging.sh --bootstrap <IMAGE_DIGEST> [COMMIT_SHA]
+```
+
+### Staging Database Secret Model & Zero-Default Policy
+
+All database credentials in `deploy/compose/docker-compose.staging.yml` are strictly required with **zero repository-known fallback defaults**:
+
+- `DEADBOLT_DB_ADMIN_PASSWORD`: Superuser password used solely during cluster init and base backups.
+- `DEADBOLT_MIGRATOR_PASSWORD`: DDL-capable password for schema migrations.
+- `DEADBOLT_RUNTIME_PASSWORD`: Restricted DML password for runtime control plane.
+- `DEADBOLT_SYSTEM_PASSWORD`: Restricted function-caller password for scheduler tenancy sweeps.
+- Connection URLs (`DATABASE_URL`, `MIGRATOR_DATABASE_URL`, `SYSTEM_DATABASE_URL`) are validated for strict password consistency against the above role passwords prior to starting PostgreSQL or running migrations.
+
+---
+
+## 5. Deployment Workflow
 
 Automated deployment is executed via `scripts/deploy-staging.sh`:
 
@@ -79,10 +114,11 @@ Automated deployment is executed via `scripts/deploy-staging.sh`:
 
 ### Deployment Pipeline Stages
 
-1. **Host Configuration Loading**:
+1. **Host Configuration Loading & Credential Validation**:
    - Sources private configuration from `/etc/deadbolt/staging.env` (or `/opt/deadbolt/config/staging.env`).
    - Validates file permissions (rejects world-readable files, `chmod 600` enforced).
-   - Validates required configuration keys and ensures `MIGRATOR_DATABASE_URL != DATABASE_URL`.
+   - Validates required configuration keys, enforces zero default passwords, and checks URL-to-password consistency.
+   - Enforces `MIGRATOR_DATABASE_URL != DATABASE_URL` and `SYSTEM_DATABASE_URL != DATABASE_URL`.
 2. **Backup & Headroom Pre-flight Checks**:
    - Validates memory (≥1024 MiB) and disk (≥4096 MiB).
    - Executes `scripts/check-backup-readiness.sh`.

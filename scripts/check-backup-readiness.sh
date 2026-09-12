@@ -56,6 +56,14 @@ if [[ -n "$S3_BUCKET" ]]; then
     BACKUP_DEST="s3://${S3_BUCKET}/postgres"
   fi
 
+  AWS_ARGS=()
+  if [[ -n "${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL:-}}" ]]; then
+    AWS_ARGS+=(--endpoint-url "${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL}}")
+  fi
+  if [[ -n "${DEADBOLT_STORAGE_S3_REGION:-${AWS_DEFAULT_REGION:-}}" ]]; then
+    AWS_ARGS+=(--region "${DEADBOLT_STORAGE_S3_REGION:-${AWS_DEFAULT_REGION}}")
+  fi
+
   # 1. Verify aws-cli is installed
   if ! command -v aws >/dev/null 2>&1; then
     err "aws-cli is not installed on host! Cannot verify remote S3 backup readiness."
@@ -65,7 +73,7 @@ if [[ -n "$S3_BUCKET" ]]; then
 
   # 2. Test S3 accessibility
   log "Step 1: Testing S3 bucket access at ${BACKUP_DEST}..."
-  if ! aws s3 ls "${BACKUP_DEST}/" >/dev/null 2>&1; then
+  if ! aws s3 ls "${BACKUP_DEST}/" "${AWS_ARGS[@]}" >/dev/null 2>&1; then
     err "Failed to access backup destination: ${BACKUP_DEST}!"
     err "Ensure AWS credentials or IAM role has s3:ListBucket permission on dedicated bucket."
     exit 1
@@ -74,12 +82,12 @@ if [[ -n "$S3_BUCKET" ]]; then
 
   # 3. Verify base backup existence and freshness
   log "Step 2: Checking base backup availability in ${BACKUP_DEST}/basebackups/..."
-  BASE_LIST=$(aws s3 ls "${BACKUP_DEST}/basebackups/" 2>/dev/null || true)
+  BASE_LIST=$(aws s3 ls "${BACKUP_DEST}/basebackups/" "${AWS_ARGS[@]}" 2>/dev/null || true)
   if [[ -z "$BASE_LIST" ]]; then
     if [[ "$BOOTSTRAP_INITIAL_BACKUP" == "true" ]]; then
       log "First initialization requested: running bootstrap-initial-backup.sh..."
       ./scripts/bootstrap-initial-backup.sh
-      BASE_LIST=$(aws s3 ls "${BACKUP_DEST}/basebackups/" 2>/dev/null || true)
+      BASE_LIST=$(aws s3 ls "${BACKUP_DEST}/basebackups/" "${AWS_ARGS[@]}" 2>/dev/null || true)
     fi
   fi
 
@@ -109,7 +117,7 @@ if [[ -n "$S3_BUCKET" ]]; then
 
   # 4. Verify continuous WAL archive presence and lag
   log "Step 3: Checking continuous WAL archive lag in ${BACKUP_DEST}/wal/..."
-  WAL_LIST=$(aws s3 ls "${BACKUP_DEST}/wal/" 2>/dev/null || true)
+  WAL_LIST=$(aws s3 ls "${BACKUP_DEST}/wal/" "${AWS_ARGS[@]}" 2>/dev/null || true)
   if [[ -z "$WAL_LIST" ]]; then
     err "RECOVERY PRECONDITION FAILED: Zero WAL archives found in ${BACKUP_DEST}/wal/!"
     err "Failing closed: Continuous archiving is not functional or no segments have shipped."
@@ -132,6 +140,44 @@ if [[ -n "$S3_BUCKET" ]]; then
       log "WAL archive lag: ${WAL_LAG}s (within ${MAX_WAL_LAG_SECONDS}s limit)."
     fi
   fi
+
+  # 5. Verify off-host backup and WAL encryption policy (Blueprint §26 & Issue #5)
+  log "Step 4: Verifying off-host backup & WAL encryption policy..."
+  BASE_FILENAME=$(echo "$LATEST_BASE_LINE" | awk '{print $4}')
+  WAL_FILENAME=$(echo "$LATEST_WAL_LINE" | awk '{print $4}')
+
+  BASE_KEY="postgres/basebackups/${BASE_FILENAME}"
+  WAL_KEY="postgres/wal/${WAL_FILENAME}"
+
+  BASE_HEAD=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$BASE_KEY" "${AWS_ARGS[@]}" 2>/dev/null || true)
+  WAL_HEAD=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$WAL_KEY" "${AWS_ARGS[@]}" 2>/dev/null || true)
+
+  BASE_ENCRYPTED=false
+  if echo "$BASE_HEAD" | grep -iq "ServerSideEncryption"; then
+    BASE_ENCRYPTED=true
+    BASE_SSE_ALGO=$(echo "$BASE_HEAD" | grep -i "ServerSideEncryption" | head -n 1 | tr -d '",: \t')
+    log "Base backup encryption verified: $BASE_SSE_ALGO"
+  fi
+
+  WAL_ENCRYPTED=false
+  if echo "$WAL_HEAD" | grep -iq "ServerSideEncryption"; then
+    WAL_ENCRYPTED=true
+    WAL_SSE_ALGO=$(echo "$WAL_HEAD" | grep -i "ServerSideEncryption" | head -n 1 | tr -d '",: \t')
+    log "WAL segment encryption verified: $WAL_SSE_ALGO"
+  fi
+
+  if [[ "$BASE_ENCRYPTED" != "true" || "$WAL_ENCRYPTED" != "true" ]]; then
+    BUCKET_ENC=$(aws s3api get-bucket-encryption --bucket "$S3_BUCKET" "${AWS_ARGS[@]}" 2>/dev/null || true)
+    if echo "$BUCKET_ENC" | grep -iq "ServerSideEncryptionConfiguration"; then
+      log "Bucket default server-side encryption confirmed for bucket $S3_BUCKET."
+    else
+      err "ENCRYPTION POLICY VIOLATION: Remote backup / WAL segment is not encrypted with ServerSideEncryption!"
+      err "Base backup encrypted: $BASE_ENCRYPTED, WAL segment encrypted: $WAL_ENCRYPTED"
+      err "Failing closed: Blueprint §26 & Issue #5 require encrypted off-host backup & WAL archives."
+      exit 1
+    fi
+  fi
+  log "Off-host backup and WAL encryption verified."
 fi
 
 # Path 2: Directory Archive Destination (for local integration testing / filesystem backup)

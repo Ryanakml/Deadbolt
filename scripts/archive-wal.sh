@@ -22,7 +22,21 @@ fi
 # 2. Archive to external dedicated S3 bucket via aws-cli if configured
 if [[ -n "${DEADBOLT_STORAGE_S3_BUCKET:-}" ]] && command -v aws >/dev/null 2>&1; then
   S3_DEST="s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/${WAL_FILE}"
-  if aws s3 cp "$WAL_PATH" "$S3_DEST" --only-show-errors; then
+  AWS_ARGS=()
+  if [[ -n "${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL:-}}" ]]; then
+    AWS_ARGS+=(--endpoint-url "${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL}}")
+  fi
+  if [[ -n "${DEADBOLT_STORAGE_S3_REGION:-${AWS_DEFAULT_REGION:-}}" ]]; then
+    AWS_ARGS+=(--region "${DEADBOLT_STORAGE_S3_REGION:-${AWS_DEFAULT_REGION}}")
+  fi
+  SSE_OPTS=()
+  if [[ -n "${DEADBOLT_STORAGE_S3_SSE:-}" ]]; then
+    SSE_OPTS+=(--sse "$DEADBOLT_STORAGE_S3_SSE")
+  else
+    SSE_OPTS+=(--sse AES256)
+  fi
+
+  if aws s3 cp "$WAL_PATH" "$S3_DEST" "${AWS_ARGS[@]}" "${SSE_OPTS[@]}" --only-show-errors; then
     exit 0
   else
     echo "[WAL_ARCHIVE_ERROR] Failed to upload WAL segment $WAL_FILE to $S3_DEST" >&2

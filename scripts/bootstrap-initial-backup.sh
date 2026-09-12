@@ -46,7 +46,20 @@ docker exec "$CONTAINER_NAME" rm -rf "/tmp/base_${TIMESTAMP}"
 if [[ -n "$S3_BUCKET" ]]; then
   DEST_S3="s3://${S3_BUCKET}/postgres/basebackups/base_${TIMESTAMP}.tar.gz"
   log "Uploading base backup to ${DEST_S3}..."
-  aws s3 cp "${TMP_DIR}/base_${TIMESTAMP}.tar.gz" "$DEST_S3" --only-show-errors
+  AWS_ARGS=()
+  if [[ -n "${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL:-}}" ]]; then
+    AWS_ARGS+=(--endpoint-url "${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL}}")
+  fi
+  if [[ -n "${DEADBOLT_STORAGE_S3_REGION:-${AWS_DEFAULT_REGION:-}}" ]]; then
+    AWS_ARGS+=(--region "${DEADBOLT_STORAGE_S3_REGION:-${AWS_DEFAULT_REGION}}")
+  fi
+  SSE_OPTS=()
+  if [[ -n "${DEADBOLT_STORAGE_S3_SSE:-}" ]]; then
+    SSE_OPTS+=(--sse "$DEADBOLT_STORAGE_S3_SSE")
+  else
+    SSE_OPTS+=(--sse AES256)
+  fi
+  aws s3 cp "${TMP_DIR}/base_${TIMESTAMP}.tar.gz" "$DEST_S3" "${AWS_ARGS[@]}" "${SSE_OPTS[@]}" --only-show-errors
 fi
 
 if [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then

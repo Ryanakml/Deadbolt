@@ -8,8 +8,18 @@ set -euo pipefail
 
 DRY_RUN="${DRY_RUN:-false}"
 RELEASE_DIR="${DEADBOLT_RELEASE_DIR:-/opt/deadbolt/releases}"
-CANDIDATE_DIGEST="${DEADBOLT_IMAGE_DIGEST:-${1:-}}"
-CANDIDATE_COMMIT="${DEADBOLT_COMMIT_SHA:-${2:-}}"
+BOOTSTRAP_MODE="${DEADBOLT_BOOTSTRAP:-false}"
+POSITIONAL_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--bootstrap" ]]; then
+    BOOTSTRAP_MODE="true"
+  else
+    POSITIONAL_ARGS+=("$arg")
+  fi
+done
+
+CANDIDATE_DIGEST="${DEADBOLT_IMAGE_DIGEST:-${POSITIONAL_ARGS[0]:-}}"
+CANDIDATE_COMMIT="${DEADBOLT_COMMIT_SHA:-${POSITIONAL_ARGS[1]:-}}"
 COMPOSE_FILE="deploy/compose/docker-compose.staging.yml"
 ACTIVE_SLOT_FILE="${RELEASE_DIR}/active_slot"
 CURRENT_RELEASE_FILE="${RELEASE_DIR}/current"
@@ -25,9 +35,13 @@ err() {
 
 if [[ "$DRY_RUN" == "true" ]]; then
   log "DRY RUN mode activated: validating deployment scripts and Compose configurations..."
-  DEADBOLT_DB_SYSTEM_PASSWORD="mock_password" \
-  DATABASE_URL="postgres://mock:mock@localhost:5432/mock" \
-  MIGRATOR_DATABASE_URL="postgres://mock_migrator:mock@localhost:5432/mock" \
+  DEADBOLT_DB_ADMIN_PASSWORD="mock_admin_password" \
+  DEADBOLT_MIGRATOR_PASSWORD="mock_migrator_password" \
+  DEADBOLT_RUNTIME_PASSWORD="mock_runtime_password" \
+  DEADBOLT_SYSTEM_PASSWORD="mock_system_password" \
+  DATABASE_URL="postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock" \
+  MIGRATOR_DATABASE_URL="postgres://deadbolt_migrator:mock_migrator_password@localhost:5432/mock" \
+  SYSTEM_DATABASE_URL="postgres://deadbolt_system:mock_system_password@localhost:5432/mock" \
   DEADBOLT_IMAGE="ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee" \
   DEADBOLT_OIDC_ISSUER="https://mock-issuer.com" \
   DEADBOLT_OIDC_CLIENT_ID="mock_client_id" \
@@ -59,14 +73,28 @@ if [[ -f "$CONFIG_FILE" ]]; then
   set +a
 fi
 
-# Validate required variables
-for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL MIGRATOR_DATABASE_URL DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_STORAGE_S3_BUCKET; do
+# Validate required variables (zero repository-known defaults allowed in hosted staging)
+for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL MIGRATOR_DATABASE_URL SYSTEM_DATABASE_URL DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_STORAGE_S3_BUCKET; do
   if [[ -z "${!var:-}" ]]; then
     err "Required configuration variable $var is missing or empty!"
-    err "Configure in $CONFIG_FILE or via environment."
+    err "Configure in $CONFIG_FILE or via environment. Zero default passwords permitted."
     exit 1
   fi
 done
+
+# Validate password consistency between URLs and role passwords
+if [[ "$MIGRATOR_DATABASE_URL" != *":${DEADBOLT_MIGRATOR_PASSWORD}@"* ]]; then
+  err "PASSWORD CONSISTENCY FAILURE: Password in MIGRATOR_DATABASE_URL does not match DEADBOLT_MIGRATOR_PASSWORD!"
+  exit 1
+fi
+if [[ "$DATABASE_URL" != *":${DEADBOLT_RUNTIME_PASSWORD}@"* ]]; then
+  err "PASSWORD CONSISTENCY FAILURE: Password in DATABASE_URL does not match DEADBOLT_RUNTIME_PASSWORD!"
+  exit 1
+fi
+if [[ "$SYSTEM_DATABASE_URL" != *":${DEADBOLT_SYSTEM_PASSWORD}@"* ]]; then
+  err "PASSWORD CONSISTENCY FAILURE: Password in SYSTEM_DATABASE_URL does not match DEADBOLT_SYSTEM_PASSWORD!"
+  exit 1
+fi
 
 # Enforce least-privilege credential separation (Blueprint §26.3)
 if [[ "$MIGRATOR_DATABASE_URL" == "$DATABASE_URL" ]]; then
@@ -75,7 +103,6 @@ if [[ "$MIGRATOR_DATABASE_URL" == "$DATABASE_URL" ]]; then
   exit 1
 fi
 
-SYSTEM_DATABASE_URL="${SYSTEM_DATABASE_URL:-}"
 if [[ -n "$SYSTEM_DATABASE_URL" ]]; then
   if [[ "$SYSTEM_DATABASE_URL" == "$DATABASE_URL" || "$SYSTEM_DATABASE_URL" == "$MIGRATOR_DATABASE_URL" ]]; then
     err "SECURITY VIOLATION: SYSTEM_DATABASE_URL must not be identical to DATABASE_URL or MIGRATOR_DATABASE_URL!"
@@ -88,55 +115,111 @@ if [[ -z "$CANDIDATE_DIGEST" ]]; then
   exit 1
 fi
 
-# 2. Verify external S3 backup readiness
-log "Step 2: Checking backup & WAL readiness..."
-if [[ -f "scripts/check-backup-readiness.sh" ]]; then
-  ./scripts/check-backup-readiness.sh
-fi
+if [[ "$BOOTSTRAP_MODE" == "true" ]]; then
+  log "BOOTSTRAP MODE: Fresh staging host cluster initialization sequence enabled."
+  # Bootstrap data infrastructure first
+  log "Step 4b: Bootstrapping persistent staging data infrastructure (PostgreSQL & NATS)..."
+  docker compose -p deadbolt-staging -f "$COMPOSE_FILE" up -d --build postgres nats
 
-# 3. Headroom & Co-tenant isolation checks
-log "Step 3: Checking system headroom & co-tenant boundaries..."
-FREE_RAM_MB=$(free -m | awk '/^Mem:/{print $7}')
-if [[ "$FREE_RAM_MB" -lt 1024 ]]; then
-  err "INSUFFICIENT MEMORY: Only ${FREE_RAM_MB}MB available, minimum 1024MB required."
-  exit 1
-fi
+  log "Waiting for PostgreSQL service to report healthy..."
+  PG_HEALTHY=false
+  for i in $(seq 1 30); do
+    STATUS=$(docker inspect --format '{{.State.Health.Status}}' deadbolt-staging-postgres 2>/dev/null || echo "unknown")
+    if [[ "$STATUS" == "healthy" ]]; then
+      PG_HEALTHY=true
+      break
+    fi
+    sleep 2
+  done
 
-FREE_DISK_MB=$(df -m / | awk 'NR==2 {print $4}')
-if [[ "$FREE_DISK_MB" -lt 4096 ]]; then
-  err "INSUFFICIENT DISK: Only ${FREE_DISK_MB}MB available on root, minimum 4096MB required."
-  exit 1
-fi
-
-if docker ps -a --format '{{.Names}}' | grep -qi "flowdesk"; then
-  log "FlowDesk co-tenant containers detected and protected."
-fi
-
-# 4. Pull candidate immutable image
-log "Step 4: Pulling candidate image by immutable digest: $CANDIDATE_DIGEST"
-docker pull "$CANDIDATE_DIGEST"
-
-# 4b. Bootstrap persistent data services (PostgreSQL, NATS) before migration
-log "Step 4b: Bootstrapping persistent staging data infrastructure (PostgreSQL & NATS)..."
-docker compose -p deadbolt-staging -f "$COMPOSE_FILE" up -d postgres nats
-
-log "Waiting for PostgreSQL service to report healthy..."
-PG_HEALTHY=false
-for i in $(seq 1 30); do
-  STATUS=$(docker inspect --format '{{.State.Health.Status}}' deadbolt-staging-postgres 2>/dev/null || echo "unknown")
-  if [[ "$STATUS" == "healthy" ]]; then
-    PG_HEALTHY=true
-    break
+  if [[ "$PG_HEALTHY" != "true" ]]; then
+    err "PostgreSQL failed to report healthy within 60s!"
+    docker compose -p deadbolt-staging -f "$COMPOSE_FILE" logs postgres || true
+    exit 1
   fi
-  sleep 2
-done
+  log "PostgreSQL is healthy and database roles are initialized."
 
-if [[ "$PG_HEALTHY" != "true" ]]; then
-  err "PostgreSQL failed to report healthy within 60s!"
-  docker compose -p deadbolt-staging -f "$COMPOSE_FILE" logs postgres || true
-  exit 1
+  # Initial base backup + WAL switch
+  log "Establishing initial base backup and archived WAL segment..."
+  ./scripts/bootstrap-initial-backup.sh
+
+  # Fail-closed backup readiness check
+  log "Step 2: Checking backup & WAL readiness (fail-closed)..."
+  ./scripts/check-backup-readiness.sh
+
+  # Headroom & Co-tenant isolation checks
+  log "Step 3: Checking system headroom & co-tenant boundaries..."
+  FREE_RAM_MB=$(free -m | awk '/^Mem:/{print $7}')
+  if [[ "$FREE_RAM_MB" -lt 1024 ]]; then
+    err "INSUFFICIENT MEMORY: Only ${FREE_RAM_MB}MB available, minimum 1024MB required."
+    exit 1
+  fi
+
+  FREE_DISK_MB=$(df -m / | awk 'NR==2 {print $4}')
+  if [[ "$FREE_DISK_MB" -lt 4096 ]]; then
+    err "INSUFFICIENT DISK: Only ${FREE_DISK_MB}MB available on root, minimum 4096MB required."
+    exit 1
+  fi
+
+  if docker ps -a --format '{{.Names}}' | grep -qi "flowdesk"; then
+    log "FlowDesk co-tenant containers detected and protected."
+  fi
+
+  # Pull candidate immutable image
+  log "Step 4: Pulling candidate image by immutable digest: $CANDIDATE_DIGEST"
+  docker pull "$CANDIDATE_DIGEST"
+else
+  # Normal Promotion Mode:
+  # 2. Verify external S3 backup readiness FIRST
+  log "Step 2: Checking backup & WAL readiness..."
+  if [[ -f "scripts/check-backup-readiness.sh" ]]; then
+    ./scripts/check-backup-readiness.sh
+  fi
+
+  # 3. Headroom & Co-tenant isolation checks
+  log "Step 3: Checking system headroom & co-tenant boundaries..."
+  FREE_RAM_MB=$(free -m | awk '/^Mem:/{print $7}')
+  if [[ "$FREE_RAM_MB" -lt 1024 ]]; then
+    err "INSUFFICIENT MEMORY: Only ${FREE_RAM_MB}MB available, minimum 1024MB required."
+    exit 1
+  fi
+
+  FREE_DISK_MB=$(df -m / | awk 'NR==2 {print $4}')
+  if [[ "$FREE_DISK_MB" -lt 4096 ]]; then
+    err "INSUFFICIENT DISK: Only ${FREE_DISK_MB}MB available on root, minimum 4096MB required."
+    exit 1
+  fi
+
+  if docker ps -a --format '{{.Names}}' | grep -qi "flowdesk"; then
+    log "FlowDesk co-tenant containers detected and protected."
+  fi
+
+  # 4. Pull candidate immutable image
+  log "Step 4: Pulling candidate image by immutable digest: $CANDIDATE_DIGEST"
+  docker pull "$CANDIDATE_DIGEST"
+
+  # 4b. Bootstrap persistent data services (PostgreSQL, NATS) before migration
+  log "Step 4b: Bootstrapping persistent staging data infrastructure (PostgreSQL & NATS)..."
+  docker compose -p deadbolt-staging -f "$COMPOSE_FILE" up -d postgres nats
+
+  log "Waiting for PostgreSQL service to report healthy..."
+  PG_HEALTHY=false
+  for i in $(seq 1 30); do
+    STATUS=$(docker inspect --format '{{.State.Health.Status}}' deadbolt-staging-postgres 2>/dev/null || echo "unknown")
+    if [[ "$STATUS" == "healthy" ]]; then
+      PG_HEALTHY=true
+      break
+    fi
+    sleep 2
+  done
+
+  if [[ "$PG_HEALTHY" != "true" ]]; then
+    err "PostgreSQL failed to report healthy within 60s!"
+    docker compose -p deadbolt-staging -f "$COMPOSE_FILE" logs postgres || true
+    exit 1
+  fi
+  log "PostgreSQL is healthy and accepting connections."
 fi
-log "PostgreSQL is healthy and accepting connections."
 
 # 5. Deterministic migration execution via candidate container runner
 log "Step 5: Executing forward schema migrations with advisory lock..."

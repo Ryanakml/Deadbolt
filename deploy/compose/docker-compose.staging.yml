@@ -11,7 +11,10 @@ volumes:
 
 services:
   postgres:
-    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.postgres
+    image: ${DEADBOLT_POSTGRES_IMAGE:-deadbolt-staging-postgres:18}
     container_name: deadbolt-staging-postgres
     restart: unless-stopped
     networks:
@@ -29,11 +32,18 @@ services:
     environment:
       POSTGRES_DB: deadbolt_staging
       POSTGRES_USER: deadbolt_admin
-      POSTGRES_PASSWORD: ${DEADBOLT_DB_ADMIN_PASSWORD:-${DEADBOLT_DB_SYSTEM_PASSWORD:?Required admin db password}}
-      DEADBOLT_MIGRATOR_PASSWORD: ${DEADBOLT_MIGRATOR_PASSWORD:-migrator_secure_pass}
-      DEADBOLT_RUNTIME_PASSWORD: ${DEADBOLT_RUNTIME_PASSWORD:-runtime_secure_pass}
-      DEADBOLT_SYSTEM_PASSWORD: ${DEADBOLT_SYSTEM_PASSWORD:-system_secure_pass}
+      POSTGRES_PASSWORD: ${DEADBOLT_DB_ADMIN_PASSWORD:?Required admin db password}
+      DEADBOLT_MIGRATOR_PASSWORD: ${DEADBOLT_MIGRATOR_PASSWORD:?Required migrator db password}
+      DEADBOLT_RUNTIME_PASSWORD: ${DEADBOLT_RUNTIME_PASSWORD:?Required runtime db password}
+      DEADBOLT_SYSTEM_PASSWORD: ${DEADBOLT_SYSTEM_PASSWORD:?Required system db password}
       DEADBOLT_STORAGE_S3_BUCKET: ${DEADBOLT_STORAGE_S3_BUCKET:-}
+      DEADBOLT_STORAGE_S3_ENDPOINT: ${DEADBOLT_STORAGE_S3_ENDPOINT:-}
+      DEADBOLT_STORAGE_S3_REGION: ${DEADBOLT_STORAGE_S3_REGION:-}
+      DEADBOLT_STORAGE_S3_SSE: ${DEADBOLT_STORAGE_S3_SSE:-AES256}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-${DEADBOLT_STORAGE_S3_REGION:-us-east-1}}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-${DEADBOLT_STORAGE_S3_ENDPOINT:-}}
       DEADBOLT_WAL_ARCHIVE_DIR: ${DEADBOLT_WAL_ARCHIVE_DIR:-}
       DEADBOLT_WAL_ARCHIVE_DISABLED: ${DEADBOLT_WAL_ARCHIVE_DISABLED:-false}
     # Security constraint: No public host port exposure for PostgreSQL
@@ -95,7 +105,7 @@ services:
       LISTEN_ADDR: "0.0.0.0:8080"
       DEADBOLT_IMAGE_DIGEST: ${DEADBOLT_IMAGE_BLUE:-${DEADBOLT_IMAGE}}
       DATABASE_URL: ${DATABASE_URL:?Required restricted runtime database connection string}
-      SYSTEM_DATABASE_URL: ${SYSTEM_DATABASE_URL:-postgres://deadbolt_system:${DEADBOLT_SYSTEM_PASSWORD:-system_secure_pass}@postgres:5432/deadbolt_staging?sslmode=disable}
+      SYSTEM_DATABASE_URL: ${SYSTEM_DATABASE_URL:?Required system database connection string}
       NATS_URL: nats://nats:4222
       DEADBOLT_OIDC_ISSUER: ${DEADBOLT_OIDC_ISSUER:?Required OIDC issuer}
       DEADBOLT_OIDC_CLIENT_ID: ${DEADBOLT_OIDC_CLIENT_ID:?Required OIDC client id}
@@ -135,7 +145,7 @@ services:
       LISTEN_ADDR: "0.0.0.0:8080"
       DEADBOLT_IMAGE_DIGEST: ${DEADBOLT_IMAGE_GREEN:-${DEADBOLT_IMAGE}}
       DATABASE_URL: ${DATABASE_URL:?Required restricted runtime database connection string}
-      SYSTEM_DATABASE_URL: ${SYSTEM_DATABASE_URL:-postgres://deadbolt_system:${DEADBOLT_SYSTEM_PASSWORD:-system_secure_pass}@postgres:5432/deadbolt_staging?sslmode=disable}
+      SYSTEM_DATABASE_URL: ${SYSTEM_DATABASE_URL:?Required system database connection string}
       NATS_URL: nats://nats:4222
       DEADBOLT_OIDC_ISSUER: ${DEADBOLT_OIDC_ISSUER:?Required OIDC issuer}
       DEADBOLT_OIDC_CLIENT_ID: ${DEADBOLT_OIDC_CLIENT_ID:?Required OIDC client id}
