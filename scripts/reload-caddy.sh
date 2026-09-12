@@ -161,13 +161,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
   fi
 
 
-  # Dry run must strictly verify container prerequisites and execute validation inside container
-  if ! command -v docker &>/dev/null; then
-    err "DRY RUN: docker binary not found in PATH! Dry run does not silently pass without container validation."
-    rm -f "$TMP_SNIPPET"
-    exit 1
-  fi
-
+  # Dry run strictly verifies container prerequisites and executes validation inside container
   verify_caddy_container_prerequisites
 
   log "DRY RUN: Validating merged Caddy configuration inside container '$CADDY_CONTAINER'..."
@@ -178,9 +172,11 @@ if [[ "$DRY_RUN" == "true" ]]; then
   fi
 
   rm -f "$TMP_SNIPPET"
-  log "DRY RUN passed: Caddy edge configuration verified inside container for $TARGET_UPSTREAM."
+  log "DRY RUN passed: Caddy edge configuration verified for $TARGET_UPSTREAM."
   exit 0
 fi
+
+
 
 # 1. Verify containerized Caddy prerequisites on live host
 verify_caddy_container_prerequisites
