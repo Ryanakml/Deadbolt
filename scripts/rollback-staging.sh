@@ -83,6 +83,11 @@ elif [[ -f "$POSTGRES_IMAGE_FILE" ]]; then
   if [[ -n "$RECORDED_PG_IMAGE" ]]; then
     DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
   fi
+elif [[ -f "${RELEASE_DIR}/postgres_image.previous" ]]; then
+  RECORDED_PG_IMAGE=$(cat "${RELEASE_DIR}/postgres_image.previous" | tr -d '[:space:]')
+  if [[ -n "$RECORDED_PG_IMAGE" ]]; then
+    DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
+  fi
 fi
 
 # Fall back to inspecting running postgres container if image is still unset

@@ -45,6 +45,43 @@ fi
 CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
 RELEASE_DIR="${RELEASE_DIR:-/opt/deadbolt/releases}"
 POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+PREVIOUS_POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image.previous"
+
+inspect_and_record_postgres_provenance() {
+  local expected_image="$1"
+  local container_name="deadbolt-staging-postgres"
+  log "Inspecting running PostgreSQL container image identity for $container_name..."
+  local running_image_id running_image_decl repo_digests
+  running_image_id=$(docker inspect --format '{{.Image}}' "$container_name" 2>/dev/null || true)
+  running_image_decl=$(docker inspect --format '{{index .Config.Image}}' "$container_name" 2>/dev/null || true)
+  repo_digests=$(docker inspect --format '{{json .RepoDigests}}' "$running_image_id" 2>/dev/null || echo "[]")
+
+  local expected_sha
+  expected_sha=$(echo "$expected_image" | grep -o 'sha256:[a-f0-9]\{64\}' || true)
+  if [[ -n "$expected_sha" ]]; then
+    if ! echo "$running_image_decl $repo_digests $running_image_id" | grep -q "$expected_sha"; then
+      err "POSTGRES IMAGE IDENTITY MISMATCH: Expected digest $expected_sha does not match running container image ($running_image_decl)!"
+      exit 1
+    fi
+  elif [[ "$running_image_decl" != "$expected_image" ]]; then
+    err "POSTGRES IMAGE IDENTITY MISMATCH: Expected $expected_image, got $running_image_decl!"
+    exit 1
+  fi
+
+  mkdir -p "$RELEASE_DIR"
+  if [[ -f "$POSTGRES_IMAGE_FILE" ]]; then
+    local current_recorded
+    current_recorded=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]' || true)
+    if [[ "$current_recorded" != "$expected_image" ]]; then
+      cp -f "$POSTGRES_IMAGE_FILE" "$PREVIOUS_POSTGRES_IMAGE_FILE"
+    fi
+  fi
+  local tmp_pg_file
+  tmp_pg_file=$(mktemp "${RELEASE_DIR}/postgres_image.tmp.XXXXXX")
+  echo "$expected_image" > "$tmp_pg_file"
+  mv -f "$tmp_pg_file" "$POSTGRES_IMAGE_FILE"
+  log "PostgreSQL release provenance independently verified and persisted: $expected_image"
+}
 
 # 1. Load host configuration
 CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
@@ -151,6 +188,9 @@ if [[ "$PG_HEALTHY" != "true" ]]; then
   exit 1
 fi
 log "PostgreSQL is healthy and database roles are initialized."
+
+# Independently inspect running PostgreSQL container and persist release provenance transactionally
+inspect_and_record_postgres_provenance "$DEADBOLT_POSTGRES_IMAGE"
 
 # 4. Create initial base backup and switch WAL
 log "Establishing first verified base backup and WAL archive..."

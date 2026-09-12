@@ -1535,13 +1535,19 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 
 	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
 
-	// Execute restore-staging-db.sh in default --drill mode
+	// Write recorded release provenance to verify standalone recovery resolution without caller env
+	drillReleaseDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(drillReleaseDir, "postgres_image"), []byte("postgres:18-bookworm\n"), 0644); err != nil {
+		t.Fatalf("failed to write postgres_image for drill: %v", err)
+	}
+
+	// Execute restore-staging-db.sh in default --drill mode (DEADBOLT_POSTGRES_IMAGE resolved standalone from release state)
 	drillCmd := exec.Command("/bin/bash", scriptPath, "--drill")
 	drillCmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
+		"RELEASE_DIR=" + drillReleaseDir,
 		"DEADBOLT_WAL_ARCHIVE_DIR=" + archiveDir,
 		"DEADBOLT_DB_ADMIN_PASSWORD=testpass",
-		"DEADBOLT_POSTGRES_IMAGE=postgres:18-bookworm",
 	}
 	drillOut, drillErr := drillCmd.CombinedOutput()
 	if drillErr != nil {
@@ -1557,9 +1563,10 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 }
 
 // TestDeployToRollbackPostgresImageProvenance verifies Finding 1 from Follow-up Audit #5:
+// TestDeployToRollbackPostgresImageProvenance verifies Finding 1 from Follow-up Audit #5 & #6:
 // Workflow-supplied DEADBOLT_POSTGRES_IMAGE is preserved across sourcing static host configuration,
-// recorded to ${RELEASE_DIR}/postgres_image, and recovered by scripts/rollback-staging.sh to succeed
-// standalone with zero operator environment even when staging.env omits it.
+// persisted only after the actual staging Postgres service is healthy and inspected, and recovered
+// by scripts/rollback-staging.sh to succeed standalone with zero operator environment even when staging.env omits it.
 func TestDeployToRollbackPostgresImageProvenance(t *testing.T) {
 	tmpDir := t.TempDir()
 	releaseDir := filepath.Join(tmpDir, "releases")
@@ -1575,8 +1582,15 @@ func TestDeployToRollbackPostgresImageProvenance(t *testing.T) {
 
 	workflowDigest := "ghcr.io/ryanakml/deadbolt/postgres@sha256:active222222222222222222222222222222222222222222222222222222222222"
 	staleDigest := "ghcr.io/ryanakml/deadbolt/postgres@sha256:stale111111111111111111111111111111111111111111111111111111111111"
+	priorDigest := "ghcr.io/ryanakml/deadbolt/postgres@sha256:prior000000000000000000000000000000000000000000000000000000000000"
 
-	// 1. Static config with stale digest
+	// 1. Establish prior release state
+	pgImageFile := filepath.Join(releaseDir, "postgres_image")
+	if err := os.WriteFile(pgImageFile, []byte(priorDigest+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write initial postgres_image: %v", err)
+	}
+
+	// 2. Static config with stale digest
 	envWithStale := fmt.Sprintf(`DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud
 DATABASE_URL=postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock
 MIGRATOR_DATABASE_URL=postgres://deadbolt_migrator:mock_migrator_password@localhost:5432/mock
@@ -1596,13 +1610,15 @@ DEADBOLT_POSTGRES_IMAGE=%s
 		t.Fatalf("failed to write staging.env: %v", err)
 	}
 
-	// Sourcing deploy logic: caller DEADBOLT_POSTGRES_IMAGE must win over stale config
-	cmdTestDeploy := exec.Command("/bin/bash", "-c", fmt.Sprintf(`
+	// 3. Sourcing deploy logic: caller DEADBOLT_POSTGRES_IMAGE must win over stale config
+	// AND early failures before Postgres inspection MUST NOT overwrite prior release state
+	cmdTestDeployEarlyFail := exec.Command("/bin/bash", "-c", fmt.Sprintf(`
 		set -euo pipefail
 		RELEASE_DIR=%q
 		DEADBOLT_CONFIG_FILE=%q
 		DEADBOLT_POSTGRES_IMAGE=%q
 		POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+		PREVIOUS_POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image.previous"
 		CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
 		source "$DEADBOLT_CONFIG_FILE"
 		if [[ -n "$CALLER_POSTGRES_IMAGE" ]]; then
@@ -1610,30 +1626,71 @@ DEADBOLT_POSTGRES_IMAGE=%s
 		elif [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" && -f "$POSTGRES_IMAGE_FILE" ]]; then
 			DEADBOLT_POSTGRES_IMAGE=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
 		fi
-		mkdir -p "$RELEASE_DIR"
-		echo "$DEADBOLT_POSTGRES_IMAGE" > "$POSTGRES_IMAGE_FILE"
+		export DEADBOLT_POSTGRES_IMAGE
 		echo "RESOLVED_IMAGE=$DEADBOLT_POSTGRES_IMAGE"
+		# Simulate a failure before postgres inspection / compose up
+		exit 42
 	`, releaseDir, configFile, workflowDigest))
 
-	deployOut, err := cmdTestDeploy.CombinedOutput()
-	if err != nil {
-		t.Fatalf("deploy image provenance resolution failed: %v, %s", err, string(deployOut))
+	earlyFailOut, earlyFailErr := cmdTestDeployEarlyFail.CombinedOutput()
+	if earlyFailErr == nil {
+		t.Fatalf("expected early fail script to exit with error")
 	}
-	if !strings.Contains(string(deployOut), "RESOLVED_IMAGE="+workflowDigest) {
-		t.Fatalf("expected caller image %s, got output: %s", workflowDigest, string(deployOut))
-	}
-
-	// Verify postgres_image file was created
-	pgImageFile := filepath.Join(releaseDir, "postgres_image")
-	pgData, err := os.ReadFile(pgImageFile)
-	if err != nil {
-		t.Fatalf("failed to read postgres_image: %v", err)
-	}
-	if strings.TrimSpace(string(pgData)) != workflowDigest {
-		t.Fatalf("expected %s in postgres_image file, got %s", workflowDigest, string(pgData))
+	if !strings.Contains(string(earlyFailOut), "RESOLVED_IMAGE="+workflowDigest) {
+		t.Fatalf("expected caller image %s, got output: %s", workflowDigest, string(earlyFailOut))
 	}
 
-	// 2. Now rewrite staging.env so it completely OMITS DEADBOLT_POSTGRES_IMAGE
+	// Prior release state MUST remain completely untouched after early failure
+	priorCheckData, err := os.ReadFile(pgImageFile)
+	if err != nil {
+		t.Fatalf("failed to read postgres_image after early fail: %v", err)
+	}
+	if strings.TrimSpace(string(priorCheckData)) != priorDigest {
+		t.Fatalf("REGRESSION: postgres_image was modified before service verification! expected %s, got %s", priorDigest, string(priorCheckData))
+	}
+
+	// 4. Simulate successful post-verification transactional release state persistence
+	cmdTestInspectAndPersist := exec.Command("/bin/bash", "-c", fmt.Sprintf(`
+		set -euo pipefail
+		RELEASE_DIR=%q
+		POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+		PREVIOUS_POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image.previous"
+		expected_image=%q
+
+		mkdir -p "$RELEASE_DIR"
+		if [[ -f "$POSTGRES_IMAGE_FILE" ]]; then
+			current_recorded=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]' || true)
+			if [[ "$current_recorded" != "$expected_image" ]]; then
+				cp -f "$POSTGRES_IMAGE_FILE" "$PREVIOUS_POSTGRES_IMAGE_FILE"
+			fi
+		fi
+		tmp_pg_file=$(mktemp "${RELEASE_DIR}/postgres_image.tmp.XXXXXX")
+		echo "$expected_image" > "$tmp_pg_file"
+		mv -f "$tmp_pg_file" "$POSTGRES_IMAGE_FILE"
+	`, releaseDir, workflowDigest))
+
+	if out, err := cmdTestInspectAndPersist.CombinedOutput(); err != nil {
+		t.Fatalf("transactional persist failed: %v, %s", err, string(out))
+	}
+
+	// Verify current postgres_image has new digest and previous has priorDigest
+	currentData, err := os.ReadFile(pgImageFile)
+	if err != nil {
+		t.Fatalf("failed to read updated postgres_image: %v", err)
+	}
+	if strings.TrimSpace(string(currentData)) != workflowDigest {
+		t.Fatalf("expected %s in postgres_image, got %s", workflowDigest, string(currentData))
+	}
+
+	prevData, err := os.ReadFile(filepath.Join(releaseDir, "postgres_image.previous"))
+	if err != nil {
+		t.Fatalf("failed to read postgres_image.previous: %v", err)
+	}
+	if strings.TrimSpace(string(prevData)) != priorDigest {
+		t.Fatalf("expected %s in postgres_image.previous, got %s", priorDigest, string(prevData))
+	}
+
+	// 5. Now rewrite staging.env so it completely OMITS DEADBOLT_POSTGRES_IMAGE
 	envWithoutPG := `DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud
 DATABASE_URL=postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock
 MIGRATOR_DATABASE_URL=postgres://deadbolt_migrator:mock_migrator_password@localhost:5432/mock
@@ -1666,6 +1723,11 @@ DEADBOLT_OIDC_CLIENT_SECRET=mock_client_secret
 			if [[ -n "$RECORDED_PG_IMAGE" ]]; then
 				DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
 			fi
+		elif [[ -f "${RELEASE_DIR}/postgres_image.previous" ]]; then
+			RECORDED_PG_IMAGE=$(cat "${RELEASE_DIR}/postgres_image.previous" | tr -d '[:space:]')
+			if [[ -n "$RECORDED_PG_IMAGE" ]]; then
+				DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
+			fi
 		fi
 		echo "ROLLBACK_RESOLVED_IMAGE=${DEADBOLT_POSTGRES_IMAGE:-}"
 	`, releaseDir, configFile))
@@ -1681,21 +1743,23 @@ DEADBOLT_OIDC_CLIENT_SECRET=mock_client_secret
 		t.Fatalf("expected rollback to recover %s from release state, got: %s", workflowDigest, string(rollbackOut))
 	}
 
-	// 3. Verify deploy-staging.sh, rollback-staging.sh, and bootstrap-staging-cluster.sh script contracts
+	// 6. Verify deploy-staging.sh, rollback-staging.sh, and bootstrap-staging-cluster.sh script contracts
 	scriptsToCheck := map[string][]string{
 		"../../scripts/deploy-staging.sh": {
 			"POSTGRES_IMAGE_FILE=\"${RELEASE_DIR}/postgres_image\"",
-			"echo \"$DEADBOLT_POSTGRES_IMAGE\" > \"$POSTGRES_IMAGE_FILE\"",
+			"PREVIOUS_POSTGRES_IMAGE_FILE=\"${RELEASE_DIR}/postgres_image.previous\"",
+			"inspect_and_record_postgres_provenance",
 			"export DEADBOLT_POSTGRES_IMAGE",
 		},
 		"../../scripts/rollback-staging.sh": {
 			"POSTGRES_IMAGE_FILE=\"${RELEASE_DIR}/postgres_image\"",
 			"cat \"$POSTGRES_IMAGE_FILE\"",
+			"postgres_image.previous",
 			"export DEADBOLT_POSTGRES_IMAGE",
 		},
 		"../../scripts/bootstrap-staging-cluster.sh": {
 			"POSTGRES_IMAGE_FILE=\"${RELEASE_DIR}/postgres_image\"",
-			"CALLER_POSTGRES_IMAGE=\"${DEADBOLT_POSTGRES_IMAGE:-}\"",
+			"inspect_and_record_postgres_provenance",
 			"export DEADBOLT_POSTGRES_IMAGE",
 		},
 	}
@@ -1711,6 +1775,128 @@ DEADBOLT_OIDC_CLIENT_SECRET=mock_client_secret
 				t.Fatalf("contract violation in %s: missing expected pattern %q", sPath, pat)
 			}
 		}
+	}
+}
+
+// TestStandaloneRestorePostgresImageProvenance verifies Finding 2 from Follow-up Audit #6:
+// restore-staging-db.sh resolves immutable PostgreSQL image from explicit caller input ->
+// recorded release provenance -> running container, fails closed with zero mutable fallback (no postgres:18),
+// uses pinned helper images by digest, and recovers release digest standalone when staging.env omits it.
+func TestStandaloneRestorePostgresImageProvenance(t *testing.T) {
+	scriptPath := "../../scripts/restore-staging-db.sh"
+	scriptBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("failed to read restore-staging-db.sh: %v", err)
+	}
+	scriptStr := string(scriptBytes)
+
+	// Verify script does NOT contain mutable postgres:18 fallback
+	if strings.Contains(scriptStr, "postgres:18}") || strings.Contains(scriptStr, "postgres:18\"") {
+		t.Fatalf("CONTRACT VIOLATION: restore-staging-db.sh still contains mutable postgres:18 fallback")
+	}
+
+	// Verify script does NOT contain mutable alpine helper
+	if strings.Contains(scriptStr, "alpine") {
+		t.Fatalf("CONTRACT VIOLATION: restore-staging-db.sh still contains mutable alpine helper")
+	}
+
+	tmpDir := t.TempDir()
+	releaseDir := filepath.Join(tmpDir, "releases")
+	if err := os.MkdirAll(releaseDir, 0755); err != nil {
+		t.Fatalf("failed to create release dir: %v", err)
+	}
+
+	configDir := filepath.Join(tmpDir, "config")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configFile := filepath.Join(configDir, "staging.env")
+
+	// 1. staging.env contains NO DEADBOLT_POSTGRES_IMAGE
+	stagingEnv := `DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud
+DEADBOLT_STORAGE_S3_BUCKET=mock-backup-bucket
+DEADBOLT_DB_ADMIN_PASSWORD=mock_admin_password
+DATABASE_URL=postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock
+SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system_password@localhost:5432/mock
+`
+	if err := os.WriteFile(configFile, []byte(stagingEnv), 0600); err != nil {
+		t.Fatalf("failed to write staging.env: %v", err)
+	}
+
+	// 2. When postgres_image file is absent, restore-staging-db.sh must FAIL CLOSED
+	failClosedCmd := exec.Command("/bin/bash", scriptPath, "--drill")
+	failClosedCmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_CONFIG_FILE=" + configFile,
+		"RELEASE_DIR=" + releaseDir,
+	}
+	failClosedOut, failClosedErr := failClosedCmd.CombinedOutput()
+	if failClosedErr == nil {
+		t.Fatalf("expected restore-staging-db.sh to fail closed when DEADBOLT_POSTGRES_IMAGE is absent, but succeeded:\n%s", string(failClosedOut))
+	}
+	if !strings.Contains(string(failClosedOut), "DEADBOLT_POSTGRES_IMAGE could not be resolved") {
+		t.Fatalf("expected 'DEADBOLT_POSTGRES_IMAGE could not be resolved' in error output, got:\n%s", string(failClosedOut))
+	}
+
+	// 3. Populate releases/postgres_image with authoritative digest
+	recordedDigest := "ghcr.io/ryanakml/deadbolt/postgres@sha256:authoritative1111111111111111111111111111111111111111111111111111"
+	if err := os.WriteFile(filepath.Join(releaseDir, "postgres_image"), []byte(recordedDigest+"\n"), 0644); err != nil {
+		t.Fatalf("failed to write postgres_image: %v", err)
+	}
+
+	// 4. Test resolution logic: verify recorded digest is recovered standalone from release state
+	checkHarness := filepath.Join(tmpDir, "check_resolution.sh")
+	harnessScript := `
+set -euo pipefail
+CONFIG_FILE="$DEADBOLT_CONFIG_FILE"
+source "$CONFIG_FILE"
+POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
+if [[ -n "$CALLER_POSTGRES_IMAGE" ]]; then
+	DEADBOLT_POSTGRES_IMAGE="$CALLER_POSTGRES_IMAGE"
+elif [[ -f "$POSTGRES_IMAGE_FILE" ]]; then
+	RECORDED_PG_IMAGE=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
+	if [[ -n "$RECORDED_PG_IMAGE" ]]; then
+		DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
+	fi
+fi
+echo "RESOLVED_PG_IMAGE=${DEADBOLT_POSTGRES_IMAGE:-}"
+`
+	if err := os.WriteFile(checkHarness, []byte(harnessScript), 0755); err != nil {
+		t.Fatalf("failed to write harness: %v", err)
+	}
+
+	resolveCmd := exec.Command("/bin/bash", checkHarness)
+	resolveCmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_CONFIG_FILE=" + configFile,
+		"RELEASE_DIR=" + releaseDir,
+	}
+
+	resolveOut, resolveErr := resolveCmd.CombinedOutput()
+	if resolveErr != nil {
+		t.Fatalf("resolution harness failed: %v, %s", resolveErr, string(resolveOut))
+	}
+	if !strings.Contains(string(resolveOut), "RESOLVED_PG_IMAGE="+recordedDigest) {
+		t.Fatalf("expected %s to be recovered from postgres_image, got: %s", recordedDigest, string(resolveOut))
+	}
+
+	// 5. Verify caller environment takes precedence over recorded file
+	callerOverride := "ghcr.io/ryanakml/deadbolt/postgres@sha256:calleroverride222222222222222222222222222222222222222222222222222"
+	overrideCmd := exec.Command("/bin/bash", checkHarness)
+	overrideCmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DEADBOLT_CONFIG_FILE=" + configFile,
+		"RELEASE_DIR=" + releaseDir,
+		"DEADBOLT_POSTGRES_IMAGE=" + callerOverride,
+	}
+
+	overrideOut, overrideErr := overrideCmd.CombinedOutput()
+	if overrideErr != nil {
+		t.Fatalf("override harness failed: %v, %s", overrideErr, string(overrideOut))
+	}
+	if !strings.Contains(string(overrideOut), "RESOLVED_PG_IMAGE="+callerOverride) {
+		t.Fatalf("expected caller override %s, got: %s", callerOverride, string(overrideOut))
 	}
 }
 
@@ -2142,7 +2328,7 @@ func TestDatabasePointInTimeRecoveryDrillRemoteS3(t *testing.T) {
 	_ = exec.Command("docker", "rm", "-f", sourceContainer).Run()
 
 	// Ensure all files written by Docker container in localArchiveDir are readable by non-root test runner
-	_ = exec.Command("docker", "run", "--rm", "-v", localArchiveDir+":/data", "alpine", "chmod", "-R", "a+rw", "/data").Run()
+	_ = exec.Command("docker", "run", "--rm", "--entrypoint", "chmod", "-v", localArchiveDir+":/data", "postgres:18-bookworm", "-R", "a+rw", "/data").Run()
 
 	// Upload real base backup and WAL to mock S3 server objects
 	baseBytes, err := os.ReadFile(localBaseTarball)

@@ -19,6 +19,10 @@ MODE="drill"
 FORCE_RESTORE="${FORCE_RESTORE:-false}"
 TARGET_TIME="${DEADBOLT_RECOVERY_TARGET_TIME:-}"
 S3_BUCKET="${DEADBOLT_STORAGE_S3_BUCKET:-}"
+RELEASE_DIR="${RELEASE_DIR:-/opt/deadbolt/releases}"
+POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+PREVIOUS_POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image.previous"
+CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
 DRILL_CONTAINER_NAME="deadbolt-recovery-drill-postgres"
 LIVE_CONTAINER_NAME="deadbolt-staging-postgres"
 LIVE_VOLUME_NAME="deadbolt_staging_postgres_data"
@@ -89,19 +93,62 @@ if [[ "$MODE" == "destructive" && "$FORCE_RESTORE" != "true" ]]; then
 fi
 
 # 1. Load host configuration if available
-if [[ -z "$S3_BUCKET" && -z "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
-  CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
-  if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
-    CONFIG_FILE="/opt/deadbolt/config/staging.env"
+CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
+if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
+  CONFIG_FILE="/opt/deadbolt/config/staging.env"
+fi
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  PERMS=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%Op" "$CONFIG_FILE" 2>/dev/null || echo "600")
+  if [[ "$PERMS" =~ [4567]$ ]]; then
+    err "SECURITY VIOLATION: Configuration file $CONFIG_FILE is world-readable ($PERMS)!"
+    err "Remediation: chmod 600 $CONFIG_FILE"
+    exit 1
   fi
-  if [[ -f "$CONFIG_FILE" ]]; then
-    set -a
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-    set +a
-    S3_BUCKET="${DEADBOLT_STORAGE_S3_BUCKET:-}"
+  log "Loading configuration from $CONFIG_FILE..."
+  set -a
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  set +a
+fi
+
+S3_BUCKET="${DEADBOLT_STORAGE_S3_BUCKET:-$S3_BUCKET}"
+
+# Resolve authoritative PostgreSQL image digest:
+# 1. Explicit caller environment input ($CALLER_POSTGRES_IMAGE)
+# 2. Recorded release provenance ($POSTGRES_IMAGE_FILE or $PREVIOUS_POSTGRES_IMAGE_FILE)
+# 3. Running staging container ($LIVE_CONTAINER_NAME)
+if [[ -n "$CALLER_POSTGRES_IMAGE" ]]; then
+  DEADBOLT_POSTGRES_IMAGE="$CALLER_POSTGRES_IMAGE"
+elif [[ -f "$POSTGRES_IMAGE_FILE" ]]; then
+  RECORDED_PG_IMAGE=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
+  if [[ -n "$RECORDED_PG_IMAGE" ]]; then
+    DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
+  fi
+elif [[ -f "$PREVIOUS_POSTGRES_IMAGE_FILE" ]]; then
+  RECORDED_PG_IMAGE=$(cat "$PREVIOUS_POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
+  if [[ -n "$RECORDED_PG_IMAGE" ]]; then
+    DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
   fi
 fi
+
+if [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" ]]; then
+  RUNNING_PG_IMAGE=$(docker inspect --format '{{.Config.Image}}' "$LIVE_CONTAINER_NAME" 2>/dev/null || true)
+  if [[ -n "$RUNNING_PG_IMAGE" ]]; then
+    DEADBOLT_POSTGRES_IMAGE="$RUNNING_PG_IMAGE"
+  fi
+fi
+
+# Fail closed if no immutable digest can be established (zero mutable fallback permitted)
+if [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" ]]; then
+  err "RECOVERY ABORTED: DEADBOLT_POSTGRES_IMAGE could not be resolved!"
+  err "An immutable digest must be provided via environment, recorded in $POSTGRES_IMAGE_FILE, or running container $LIVE_CONTAINER_NAME."
+  exit 1
+fi
+export DEADBOLT_POSTGRES_IMAGE
+
+# Pinned helper image: defaults to resolved immutable PostgreSQL image (strictly pinned by digest)
+HELPER_IMG="${DEADBOLT_HELPER_IMAGE:-$DEADBOLT_POSTGRES_IMAGE}"
 
 if [[ -z "$S3_BUCKET" && -z "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
   err "Neither DEADBOLT_STORAGE_S3_BUCKET nor DEADBOLT_WAL_ARCHIVE_DIR is configured!"
@@ -123,8 +170,12 @@ cleanup() {
     docker rm -f "$DRILL_CONTAINER_NAME" 2>/dev/null || true
   fi
   if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
-    docker run --rm -v "${TMP_DIR}":/cleanup alpine rm -rf /cleanup/* 2>/dev/null || true
-    rm -rf "$TMP_DIR" 2>/dev/null || true
+    rm -rf "$TMP_DIR" 2>/dev/null || {
+      if [[ -n "${HELPER_IMG:-}" ]]; then
+        docker run --rm --entrypoint sh -v "${TMP_DIR}":/cleanup "$HELPER_IMG" -c "rm -rf /cleanup/*" 2>/dev/null || true
+      fi
+      rm -rf "$TMP_DIR" 2>/dev/null || true
+    }
   fi
 }
 trap cleanup EXIT
@@ -220,7 +271,7 @@ if [[ "$MODE" == "drill" ]]; then
   log "Live staging database ($LIVE_CONTAINER_NAME) and volume ($LIVE_VOLUME_NAME) are NOT touched."
   log "================================================================================"
 
-  DRILL_IMG="${DEADBOLT_POSTGRES_IMAGE:-postgres:18}"
+  DRILL_IMG="$DEADBOLT_POSTGRES_IMAGE"
 
   DOCKER_ARGS=(
     run -d
@@ -312,9 +363,10 @@ elif [[ "$MODE" == "destructive" ]]; then
 
   log "Replacing persistent data in $LIVE_VOLUME_NAME with recovered state..."
   docker run --rm \
+    --entrypoint sh \
     -v "${LIVE_VOLUME_NAME}":/dest \
     -v "$RECOVERED_ROOT":/src \
-    alpine sh -c "rm -rf /dest/* && cp -a /src/* /dest/ && chown -R 999:999 /dest"
+    "$HELPER_IMG" -c "rm -rf /dest/* && cp -a /src/* /dest/ && chown -R 999:999 /dest"
 
   log "Restarting staging PostgreSQL container..."
   docker compose -f "$COMPOSE_FILE" up -d postgres

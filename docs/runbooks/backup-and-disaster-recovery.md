@@ -134,7 +134,7 @@ EOF
 
 ```bash
 docker compose -f deploy/compose/docker-compose.staging.yml stop postgres
-docker run --rm -v deadbolt_staging_postgres_data:/dest -v "${TMP_DIR}/recovered_data":/src alpine sh -c "rm -rf /dest/* && cp -a /src/* /dest/"
+docker run --rm --entrypoint sh -v deadbolt_staging_postgres_data:/dest -v "${TMP_DIR}/recovered_data":/src "${DEADBOLT_POSTGRES_IMAGE}" -c "rm -rf /dest/* && cp -a /src/* /dest/ && chown -R 999:999 /dest"
 docker compose -f deploy/compose/docker-compose.staging.yml up -d postgres
 ```
 
