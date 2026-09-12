@@ -72,8 +72,8 @@ func TestCleanDatabaseMigrationAsDeadboltMigrator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get migration version: %v", err)
 	}
-	if v != 5 {
-		t.Fatalf("expected latest migration version 5, got %d", v)
+	if v != 6 {
+		t.Fatalf("expected latest migration version 6, got %d", v)
 	}
 }
 
@@ -145,10 +145,10 @@ func TestMigrationAdvisoryLockBlocking(t *testing.T) {
 		t.Fatalf("Runner B failed to run migration Up after Runner A released: %v", err)
 	}
 
-	// Verify version is now upgraded to 5
+	// Verify version is now upgraded to 6
 	v, err = runnerB.Version(ctx)
-	if err != nil || v != 5 {
-		t.Fatalf("expected version 5 after migration Up, got %d (err: %v)", v, err)
+	if err != nil || v != 6 {
+		t.Fatalf("expected version 6 after migration Up, got %d (err: %v)", v, err)
 	}
 }
 
@@ -529,8 +529,8 @@ func TestIntermediateMigrationStepUpgradeSafety(t *testing.T) {
 	}
 
 	latestV, err := runner.Version(ctx)
-	if err != nil || latestV != 5 {
-		t.Fatalf("expected version 5 after Up, got %d (err: %v)", latestV, err)
+	if err != nil || latestV != 6 {
+		t.Fatalf("expected version 6 after Up, got %d (err: %v)", latestV, err)
 	}
 
 	// 4. Verify pre-existing data is preserved intact
