@@ -1,0 +1,143 @@
+name: deadbolt
+
+networks:
+  deadbolt_network:
+    driver: bridge
+
+volumes:
+  deadbolt_postgres_data:
+  deadbolt_nats_data:
+  deadbolt_minio_data:
+
+services:
+  postgres:
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    container_name: deadbolt-postgres
+    profiles: ["core"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    environment:
+      POSTGRES_DB: deadbolt
+      POSTGRES_USER: deadbolt_system
+      POSTGRES_PASSWORD: localdevpassword
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - deadbolt_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deadbolt_system"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 30s
+
+  nats:
+    image: nats:2-alpine@sha256:ad7a43eb7e3337c3c38ce5d784d1461791f95f730f252d2b25eee699752a0ca3
+    container_name: deadbolt-nats
+    profiles: ["core"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - deadbolt_nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4222 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  minio:
+    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    container_name: deadbolt-minio
+    profiles: ["core"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: deadbolt
+      MINIO_ROOT_PASSWORD: localdevpassword
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - deadbolt_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.control-plane
+    image: deadbolt-control-plane:local
+    container_name: deadbolt-control-plane
+    profiles: ["core"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    environment:
+      RUNTIME_MODE: local
+      DEV_AUTH_ENABLED: "true"
+      DEADBOLT_CONTAINER_LOCAL: "true"
+      COOKIE_SECURE: "false"
+      LISTEN_ADDR: "0.0.0.0:8080"
+      DATABASE_URL: postgres://deadbolt_system:localdevpassword@postgres:5432/deadbolt?sslmode=disable
+      MIGRATOR_DATABASE_URL: postgres://deadbolt_system:localdevpassword@postgres:5432/deadbolt?sslmode=disable
+      NATS_URL: nats://nats:4222
+      DEADBOLT_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/livez"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Telemetry Profile Services (Blueprint §25)
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.110.0@sha256:0ed3688bbb02dabc0429ef648ebe3e9c53aca5e7c5a6b1a4a61b9f583b823e36
+    container_name: deadbolt-otel-collector
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    ports:
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
+
+  prometheus:
+    image: prom/prometheus:v2.54.1@sha256:f6639335d34a77d9d9db382b92eeb7fc00934be8eae81dbc03b31cfe90411a94
+    container_name: deadbolt-prometheus
+    profiles: ["telemetry"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  # Fault Injection Profile Services (Blueprint §25 / §26)
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0@sha256:b44c283298cea49e2defaba1b3028783798346f2a926684e3a345fd8441af3b8
+    container_name: deadbolt-toxiproxy
+    profiles: ["fault"]
+    restart: unless-stopped
+    networks:
+      - deadbolt_network
+    ports:
+      - "127.0.0.1:8474:8474" # Toxiproxy API

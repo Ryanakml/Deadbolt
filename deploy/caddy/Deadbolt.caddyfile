@@ -1,0 +1,10 @@
+# deploy/caddy/Deadbolt.caddyfile
+# Managed reverse proxy snippet for Deadbolt Milestone 0 Staging
+{$DEADBOLT_STAGING_DOMAIN} {
+    reverse_proxy deadbolt-control-plane-blue:8080 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

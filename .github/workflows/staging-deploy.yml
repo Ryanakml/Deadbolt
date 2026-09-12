@@ -1,0 +1,198 @@
+name: Staging Immutable Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: staging-deploy-${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  # pull_request normally exposes a synthetic merge SHA. Staging must build and
+  # deploy the reviewed PR head instead; other entry points retain github.sha.
+  RELEASE_COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  build-and-publish:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' &&
+       github.event.label.name == 'deploy-staging' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.state == 'open')
+    name: Build & Publish Immutable GHCR Artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-ref: ${{ steps.meta.outputs.tags }}
+      postgres-digest: ${{ steps.build-postgres.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_COMMIT_SHA }}
+
+      - name: Normalize GHCR repository path
+        id: ghcr-repository
+        run: |
+          GHCR_REPOSITORY="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "path=$GHCR_REPOSITORY" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker Metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.7.0
+        with:
+          images: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/control-plane
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and Push Linux amd64 Control Plane Image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.15.0
+        with:
+          context: .
+          file: deploy/Dockerfile.control-plane
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=0.1.0
+            COMMIT_SHA=${{ env.RELEASE_COMMIT_SHA }}
+            BUILD_TIME=${{ steps.meta.outputs.version }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record Immutable Control Plane Digest Output
+        run: |
+          echo "Published immutable control-plane artifact: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/control-plane@${{ steps.build.outputs.digest }}"
+
+      - name: Generate Docker Metadata for Postgres
+        id: meta-postgres
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.7.0
+        with:
+          images: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/postgres
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and Push Linux amd64 Postgres Archiver Image
+        id: build-postgres
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.15.0
+        with:
+          context: .
+          file: deploy/Dockerfile.postgres
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-postgres.outputs.tags }}
+          labels: ${{ steps.meta-postgres.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record Immutable Postgres Digest Output
+        run: |
+          echo "Published immutable postgres artifact: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/postgres@${{ steps.build-postgres.outputs.digest }}"
+
+  deploy-staging:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' &&
+       github.event.label.name == 'deploy-staging' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.state == 'open')
+    name: Deploy to Shared EC2 Staging
+    needs: build-and-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_COMMIT_SHA }}
+
+      - name: Normalize GHCR repository path
+        id: ghcr-repository
+        run: |
+          GHCR_REPOSITORY="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "path=$GHCR_REPOSITORY" >> "$GITHUB_OUTPUT"
+
+      - name: Check Staging Provisioning Readiness
+        id: prov-check
+        run: |
+          if [[ -z "${{ secrets.DEADBOLT_DEPLOY_HOST }}" || -z "${{ secrets.DEADBOLT_DEPLOY_SSH_KEY }}" ]]; then
+            echo "PROVISIONING_PENDING=true" >> "$GITHUB_OUTPUT"
+            echo "Staging EC2 destination secrets (DEADBOLT_DEPLOY_HOST, DEADBOLT_DEPLOY_SSH_KEY) are not yet configured."
+            echo "Artifact ghcr.io/${{ steps.ghcr-repository.outputs.path }}/control-plane@${{ needs.build-and-publish.outputs.image-digest }} was published successfully with full provenance."
+            echo "Awaiting private configuration channel provisioning per deploy/provisioning.json."
+          else
+            echo "PROVISIONING_PENDING=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH and Execute Staging Deployment
+        if: steps.prov-check.outputs.PROVISIONING_PENDING == 'false'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEADBOLT_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEADBOLT_DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_KEY: ${{ secrets.DEADBOLT_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEADBOLT_DEPLOY_KNOWN_HOSTS }}
+          IMAGE_DIGEST: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/control-plane@${{ needs.build-and-publish.outputs.image-digest }}
+          POSTGRES_DIGEST: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/postgres@${{ needs.build-and-publish.outputs.postgres-digest }}
+          COMMIT_SHA: ${{ env.RELEASE_COMMIT_SHA }}
+          GHCR_PULL_USER: ${{ secrets.DEADBOLT_GHCR_USER || github.actor }}
+          GHCR_PULL_TOKEN: ${{ secrets.DEADBOLT_GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          if [[ -n "$KNOWN_HOSTS" ]]; then
+            echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+            chmod 644 ~/.ssh/known_hosts
+          else
+            echo "Strict host-key verification requires DEADBOLT_DEPLOY_KNOWN_HOSTS; skipping untrusted deployment."
+            exit 1
+          fi
+
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts $DEPLOY_USER@$DEPLOY_HOST"
+
+          # Sync deployment scripts and Compose definitions to release target using strict host-key verification
+          rsync -avz -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts" \
+            deploy \
+            scripts \
+            migrations \
+            "$DEPLOY_USER@$DEPLOY_HOST:/opt/deadbolt/"
+
+          # Securely authenticate remote Docker daemon against GHCR via stdin (never printed or leaked)
+          if [[ -n "$GHCR_PULL_TOKEN" ]]; then
+            echo "Authenticating remote Docker daemon against ghcr.io..."
+            echo "$GHCR_PULL_TOKEN" | $SSH_CMD "docker login ghcr.io -u '$GHCR_PULL_USER' --password-stdin"
+          else
+            echo "No GHCR pull token provided; running in public-package / pre-authenticated mode."
+          fi
+
+          # Trigger remote deployment orchestration with explicit host configuration source
+          $SSH_CMD "cd /opt/deadbolt && DEADBOLT_CONFIG_FILE='/etc/deadbolt/staging.env' DEADBOLT_POSTGRES_IMAGE='$POSTGRES_DIGEST' DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"

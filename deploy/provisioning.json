@@ -33,6 +33,11 @@
       "purpose": "Authorized automated SSH account"
     },
     {
+      "name": "DEADBOLT_CONFIG_GROUP",
+      "status": "unresolved",
+      "purpose": "Host group deadbolt-deploy; only the automated deploy user may read /etc/deadbolt/staging.env (root:deadbolt-deploy 640, directory 750)"
+    },
+    {
       "name": "DEADBOLT_DEPLOY_SSH_KEY",
       "status": "unresolved",
       "purpose": "Actions secret holding deployment private key"

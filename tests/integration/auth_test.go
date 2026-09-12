@@ -458,33 +458,33 @@ func TestSessionIdleAndAbsoluteExpiry(t *testing.T) {
 	}
 
 	// 1. Idle Expiry Test
-	sessIdle, rawIdleToken, _, err := store.CreateSession(ctx, user.ID, nil, "127.0.0.1", "agent", 10*time.Millisecond, 7*24*time.Hour)
+	sessIdle, rawIdleToken, _, err := store.CreateSession(ctx, user.ID, nil, "127.0.0.1", "agent", 200*time.Millisecond, 7*24*time.Hour)
 	if err != nil {
 		t.Fatalf("failed to create idle test session: %v", err)
 	}
 	_ = sessIdle
 
 	// Immediate validation succeeds
-	v1, err := store.ValidateSession(ctx, rawIdleToken, 10*time.Millisecond)
+	v1, err := store.ValidateSession(ctx, rawIdleToken, 200*time.Millisecond)
 	if err != nil || v1 == nil {
 		t.Fatalf("expected session to be valid immediately, got %v", err)
 	}
 
 	// Wait for idle window to lapse
-	time.Sleep(25 * time.Millisecond)
-	_, err = store.ValidateSession(ctx, rawIdleToken, 10*time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
+	_, err = store.ValidateSession(ctx, rawIdleToken, 200*time.Millisecond)
 	if !errors.Is(err, auth.ErrSessionIdleTimeout) {
 		t.Fatalf("expected ErrSessionIdleTimeout after idle lapse, got: %v", err)
 	}
 
 	// 2. Absolute Expiry Test
-	sessAbs, rawAbsToken, _, err := store.CreateSession(ctx, user.ID, nil, "127.0.0.1", "agent", 1*time.Hour, 15*time.Millisecond)
+	sessAbs, rawAbsToken, _, err := store.CreateSession(ctx, user.ID, nil, "127.0.0.1", "agent", 1*time.Hour, 200*time.Millisecond)
 	if err != nil {
 		t.Fatalf("failed to create abs test session: %v", err)
 	}
 	_ = sessAbs
 
-	time.Sleep(25 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	_, err = store.ValidateSession(ctx, rawAbsToken, 1*time.Hour)
 	if !errors.Is(err, auth.ErrSessionExpired) {
 		t.Fatalf("expected ErrSessionExpired after absolute lifetime passed, got: %v", err)

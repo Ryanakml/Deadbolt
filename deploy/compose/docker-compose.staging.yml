@@ -1,0 +1,177 @@
+name: deadbolt-staging
+
+networks:
+  deadbolt_staging_net:
+    name: deadbolt_staging_net
+    driver: bridge
+  deadbolt-edge:
+    name: deadbolt-edge
+    external: true
+
+volumes:
+  deadbolt_staging_postgres_data:
+  deadbolt_staging_nats_data:
+
+services:
+  postgres:
+    image: ${DEADBOLT_POSTGRES_IMAGE:?Required immutable postgres image digest}
+    container_name: deadbolt-staging-postgres
+    restart: unless-stopped
+    networks:
+      - deadbolt_staging_net
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_command=/usr/local/bin/archive-wal.sh %p %f"
+      - "-c"
+      - "archive_timeout=300"
+    environment:
+      POSTGRES_DB: deadbolt_staging
+      POSTGRES_USER: deadbolt_admin
+      POSTGRES_PASSWORD: ${DEADBOLT_DB_ADMIN_PASSWORD:?Required admin db password}
+      DEADBOLT_MIGRATOR_PASSWORD: ${DEADBOLT_MIGRATOR_PASSWORD:?Required migrator db password}
+      DEADBOLT_RUNTIME_PASSWORD: ${DEADBOLT_RUNTIME_PASSWORD:?Required runtime db password}
+      DEADBOLT_SYSTEM_PASSWORD: ${DEADBOLT_SYSTEM_PASSWORD:?Required system db password}
+      DEADBOLT_STORAGE_S3_BUCKET: ${DEADBOLT_STORAGE_S3_BUCKET:-}
+      DEADBOLT_STORAGE_S3_ENDPOINT: ${DEADBOLT_STORAGE_S3_ENDPOINT:-}
+      DEADBOLT_STORAGE_S3_REGION: ${DEADBOLT_STORAGE_S3_REGION:-}
+      DEADBOLT_STORAGE_S3_SSE: ${DEADBOLT_STORAGE_S3_SSE:-AES256}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-${DEADBOLT_STORAGE_S3_REGION:-us-east-1}}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-${DEADBOLT_STORAGE_S3_ENDPOINT:-}}
+      DEADBOLT_WAL_ARCHIVE_DIR: ${DEADBOLT_WAL_ARCHIVE_DIR:-}
+      DEADBOLT_WAL_ARCHIVE_DISABLED: ${DEADBOLT_WAL_ARCHIVE_DISABLED:-false}
+    # Security constraint: No public host port exposure for PostgreSQL
+    expose:
+      - "5432"
+    volumes:
+      - deadbolt_staging_postgres_data:/var/lib/postgresql
+      - ../../scripts/init-db-roles.sh:/docker-entrypoint-initdb.d/01-init-roles.sh:ro
+      - ../../scripts/bootstrap-db-roles.sql:/docker-entrypoint-initdb.d/02-bootstrap-roles.sql:ro
+      - ../../scripts/archive-wal.sh:/usr/local/bin/archive-wal.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deadbolt_admin"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  nats:
+    image: nats:2-alpine@sha256:ad7a43eb7e3337c3c38ce5d784d1461791f95f730f252d2b25eee699752a0ca3
+    container_name: deadbolt-staging-nats
+    restart: unless-stopped
+    networks:
+      - deadbolt_staging_net
+    command: ["-js", "-sd", "/data"]
+    # Security constraint: No public host port exposure for NATS
+    expose:
+      - "4222"
+    volumes:
+      - deadbolt_staging_nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4222 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # Control Plane - Slot Blue (Loopback Port 8088)
+  control-plane-blue:
+    profiles: ["slot-blue"]
+    image: ${DEADBOLT_IMAGE_BLUE:-${DEADBOLT_IMAGE:?Required immutable image digest}}
+    container_name: deadbolt-staging-control-plane-blue
+    restart: unless-stopped
+    networks:
+      deadbolt_staging_net:
+      deadbolt-edge:
+        aliases:
+          - deadbolt-control-plane-blue
+    environment:
+      RUNTIME_MODE: hosted
+      DEV_AUTH_ENABLED: "false"
+      COOKIE_SECURE: "true"
+      LISTEN_ADDR: "0.0.0.0:8080"
+      DEADBOLT_IMAGE_DIGEST: ${DEADBOLT_IMAGE_BLUE:-${DEADBOLT_IMAGE}}
+      DATABASE_URL: ${DATABASE_URL:?Required restricted runtime database connection string}
+      SYSTEM_DATABASE_URL: ${SYSTEM_DATABASE_URL:?Required system database connection string}
+      NATS_URL: nats://nats:4222
+      DEADBOLT_OIDC_ISSUER: ${DEADBOLT_OIDC_ISSUER:?Required OIDC issuer}
+      DEADBOLT_OIDC_CLIENT_ID: ${DEADBOLT_OIDC_CLIENT_ID:?Required OIDC client id}
+      DEADBOLT_OIDC_CLIENT_SECRET: ${DEADBOLT_OIDC_CLIENT_SECRET:?Required OIDC client secret}
+      DEADBOLT_OIDC_REDIRECT_URL: ${DEADBOLT_OIDC_REDIRECT_URL:-https://${DEADBOLT_STAGING_DOMAIN}/api/auth/callback}
+      DEADBOLT_ALLOWED_ORIGINS: ${DEADBOLT_ALLOWED_ORIGINS:-https://${DEADBOLT_STAGING_DOMAIN}}
+    ports:
+      - "127.0.0.1:8088:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/livez"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # Control Plane - Slot Green (Loopback Port 8089)
+  control-plane-green:
+    profiles: ["slot-green"]
+    image: ${DEADBOLT_IMAGE_GREEN:-${DEADBOLT_IMAGE:?Required immutable image digest}}
+    container_name: deadbolt-staging-control-plane-green
+    restart: unless-stopped
+    networks:
+      deadbolt_staging_net:
+      deadbolt-edge:
+        aliases:
+          - deadbolt-control-plane-green
+    environment:
+      RUNTIME_MODE: hosted
+      DEV_AUTH_ENABLED: "false"
+      COOKIE_SECURE: "true"
+      LISTEN_ADDR: "0.0.0.0:8080"
+      DEADBOLT_IMAGE_DIGEST: ${DEADBOLT_IMAGE_GREEN:-${DEADBOLT_IMAGE}}
+      DATABASE_URL: ${DATABASE_URL:?Required restricted runtime database connection string}
+      SYSTEM_DATABASE_URL: ${SYSTEM_DATABASE_URL:?Required system database connection string}
+      NATS_URL: nats://nats:4222
+      DEADBOLT_OIDC_ISSUER: ${DEADBOLT_OIDC_ISSUER:?Required OIDC issuer}
+      DEADBOLT_OIDC_CLIENT_ID: ${DEADBOLT_OIDC_CLIENT_ID:?Required OIDC client id}
+      DEADBOLT_OIDC_CLIENT_SECRET: ${DEADBOLT_OIDC_CLIENT_SECRET:?Required OIDC client secret}
+      DEADBOLT_OIDC_REDIRECT_URL: ${DEADBOLT_OIDC_REDIRECT_URL:-https://${DEADBOLT_STAGING_DOMAIN}/api/auth/callback}
+      DEADBOLT_ALLOWED_ORIGINS: ${DEADBOLT_ALLOWED_ORIGINS:-https://${DEADBOLT_STAGING_DOMAIN}}
+    ports:
+      - "127.0.0.1:8089:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/livez"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M

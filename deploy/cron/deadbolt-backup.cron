@@ -1,0 +1,3 @@
+# /etc/cron.d/deadbolt-backup
+# Scheduled daily physical base backup with 14-day bounded retention (Blueprint §26 & Issue #5)
+0 2 * * * root /opt/deadbolt/scripts/take-base-backup.sh >> /var/log/deadbolt-backup.log 2>&1

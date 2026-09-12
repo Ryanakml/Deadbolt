@@ -1,0 +1,10 @@
+# Pinned PostgreSQL 18 runtime with audited base and deterministic S3 WAL archiver tooling
+# Base image pinned from deploy/images.lock.json
+FROM postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+
+# Install awscli, curl, and ca-certificates for continuous WAL archiving and backup verification
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    awscli \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*

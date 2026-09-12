@@ -64,6 +64,66 @@ jobs:
       - run: bin/sqlc version
       - run: bin/goose -version
       - run: bin/govulncheck ./...
+      - name: Verify control plane Dockerfile builds
+        run: |
+          docker build -f deploy/Dockerfile.control-plane --build-arg COMMIT_SHA="${{ github.sha }}" -t deadbolt-control-plane:test .
+      - name: Validate Docker Compose and Profiles
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml --profile core config --quiet
+          docker compose -f deploy/compose/docker-compose.yml --profile telemetry config --quiet
+          docker compose -f deploy/compose/docker-compose.yml --profile fault config --quiet
+          DEADBOLT_DB_ADMIN_PASSWORD=mock_admin DEADBOLT_MIGRATOR_PASSWORD=mock_migrator DEADBOLT_RUNTIME_PASSWORD=mock_runtime DEADBOLT_SYSTEM_PASSWORD=mock_system DATABASE_URL=postgres://deadbolt_runtime:mock_runtime@localhost:5432/mock MIGRATOR_DATABASE_URL=postgres://deadbolt_migrator:mock_migrator@localhost:5432/mock SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system@localhost:5432/mock DEADBOLT_IMAGE=ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_POSTGRES_IMAGE=ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_OIDC_ISSUER=https://i DEADBOLT_OIDC_CLIENT_ID=id DEADBOLT_OIDC_CLIENT_SECRET=s DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud docker compose -f deploy/compose/docker-compose.staging.yml --profile slot-blue --profile slot-green config --quiet
+          DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud DEADBOLT_SNIPPET_ONLY=true DRY_RUN=true ./scripts/reload-caddy.sh
+
+
+          DRY_RUN=true ./scripts/check-backup-readiness.sh
+          DRY_RUN=true ./scripts/bootstrap-staging-cluster.sh
+          DRY_RUN=true ./scripts/deploy-staging.sh
+          DRY_RUN=true ./scripts/rollback-staging.sh
+          DRY_RUN=true ./scripts/retention.sh
+          DRY_RUN=true ./scripts/take-base-backup.sh
+          DRY_RUN=true ./scripts/restore-staging-db.sh
+          DRY_RUN=true ./scripts/setup-backup-cron.sh
+          docker build -f deploy/Dockerfile.postgres .
+      - name: Clean-clone Local Compose Boot Smoke
+        run: |
+          # Free host port 5432 if occupied by workflow runner service container
+          RUNNER_PG=$(docker ps -q --filter "publish=5432")
+          if [ -n "$RUNNER_PG" ]; then
+            echo "Stopping workflow runner Postgres service container ($RUNNER_PG) to free port 5432..."
+            docker stop "$RUNNER_PG"
+          fi
+          docker compose -f deploy/compose/docker-compose.yml --profile core up -d || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
+              echo "Local compose control plane is alive!"
+              break
+            fi
+            sleep 2
+          done
+          # Verify livez returned 200 OK
+          curl -fs http://127.0.0.1:8080/livez || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          # Execute migrations using in-container migrator runner
+          docker compose -f deploy/compose/docker-compose.yml --profile core exec -T control-plane /usr/local/bin/control-plane --migrate
+          # Verify readyz returned 200 OK after schema is current
+          READYZ_OK=false
+          for i in $(seq 1 15); do
+            if curl -fs http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
+              READYZ_OK=true
+              echo "Local compose control plane is ready!"
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READYZ_OK" != "true" ]; then
+            docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1
+          fi
+          # Test stop and start preserves volume persistence
+          docker compose -f deploy/compose/docker-compose.yml --profile core stop
+          docker compose -f deploy/compose/docker-compose.yml --profile core start
+          curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1 || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          # Explicit clean teardown
+          docker compose -f deploy/compose/docker-compose.yml --profile core down -v
       - name: Scan tracked source and history without printing secrets
         run: |
           bin/gitleaks git --redact --no-banner --log-opts="--all"
