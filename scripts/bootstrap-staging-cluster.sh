@@ -204,4 +204,16 @@ log "Running fail-closed backup readiness verification..."
 log "Configuring and verifying scheduled daily base backup maintenance (14-day retention)..."
 ./scripts/setup-backup-cron.sh
 
+# 7. Record durable bootstrap completion marker
+BOOTSTRAP_MARKER_FILE="${RELEASE_DIR}/bootstrap_complete"
+mkdir -p "$RELEASE_DIR"
+cat <<EOF > "${BOOTSTRAP_MARKER_FILE}.tmp"
+BOOTSTRAP_COMPLETED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+POSTGRES_IMAGE="$DEADBOLT_POSTGRES_IMAGE"
+HOST_BOOTSTRAP="true"
+EOF
+mv -f "${BOOTSTRAP_MARKER_FILE}.tmp" "$BOOTSTRAP_MARKER_FILE"
+log "Durable bootstrap marker written to: $BOOTSTRAP_MARKER_FILE"
+
 log "SUCCESS: Clean staging cluster data infrastructure, backup baseline, and recurring maintenance established."
+

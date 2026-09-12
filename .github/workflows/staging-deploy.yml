@@ -128,6 +128,8 @@ jobs:
           IMAGE_DIGEST: ghcr.io/${{ github.repository }}/control-plane@${{ needs.build-and-publish.outputs.image-digest }}
           POSTGRES_DIGEST: ghcr.io/${{ github.repository }}/postgres@${{ needs.build-and-publish.outputs.postgres-digest }}
           COMMIT_SHA: ${{ github.sha }}
+          GHCR_PULL_USER: ${{ secrets.DEADBOLT_GHCR_USER || github.actor }}
+          GHCR_PULL_TOKEN: ${{ secrets.DEADBOLT_GHCR_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -142,14 +144,22 @@ jobs:
             exit 1
           fi
 
-          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes $DEPLOY_USER@$DEPLOY_HOST"
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts $DEPLOY_USER@$DEPLOY_HOST"
 
-          # Sync deployment scripts and Compose definitions to release target
-          rsync -avz -e "ssh -i ~/.ssh/deploy_key" \
+          # Sync deployment scripts and Compose definitions to release target using strict host-key verification
+          rsync -avz -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts" \
             deploy \
             scripts \
             migrations \
             "$DEPLOY_USER@$DEPLOY_HOST:/opt/deadbolt/"
+
+          # Securely authenticate remote Docker daemon against GHCR via stdin (never printed or leaked)
+          if [[ -n "$GHCR_PULL_TOKEN" ]]; then
+            echo "Authenticating remote Docker daemon against ghcr.io..."
+            echo "$GHCR_PULL_TOKEN" | $SSH_CMD "docker login ghcr.io -u '$GHCR_PULL_USER' --password-stdin"
+          else
+            echo "No GHCR pull token provided; running in public-package / pre-authenticated mode."
+          fi
 
           # Trigger remote deployment orchestration with explicit host configuration source
           $SSH_CMD "cd /opt/deadbolt && DEADBOLT_CONFIG_FILE='/etc/deadbolt/staging.env' DEADBOLT_POSTGRES_IMAGE='$POSTGRES_DIGEST' DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"

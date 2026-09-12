@@ -44,6 +44,20 @@ Nightly physical base backups are created using `scripts/take-base-backup.sh`, s
 - Migration user: `deadbolt_migrator`.
 - This volume is never touched, pruned, or shared across projects or with FlowDesk.
 
+### 2.4 Fresh-Host Cluster Bootstrap & Baseline Backups
+
+On an uninitialized staging host (where `/opt/deadbolt/releases/bootstrap_complete` does not exist), `scripts/deploy-staging.sh` automatically engages `--bootstrap` mode.
+The cluster initialization workflow in `scripts/bootstrap-staging-cluster.sh` establishes the baseline:
+
+1. Validates host configuration and credentials.
+2. Starts PostgreSQL and NATS on `deadbolt_staging_net`.
+3. Waits for PostgreSQL healthcheck (verifying schema/role initialization).
+4. Creates the initial physical base backup and triggers an immediate WAL switch via `scripts/bootstrap-initial-backup.sh`.
+5. Verifies backup and WAL readiness via `scripts/check-backup-readiness.sh`.
+6. Configures nightly base backup cron with 14-day retention via `scripts/setup-backup-cron.sh`.
+7. Records the durable bootstrap marker `/opt/deadbolt/releases/bootstrap_complete` only upon 100% successful completion.
+   Subsequent promotions require this marker and verify backup readiness before running candidate migrations.
+
 ---
 
 ## 3. Pre-Flight Backup Readiness Validation

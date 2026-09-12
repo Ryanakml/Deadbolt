@@ -7,9 +7,16 @@ Deadbolt runs on an EC2 `x86_64` host co-located with `flowdesk-staging`. The st
 
 ### Guiding Principles & Invariants
 
-1. **Strict Co-Tenant Isolation**: FlowDesk containers, images, volumes, and networks must **never** be modified, stopped, deleted, or shared. All Deadbolt operations are strictly scoped to the Compose project `deadbolt-staging` and directory `/opt/deadbolt`.
-2. **Caddy Edge Gateway & Dual Slot Upstream**: Caddy owns public ports TCP 80/443 and UDP 443. Deadbolt listens only on internal loopback ports (`127.0.0.1:8088` for Slot Blue, `127.0.0.1:8089` for Slot Green) and is reverse-proxied by Caddy.
-3. **Pre-Traffic Readiness Gating**: Candidates start in the inactive slot, pass deep `/readyz` and `/version` checks while the active instance continues serving live staging traffic, and traffic is switched only after readiness is proven.
+1. **Strict Co-Tenant Isolation**: FlowDesk containers, images, volumes, and networks must **never** be modified, stopped, deleted, or shared. All Deadbolt operations are strictly scoped to the Compose project `deadbolt-staging` and directory `/opt/deadbolt`. Deadbolt never joins or reuses FlowDesk application networks (`flowdesk-staging_application`, `flowdesk-staging_edge`).
+2. **Containerized Caddy Edge Gateway & Dedicated Edge Network**:
+   - The existing FlowDesk Caddy container (`flowdesk-staging-caddy-1`, image `caddy:2.10.0-alpine`) remains the sole owner of host public ports TCP 80/443 and UDP 443. No second reverse proxy is ever created.
+   - A dedicated external Docker network `deadbolt-edge` bridges FlowDesk Caddy and Deadbolt control plane slots.
+   - Staging Compose attaches **only** `control-plane-blue` (alias: `deadbolt-control-plane-blue`) and `control-plane-green` (alias: `deadbolt-control-plane-green`) to `deadbolt-edge`.
+   - PostgreSQL and NATS remain strictly private on internal network `deadbolt_staging_net` and are **never** attached to `deadbolt-edge` or published to host ports.
+   - Caddy proxies to Docker DNS aliases (`deadbolt-control-plane-blue:8080` or `deadbolt-control-plane-green:8080`), never host loopback `127.0.0.1`.
+   - The host directory `/opt/deadbolt/caddy` is mounted read-only into Caddy at `/etc/caddy/deadbolt:ro`, and the active Caddyfile imports `/etc/caddy/deadbolt/*.caddyfile`.
+   - Host loopback ports (`127.0.0.1:8088` for Blue, `127.0.0.1:8089` for Green) remain active strictly for host-side pre-traffic readiness (`/readyz`) and image provenance (`/version`) gating.
+3. **Pre-Traffic Readiness Gating**: Candidates start in the inactive slot, pass deep `/readyz` and `/version` checks on host loopback while the active instance continues serving live staging traffic, and edge traffic is switched only after readiness is proven.
 4. **Least-Privilege Credential Separation**: Migrations run via candidate transient container using DDL-capable `MIGRATOR_DATABASE_URL` with session-level advisory locking. The runtime control plane receives `DATABASE_URL` (restricted DML role with zero DDL privileges).
 5. **No Destructive Database Rollback**: A rollback restores the previous known-good Deadbolt container image and Caddy configuration. It **never** executes down migrations or drops database volumes.
 6. **Separate S3 Storage & WAL Readiness**: Artifact storage and WAL backups use the dedicated external S3 bucket provisioned in Issue #1, never FlowDesk MinIO.
@@ -35,11 +42,12 @@ Deadbolt runs on an EC2 `x86_64` host co-located with `flowdesk-staging`. The st
 ### Staging (`deploy/compose/docker-compose.staging.yml`)
 
 - Compose project: `deadbolt-staging`.
-- Isolated bridge network: `deadbolt_staging_net`.
-- PostgreSQL and NATS have **zero** host port publication (internal network only).
+- Internal bridge network: `deadbolt_staging_net`.
+- Dedicated external edge network: `deadbolt-edge` (external: true).
+- PostgreSQL and NATS have **zero** host port publication and join only `deadbolt_staging_net`.
 - Dual blue/green control-plane service slots:
-  - `control-plane-blue`: binds to `127.0.0.1:8088:8080` (profile `slot-blue`).
-  - `control-plane-green`: binds to `127.0.0.1:8089:8080` (profile `slot-green`).
+  - `control-plane-blue`: joins `deadbolt_staging_net` and `deadbolt-edge` (network alias: `deadbolt-control-plane-blue`); binds to `127.0.0.1:8088:8080` (profile `slot-blue`).
+  - `control-plane-green`: joins `deadbolt_staging_net` and `deadbolt-edge` (network alias: `deadbolt-control-plane-green`); binds to `127.0.0.1:8089:8080` (profile `slot-green`).
 - Resource constraints enforced via `deploy.resources.limits`:
   - Control Plane: 512 MiB RAM, 1.0 CPU
   - PostgreSQL: 1024 MiB RAM, 1.0 CPU
@@ -114,14 +122,19 @@ Automated deployment is executed via `scripts/deploy-staging.sh`:
 
 ### Deployment Pipeline Stages
 
-1. **Host Configuration Loading & Credential Validation**:
-   - Sources private configuration from `/etc/deadbolt/staging.env` (or `/opt/deadbolt/config/staging.env`).
-   - Validates file permissions (rejects world-readable files, `chmod 600` enforced).
-   - Validates required configuration keys, enforces zero default passwords, and checks URL-to-password consistency.
+1. **Configuration Loading & Security Checks**:
+   - Sources configuration from `/etc/deadbolt/staging.env`.
+   - Rejects world-readable configuration files (`chmod 600` enforced).
+   - Validates password consistency between connection URLs and secret variables.
    - Enforces `MIGRATOR_DATABASE_URL != DATABASE_URL` and `SYSTEM_DATABASE_URL != DATABASE_URL`.
+     1b. **Fresh-Host First Deploy Detection**:
+   - Checks for the durable bootstrap marker `/opt/deadbolt/releases/bootstrap_complete`.
+   - If missing (uninitialized host), automatically activates `--bootstrap` mode and delegates to `scripts/bootstrap-staging-cluster.sh`.
+   - Initializes PostgreSQL and NATS on `deadbolt_staging_net`, takes the first verified base backup, verifies backup readiness, installs the 14-day retention backup cron, and records the durable bootstrap marker only on complete success.
 2. **Backup & Headroom Pre-flight Checks**:
    - Validates memory (≥1024 MiB) and disk (≥4096 MiB).
-   - Executes `scripts/check-backup-readiness.sh`.
+   - Verifies FlowDesk co-tenant containers are running and untouched.
+   - In normal promotion mode, executes `scripts/check-backup-readiness.sh`.
 3. **Candidate Image Pull**:
    - Pulls exact immutable digest from GHCR (`ghcr.io/ryanakml/deadbolt/control-plane@sha256:...`).
 4. **Deterministic Forward Migration Execution**:
@@ -143,19 +156,28 @@ Automated deployment is executed via `scripts/deploy-staging.sh`:
      - Active scheduler loop heartbeat (<60s).
      - Separate reporting of NATS connectivity/degradation (does not fail readiness per Blueprint §25.2).
      - Strict topology redaction (zero credentials, passwords, or hostnames in responses).
-7. **Provenance Verification**:
+7. **Provenance & Image Identity Verification**:
    - Queries `http://127.0.0.1:<CANDIDATE_PORT>/version` and verifies both:
      - Exact Git commit SHA.
      - Exact immutable image digest (`@sha256:...`).
-8. **Atomic Edge Traffic Switch**:
-   - Updates Caddy upstream: `export DEADBOLT_UPSTREAM_PORT=<CANDIDATE_PORT>`.
-   - Reloads Caddy with zero downtime: `./scripts/reload-caddy.sh`.
-   - On reload failure, immediately restores previous Caddy configuration.
-9. **Staged Edge Smoke Verification**:
+   - Independently inspects running container image ID and RepoDigests via `docker inspect`.
+8. **Atomic Edge Traffic Switch (Containerized Caddy)**:
+   - Updates managed snippet `/opt/deadbolt/caddy/Deadbolt.caddyfile` via `./scripts/reload-caddy.sh <CANDIDATE_PORT>`.
+   - Upstream points to Docker DNS alias (`deadbolt-control-plane-blue:8080` or `green:8080`), never loopback.
+   - Validates merged Caddy configuration inside `flowdesk-staging-caddy-1` via `docker exec`.
+   - Reloads Caddy with zero downtime inside the container.
+   - Fails closed if Caddy container, mount (`/etc/caddy/deadbolt`), or import directive is missing.
+9. **Staged Edge Smoke Verification & Rollback Protection**:
    - Smokes `https://${DEADBOLT_STAGING_DOMAIN}/version` through Caddy.
+   - If edge smoke fails:
+     - Restores previous Deadbolt snippet.
+     - Reloads Caddy container to point back to previous slot.
+     - Stops candidate slot container; leaves active slot alive and completely unharmed.
+     - Never touches FlowDesk containers or routes.
 10. **Decommission Old Slot & Update State**:
     - Stops previous slot container.
     - Updates `/opt/deadbolt/releases/active_slot` and release pointers (`current`, `previous`).
+    - Confirms `/opt/deadbolt/releases/bootstrap_complete` is recorded.
 
 ---
 
@@ -171,10 +193,11 @@ If candidate health checks fail or post-deployment smoke tests detect an anomaly
 
 - **Restores Previous Binary**: Re-launches the image digest referenced by `/opt/deadbolt/releases/previous` in the alternate slot.
 - **Image Provenance Recovery**: Automatically recovers `DEADBOLT_POSTGRES_IMAGE` from `/opt/deadbolt/releases/postgres_image` or the running container, enabling standalone rollback execution even when host environment or `staging.env` omits the digest.
-- **Gates Before Switching**: Validates `/readyz` on the restored instance before updating Caddy.
-- **Restores Edge Route**: Points Caddy edge to the restored slot port.
+- **Gates Before Switching**: Validates `/readyz` on the restored instance host port before updating Caddy.
+- **Restores Edge Route**: Points Caddy edge to the restored slot Docker DNS alias via containerized reload.
 - **NEVER Rolls Back Database**: Backward compatibility ensures the previous binary runs safely against the newly migrated schema. Down migrations are **strictly prohibited** during automated rollback.
 - **Preserves Persistent Volumes**: `deadbolt_staging_postgres_data` is untouched.
+- **FlowDesk Isolation**: FlowDesk containers, networks, volumes, and routes remain completely untouched.
 
 ---
 

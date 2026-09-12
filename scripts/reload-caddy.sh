@@ -1,46 +1,84 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# reload-caddy.sh: Safely integrates Deadbolt staging routes into existing Caddy edge
-# with pre-validation and automatic rollback on reload failure (Issue #5).
+# reload-caddy.sh: Safely integrates Deadbolt staging routes into existing containerized Caddy edge
+# using Docker network DNS aliases (deadbolt-edge) and zero host caddy binary dependency (Issue #5).
 
-CADDYFILE="${CADDY_CONFIG_PATH:-/etc/caddy/Caddyfile}"
-SNIPPET_FILE="${DEADBOLT_CADDYFILE_SNIPPET:-deploy/caddy/Deadbolt.caddyfile}"
-DRY_RUN="${DRY_RUN:-false}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 RELEASE_DIR="${DEADBOLT_RELEASE_DIR:-/opt/deadbolt/releases}"
 ACTIVE_UPSTREAM_FILE="${RELEASE_DIR}/active_upstream_port"
+ACTIVE_SLOT_FILE="${RELEASE_DIR}/active_slot"
+DRY_RUN="${DRY_RUN:-false}"
 
-# Determine target upstream port: argument > env var > persisted active upstream file > default 8088
-TARGET_PORT="${1:-${DEADBOLT_UPSTREAM_PORT:-}}"
-if [[ -z "$TARGET_PORT" && -f "$ACTIVE_UPSTREAM_FILE" ]]; then
-  TARGET_PORT=$(cat "$ACTIVE_UPSTREAM_FILE" | tr -d '[:space:]')
+log() {
+  echo "[CADDY_EDGE] $*"
+}
+
+err() {
+  echo "[CADDY_EDGE_ERROR] $*" >&2
+}
+
+# 1. Deterministic host configuration loading
+CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
+if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
+  CONFIG_FILE="/opt/deadbolt/config/staging.env"
 fi
-if [[ -z "$TARGET_PORT" ]]; then
+if [[ -f "$CONFIG_FILE" ]]; then
+  PERMS=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%Op" "$CONFIG_FILE" 2>/dev/null || echo "600")
+  if [[ "$PERMS" =~ [4567]$ ]]; then
+    err "SECURITY VIOLATION: Configuration file $CONFIG_FILE is world-readable ($PERMS)!"
+    err "Remediation: chmod 600 $CONFIG_FILE"
+    exit 1
+  fi
+  set -a
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  set +a
+fi
+
+# Managed host snippet path (default /opt/deadbolt/caddy/Deadbolt.caddyfile)
+if [[ -n "${DEADBOLT_CADDYFILE_SNIPPET:-}" ]]; then
+  HOST_SNIPPET_FILE="$DEADBOLT_CADDYFILE_SNIPPET"
+elif [[ -d "/opt/deadbolt/caddy" || -w "/opt/deadbolt" ]]; then
+  HOST_SNIPPET_FILE="/opt/deadbolt/caddy/Deadbolt.caddyfile"
+else
+  HOST_SNIPPET_FILE="${REPO_ROOT}/deploy/caddy/Deadbolt.caddyfile"
+fi
+
+# Existing containerized Caddy edge (FlowDesk Caddy owning 80/443)
+CADDY_CONTAINER="${DEADBOLT_CADDY_CONTAINER:-flowdesk-staging-caddy-1}"
+CONTAINER_CADDYFILE="${DEADBOLT_CONTAINER_CADDYFILE:-/etc/caddy/Caddyfile}"
+CONTAINER_SNIPPET_FILE="${DEADBOLT_CONTAINER_SNIPPET:-/etc/caddy/deadbolt/Deadbolt.caddyfile}"
+
+# Resolve target upstream slot and Docker alias
+TARGET_ARG="${1:-${DEADBOLT_UPSTREAM_TARGET:-${DEADBOLT_UPSTREAM_PORT:-}}}"
+if [[ -z "$TARGET_ARG" && -f "$ACTIVE_UPSTREAM_FILE" ]]; then
+  TARGET_ARG=$(cat "$ACTIVE_UPSTREAM_FILE" | tr -d '[:space:]')
+fi
+if [[ -z "$TARGET_ARG" && -f "$ACTIVE_SLOT_FILE" ]]; then
+  TARGET_ARG=$(cat "$ACTIVE_SLOT_FILE" | tr -d '[:space:]')
+fi
+if [[ -z "$TARGET_ARG" ]]; then
+  TARGET_ARG="8088"
+fi
+
+if [[ "$TARGET_ARG" == "8088" || "$TARGET_ARG" == "blue" || "$TARGET_ARG" == "deadbolt-control-plane-blue:8080" ]]; then
+  TARGET_SLOT="blue"
   TARGET_PORT="8088"
-fi
-
-if [[ "$TARGET_PORT" != "8088" && "$TARGET_PORT" != "8089" ]]; then
-  echo "[CADDY_EDGE_ERROR] Invalid upstream port: $TARGET_PORT (must be 8088 for blue or 8089 for green)" >&2
+  TARGET_UPSTREAM="deadbolt-control-plane-blue:8080"
+elif [[ "$TARGET_ARG" == "8089" || "$TARGET_ARG" == "green" || "$TARGET_ARG" == "deadbolt-control-plane-green:8080" ]]; then
+  TARGET_SLOT="green"
+  TARGET_PORT="8089"
+  TARGET_UPSTREAM="deadbolt-control-plane-green:8080"
+else
+  err "Invalid upstream target: $TARGET_ARG (must resolve to blue/8088 or green/8089)"
   exit 1
 fi
 
-# Deterministic host configuration loading if DEADBOLT_STAGING_DOMAIN is not provided
-if [[ -z "${DEADBOLT_STAGING_DOMAIN:-}" ]]; then
-  CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
-  if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
-    CONFIG_FILE="/opt/deadbolt/config/staging.env"
-  fi
-  if [[ -f "$CONFIG_FILE" ]]; then
-    set -a
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-    set +a
-  fi
-fi
-
 if [[ "$DRY_RUN" != "true" && -z "${DEADBOLT_STAGING_DOMAIN:-}" ]]; then
-  echo "[CADDY_EDGE_ERROR] Required DEADBOLT_STAGING_DOMAIN is missing or empty! Zero invented fallback domains permitted." >&2
+  err "Required DEADBOLT_STAGING_DOMAIN is missing or empty! Zero invented fallback domains permitted."
   exit 1
 fi
 
@@ -51,15 +89,15 @@ render_snippet() {
     if [[ "$DRY_RUN" == "true" ]]; then
       domain="staging-dryrun.internal"
     else
-      echo "[CADDY_EDGE_ERROR] DEADBOLT_STAGING_DOMAIN is required to render Caddy snippet!" >&2
+      err "DEADBOLT_STAGING_DOMAIN is required to render Caddy snippet!"
       exit 1
     fi
   fi
   cat <<EOF > "$target_file"
 # Deadbolt Control Plane Staging Route Snippet (Issue #5)
-# Persisted active upstream route: literal loopback port ${TARGET_PORT}
+# Managed active upstream: ${TARGET_UPSTREAM} (slot: ${TARGET_SLOT})
 ${domain} {
-    reverse_proxy 127.0.0.1:${TARGET_PORT} {
+    reverse_proxy ${TARGET_UPSTREAM} {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}
@@ -69,123 +107,152 @@ ${domain} {
 EOF
 }
 
-# Resolve absolute path for snippet file to prevent Caddy relative import errors (Issue #5)
-if [[ -f "$SNIPPET_FILE" ]]; then
-  ABS_SNIPPET_FILE="$(cd "$(dirname "$SNIPPET_FILE")" && pwd)/$(basename "$SNIPPET_FILE")"
-elif [[ "$SNIPPET_FILE" = /* ]]; then
-  ABS_SNIPPET_FILE="$SNIPPET_FILE"
-else
-  ABS_SNIPPET_FILE="$(pwd)/$SNIPPET_FILE"
-fi
+verify_caddy_container_prerequisites() {
+  # 1. Verify Caddy container exists and is running
+  local caddy_status
+  caddy_status=$(docker inspect --format '{{.State.Status}}' "$CADDY_CONTAINER" 2>/dev/null || true)
+  if [[ "$caddy_status" != "running" ]]; then
+    err "PREREQUISITE FAILURE: Caddy container '$CADDY_CONTAINER' is not running (status: ${caddy_status:-not found})!"
+    err "Remediation: Ensure FlowDesk Caddy container is running and joined to external network 'deadbolt-edge'."
+    exit 1
+  fi
 
-log() {
-  echo "[CADDY_EDGE] $*"
-}
+  # 2. Verify managed host snippet directory is mounted into container
+  local mounts_json
+  mounts_json=$(docker inspect --format '{{json .Mounts}}' "$CADDY_CONTAINER" 2>/dev/null || echo "[]")
+  if ! echo "$mounts_json" | grep -Eq '/etc/caddy/deadbolt|/etc/caddy/deadbolt/Deadbolt\.caddyfile'; then
+    err "PREREQUISITE FAILURE: Managed snippet directory '/etc/caddy/deadbolt' is not mounted in container '$CADDY_CONTAINER'!"
+    err "Remediation: Add mount '/opt/deadbolt/caddy:/etc/caddy/deadbolt:ro' to Caddy container."
+    exit 1
+  fi
 
-err() {
-  echo "[CADDY_EDGE_ERROR] $*" >&2
+  # 3. Verify active container Caddyfile imports the managed Deadbolt snippet path
+  local container_caddy_content
+  container_caddy_content=$(docker exec "$CADDY_CONTAINER" cat "$CONTAINER_CADDYFILE" 2>/dev/null || true)
+  if ! echo "$container_caddy_content" | grep -Eq 'import +/etc/caddy/deadbolt/.*|import +/etc/caddy/deadbolt/Deadbolt\.caddyfile|import +/etc/caddy/deadbolt'; then
+    err "PREREQUISITE FAILURE: Container Caddyfile ($CONTAINER_CADDYFILE) does not import Deadbolt snippet!"
+    err "Expected import directive: 'import /etc/caddy/deadbolt/*.caddyfile'"
+    err "Deadbolt does not own or modify the FlowDesk Caddyfile. The host import is a provisioning prerequisite."
+    exit 1
+  fi
 }
 
 if [[ "$DRY_RUN" == "true" ]]; then
-  log "DRY RUN: Verifying Caddy snippet and merged configuration (active port $TARGET_PORT)..."
+  log "DRY RUN: Verifying Caddy snippet rendering and container contracts (target: $TARGET_UPSTREAM)..."
   TMP_SNIPPET=$(mktemp)
   render_snippet "$TMP_SNIPPET"
-  if command -v caddy &>/dev/null; then
-    TMP_CADDY=$(mktemp)
-    trap 'rm -f "$TMP_SNIPPET" "$TMP_CADDY"' EXIT
-    if [[ -f "$CADDYFILE" ]]; then
-      cp "$CADDYFILE" "$TMP_CADDY"
-    else
-      echo ":80 {}" > "$TMP_CADDY"
-    fi
-    sed -i.tmp "\|import ${ABS_SNIPPET_FILE}|d" "$TMP_CADDY" 2>/dev/null || true
-    echo "import ${TMP_SNIPPET}" >> "$TMP_CADDY"
-    if ! caddy validate --config "$TMP_CADDY" --adapter caddyfile 2>/dev/null; then
-      err "DRY RUN: Merged Caddy configuration validation failed!"
-      exit 1
-    fi
-    log "DRY RUN: Merged Caddy configuration validation passed."
-  else
-    log "DRY RUN: Snippet rendered and syntax check passed (port $TARGET_PORT)."
+
+  # Enforce strict contract: rendered snippet must use Docker DNS alias, NEVER loopback
+  if grep -q "127.0.0.1" "$TMP_SNIPPET"; then
+    err "DRY RUN: Snippet contains forbidden host loopback address (127.0.0.1)!"
     rm -f "$TMP_SNIPPET"
+    exit 1
   fi
+  if ! grep -q "$TARGET_UPSTREAM" "$TMP_SNIPPET"; then
+    err "DRY RUN: Snippet does not contain expected upstream '$TARGET_UPSTREAM'!"
+    rm -f "$TMP_SNIPPET"
+    exit 1
+  fi
+
+  if [[ "${DEADBOLT_SYNTAX_ONLY:-${DEADBOLT_SNIPPET_ONLY:-false}}" == "true" ]]; then
+    rm -f "$TMP_SNIPPET"
+    log "DRY RUN passed: Caddy edge snippet syntax and Docker DNS alias verified for $TARGET_UPSTREAM (syntax only)."
+    exit 0
+  fi
+
+
+  # Dry run must strictly verify container prerequisites and execute validation inside container
+  if ! command -v docker &>/dev/null; then
+    err "DRY RUN: docker binary not found in PATH! Dry run does not silently pass without container validation."
+    rm -f "$TMP_SNIPPET"
+    exit 1
+  fi
+
+  verify_caddy_container_prerequisites
+
+  log "DRY RUN: Validating merged Caddy configuration inside container '$CADDY_CONTAINER'..."
+  if ! docker exec "$CADDY_CONTAINER" caddy validate --config "$CONTAINER_CADDYFILE" --adapter caddyfile; then
+    err "DRY RUN: Caddy container validation failed inside '$CADDY_CONTAINER'!"
+    rm -f "$TMP_SNIPPET"
+    exit 1
+  fi
+
+  rm -f "$TMP_SNIPPET"
+  log "DRY RUN passed: Caddy edge configuration verified inside container for $TARGET_UPSTREAM."
   exit 0
 fi
 
-if [[ ! -f "$CADDYFILE" ]]; then
-  err "Active Caddyfile not found at: $CADDYFILE"
-  exit 1
-fi
+# 1. Verify containerized Caddy prerequisites on live host
+verify_caddy_container_prerequisites
 
-# Ensure Caddy binary is present
-if ! command -v caddy &>/dev/null; then
-  err "caddy executable not found in PATH"
-  exit 1
-fi
-
+# 2. Back up current snippet and upstream route state
 TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-BACKUP_FILE="${CADDYFILE}.bak.${TIMESTAMP}"
-SNIPPET_BACKUP="${ABS_SNIPPET_FILE}.bak.${TIMESTAMP}"
+SNIPPET_BACKUP="${HOST_SNIPPET_FILE}.bak.${TIMESTAMP}"
 UPSTREAM_BACKUP="${ACTIVE_UPSTREAM_FILE}.bak.${TIMESTAMP}"
+SLOT_BACKUP="${ACTIVE_SLOT_FILE}.bak.${TIMESTAMP}"
 
-log "Backing up current Caddyfile and route state..."
-cp "$CADDYFILE" "$BACKUP_FILE"
-if [[ -f "$ABS_SNIPPET_FILE" ]]; then
-  cp "$ABS_SNIPPET_FILE" "$SNIPPET_BACKUP"
+mkdir -p "$(dirname "$HOST_SNIPPET_FILE")"
+if [[ -f "$HOST_SNIPPET_FILE" ]]; then
+  cp "$HOST_SNIPPET_FILE" "$SNIPPET_BACKUP"
 fi
 if [[ -f "$ACTIVE_UPSTREAM_FILE" ]]; then
   cp "$ACTIVE_UPSTREAM_FILE" "$UPSTREAM_BACKUP"
 fi
+if [[ -f "$ACTIVE_SLOT_FILE" ]]; then
+  cp "$ACTIVE_SLOT_FILE" "$SLOT_BACKUP"
+fi
 
 rollback() {
-  err "Reload failed! Rolling back Caddy configuration and upstream state..."
-  cp "$BACKUP_FILE" "$CADDYFILE"
+  err "Caddy reload or validation failed! Rolling back Deadbolt snippet and route state..."
   if [[ -f "$SNIPPET_BACKUP" ]]; then
-    cp "$SNIPPET_BACKUP" "$ABS_SNIPPET_FILE"
+    cp -f "$SNIPPET_BACKUP" "$HOST_SNIPPET_FILE"
+    rm -f "$SNIPPET_BACKUP"
+  else
+    rm -f "$HOST_SNIPPET_FILE"
   fi
   if [[ -f "$UPSTREAM_BACKUP" ]]; then
-    cp "$UPSTREAM_BACKUP" "$ACTIVE_UPSTREAM_FILE"
+    cp -f "$UPSTREAM_BACKUP" "$ACTIVE_UPSTREAM_FILE"
+    rm -f "$UPSTREAM_BACKUP"
   else
     rm -f "$ACTIVE_UPSTREAM_FILE"
   fi
-  caddy reload --config "$CADDYFILE" --adapter caddyfile || true
-  err "Rollback completed."
+  if [[ -f "$SLOT_BACKUP" ]]; then
+    cp -f "$SLOT_BACKUP" "$ACTIVE_SLOT_FILE"
+    rm -f "$SLOT_BACKUP"
+  else
+    rm -f "$ACTIVE_SLOT_FILE"
+  fi
+  docker exec "$CADDY_CONTAINER" caddy reload --config "$CONTAINER_CADDYFILE" --adapter caddyfile 2>/dev/null || true
+  err "Rollback completed. Prior snippet and Caddy in-memory state restored."
 }
 
-# Render managed snippet with literal validated upstream port
-mkdir -p "$(dirname "$ABS_SNIPPET_FILE")"
-render_snippet "$ABS_SNIPPET_FILE"
+# 3. Atomically render and place candidate snippet
+TMP_SNIPPET="$(mktemp "$(dirname "$HOST_SNIPPET_FILE")/Deadbolt.caddyfile.tmp.XXXXXX")"
+render_snippet "$TMP_SNIPPET"
+mv -f "$TMP_SNIPPET" "$HOST_SNIPPET_FILE"
 
-# Remove legacy relative import if present to ensure clean merged config
-sed -i.tmp "\|import deploy/caddy/Deadbolt.caddyfile|d" "$CADDYFILE" 2>/dev/null || true
-rm -f "${CADDYFILE}.tmp" 2>/dev/null || true
-
-# Append absolute snippet import if not already present
-IMPORT_LINE="import ${ABS_SNIPPET_FILE}"
-if ! grep -q "$ABS_SNIPPET_FILE" "$CADDYFILE"; then
-  log "Appending Deadbolt absolute snippet import to: $CADDYFILE"
-  echo "" >> "$CADDYFILE"
-  echo "# Deadbolt Staging Route" >> "$CADDYFILE"
-  echo "$IMPORT_LINE" >> "$CADDYFILE"
-fi
-
-log "Validating exact merged Caddy configuration (active upstream port: $TARGET_PORT)..."
-if ! caddy validate --config "$CADDYFILE" --adapter caddyfile; then
-  err "Caddy validation failed on merged configuration! Aborting reload."
+# 4. Validate merged configuration inside existing Caddy container
+log "Validating Caddy configuration inside container '$CADDY_CONTAINER'..."
+if ! docker exec "$CADDY_CONTAINER" caddy validate --config "$CONTAINER_CADDYFILE" --adapter caddyfile; then
+  err "Caddy validation failed inside container '$CADDY_CONTAINER'!"
   rollback
   exit 1
 fi
+log "Caddy configuration validated successfully."
 
-log "Executing safe Caddy zero-downtime reload..."
-if ! caddy reload --config "$CADDYFILE" --adapter caddyfile; then
-  err "Caddy reload execution failed!"
+# 5. Execute zero-downtime reload inside existing Caddy container
+log "Executing Caddy reload inside container '$CADDY_CONTAINER'..."
+if ! docker exec "$CADDY_CONTAINER" caddy reload --config "$CONTAINER_CADDYFILE" --adapter caddyfile; then
+  err "Caddy reload failed inside container '$CADDY_CONTAINER'!"
   rollback
   exit 1
 fi
+log "Caddy reload completed successfully."
 
-# Persist active upstream port to release state ONLY after successful reload
+# 6. Persist active upstream state ONLY after successful reload
 mkdir -p "$RELEASE_DIR"
 echo "$TARGET_PORT" > "$ACTIVE_UPSTREAM_FILE"
-rm -f "$UPSTREAM_BACKUP" 2>/dev/null || true
+echo "$TARGET_SLOT" > "$ACTIVE_SLOT_FILE"
+rm -f "$SNIPPET_BACKUP" "$UPSTREAM_BACKUP" "$SLOT_BACKUP" 2>/dev/null || true
 
-log "Caddy reload successfully completed with Deadbolt staging upstream persisted to port $TARGET_PORT."
+log "SUCCESS: Caddy edge route switched to $TARGET_UPSTREAM (slot: $TARGET_SLOT, port: $TARGET_PORT)."

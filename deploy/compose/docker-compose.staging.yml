@@ -4,6 +4,9 @@ networks:
   deadbolt_staging_net:
     name: deadbolt_staging_net
     driver: bridge
+  deadbolt-edge:
+    name: deadbolt-edge
+    external: true
 
 volumes:
   deadbolt_staging_postgres_data:
@@ -94,7 +97,10 @@ services:
     container_name: deadbolt-staging-control-plane-blue
     restart: unless-stopped
     networks:
-      - deadbolt_staging_net
+      deadbolt_staging_net:
+      deadbolt-edge:
+        aliases:
+          - deadbolt-control-plane-blue
     environment:
       RUNTIME_MODE: hosted
       DEV_AUTH_ENABLED: "false"
@@ -134,7 +140,10 @@ services:
     container_name: deadbolt-staging-control-plane-green
     restart: unless-stopped
     networks:
-      - deadbolt_staging_net
+      deadbolt_staging_net:
+      deadbolt-edge:
+        aliases:
+          - deadbolt-control-plane-green
     environment:
       RUNTIME_MODE: hosted
       DEV_AUTH_ENABLED: "false"

@@ -8,6 +8,7 @@ set -euo pipefail
 
 DRY_RUN="${DRY_RUN:-false}"
 RELEASE_DIR="${DEADBOLT_RELEASE_DIR:-/opt/deadbolt/releases}"
+BOOTSTRAP_MARKER_FILE="${RELEASE_DIR}/bootstrap_complete"
 BOOTSTRAP_MODE="${DEADBOLT_BOOTSTRAP:-false}"
 POSITIONAL_ARGS=()
 for arg in "$@"; do
@@ -17,6 +18,7 @@ for arg in "$@"; do
     POSITIONAL_ARGS+=("$arg")
   fi
 done
+
 
 CANDIDATE_DIGEST="${DEADBOLT_IMAGE_DIGEST:-${POSITIONAL_ARGS[0]:-}}"
 CANDIDATE_COMMIT="${DEADBOLT_COMMIT_SHA:-${POSITIONAL_ARGS[1]:-}}"
@@ -193,10 +195,18 @@ fi
 
 export DEADBOLT_POSTGRES_IMAGE
 
+# Automatic fresh-host detection: if bootstrap marker does not exist, activate bootstrap mode
+if [[ "$BOOTSTRAP_MODE" != "true" && ! -f "$BOOTSTRAP_MARKER_FILE" ]]; then
+  log "Uninitialized Deadbolt staging host detected (marker $BOOTSTRAP_MARKER_FILE missing)."
+  log "Automatically activating --bootstrap mode for fresh host initialization..."
+  BOOTSTRAP_MODE="true"
+fi
+
 if [[ "$BOOTSTRAP_MODE" == "true" ]]; then
   log "BOOTSTRAP MODE: Fresh staging host cluster initialization sequence enabled."
   log "Delegating to authoritative bootstrap script (scripts/bootstrap-staging-cluster.sh)..."
   ./scripts/bootstrap-staging-cluster.sh
+
 
   # Headroom & Co-tenant isolation checks
   log "Step 3: Checking system headroom & co-tenant boundaries..."
@@ -392,7 +402,7 @@ fi
 
 # 11. Staged edge smoke test
 log "Step 11: Smokin edge route via Caddy..."
-EDGE_VERSION=$(curl -fsSL "https://${DEADBOLT_STAGING_DOMAIN}/version" 2>/dev/null || echo "{}")
+EDGE_VERSION=$(curl -fsSL "https://${DEADBOLT_STAGING_DOMAIN}/version" 2>/dev/null || curl -fsSL --resolve "${DEADBOLT_STAGING_DOMAIN}:443:127.0.0.1" "https://${DEADBOLT_STAGING_DOMAIN}/version" 2>/dev/null || echo "{}")
 if ! echo "$EDGE_VERSION" | grep -q "$CANDIDATE_DIGEST"; then
   err "EDGE SMOKE FAILED: Caddy edge is not serving candidate image digest!"
   # Rollback Caddy route to old port
@@ -413,4 +423,17 @@ fi
 echo "$CANDIDATE_DIGEST" > "$CURRENT_RELEASE_FILE"
 echo "$CANDIDATE_SLOT" > "$ACTIVE_SLOT_FILE"
 
+# Record durable bootstrap completion marker
+if [[ ! -f "$BOOTSTRAP_MARKER_FILE" ]]; then
+  cat <<EOF > "${BOOTSTRAP_MARKER_FILE}.tmp"
+BOOTSTRAP_COMPLETED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+POSTGRES_IMAGE="$DEADBOLT_POSTGRES_IMAGE"
+FIRST_DEPLOY_DIGEST="$CANDIDATE_DIGEST"
+FIRST_DEPLOY_COMMIT="${CANDIDATE_COMMIT:-unknown}"
+EOF
+  mv -f "${BOOTSTRAP_MARKER_FILE}.tmp" "$BOOTSTRAP_MARKER_FILE"
+  log "Durable bootstrap marker confirmed: $BOOTSTRAP_MARKER_FILE"
+fi
+
 log "SUCCESS: Staging deployment completed. Active slot: $CANDIDATE_SLOT (port $CANDIDATE_PORT)."
+

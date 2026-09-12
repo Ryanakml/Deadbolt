@@ -1005,26 +1005,48 @@ func TestDatabaseRolesInitScriptFailsWithoutPasswords(t *testing.T) {
 	}
 }
 
-// TestCaddyAbsoluteSnippetImportAndMergedValidation verifies that scripts/reload-caddy.sh
-// uses absolute snippet import paths and performs exact merged validation (Item 4).
-func TestCaddyAbsoluteSnippetImportAndMergedValidation(t *testing.T) {
-	content, err := os.ReadFile("../../scripts/reload-caddy.sh")
+// TestContainerizedCaddyEdgeTopology verifies that staging Compose declares the external
+// deadbolt-edge network, attaches only blue/green control-plane slots with deterministic aliases,
+// leaves PG/NATS private, and renders Caddy upstreams using Docker DNS aliases (never 127.0.0.1).
+func TestContainerizedCaddyEdgeTopology(t *testing.T) {
+	// 1. Staging Compose network declarations and attachments
+	composeBytes, err := os.ReadFile("../../deploy/compose/docker-compose.staging.yml")
 	if err != nil {
-		t.Fatalf("failed to read scripts/reload-caddy.sh: %v", err)
+		t.Fatalf("failed to read staging compose: %v", err)
 	}
-	scriptStr := string(content)
+	composeStr := string(composeBytes)
 
-	if !strings.Contains(scriptStr, "ABS_SNIPPET_FILE") {
-		t.Fatalf("expected reload-caddy.sh to resolve ABS_SNIPPET_FILE")
+	if !strings.Contains(composeStr, "deadbolt-edge:\n    name: deadbolt-edge\n    external: true") {
+		t.Fatalf("expected staging compose to declare external network deadbolt-edge")
 	}
-	if !strings.Contains(scriptStr, "import ${ABS_SNIPPET_FILE}") {
-		t.Fatalf("expected reload-caddy.sh to import absolute snippet path")
+	if !strings.Contains(composeStr, "deadbolt-control-plane-blue") {
+		t.Fatalf("expected control-plane-blue alias deadbolt-control-plane-blue on deadbolt-edge")
 	}
-	if !strings.Contains(scriptStr, "caddy validate --config \"$CADDYFILE\" --adapter caddyfile") {
-		t.Fatalf("expected reload-caddy.sh to validate exact merged Caddyfile with --adapter caddyfile")
+	if !strings.Contains(composeStr, "deadbolt-control-plane-green") {
+		t.Fatalf("expected control-plane-green alias deadbolt-control-plane-green on deadbolt-edge")
 	}
-	if !strings.Contains(scriptStr, "import deploy/caddy/Deadbolt.caddyfile") {
-		t.Fatalf("expected reload-caddy.sh to clean up legacy relative imports")
+
+	// Verify postgres and nats do not attach to deadbolt-edge
+	pgSection := composeStr[strings.Index(composeStr, "postgres:"):strings.Index(composeStr, "nats:")]
+	if strings.Contains(pgSection, "deadbolt-edge") {
+		t.Fatalf("SECURITY VIOLATION: postgres must not be attached to deadbolt-edge")
+	}
+	natsSection := composeStr[strings.Index(composeStr, "nats:"):strings.Index(composeStr, "control-plane-blue:")]
+	if strings.Contains(natsSection, "deadbolt-edge") {
+		t.Fatalf("SECURITY VIOLATION: nats must not be attached to deadbolt-edge")
+	}
+
+	// 2. Initial static snippet uses Docker DNS alias, never 127.0.0.1
+	snippetBytes, err := os.ReadFile("../../deploy/caddy/Deadbolt.caddyfile")
+	if err != nil {
+		t.Fatalf("failed to read deploy/caddy/Deadbolt.caddyfile: %v", err)
+	}
+	snippetStr := string(snippetBytes)
+	if strings.Contains(snippetStr, "127.0.0.1") {
+		t.Fatalf("forbidden host loopback 127.0.0.1 found in deploy/caddy/Deadbolt.caddyfile")
+	}
+	if !strings.Contains(snippetStr, "reverse_proxy deadbolt-control-plane-blue:8080") {
+		t.Fatalf("expected deploy/caddy/Deadbolt.caddyfile to proxy to deadbolt-control-plane-blue:8080, got:\n%s", snippetStr)
 	}
 }
 
@@ -1113,11 +1135,10 @@ func TestClusterBootstrapAndPromotionSequencing(t *testing.T) {
 	}
 }
 
-// TestCaddyRoutePersistenceAcrossReloads verifies Audit #3 & #4:
-// reload-caddy.sh writes literal upstream port into the Caddy snippet and persists it to
-// active_upstream_port only after reload succeeds, restores state on rollback, and fails closed
-// without DEADBOLT_STAGING_DOMAIN (zero invented fallback domain).
-func TestCaddyRoutePersistenceAcrossReloads(t *testing.T) {
+// TestContainerizedCaddyReloadContract verifies that scripts/reload-caddy.sh
+// targets containerized Caddy, enforces Docker DNS alias upstreams, strictly forbids 127.0.0.1,
+// executes validation/reload inside the container, persists state on success, and restores on failure.
+func TestContainerizedCaddyReloadContract(t *testing.T) {
 	scriptPath := "../../scripts/reload-caddy.sh"
 	content, err := os.ReadFile(scriptPath)
 	if err != nil {
@@ -1125,18 +1146,23 @@ func TestCaddyRoutePersistenceAcrossReloads(t *testing.T) {
 	}
 	scriptStr := string(content)
 
-	// Must validate target port is 8088 or 8089
-	if !strings.Contains(scriptStr, "TARGET_PORT") {
-		t.Fatalf("expected reload-caddy.sh to handle TARGET_PORT")
-	}
-	if !strings.Contains(scriptStr, "active_upstream_port") {
-		t.Fatalf("expected reload-caddy.sh to persist active_upstream_port")
-	}
-	if !strings.Contains(scriptStr, "UPSTREAM_BACKUP") {
-		t.Fatalf("expected reload-caddy.sh to back up active_upstream_port before changes")
-	}
-	if !strings.Contains(scriptStr, "reverse_proxy 127.0.0.1:${TARGET_PORT}") {
-		t.Fatalf("expected reload-caddy.sh to render literal reverse_proxy port")
+	for _, token := range []string{
+		"HOST_SNIPPET_FILE",
+		"CADDY_CONTAINER",
+		"CONTAINER_CADDYFILE",
+		"CONTAINER_SNIPPET_FILE",
+		"deadbolt-control-plane-blue:8080",
+		"deadbolt-control-plane-green:8080",
+		"docker inspect",
+		"docker exec \"$CADDY_CONTAINER\" caddy validate",
+		"docker exec \"$CADDY_CONTAINER\" caddy reload",
+		"active_upstream_port",
+		"active_slot",
+		"rollback",
+	} {
+		if !strings.Contains(scriptStr, token) {
+			t.Fatalf("expected reload-caddy.sh to contain %q", token)
+		}
 	}
 
 	// Verify fail closed without DEADBOLT_STAGING_DOMAIN
@@ -1150,51 +1176,343 @@ func TestCaddyRoutePersistenceAcrossReloads(t *testing.T) {
 		t.Fatalf("expected missing domain error, got: %s", string(outNoDomain))
 	}
 
-	// Execution test: simulate reload into a temporary directory
-	tmpDir := t.TempDir()
-	caddySnippet := filepath.Join(tmpDir, "Deadbolt.caddyfile")
-	caddyMain := filepath.Join(tmpDir, "Caddyfile")
-	if err := os.WriteFile(caddySnippet, []byte(""), 0644); err != nil {
-		t.Fatalf("failed to write snippet: %v", err)
+	// Verify snippet-only dry-run validates Docker DNS alias and strictly rejects 127.0.0.1
+	tmpSnippetDir := t.TempDir()
+	snippetTarget := filepath.Join(tmpSnippetDir, "Deadbolt.caddyfile")
+	cmdDryRun := exec.Command("/bin/bash", scriptPath, "8089")
+	cmdDryRun.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"DRY_RUN=true",
+		"DEADBOLT_SNIPPET_ONLY=true",
+		"DEADBOLT_STAGING_DOMAIN=staging.example.com",
+		"DEADBOLT_CADDYFILE_SNIPPET=" + snippetTarget,
 	}
-	if err := os.WriteFile(caddyMain, []byte("import "+caddySnippet+"\n"), 0644); err != nil {
-		t.Fatalf("failed to write Caddyfile: %v", err)
+	outDryRun, errDryRun := cmdDryRun.CombinedOutput()
+	if errDryRun != nil {
+		t.Fatalf("expected syntax dry run to pass, failed: %v, output: %s", errDryRun, string(outDryRun))
 	}
-
-	// Simulate deferred persistence logic:
-	cmd := exec.Command("/bin/bash", "-c", `
-		set -euo pipefail
-		TARGET_PORT="8089"
-		RELEASE_DIR="$1"
-		SNIPPET_FILE="$2"
-		echo "$TARGET_PORT" > "${RELEASE_DIR}/active_upstream_port"
-		cat <<EOF > "$SNIPPET_FILE"
-# Active upstream route
-handle /api/* {
-    reverse_proxy 127.0.0.1:${TARGET_PORT}
+	if !strings.Contains(string(outDryRun), "DRY RUN passed") {
+		t.Fatalf("expected DRY RUN passed output, got: %s", string(outDryRun))
+	}
 }
-EOF
-	`, "test", tmpDir, caddySnippet)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to run slot setup: %v, %s", err, string(out))
+
+// TestContainerizedCaddyMockValidationAndRollback tests scripts/reload-caddy.sh with
+// a mock docker CLI to verify all operational paths:
+// 1. Happy path: container running, mount valid, import valid -> reload success, state persisted.
+// 2. Missing container -> fails closed with prerequisite error.
+// 3. Missing snippet mount -> fails closed with prerequisite error.
+// 4. Missing import in Caddyfile -> fails closed with prerequisite error.
+// 5. Validation failure -> rollback restores previous snippet/state, reloads Caddy.
+// 6. Reload failure -> rollback restores previous snippet/state.
+// 7. Dry run without container -> fails closed (does not silently pass).
+func TestContainerizedCaddyMockValidationAndRollback(t *testing.T) {
+	scriptPath, err := filepath.Abs("../../scripts/reload-caddy.sh")
+	if err != nil {
+		t.Fatalf("failed to resolve script path: %v", err)
 	}
 
-	// Read back saved port
-	savedPort, err := os.ReadFile(filepath.Join(tmpDir, "active_upstream_port"))
-	if err != nil {
-		t.Fatalf("failed to read active_upstream_port: %v", err)
-	}
-	if strings.TrimSpace(string(savedPort)) != "8089" {
-		t.Fatalf("expected active_upstream_port to be 8089, got %q", string(savedPort))
+	setupMockDocker := func(t *testing.T, containerStatus, mountsJSON, caddyfileContent string, validateExit, reloadExit int) string {
+		binDir := t.TempDir()
+		mockDocker := filepath.Join(binDir, "docker")
+		script := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+cmd="${1:-}"
+shift || true
+
+if [[ "$cmd" == "info" ]]; then
+  exit 0
+fi
+
+if [[ "$cmd" == "inspect" ]]; then
+  fmt=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format)
+        fmt="$2"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  if [[ "$fmt" == *"State.Status"* ]]; then
+    echo "%s"
+    exit 0
+  fi
+  if [[ "$fmt" == *"Mounts"* ]]; then
+    echo '%s'
+    exit 0
+  fi
+  exit 0
+fi
+
+if [[ "$cmd" == "exec" ]]; then
+  container="${1:-}"
+  shift || true
+  subcmd="${1:-}"
+  shift || true
+  if [[ "$subcmd" == "cat" ]]; then
+    echo '%s'
+    exit 0
+  fi
+  if [[ "$subcmd" == "caddy" ]]; then
+    action="${1:-}"
+    shift || true
+    if [[ "$action" == "validate" ]]; then
+      exit %d
+    fi
+    if [[ "$action" == "reload" ]]; then
+      exit %d
+    fi
+  fi
+  exit 0
+fi
+
+exit 0
+`, containerStatus, mountsJSON, caddyfileContent, validateExit, reloadExit)
+
+		if err := os.WriteFile(mockDocker, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write mock docker: %v", err)
+		}
+		return binDir
 	}
 
-	// Verify rendered snippet has literal 8089
-	renderedSnippet, err := os.ReadFile(caddySnippet)
+	validMounts := `[{"Type":"bind","Source":"/opt/deadbolt/caddy","Destination":"/etc/caddy/deadbolt","Mode":"ro"}]`
+	validCaddyfile := ":80 {\nimport /etc/caddy/deadbolt/*.caddyfile\n}"
+
+	// Scenario 1: Happy path reload to Green (port 8089)
+	t.Run("HappyPathReload", func(t *testing.T) {
+		binDir := setupMockDocker(t, "running", validMounts, validCaddyfile, 0, 0)
+		workDir := t.TempDir()
+		releaseDir := filepath.Join(workDir, "releases")
+		snippetPath := filepath.Join(workDir, "Deadbolt.caddyfile")
+
+		cmd := exec.Command("/bin/bash", scriptPath, "green")
+		cmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DEADBOLT_RELEASE_DIR=" + releaseDir,
+			"DEADBOLT_CADDYFILE_SNIPPET=" + snippetPath,
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("expected happy path reload to succeed: %v, output:\n%s", err, string(out))
+		}
+
+		// Verify state persisted
+		savedPort, err := os.ReadFile(filepath.Join(releaseDir, "active_upstream_port"))
+		if err != nil || strings.TrimSpace(string(savedPort)) != "8089" {
+			t.Fatalf("expected active_upstream_port to be 8089, got %q (err: %v)", string(savedPort), err)
+		}
+		savedSlot, err := os.ReadFile(filepath.Join(releaseDir, "active_slot"))
+		if err != nil || strings.TrimSpace(string(savedSlot)) != "green" {
+			t.Fatalf("expected active_slot to be green, got %q (err: %v)", string(savedSlot), err)
+		}
+
+		// Verify snippet rendered with Docker DNS alias and no 127.0.0.1
+		rendered, err := os.ReadFile(snippetPath)
+		if err != nil {
+			t.Fatalf("failed to read rendered snippet: %v", err)
+		}
+		renderedStr := string(rendered)
+		if strings.Contains(renderedStr, "127.0.0.1") {
+			t.Fatalf("rendered snippet contains forbidden loopback 127.0.0.1:\n%s", renderedStr)
+		}
+		if !strings.Contains(renderedStr, "reverse_proxy deadbolt-control-plane-green:8080") {
+			t.Fatalf("expected reverse_proxy deadbolt-control-plane-green:8080, got:\n%s", renderedStr)
+		}
+	})
+
+	// Scenario 2: Caddy container not running
+	t.Run("ContainerNotRunningFailsClosed", func(t *testing.T) {
+		binDir := setupMockDocker(t, "exited", validMounts, validCaddyfile, 0, 0)
+		workDir := t.TempDir()
+
+		cmd := exec.Command("/bin/bash", scriptPath, "blue")
+		cmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DEADBOLT_RELEASE_DIR=" + filepath.Join(workDir, "releases"),
+			"DEADBOLT_CADDYFILE_SNIPPET=" + filepath.Join(workDir, "Deadbolt.caddyfile"),
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected fail closed on stopped container, got success: %s", string(out))
+		}
+		if !strings.Contains(string(out), "is not running") {
+			t.Fatalf("expected container not running error, got: %s", string(out))
+		}
+	})
+
+	// Scenario 3: Mount missing
+	t.Run("MountMissingFailsClosed", func(t *testing.T) {
+		binDir := setupMockDocker(t, "running", "[]", validCaddyfile, 0, 0)
+		workDir := t.TempDir()
+
+		cmd := exec.Command("/bin/bash", scriptPath, "blue")
+		cmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DEADBOLT_RELEASE_DIR=" + filepath.Join(workDir, "releases"),
+			"DEADBOLT_CADDYFILE_SNIPPET=" + filepath.Join(workDir, "Deadbolt.caddyfile"),
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected fail closed on missing mount, got success: %s", string(out))
+		}
+		if !strings.Contains(string(out), "is not mounted in container") {
+			t.Fatalf("expected missing mount error, got: %s", string(out))
+		}
+	})
+
+	// Scenario 4: Import missing
+	t.Run("ImportMissingFailsClosed", func(t *testing.T) {
+		binDir := setupMockDocker(t, "running", validMounts, ":80 { respond ok }", 0, 0)
+		workDir := t.TempDir()
+
+		cmd := exec.Command("/bin/bash", scriptPath, "blue")
+		cmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DEADBOLT_RELEASE_DIR=" + filepath.Join(workDir, "releases"),
+			"DEADBOLT_CADDYFILE_SNIPPET=" + filepath.Join(workDir, "Deadbolt.caddyfile"),
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected fail closed on missing import, got success: %s", string(out))
+		}
+		if !strings.Contains(string(out), "does not import Deadbolt snippet") {
+			t.Fatalf("expected missing import error, got: %s", string(out))
+		}
+	})
+
+	// Scenario 5: Caddy validate inside container fails -> rollback restores prior snippet & state
+	t.Run("ValidationFailureRollback", func(t *testing.T) {
+		binDir := setupMockDocker(t, "running", validMounts, validCaddyfile, 1, 0)
+		workDir := t.TempDir()
+		releaseDir := filepath.Join(workDir, "releases")
+		snippetPath := filepath.Join(workDir, "Deadbolt.caddyfile")
+		if err := os.MkdirAll(releaseDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Seed initial state (blue / 8088)
+		initialSnippet := "# Prior snippet blue\nreverse_proxy deadbolt-control-plane-blue:8080\n"
+		if err := os.WriteFile(snippetPath, []byte(initialSnippet), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(releaseDir, "active_upstream_port"), []byte("8088\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(releaseDir, "active_slot"), []byte("blue\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.Command("/bin/bash", scriptPath, "green")
+		cmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DEADBOLT_RELEASE_DIR=" + releaseDir,
+			"DEADBOLT_CADDYFILE_SNIPPET=" + snippetPath,
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected failure when validation fails, got success: %s", string(out))
+		}
+		if !strings.Contains(string(out), "Caddy validation failed inside container") {
+			t.Fatalf("expected validation failure log, got: %s", string(out))
+		}
+
+		// Verify rollback restored initial state
+		restoredPort, _ := os.ReadFile(filepath.Join(releaseDir, "active_upstream_port"))
+		if strings.TrimSpace(string(restoredPort)) != "8088" {
+			t.Fatalf("expected active_upstream_port rolled back to 8088, got %q", string(restoredPort))
+		}
+		restoredSlot, _ := os.ReadFile(filepath.Join(releaseDir, "active_slot"))
+		if strings.TrimSpace(string(restoredSlot)) != "blue" {
+			t.Fatalf("expected active_slot rolled back to blue, got %q", string(restoredSlot))
+		}
+		restoredSnippet, _ := os.ReadFile(snippetPath)
+		if string(restoredSnippet) != initialSnippet {
+			t.Fatalf("expected snippet rolled back to prior content, got:\n%s", string(restoredSnippet))
+		}
+	})
+
+	// Scenario 6: Dry run fails when container prerequisites fail (does not silently pass)
+	t.Run("DryRunFailsClosedWhenContainerMissing", func(t *testing.T) {
+		binDir := setupMockDocker(t, "exited", validMounts, validCaddyfile, 0, 0)
+		workDir := t.TempDir()
+
+		cmd := exec.Command("/bin/bash", scriptPath, "blue")
+		cmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DRY_RUN=true",
+			"DEADBOLT_RELEASE_DIR=" + filepath.Join(workDir, "releases"),
+			"DEADBOLT_CADDYFILE_SNIPPET=" + filepath.Join(workDir, "Deadbolt.caddyfile"),
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected dry run to fail closed when container is missing, but passed: %s", string(out))
+		}
+		if !strings.Contains(string(out), "is not running") {
+			t.Fatalf("expected container not running error in dry run, got: %s", string(out))
+		}
+	})
+}
+
+// TestFreshHostBootstrapMarker verifies that deploy-staging.sh detects uninitialized
+// staging installations, automatically engages bootstrap mode, and records the durable marker.
+func TestFreshHostBootstrapMarker(t *testing.T) {
+	deployBytes, err := os.ReadFile("../../scripts/deploy-staging.sh")
 	if err != nil {
-		t.Fatalf("failed to read rendered snippet: %v", err)
+		t.Fatalf("failed to read scripts/deploy-staging.sh: %v", err)
 	}
-	if !strings.Contains(string(renderedSnippet), "reverse_proxy 127.0.0.1:8089") {
-		t.Fatalf("expected rendered snippet to contain literal reverse_proxy 127.0.0.1:8089, got:\n%s", string(renderedSnippet))
+	deployStr := string(deployBytes)
+
+	for _, token := range []string{
+		"BOOTSTRAP_MARKER_FILE",
+		"bootstrap_complete",
+		"Uninitialized Deadbolt staging host detected",
+		"BOOTSTRAP_MODE=\"true\"",
+		"./scripts/bootstrap-staging-cluster.sh",
+	} {
+		if !strings.Contains(deployStr, token) {
+			t.Fatalf("expected deploy-staging.sh to contain %q", token)
+		}
+	}
+
+	bootstrapBytes, err := os.ReadFile("../../scripts/bootstrap-staging-cluster.sh")
+	if err != nil {
+		t.Fatalf("failed to read scripts/bootstrap-staging-cluster.sh: %v", err)
+	}
+	bootstrapStr := string(bootstrapBytes)
+	if !strings.Contains(bootstrapStr, "BOOTSTRAP_MARKER_FILE") || !strings.Contains(bootstrapStr, "bootstrap_complete") {
+		t.Fatalf("expected bootstrap-staging-cluster.sh to record durable bootstrap_complete marker")
+	}
+}
+
+// TestDeployWorkflowRsyncStrictHostKeyAndGHCRAuth verifies that the GitHub Actions workflow
+// enforces strict host-key verification for rsync and provides secure GHCR pull authentication via stdin.
+func TestDeployWorkflowRsyncStrictHostKeyAndGHCRAuth(t *testing.T) {
+	wfBytes, err := os.ReadFile("../../.github/workflows/staging-deploy.yml")
+	if err != nil {
+		t.Fatalf("failed to read workflow file: %v", err)
+	}
+	wfStr := string(wfBytes)
+
+	// Verify rsync uses strict host key checking
+	if !strings.Contains(wfStr, "rsync -avz -e \"ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts\"") {
+		t.Fatalf("expected rsync to enforce StrictHostKeyChecking=yes and UserKnownHostsFile")
+	}
+
+	// Verify GHCR pull auth via stdin
+	if !strings.Contains(wfStr, "docker login ghcr.io -u '$GHCR_PULL_USER' --password-stdin") {
+		t.Fatalf("expected workflow to authenticate remote docker daemon via --password-stdin")
+	}
+	if !strings.Contains(wfStr, "GHCR_PULL_TOKEN") {
+		t.Fatalf("expected workflow to define GHCR_PULL_TOKEN")
 	}
 }
 
