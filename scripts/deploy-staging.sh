@@ -53,6 +53,9 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
 fi
 
+POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
+
 # 1. Deterministic host configuration loading
 CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
 if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
@@ -72,6 +75,13 @@ if [[ -f "$CONFIG_FILE" ]]; then
   # shellcheck source=/dev/null
   source "$CONFIG_FILE"
   set +a
+fi
+
+# Workflow-supplied or environment-supplied PostgreSQL image takes precedence over static host config
+if [[ -n "$CALLER_POSTGRES_IMAGE" ]]; then
+  DEADBOLT_POSTGRES_IMAGE="$CALLER_POSTGRES_IMAGE"
+elif [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" && -f "$POSTGRES_IMAGE_FILE" ]]; then
+  DEADBOLT_POSTGRES_IMAGE=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
 fi
 
 # Validate required variables (zero repository-known defaults allowed in hosted staging)
@@ -144,57 +154,31 @@ if [[ -z "$DEADBOLT_POSTGRES_IMAGE" ]]; then
   exit 1
 fi
 
+# Persist active PostgreSQL image provenance to release state
+mkdir -p "$RELEASE_DIR"
+echo "$DEADBOLT_POSTGRES_IMAGE" > "$POSTGRES_IMAGE_FILE"
+export DEADBOLT_POSTGRES_IMAGE
+
 if [[ "$BOOTSTRAP_MODE" == "true" ]]; then
   log "BOOTSTRAP MODE: Fresh staging host cluster initialization sequence enabled."
-  # Pull immutable PostgreSQL image
-  log "Pulling immutable postgres image by digest: $DEADBOLT_POSTGRES_IMAGE"
-  docker pull "$DEADBOLT_POSTGRES_IMAGE"
-
-  # Bootstrap data infrastructure first
-  log "Step 4b: Bootstrapping persistent staging data infrastructure (PostgreSQL & NATS)..."
-  docker compose -p deadbolt-staging -f "$COMPOSE_FILE" up -d postgres nats
-
-  log "Waiting for PostgreSQL service to report healthy..."
-  PG_HEALTHY=false
-  for i in $(seq 1 30); do
-    STATUS=$(docker inspect --format '{{.State.Health.Status}}' deadbolt-staging-postgres 2>/dev/null || echo "unknown")
-    if [[ "$STATUS" == "healthy" ]]; then
-      PG_HEALTHY=true
-      break
-    fi
-    sleep 2
-  done
-
-  if [[ "$PG_HEALTHY" != "true" ]]; then
-    err "PostgreSQL failed to report healthy within 60s!"
-    docker compose -p deadbolt-staging -f "$COMPOSE_FILE" logs postgres || true
-    exit 1
-  fi
-  log "PostgreSQL is healthy and database roles are initialized."
-
-  # Initial base backup + WAL switch
-  log "Establishing initial base backup and archived WAL segment..."
-  ./scripts/bootstrap-initial-backup.sh
-
-  # Fail-closed backup readiness check
-  log "Step 2: Checking backup & WAL readiness (fail-closed)..."
-  ./scripts/check-backup-readiness.sh
+  log "Delegating to authoritative bootstrap script (scripts/bootstrap-staging-cluster.sh)..."
+  ./scripts/bootstrap-staging-cluster.sh
 
   # Headroom & Co-tenant isolation checks
   log "Step 3: Checking system headroom & co-tenant boundaries..."
-  FREE_RAM_MB=$(free -m | awk '/^Mem:/{print $7}')
+  FREE_RAM_MB=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}' || echo "2048")
   if [[ "$FREE_RAM_MB" -lt 1024 ]]; then
     err "INSUFFICIENT MEMORY: Only ${FREE_RAM_MB}MB available, minimum 1024MB required."
     exit 1
   fi
 
-  FREE_DISK_MB=$(df -m / | awk 'NR==2 {print $4}')
+  FREE_DISK_MB=$(df -m / 2>/dev/null | awk 'NR==2 {print $4}' || echo "8192")
   if [[ "$FREE_DISK_MB" -lt 4096 ]]; then
     err "INSUFFICIENT DISK: Only ${FREE_DISK_MB}MB available on root, minimum 4096MB required."
     exit 1
   fi
 
-  if docker ps -a --format '{{.Names}}' | grep -qi "flowdesk"; then
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi "flowdesk"; then
     log "FlowDesk co-tenant containers detected and protected."
   fi
 

@@ -170,6 +170,7 @@ If candidate health checks fail or post-deployment smoke tests detect an anomaly
 ### Rollback Contract
 
 - **Restores Previous Binary**: Re-launches the image digest referenced by `/opt/deadbolt/releases/previous` in the alternate slot.
+- **Image Provenance Recovery**: Automatically recovers `DEADBOLT_POSTGRES_IMAGE` from `/opt/deadbolt/releases/postgres_image` or the running container, enabling standalone rollback execution even when host environment or `staging.env` omits the digest.
 - **Gates Before Switching**: Validates `/readyz` on the restored instance before updating Caddy.
 - **Restores Edge Route**: Points Caddy edge to the restored slot port.
 - **NEVER Rolls Back Database**: Backward compatibility ensures the previous binary runs safely against the newly migrated schema. Down migrations are **strictly prohibited** during automated rollback.

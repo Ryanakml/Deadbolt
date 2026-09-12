@@ -75,6 +75,7 @@ In adherence to architectural invariants, the tool provides two distinct, explic
 1. **Safe Isolated Recovery Drill (Default)**:
    - Evaluates recoverability without stopping live services or altering persistent staging state.
    - Spins up an isolated recovery container (`deadbolt-recovery-drill-postgres`) attached to `--network none` and an ephemeral volume.
+   - When S3 is configured, WAL archives are prefetched by the host to an ephemeral cache directory and mounted read-only (`/wal_archive:ro`), allowing PostgreSQL to replay via `cp /wal_archive/%f %p` under strict `--network none` isolation without AWS credentials inside the container.
    - Replays WAL archives up to the specified target time (or latest), verifies database promotion, runs smoke queries, and cleans up.
    - Live staging services (`deadbolt-staging-postgres`) and data volume (`deadbolt_staging_postgres_data`) remain 100% untouched.
 

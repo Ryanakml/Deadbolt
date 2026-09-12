@@ -14,6 +14,8 @@ RELEASE_DIR="${RELEASE_DIR:-/opt/deadbolt/releases}"
 CURRENT_RELEASE_FILE="${RELEASE_DIR}/current"
 PREVIOUS_RELEASE_FILE="${RELEASE_DIR}/previous"
 ACTIVE_SLOT_FILE="${RELEASE_DIR}/active_slot"
+POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose/docker-compose.staging.yml}"
 DRY_RUN="${DRY_RUN:-false}"
 
@@ -72,6 +74,25 @@ if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
   set +a
 fi
+
+# Workflow-supplied or environment-supplied PostgreSQL image takes precedence over static host config
+if [[ -n "$CALLER_POSTGRES_IMAGE" ]]; then
+  DEADBOLT_POSTGRES_IMAGE="$CALLER_POSTGRES_IMAGE"
+elif [[ -f "$POSTGRES_IMAGE_FILE" ]]; then
+  RECORDED_PG_IMAGE=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
+  if [[ -n "$RECORDED_PG_IMAGE" ]]; then
+    DEADBOLT_POSTGRES_IMAGE="$RECORDED_PG_IMAGE"
+  fi
+fi
+
+# Fall back to inspecting running postgres container if image is still unset
+if [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" ]]; then
+  RUNNING_PG_IMAGE=$(docker inspect --format '{{.Config.Image}}' deadbolt-staging-postgres 2>/dev/null || true)
+  if [[ -n "$RUNNING_PG_IMAGE" ]]; then
+    DEADBOLT_POSTGRES_IMAGE="$RUNNING_PG_IMAGE"
+  fi
+fi
+export DEADBOLT_POSTGRES_IMAGE
 
 # 2. Strict validation of required staging variables (no invented domain or default passwords)
 for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL SYSTEM_DATABASE_URL DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_POSTGRES_IMAGE; do

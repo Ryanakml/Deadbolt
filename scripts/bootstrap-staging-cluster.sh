@@ -42,6 +42,10 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
 fi
 
+CALLER_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
+RELEASE_DIR="${RELEASE_DIR:-/opt/deadbolt/releases}"
+POSTGRES_IMAGE_FILE="${RELEASE_DIR}/postgres_image"
+
 # 1. Load host configuration
 CONFIG_FILE="${DEADBOLT_CONFIG_FILE:-/etc/deadbolt/staging.env}"
 if [[ ! -f "$CONFIG_FILE" && -f "/opt/deadbolt/config/staging.env" ]]; then
@@ -61,6 +65,14 @@ if [[ -f "$CONFIG_FILE" ]]; then
   set +a
 fi
 
+# Workflow-supplied or environment-supplied PostgreSQL image takes precedence over static host config
+if [[ -n "$CALLER_POSTGRES_IMAGE" ]]; then
+  DEADBOLT_POSTGRES_IMAGE="$CALLER_POSTGRES_IMAGE"
+elif [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" && -f "$POSTGRES_IMAGE_FILE" ]]; then
+  DEADBOLT_POSTGRES_IMAGE=$(cat "$POSTGRES_IMAGE_FILE" | tr -d '[:space:]')
+fi
+export DEADBOLT_POSTGRES_IMAGE
+
 # 2. Strict password and URL validation (no repository-known defaults permitted)
 for var in DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DATABASE_URL MIGRATOR_DATABASE_URL SYSTEM_DATABASE_URL; do
   if [[ -z "${!var:-}" ]]; then
@@ -70,8 +82,7 @@ for var in DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIM
   fi
 done
 
-DEADBOLT_POSTGRES_IMAGE="${DEADBOLT_POSTGRES_IMAGE:-}"
-if [[ -z "$DEADBOLT_POSTGRES_IMAGE" ]]; then
+if [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" ]]; then
   err "DEADBOLT_POSTGRES_IMAGE is required (format: ghcr.io/ryanakml/deadbolt/postgres@sha256:...)"
   exit 1
 fi

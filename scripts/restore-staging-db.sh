@@ -173,14 +173,30 @@ touch "${TARGET_DATA_DIR}/recovery.signal"
 
 RECOVERY_CONF="${TARGET_DATA_DIR}/postgresql.auto.conf"
 
-if [[ -n "$S3_BUCKET" ]]; then
-  RESTORE_CMD="aws s3 cp s3://${S3_BUCKET}/postgres/wal/%f %p"
-  if [[ ${#AWS_ARGS[@]} -gt 0 ]]; then
-    RESTORE_CMD="aws s3 cp s3://${S3_BUCKET}/postgres/wal/%f %p ${AWS_ARGS[*]}"
+WAL_MOUNT_SOURCE=""
+if [[ "$MODE" == "drill" ]]; then
+  if [[ -n "$S3_BUCKET" ]]; then
+    PREFETCH_WAL_DIR="${TMP_DIR}/prefetched_wal"
+    mkdir -p "$PREFETCH_WAL_DIR"
+    log "Prefetching archived WAL files from s3://${S3_BUCKET}/postgres/wal/ to host cache ($PREFETCH_WAL_DIR)..."
+    if ! aws s3 sync "s3://${S3_BUCKET}/postgres/wal/" "$PREFETCH_WAL_DIR" "${AWS_ARGS[@]}" --only-show-errors 2>/dev/null; then
+      aws s3 cp "s3://${S3_BUCKET}/postgres/wal/" "$PREFETCH_WAL_DIR" --recursive "${AWS_ARGS[@]}" --only-show-errors 2>/dev/null || true
+    fi
+    chmod -R a+rX "$PREFETCH_WAL_DIR" 2>/dev/null || true
+    WAL_MOUNT_SOURCE="$PREFETCH_WAL_DIR"
+  elif [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
+    WAL_MOUNT_SOURCE="$DEADBOLT_WAL_ARCHIVE_DIR"
   fi
-else
-  # When running in isolated container, mount archive directory
   RESTORE_CMD="cp /wal_archive/%f %p"
+else
+  if [[ -n "$S3_BUCKET" ]]; then
+    RESTORE_CMD="aws s3 cp s3://${S3_BUCKET}/postgres/wal/%f %p"
+    if [[ ${#AWS_ARGS[@]} -gt 0 ]]; then
+      RESTORE_CMD="aws s3 cp s3://${S3_BUCKET}/postgres/wal/%f %p ${AWS_ARGS[*]}"
+    fi
+  else
+    RESTORE_CMD="cp /wal_archive/%f %p"
+  fi
 fi
 
 {
@@ -218,20 +234,8 @@ if [[ "$MODE" == "drill" ]]; then
     -e POSTGRES_DB="deadbolt_staging"
   )
 
-  if [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" ]]; then
-    DOCKER_ARGS+=(-v "${DEADBOLT_WAL_ARCHIVE_DIR}":/wal_archive:ro)
-  fi
-
-  if [[ -n "$S3_BUCKET" ]]; then
-    DOCKER_ARGS+=(
-      -e DEADBOLT_STORAGE_S3_BUCKET="$S3_BUCKET"
-      -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
-      -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
-      -e AWS_DEFAULT_REGION="${DEADBOLT_STORAGE_S3_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
-    )
-    if [[ -n "${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL:-}}" ]]; then
-      DOCKER_ARGS+=(-e AWS_ENDPOINT_URL="${DEADBOLT_STORAGE_S3_ENDPOINT:-${AWS_ENDPOINT_URL}}")
-    fi
+  if [[ -n "${WAL_MOUNT_SOURCE:-}" ]]; then
+    DOCKER_ARGS+=(-v "${WAL_MOUNT_SOURCE}":/wal_archive:ro)
   fi
 
   DOCKER_ARGS+=("$DRILL_IMG")

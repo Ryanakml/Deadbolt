@@ -46,7 +46,10 @@ elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
 # 3. Fallback to user crontab if crontab command is available
 elif command -v crontab &>/dev/null; then
   log "Installing Deadbolt backup schedule into current user crontab..."
-  CRON_LINE=$(grep -E '^[0-9]' "$CRON_SRC" | head -n 1 | sed -E 's/ +root +/ /')
+  USER_LOG_DIR="${HOME:-/tmp}/.deadbolt/logs"
+  mkdir -p "$USER_LOG_DIR"
+  touch "${USER_LOG_DIR}/deadbolt-backup.log" 2>/dev/null || true
+  CRON_LINE=$(grep -E '^[0-9]' "$CRON_SRC" | head -n 1 | sed -E 's/ +root +/ /' | sed "s|/var/log/deadbolt-backup.log|${USER_LOG_DIR}/deadbolt-backup.log|g")
   if [[ -n "$CRON_LINE" ]]; then
     EXISTING_CRON=$(crontab -l 2>/dev/null || true)
     if ! echo "$EXISTING_CRON" | grep -Fq "take-base-backup.sh"; then
