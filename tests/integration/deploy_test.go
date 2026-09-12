@@ -1500,15 +1500,19 @@ func TestDatabasePointInTimeRecoveryDrill(t *testing.T) {
 		t.Fatalf("failed to copy base backup tarball: %v, %s", err, string(out))
 	}
 
-	// Insert second record and switch WAL segment to ensure it is archived
-	walSQL := "INSERT INTO drill_verification VALUES (2, 'wal_replayed_record'); SELECT pg_walfile_name(pg_switch_wal());"
-	switchedOut, err := exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-t", "-A", "-c", walSQL).CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to insert wal record: %v, %s", err, string(switchedOut))
+	// Insert second record and commit it before switching WAL
+	insertSQL := "INSERT INTO drill_verification VALUES (2, 'wal_replayed_record');"
+	if out, err := exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-c", insertSQL).CombinedOutput(); err != nil {
+		t.Fatalf("failed to insert wal record: %v, %s", err, string(out))
 	}
-	rawLines := strings.Split(strings.TrimSpace(string(switchedOut)), "\n")
-	switchedWal := strings.TrimSpace(rawLines[len(rawLines)-1])
-	t.Logf("Awaiting archive of WAL file containing record: %s", switchedWal)
+
+	// Switch WAL so the WAL segment containing the committed insert is archived
+	switchedOut, err := exec.Command("docker", "exec", sourceContainer, "psql", "-U", "deadbolt_admin", "-d", "deadbolt_staging", "-t", "-A", "-c", "SELECT pg_walfile_name(pg_switch_wal());").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to switch wal: %v, %s", err, string(switchedOut))
+	}
+	switchedWal := strings.TrimSpace(string(switchedOut))
+	t.Logf("Awaiting archive of WAL file containing committed record: %s", switchedWal)
 
 	// Poll until the exact switched WAL segment containing record 2 is archived into archiveDir
 	walArchived := false
