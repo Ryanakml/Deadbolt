@@ -1,0 +1,17 @@
+{
+  "name": "@runtime/runner",
+  "version": "0.1.0",
+  "description": "Deadbolt Node.js task execution runner",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test tests/*.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}
