@@ -12,6 +12,7 @@ source "${SCRIPT_DIR}/lib/config-permissions.sh"
 RELEASE_DIR="${DEADBOLT_RELEASE_DIR:-/opt/deadbolt/releases}"
 ACTIVE_UPSTREAM_FILE="${RELEASE_DIR}/active_upstream_port"
 ACTIVE_SLOT_FILE="${RELEASE_DIR}/active_slot"
+PREVIOUS_ROUTE_DIR="${RELEASE_DIR}/previous_edge_route"
 DRY_RUN="${DRY_RUN:-false}"
 
 log() {
@@ -51,8 +52,60 @@ CADDY_CONTAINER="${DEADBOLT_CADDY_CONTAINER:-flowdesk-staging-caddy-1}"
 CONTAINER_CADDYFILE="${DEADBOLT_CONTAINER_CADDYFILE:-/etc/caddy/Caddyfile}"
 CONTAINER_SNIPPET_FILE="${DEADBOLT_CONTAINER_SNIPPET:-/etc/caddy/deadbolt/Deadbolt.caddyfile}"
 
-# Resolve target upstream slot and Docker alias
-TARGET_ARG="${1:-${DEADBOLT_UPSTREAM_TARGET:-${DEADBOLT_UPSTREAM_PORT:-}}}"
+snapshot_route_file() {
+  local source_file="$1" snapshot_file="$2"
+  if [[ -f "$source_file" ]]; then
+    cp "$source_file" "$snapshot_file"
+    touch "${snapshot_file}.present"
+  fi
+}
+
+restore_route_file() {
+  local snapshot_file="$1" destination_file="$2"
+  if [[ -f "${snapshot_file}.present" ]]; then
+    cp -f "$snapshot_file" "$destination_file"
+  else
+    rm -f "$destination_file"
+  fi
+}
+
+restore_previous_route() {
+  if [[ ! -d "$PREVIOUS_ROUTE_DIR" ]]; then
+    err "No authoritative pre-switch Deadbolt route snapshot exists; refusing to stop candidate."
+    return 1
+  fi
+  verify_caddy_container_prerequisites
+  local current_dir
+  current_dir=$(mktemp -d "${RELEASE_DIR}/.current-edge-route.XXXXXX")
+  snapshot_route_file "$HOST_SNIPPET_FILE" "${current_dir}/snippet"
+  snapshot_route_file "$ACTIVE_UPSTREAM_FILE" "${current_dir}/upstream"
+  snapshot_route_file "$ACTIVE_SLOT_FILE" "${current_dir}/slot"
+
+  restore_route_file "${PREVIOUS_ROUTE_DIR}/snippet" "$HOST_SNIPPET_FILE"
+  restore_route_file "${PREVIOUS_ROUTE_DIR}/upstream" "$ACTIVE_UPSTREAM_FILE"
+  restore_route_file "${PREVIOUS_ROUTE_DIR}/slot" "$ACTIVE_SLOT_FILE"
+  if ! docker exec "$CADDY_CONTAINER" caddy validate --config "$CONTAINER_CADDYFILE" --adapter caddyfile || ! docker exec "$CADDY_CONTAINER" caddy reload --config "$CONTAINER_CADDYFILE" --adapter caddyfile; then
+    err "Prior-route restoration failed; returning host files to candidate state and preserving candidate container."
+    restore_route_file "${current_dir}/snippet" "$HOST_SNIPPET_FILE"
+    restore_route_file "${current_dir}/upstream" "$ACTIVE_UPSTREAM_FILE"
+    restore_route_file "${current_dir}/slot" "$ACTIVE_SLOT_FILE"
+    docker exec "$CADDY_CONTAINER" caddy reload --config "$CONTAINER_CADDYFILE" --adapter caddyfile 2>/dev/null || true
+    rm -rf "$current_dir"
+    return 1
+  fi
+  rm -rf "$current_dir"
+  log "SUCCESS: Restored exact pre-switch Deadbolt route state."
+}
+
+# Resolve target upstream slot and Docker alias. Restore mode bypasses target use
+# after prerequisite functions are defined, but retains a valid placeholder here.
+RESTORE_PREVIOUS_ROUTE="false"
+if [[ "${1:-}" == "--restore-previous-route" ]]; then
+  RESTORE_PREVIOUS_ROUTE="true"
+  TARGET_ARG="8088"
+else
+  TARGET_ARG="${1:-${DEADBOLT_UPSTREAM_TARGET:-${DEADBOLT_UPSTREAM_PORT:-}}}"
+fi
 if [[ -z "$TARGET_ARG" && -f "$ACTIVE_UPSTREAM_FILE" ]]; then
   TARGET_ARG=$(cat "$ACTIVE_UPSTREAM_FILE" | tr -d '[:space:]')
 fi
@@ -136,6 +189,11 @@ verify_caddy_container_prerequisites() {
   fi
 }
 
+if [[ "$RESTORE_PREVIOUS_ROUTE" == "true" ]]; then
+  restore_previous_route
+  exit $?
+fi
+
 if [[ "$DRY_RUN" == "true" ]]; then
   log "DRY RUN: Verifying Caddy snippet rendering and container contracts (target: $TARGET_UPSTREAM)..."
   TMP_SNIPPET=$(mktemp)
@@ -197,6 +255,13 @@ if [[ -f "$ACTIVE_SLOT_FILE" ]]; then
   cp "$ACTIVE_SLOT_FILE" "$SLOT_BACKUP"
 fi
 
+# Persist the exact pre-switch route, including an intentionally absent first route.
+mkdir -p "$RELEASE_DIR"
+NEW_PREVIOUS_ROUTE_DIR=$(mktemp -d "${RELEASE_DIR}/.previous-edge-route.XXXXXX")
+snapshot_route_file "$HOST_SNIPPET_FILE" "${NEW_PREVIOUS_ROUTE_DIR}/snippet"
+snapshot_route_file "$ACTIVE_UPSTREAM_FILE" "${NEW_PREVIOUS_ROUTE_DIR}/upstream"
+snapshot_route_file "$ACTIVE_SLOT_FILE" "${NEW_PREVIOUS_ROUTE_DIR}/slot"
+
 rollback() {
   err "Caddy reload or validation failed! Rolling back Deadbolt snippet and route state..."
   if [[ -f "$SNIPPET_BACKUP" ]]; then
@@ -248,6 +313,8 @@ log "Caddy reload completed successfully."
 mkdir -p "$RELEASE_DIR"
 echo "$TARGET_PORT" > "$ACTIVE_UPSTREAM_FILE"
 echo "$TARGET_SLOT" > "$ACTIVE_SLOT_FILE"
+rm -rf "$PREVIOUS_ROUTE_DIR"
+mv "$NEW_PREVIOUS_ROUTE_DIR" "$PREVIOUS_ROUTE_DIR"
 rm -f "$SNIPPET_BACKUP" "$UPSTREAM_BACKUP" "$SLOT_BACKUP" 2>/dev/null || true
 
 log "SUCCESS: Caddy edge route switched to $TARGET_UPSTREAM (slot: $TARGET_SLOT, port: $TARGET_PORT)."

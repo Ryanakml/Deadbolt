@@ -11,6 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/config-permissions.sh"
 # shellcheck source=lib/edge-smoke-rollback.sh
 source "${SCRIPT_DIR}/lib/edge-smoke-rollback.sh"
+# shellcheck source=lib/edge-smoke.sh
+source "${SCRIPT_DIR}/lib/edge-smoke.sh"
 
 DRY_RUN="${DRY_RUN:-false}"
 RELEASE_DIR="${DEADBOLT_RELEASE_DIR:-/opt/deadbolt/releases}"
@@ -300,10 +302,11 @@ docker run --rm \
   -e DEADBOLT_MIGRATIONS_DIR="/migrations" \
   "$CANDIDATE_DIGEST" --migrate
 
-# 6. Blue-Green Slot Selection
+# 6. Blue-Green Slot Selection. A missing state file is a first deployment, not proof blue is live.
 mkdir -p "$RELEASE_DIR"
-CURRENT_SLOT="blue"
-if [[ -f "$ACTIVE_SLOT_FILE" ]]; then
+CURRENT_SLOT=""
+HAS_KNOWN_GOOD_ROUTE="false"
+if [[ -s "$ACTIVE_SLOT_FILE" && -s "$CURRENT_RELEASE_FILE" ]]; then
   CURRENT_SLOT=$(cat "$ACTIVE_SLOT_FILE" | tr -d '[:space:]')
 fi
 
@@ -312,14 +315,28 @@ if [[ "$CURRENT_SLOT" == "blue" ]]; then
   CANDIDATE_PORT="8089"
   OLD_SLOT="blue"
   OLD_PORT="8088"
-else
+elif [[ "$CURRENT_SLOT" == "green" ]]; then
   CANDIDATE_SLOT="blue"
   CANDIDATE_PORT="8088"
   OLD_SLOT="green"
   OLD_PORT="8089"
+else
+  CANDIDATE_SLOT="blue"
+  CANDIDATE_PORT="8088"
+  OLD_SLOT=""
+  OLD_PORT=""
 fi
 
-log "Current active slot: $CURRENT_SLOT (port $OLD_PORT)"
+if [[ -n "$OLD_PORT" ]]; then
+  OLD_READY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${OLD_PORT}/readyz" 2>/dev/null || echo "000")
+  if [[ "$OLD_READY_STATUS" == "200" ]]; then
+    HAS_KNOWN_GOOD_ROUTE="true"
+  else
+    err "Recorded old slot $CURRENT_SLOT is not ready; it will not be used as a rollback target."
+  fi
+fi
+
+log "Current active slot: ${CURRENT_SLOT:-none} (known-good route: $HAS_KNOWN_GOOD_ROUTE)"
 log "Launching candidate into slot: $CANDIDATE_SLOT (port $CANDIDATE_PORT)"
 
 # 7. Start candidate container in candidate slot
@@ -409,19 +426,20 @@ fi
 
 # 11. Staged edge smoke test
 log "Step 11: Smokin edge route via Caddy..."
-EDGE_VERSION=$(curl -fsSL "https://${DEADBOLT_STAGING_DOMAIN}/version" 2>/dev/null || curl -fsSL --resolve "${DEADBOLT_STAGING_DOMAIN}:443:127.0.0.1" "https://${DEADBOLT_STAGING_DOMAIN}/version" 2>/dev/null || echo "{}")
-if ! echo "$EDGE_VERSION" | grep -q "$CANDIDATE_DIGEST"; then
-  err "EDGE SMOKE FAILED: Caddy edge is not serving candidate image digest!"
+if ! wait_for_candidate_edge_smoke "$DEADBOLT_STAGING_DOMAIN" "$CANDIDATE_DIGEST"; then
+  err "EDGE SMOKE FAILED after bounded retry window: Caddy edge is not serving candidate image digest!"
   # Route restoration is authoritative: never stop a candidate Caddy may still route to.
-  if ! restore_edge_route_before_stopping_candidate "$OLD_PORT"; then
+  if ! restore_edge_route_before_stopping_candidate "$OLD_PORT" "$HAS_KNOWN_GOOD_ROUTE"; then
     exit 1
   fi
   exit 1
 fi
 
 # 12. Decommission previous slot container
-log "Step 12: Stopping previous slot ($OLD_SLOT)..."
-docker compose -p deadbolt-staging -f "$COMPOSE_FILE" stop "control-plane-$OLD_SLOT" || true
+if [[ "$HAS_KNOWN_GOOD_ROUTE" == "true" ]]; then
+  log "Step 12: Stopping previous slot ($OLD_SLOT)..."
+  docker compose -p deadbolt-staging -f "$COMPOSE_FILE" stop "control-plane-$OLD_SLOT" || true
+fi
 
 # 13. Record successful release state
 if [[ -f "$CURRENT_RELEASE_FILE" ]]; then

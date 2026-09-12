@@ -1493,6 +1493,35 @@ exit 0
 			t.Fatalf("expected container not running error in dry run, got: %s", string(out))
 		}
 	})
+
+	// Scenario 7: First route rollback restores the deliberately empty prior state.
+	t.Run("FirstRouteRestoreRemovesCandidateRoute", func(t *testing.T) {
+		binDir := setupMockDocker(t, "running", validMounts, validCaddyfile, 0, 0)
+		workDir := t.TempDir()
+		releaseDir := filepath.Join(workDir, "releases")
+		snippetPath := filepath.Join(workDir, "Deadbolt.caddyfile")
+		env := []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DEADBOLT_RELEASE_DIR=" + releaseDir,
+			"DEADBOLT_CADDYFILE_SNIPPET=" + snippetPath,
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		cmdSwitch := exec.Command("/bin/bash", scriptPath, "blue")
+		cmdSwitch.Env = env
+		if out, err := cmdSwitch.CombinedOutput(); err != nil {
+			t.Fatalf("first route switch failed: %v\n%s", err, out)
+		}
+		cmdRestore := exec.Command("/bin/bash", scriptPath, "--restore-previous-route")
+		cmdRestore.Env = env
+		if out, err := cmdRestore.CombinedOutput(); err != nil {
+			t.Fatalf("first route restoration failed: %v\n%s", err, out)
+		}
+		for _, path := range []string{snippetPath, filepath.Join(releaseDir, "active_upstream_port"), filepath.Join(releaseDir, "active_slot")} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("expected first-route restore to remove prior-absent state %s, err=%v", path, err)
+			}
+		}
+	})
 }
 
 // TestFreshHostBootstrapMarker verifies that deploy-staging.sh detects uninitialized
@@ -1740,7 +1769,7 @@ CANDIDATE_SLOT=green
 err() { echo "ERROR:$*" >&2; }
 rollback() { echo stopped > %q; }
 source %q
-restore_edge_route_before_stopping_candidate 8088
+			restore_edge_route_before_stopping_candidate 8088 true
 `, statePath, helperPath)
 			cmd := exec.Command("/bin/bash", "-c", harness)
 			cmd.Env = append(os.Environ(), "DEADBOLT_CADDY_RELOAD_SCRIPT="+reloadPath)
@@ -1760,6 +1789,81 @@ restore_edge_route_before_stopping_candidate 8088
 				t.Fatalf("expected loud route-restoration failure, got: %s", out)
 			}
 		})
+	}
+}
+
+func TestFirstDeployEdgeRollbackUsesPriorRouteSnapshot(t *testing.T) {
+	helperPath, err := filepath.Abs("../../scripts/lib/edge-smoke-rollback.sh")
+	if err != nil {
+		t.Fatalf("resolve edge rollback helper: %v", err)
+	}
+	workDir := t.TempDir()
+	argsPath := filepath.Join(workDir, "reload-args")
+	reloadPath := filepath.Join(workDir, "reload-caddy")
+	if err := os.WriteFile(reloadPath, []byte(fmt.Sprintf("#!/usr/bin/env bash\nprintf '%%s' \"$1\" > %q\nexit 1\n", argsPath)), 0755); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(workDir, "candidate-stopped")
+	harness := fmt.Sprintf(`
+set -u -o pipefail
+OLD_SLOT=""
+CANDIDATE_SLOT=blue
+err() { echo "ERROR:$*" >&2; }
+rollback() { echo stopped > %q; }
+source %q
+restore_edge_route_before_stopping_candidate "" false
+`, statePath, helperPath)
+	cmd := exec.Command("/bin/bash", "-c", harness)
+	cmd.Env = append(os.Environ(), "DEADBOLT_CADDY_RELOAD_SCRIPT="+reloadPath)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected failed prior-route restore to fail deployment: %s", out)
+	}
+	args, readErr := os.ReadFile(argsPath)
+	if readErr != nil || string(args) != "--restore-previous-route" {
+		t.Fatalf("first deploy must restore snapshot rather than route to phantom blue: %q (err: %v)", args, readErr)
+	}
+	if _, stopErr := os.Stat(statePath); stopErr == nil {
+		t.Fatal("first deploy must preserve candidate when prior route restoration is not authoritative")
+	}
+}
+
+func TestEdgeSmokeRetriesTransientTLSFailure(t *testing.T) {
+	helperPath, err := filepath.Abs("../../scripts/lib/edge-smoke.sh")
+	if err != nil {
+		t.Fatalf("resolve edge smoke helper: %v", err)
+	}
+	workDir := t.TempDir()
+	countPath := filepath.Join(workDir, "curl-count")
+	curlPath := filepath.Join(workDir, "curl")
+	digest := "ghcr.io/ryanakml/deadbolt/control-plane@sha256:" + strings.Repeat("a", 64)
+	mockCurl := fmt.Sprintf(`#!/usr/bin/env bash
+count=0
+[[ -f %q ]] && count=$(cat %q)
+count=$((count + 1))
+echo "$count" > %q
+if [[ "$count" -lt 3 ]]; then exit 35; fi
+echo '{"imageDigest":"%s"}'
+`, countPath, countPath, countPath, digest)
+	if err := os.WriteFile(curlPath, []byte(mockCurl), 0755); err != nil {
+		t.Fatal(err)
+	}
+	harness := fmt.Sprintf(`
+set -euo pipefail
+log() { :; }
+err() { :; }
+source %q
+wait_for_candidate_edge_smoke staging.example.test %q
+`, helperPath, digest)
+	cmd := exec.Command("/bin/bash", "-c", harness)
+	cmd.Env = append(os.Environ(), "PATH="+workDir+":"+os.Getenv("PATH"), "DEADBOLT_EDGE_SMOKE_ATTEMPTS=3", "DEADBOLT_EDGE_SMOKE_INTERVAL_SECONDS=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("transient TLS failures should retry until candidate digest appears: %v %s", err, out)
+	}
+	count, _ := os.ReadFile(countPath)
+	if strings.TrimSpace(string(count)) != "3" {
+		t.Fatalf("expected third edge-smoke attempt to pass, got %q", count)
 	}
 }
 
