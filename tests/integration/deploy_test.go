@@ -1516,6 +1516,41 @@ func TestDeployWorkflowRsyncStrictHostKeyAndGHCRAuth(t *testing.T) {
 	}
 }
 
+// TestStagingDeployPRLabelGate verifies the only pre-merge deployment path is a
+// deliberate label on an open same-repository PR, and that it uses the PR head SHA.
+func TestStagingDeployPRLabelGate(t *testing.T) {
+	wfBytes, err := os.ReadFile("../../.github/workflows/staging-deploy.yml")
+	if err != nil {
+		t.Fatalf("failed to read staging workflow: %v", err)
+	}
+	wf := string(wfBytes)
+
+	for _, token := range []string{
+		"push:\n    branches: [main]",
+		"workflow_dispatch:",
+		"pull_request:\n    types: [labeled]",
+		"github.event.action == 'labeled'",
+		"github.event.label.name == 'deploy-staging'",
+		"github.event.pull_request.head.repo.full_name == github.repository",
+		"github.event.pull_request.state == 'open'",
+		"RELEASE_COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+		"ref: ${{ env.RELEASE_COMMIT_SHA }}",
+		"COMMIT_SHA=${{ env.RELEASE_COMMIT_SHA }}",
+		"COMMIT_SHA: ${{ env.RELEASE_COMMIT_SHA }}",
+	} {
+		if !strings.Contains(wf, token) {
+			t.Fatalf("staging PR-label gate missing %q", token)
+		}
+	}
+
+	if strings.Contains(wf, "synchronize") || strings.Contains(wf, "types: [opened]") {
+		t.Fatal("ordinary PR activity must not trigger staging deployment")
+	}
+	if strings.Count(wf, "if: >-") < 2 {
+		t.Fatal("both build and deploy jobs must be gated before any secrets are used")
+	}
+}
+
 // TestRollbackStagingConfigurationAndSafetyGuards verifies Finding 1:
 // rollback-staging.sh is self-contained, loads approved configuration, rejects world-readable
 // files, fails closed when variables are missing, and validates Compose in dry-run mode.
