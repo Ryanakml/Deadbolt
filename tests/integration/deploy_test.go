@@ -1551,6 +1551,42 @@ func TestStagingDeployPRLabelGate(t *testing.T) {
 	}
 }
 
+// TestStagingDeployGHCRRepositoryNormalization prevents display-case repository names
+// from producing invalid remote Docker references during the real staging deployment.
+func TestStagingDeployGHCRRepositoryNormalization(t *testing.T) {
+	wfBytes, err := os.ReadFile("../../.github/workflows/staging-deploy.yml")
+	if err != nil {
+		t.Fatalf("failed to read staging workflow: %v", err)
+	}
+	wf := string(wfBytes)
+
+	mixedCaseRepository := "Ryanakml/Deadbolt"
+	normalizedRepository := strings.ToLower(mixedCaseRepository)
+	if normalizedRepository != "ryanakml/deadbolt" {
+		t.Fatalf("unexpected normalized repository: %q", normalizedRepository)
+	}
+	controlDigest := "sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee"
+	postgresDigest := "sha256:aaaa222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
+	controlRef := fmt.Sprintf("ghcr.io/%s/control-plane@%s", normalizedRepository, controlDigest)
+	postgresRef := fmt.Sprintf("ghcr.io/%s/postgres@%s", normalizedRepository, postgresDigest)
+	if controlRef != "ghcr.io/ryanakml/deadbolt/control-plane@"+controlDigest || postgresRef != "ghcr.io/ryanakml/deadbolt/postgres@"+postgresDigest {
+		t.Fatalf("repository normalization changed immutable image reference format: %q / %q", controlRef, postgresRef)
+	}
+
+	for _, token := range []string{
+		"printf '%s' \"$GITHUB_REPOSITORY\" | tr '[:upper:]' '[:lower:]'",
+		"ghcr.io/${{ steps.ghcr-repository.outputs.path }}/control-plane@${{ needs.build-and-publish.outputs.image-digest }}",
+		"ghcr.io/${{ steps.ghcr-repository.outputs.path }}/postgres@${{ needs.build-and-publish.outputs.postgres-digest }}",
+	} {
+		if !strings.Contains(wf, token) {
+			t.Fatalf("staging image normalization contract missing %q", token)
+		}
+	}
+	if strings.Contains(wf, "ghcr.io/${{ github.repository }}/control-plane@") || strings.Contains(wf, "ghcr.io/${{ github.repository }}/postgres@") {
+		t.Fatal("remote immutable staging refs must not use mixed-case github.repository directly")
+	}
+}
+
 // TestRollbackStagingConfigurationAndSafetyGuards verifies Finding 1:
 // rollback-staging.sh is self-contained, loads approved configuration, rejects world-readable
 // files, fails closed when variables are missing, and validates Compose in dry-run mode.
