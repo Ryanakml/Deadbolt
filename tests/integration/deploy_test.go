@@ -511,6 +511,79 @@ func TestRetentionScriptDryRun(t *testing.T) {
 	}
 }
 
+func TestRetentionProtectsDigestPulledCurrentPreviousAndRunningImages(t *testing.T) {
+	scriptPath := "../../scripts/retention.sh"
+	workDir := t.TempDir()
+	releaseDir := filepath.Join(workDir, "releases")
+	if err := os.MkdirAll(releaseDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	currentDigest := "ghcr.io/ryanakml/deadbolt/control-plane@sha256:" + strings.Repeat("1", 64)
+	previousDigest := "ghcr.io/ryanakml/deadbolt/control-plane@sha256:" + strings.Repeat("2", 64)
+	oldDigest := "ghcr.io/ryanakml/deadbolt/control-plane@sha256:" + strings.Repeat("3", 64)
+	if err := os.WriteFile(filepath.Join(releaseDir, "current"), []byte(currentDigest+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(releaseDir, "previous"), []byte(previousDigest+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mockBin := t.TempDir()
+	mockDocker := filepath.Join(mockBin, "docker")
+	mock := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "image ls" ]]; then
+  printf 'sha256:current\nsha256:previous\nsha256:old\n'
+  exit 0
+fi
+if [[ "$1" == "ps" ]]; then
+  echo deadbolt-running
+  exit 0
+fi
+if [[ "$1" == "inspect" ]]; then
+  echo sha256:current
+  exit 0
+fi
+if [[ "$1 $2" == "image inspect" ]]; then
+  target="${@: -1}"
+  format="${@: -2:1}"
+  if [[ "$format" == *'.Id'* ]]; then
+    case "$target" in
+      %q) echo sha256:current ;;
+      %q) echo sha256:previous ;;
+    esac
+    exit 0
+  fi
+  case "$target" in
+    sha256:current) echo %q ;;
+    sha256:previous) echo %q ;;
+    sha256:old) echo %q ;;
+  esac
+  exit 0
+fi
+exit 1
+`, currentDigest, previousDigest, currentDigest, previousDigest, oldDigest)
+	if err := os.WriteFile(mockDocker, []byte(mock), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{
+		"PATH=" + mockBin + ":" + os.Getenv("PATH"),
+		"DRY_RUN=true",
+		"DEADBOLT_RELEASE_DIR=" + releaseDir,
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("digest-aware retention dry run failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !strings.Contains(output, "Images eligible for deletion: 1") || !strings.Contains(output, "image_id=sha256:old digest="+oldDigest) {
+		t.Fatalf("expected only unreferenced digest-pulled image eligible, got:\n%s", output)
+	}
+	if strings.Contains(output, "image_id=sha256:current digest=") || strings.Contains(output, "image_id=sha256:previous digest=") {
+		t.Fatalf("current/previous digest-pulled images must never be deletion candidates:\n%s", output)
+	}
+}
+
 // TestDeploymentScriptsGuards asserts that deployment, rollback, and caddy reload
 // scripts exist, have execute permissions, and enforce safety guards when invoked.
 func TestDeploymentScriptsGuards(t *testing.T) {

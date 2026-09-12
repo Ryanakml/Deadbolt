@@ -18,78 +18,81 @@ err() {
   echo "[RETENTION_ERROR] $*" >&2
 }
 
-# Collect protected image IDs (current and previous releases)
-PROTECTED_IMAGES=()
+# Docker reports digest-pulled images as repo:<none>; IDs plus RepoDigests are
+# the only reliable local identity. Never infer safety from mutable tags.
+PROTECTED_IMAGE_IDS=()
+add_protected_id() {
+  local image_id="$1" reason="$2"
+  for protected in "${PROTECTED_IMAGE_IDS[@]:-}"; do
+    [[ "$protected" == "$image_id" ]] && return 0
+  done
+  PROTECTED_IMAGE_IDS+=("$image_id")
+  log "Protecting image ID $image_id ($reason)"
+}
 
-if [[ -f "${RELEASE_DIR}/current" ]]; then
-  CURRENT_IMAGE=$(cat "${RELEASE_DIR}/current" | tr -d '\n')
-  if [[ -n "$CURRENT_IMAGE" ]]; then
-    PROTECTED_IMAGES+=("$CURRENT_IMAGE")
-    log "Protecting active release image: $CURRENT_IMAGE"
+resolve_recorded_release() {
+  local release_name="$1" release_ref="$2" image_id
+  if [[ ! "$release_ref" =~ ^ghcr\.io/ryanakml/deadbolt/control-plane@sha256:[a-f0-9]{64}$ ]]; then
+    err "$release_name release is not an immutable Deadbolt control-plane digest: $release_ref"
+    exit 1
   fi
-fi
-
-if [[ -f "${RELEASE_DIR}/previous" ]]; then
-  PREVIOUS_IMAGE=$(cat "${RELEASE_DIR}/previous" | tr -d '\n')
-  if [[ -n "$PREVIOUS_IMAGE" ]]; then
-    PROTECTED_IMAGES+=("$PREVIOUS_IMAGE")
-    log "Protecting rollback release image: $PREVIOUS_IMAGE"
+  image_id=$(docker image inspect --format '{{.Id}}' "$release_ref" 2>/dev/null || true)
+  if [[ -z "$image_id" ]]; then
+    err "$release_name release digest cannot be resolved locally: $release_ref. Refusing retention."
+    exit 1
   fi
-fi
+  add_protected_id "$image_id" "$release_name release $release_ref"
+}
 
-# Protect currently running Deadbolt containers' images
-RUNNING_IMAGES=$(docker ps --filter "label=com.docker.compose.project=${PROJECT_NAME}" --format '{{.Image}}' 2>/dev/null || true)
-while IFS= read -r img; do
-  if [[ -n "$img" ]]; then
-    PROTECTED_IMAGES+=("$img")
-    log "Protecting running container image: $img"
+for release_name in current previous; do
+  release_file="${RELEASE_DIR}/${release_name}"
+  if [[ -s "$release_file" ]]; then
+    release_ref=$(cat "$release_file" | tr -d '[:space:]')
+    resolve_recorded_release "$release_name" "$release_ref"
   fi
-done <<< "$RUNNING_IMAGES"
+done
 
-# Inventory candidate Deadbolt images (only images tagged with deadbolt/control-plane or project label)
-CANDIDATE_IMAGES=$(docker images --filter "reference=ghcr.io/ryanakml/deadbolt/control-plane" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
+# Protect image IDs used by every running Deadbolt Compose container.
+RUNNING_CONTAINER_IDS=$(docker ps --filter "label=com.docker.compose.project=${PROJECT_NAME}" --format '{{.ID}}' 2>/dev/null || true)
+while IFS= read -r container_id; do
+  [[ -z "$container_id" ]] && continue
+  image_id=$(docker inspect --format '{{.Image}}' "$container_id" 2>/dev/null || true)
+  if [[ -z "$image_id" ]]; then
+    err "Could not resolve image ID for running Deadbolt container $container_id. Refusing retention."
+    exit 1
+  fi
+  add_protected_id "$image_id" "running Deadbolt container $container_id"
+done <<< "$RUNNING_CONTAINER_IDS"
 
+CANDIDATE_IMAGES=()
 REMOVABLE_IMAGES=()
-while IFS= read -r img; do
-  if [[ -z "$img" || "$img" == "<none>:<none>" ]]; then
-    continue
-  fi
+ALL_IMAGE_IDS=$(docker image ls --all --no-trunc --format '{{.ID}}' 2>/dev/null || true)
+while IFS= read -r image_id; do
+  [[ -z "$image_id" ]] && continue
+  repo_digests=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image_id" 2>/dev/null || true)
+  candidate_digest=$(echo "$repo_digests" | grep '^ghcr.io/ryanakml/deadbolt/control-plane@sha256:' | head -n 1 || true)
+  [[ -z "$candidate_digest" ]] && continue
+  CANDIDATE_IMAGES+=("${image_id}|${candidate_digest}")
+  is_protected=false
+  for protected in "${PROTECTED_IMAGE_IDS[@]:-}"; do
+    if [[ "$protected" == "$image_id" ]]; then
+      is_protected=true
+      break
+    fi
+  done
+  [[ "$is_protected" == "false" ]] && REMOVABLE_IMAGES+=("${image_id}|${candidate_digest}")
+done <<< "$ALL_IMAGE_IDS"
 
-  # Explicit safety check: NEVER touch any image matching FlowDesk
-  if [[ "$img" =~ flowdesk ]]; then
-    log "PROTECTION GUARANTEE: Skipping FlowDesk co-tenant image: $img"
-    continue
-  fi
-
-  # Check if image is protected
-  IS_PROTECTED=false
-  if [[ ${#PROTECTED_IMAGES[@]} -gt 0 ]]; then
-    for p in "${PROTECTED_IMAGES[@]}"; do
-      if [[ "$p" == "$img" || "$p" == *"$img"* || "$img" == *"$p"* ]]; then
-        IS_PROTECTED=true
-        break
-      fi
-    done
-  fi
-
-  if [[ "$IS_PROTECTED" == "false" ]]; then
-    REMOVABLE_IMAGES+=("$img")
-  fi
-done <<< "$CANDIDATE_IMAGES"
-
-TOTAL_CANDIDATES=0
-if [[ -n "$CANDIDATE_IMAGES" ]]; then
-  TOTAL_CANDIDATES=$(echo "$CANDIDATE_IMAGES" | grep -c . || echo 0)
-fi
+TOTAL_CANDIDATES=${#CANDIDATE_IMAGES[@]}
 
 log "Retention preview:"
 log "  Total candidate Deadbolt images found: $TOTAL_CANDIDATES"
-log "  Protected images retained for rollback: ${#PROTECTED_IMAGES[@]}"
+log "  Protected image IDs retained for rollback: ${#PROTECTED_IMAGE_IDS[@]}"
 log "  Images eligible for deletion: ${#REMOVABLE_IMAGES[@]}"
 
 if [[ ${#REMOVABLE_IMAGES[@]} -gt 0 ]]; then
   for rem in "${REMOVABLE_IMAGES[@]}"; do
-    log "  -> [DELETE CANDIDATE] $rem"
+    log "  -> [DELETE CANDIDATE] image_id=${rem%%|*} digest=${rem#*|}"
   done
 fi
 
@@ -101,8 +104,9 @@ fi
 if [[ ${#REMOVABLE_IMAGES[@]} -gt 0 ]]; then
   # Execute explicit scoped removal
   for rem in "${REMOVABLE_IMAGES[@]}"; do
-    log "Removing scoped Deadbolt image: $rem"
-    docker rmi "$rem" || err "Failed to remove image $rem (skipping)"
+    image_id="${rem%%|*}"
+    log "Removing scoped Deadbolt image ID: $image_id"
+    docker rmi "$image_id" || err "Failed to remove image $image_id (skipping)"
   done
 fi
 
