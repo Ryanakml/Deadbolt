@@ -24,6 +24,12 @@ LIVE_CONTAINER_NAME="deadbolt-staging-postgres"
 LIVE_VOLUME_NAME="deadbolt_staging_postgres_data"
 COMPOSE_FILE="${COMPOSE_FILE:-deploy/compose/docker-compose.staging.yml}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [[ ! -f "$COMPOSE_FILE" && -f "${REPO_ROOT}/${COMPOSE_FILE}" ]]; then
+  COMPOSE_FILE="${REPO_ROOT}/${COMPOSE_FILE}"
+fi
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -221,7 +227,7 @@ if [[ "$MODE" == "drill" ]]; then
 
   log "Launching isolated PostgreSQL drill container..."
   docker rm -f "$DRILL_CONTAINER_NAME" 2>/dev/null || true
-  "${DOCKER_ARGS[@]}"
+  docker "${DOCKER_ARGS[@]}"
 
   log "Waiting for PostgreSQL archive recovery and promotion..."
   PROMOTED=false
