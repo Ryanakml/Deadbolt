@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -11,8 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1818,8 +1819,8 @@ exit 1
 	}
 }
 
-// Helper to spin up an in-process mock S3 HTTP server
-func newS3MockServer(t *testing.T, bucket string, objects map[string][]byte) *httptest.Server {
+// Helper to spin up an in-process mock S3 HTTP server with Range request support and race safety
+func newS3MockServer(t *testing.T, bucket string, objects map[string][]byte, mu *sync.RWMutex) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/")
@@ -1835,6 +1836,7 @@ func newS3MockServer(t *testing.T, bucket string, objects map[string][]byte) *ht
 			prefix := r.URL.Query().Get("prefix")
 			var contents []string
 			count := 0
+			mu.RLock()
 			for k, v := range objects {
 				if prefix == "" || strings.HasPrefix(k, prefix) {
 					count++
@@ -1848,6 +1850,7 @@ func newS3MockServer(t *testing.T, bucket string, objects map[string][]byte) *ht
 					contents = append(contents, item)
 				}
 			}
+			mu.RUnlock()
 			sort.Strings(contents)
 			xmlResp := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1864,21 +1867,18 @@ func newS3MockServer(t *testing.T, bucket string, objects map[string][]byte) *ht
 			return
 		}
 
-		// Handle GetObject and HeadObject
+		// Handle GetObject and HeadObject with RFC 7233 Range support
 		if r.Method == "GET" || r.Method == "HEAD" {
+			mu.RLock()
 			data, ok := objects[key]
+			mu.RUnlock()
 			if !ok {
 				http.NotFound(w, r)
 				return
 			}
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 			w.Header().Set("ETag", fmt.Sprintf("\"%x\"", sha256.Sum256(data)))
-			w.Header().Set("Last-Modified", "Sat, 12 Sep 2026 12:00:00 GMT")
-			w.WriteHeader(http.StatusOK)
-			if r.Method == "GET" {
-				w.Write(data)
-			}
+			w.Header().Set("Accept-Ranges", "bytes")
+			http.ServeContent(w, r, filepath.Base(key), time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC), bytes.NewReader(data))
 			return
 		}
 
@@ -2015,13 +2015,16 @@ func TestDatabasePointInTimeRecoveryDrillRemoteS3(t *testing.T) {
 	// 2. Set up S3 mock server and objects
 	bucketName := "deadbolt-staging-s3-drill"
 	objects := make(map[string][]byte)
+	var s3Mu sync.RWMutex
 
 	// Add dummy base backup and WAL for prefetch verification
+	s3Mu.Lock()
 	objects["postgres/basebackups/base_20260912.tar.gz"] = []byte("dummy base backup content")
 	objects["postgres/wal/000000010000000000000001"] = []byte("wal segment 1")
 	objects["postgres/wal/000000010000000000000002"] = []byte("wal segment 2")
+	s3Mu.Unlock()
 
-	s3Server := newS3MockServer(t, bucketName, objects)
+	s3Server := newS3MockServer(t, bucketName, objects, &s3Mu)
 	defer s3Server.Close()
 
 	effectivePath := setupMockAWSCLI(t)
@@ -2151,8 +2154,10 @@ func TestDatabasePointInTimeRecoveryDrillRemoteS3(t *testing.T) {
 		t.Fatalf("failed to read switched wal: %v", err)
 	}
 
+	s3Mu.Lock()
 	objects["postgres/basebackups/base_s3.tar.gz"] = baseBytes
 	objects["postgres/wal/"+switchedWal] = walBytes
+	s3Mu.Unlock()
 
 	// Run restore-staging-db.sh --drill targeting remote S3 mock server
 	drillCmd := exec.Command("/bin/bash", scriptPath, "--drill")
