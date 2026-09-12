@@ -97,11 +97,36 @@ restore_previous_route() {
   log "SUCCESS: Restored exact pre-switch Deadbolt route state."
 }
 
+clear_deadbolt_route() {
+  verify_caddy_container_prerequisites
+  local current_dir
+  current_dir=$(mktemp -d "${RELEASE_DIR}/.current-edge-route.XXXXXX")
+  snapshot_route_file "$HOST_SNIPPET_FILE" "${current_dir}/snippet"
+  snapshot_route_file "$ACTIVE_UPSTREAM_FILE" "${current_dir}/upstream"
+  snapshot_route_file "$ACTIVE_SLOT_FILE" "${current_dir}/slot"
+  rm -f "$HOST_SNIPPET_FILE" "$ACTIVE_UPSTREAM_FILE" "$ACTIVE_SLOT_FILE"
+  if ! docker exec "$CADDY_CONTAINER" caddy validate --config "$CONTAINER_CADDYFILE" --adapter caddyfile || ! docker exec "$CADDY_CONTAINER" caddy reload --config "$CONTAINER_CADDYFILE" --adapter caddyfile; then
+    err "Unable to clear stale Deadbolt route; restoring prior host state and failing closed."
+    restore_route_file "${current_dir}/snippet" "$HOST_SNIPPET_FILE"
+    restore_route_file "${current_dir}/upstream" "$ACTIVE_UPSTREAM_FILE"
+    restore_route_file "${current_dir}/slot" "$ACTIVE_SLOT_FILE"
+    docker exec "$CADDY_CONTAINER" caddy reload --config "$CONTAINER_CADDYFILE" --adapter caddyfile 2>/dev/null || true
+    rm -rf "$current_dir"
+    return 1
+  fi
+  rm -rf "$current_dir"
+  log "SUCCESS: Cleared stale Deadbolt edge route and state."
+}
+
 # Resolve target upstream slot and Docker alias. Restore mode bypasses target use
 # after prerequisite functions are defined, but retains a valid placeholder here.
 RESTORE_PREVIOUS_ROUTE="false"
+CLEAR_DEADBOLT_ROUTE="false"
 if [[ "${1:-}" == "--restore-previous-route" ]]; then
   RESTORE_PREVIOUS_ROUTE="true"
+  TARGET_ARG="8088"
+elif [[ "${1:-}" == "--clear-deadbolt-route" ]]; then
+  CLEAR_DEADBOLT_ROUTE="true"
   TARGET_ARG="8088"
 else
   TARGET_ARG="${1:-${DEADBOLT_UPSTREAM_TARGET:-${DEADBOLT_UPSTREAM_PORT:-}}}"
@@ -191,6 +216,10 @@ verify_caddy_container_prerequisites() {
 
 if [[ "$RESTORE_PREVIOUS_ROUTE" == "true" ]]; then
   restore_previous_route
+  exit $?
+fi
+if [[ "$CLEAR_DEADBOLT_ROUTE" == "true" ]]; then
+  clear_deadbolt_route
   exit $?
 fi
 

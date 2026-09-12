@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # scripts/check-backup-readiness.sh
-# Validates S3 backup accessibility, off-host base backup presence, and WAL archive lag
+# Validates S3 backup accessibility, off-host base backup presence, and an active
+# end-to-end WAL archive probe before staging promotion.
 # prior to staging promotion (Blueprint §26 & Issue #5).
 #
 # FAILS CLOSED if backup destination is unreachable, if base backups are missing/stale,
-# or if WAL archive lag exceeds the configured threshold.
+# or if a freshly switched exact WAL segment cannot be observed off-host.
 
 set -euo pipefail
 
@@ -12,8 +13,9 @@ DRY_RUN="${DRY_RUN:-false}"
 BOOTSTRAP_INITIAL_BACKUP="${BOOTSTRAP_INITIAL_BACKUP:-false}"
 S3_BUCKET="${DEADBOLT_STORAGE_S3_BUCKET:-}"
 BACKUP_DEST="${DEADBOLT_BACKUP_DESTINATION:-}"
-MAX_WAL_LAG_SECONDS="${MAX_WAL_LAG_SECONDS:-900}"           # 15 minutes default
 MAX_BASE_BACKUP_AGE_SECONDS="${MAX_BASE_BACKUP_AGE_SECONDS:-86400}" # 24 hours default
+WAL_PROBE_TIMEOUT_SECONDS="${WAL_PROBE_TIMEOUT_SECONDS:-30}"
+POSTGRES_CONTAINER="${DEADBOLT_POSTGRES_CONTAINER:-deadbolt-staging-postgres}"
 
 for arg in "$@"; do
   if [[ "$arg" == "--bootstrap" ]]; then
@@ -27,6 +29,17 @@ log() {
 
 err() {
   echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [BACKUP_CHECK_ERROR] $*" >&2
+}
+
+force_wal_archive_probe() {
+  local wal_file
+  wal_file=$(docker exec "$POSTGRES_CONTAINER" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT pg_walfile_name(pg_switch_wal());" 2>/dev/null || true)
+  wal_file=$(echo "$wal_file" | tr -d '[:space:]')
+  if [[ ! "$wal_file" =~ ^[0-9A-F]{24}$ ]]; then
+    err "WAL PROBE FAILURE: Could not obtain an exact completed WAL filename from PostgreSQL."
+    return 1
+  fi
+  echo "$wal_file"
 }
 
 if [[ "$DRY_RUN" == "true" ]]; then
@@ -115,42 +128,30 @@ if [[ -n "$S3_BUCKET" ]]; then
     fi
   fi
 
-  # 4. Verify continuous WAL archive presence and lag
-  log "Step 3: Checking continuous WAL archive lag in ${BACKUP_DEST}/wal/..."
-  WAL_LIST=$(aws s3 ls "${BACKUP_DEST}/wal/" "${AWS_ARGS[@]}" 2>/dev/null || true)
-  if [[ -z "$WAL_LIST" ]]; then
-    err "RECOVERY PRECONDITION FAILED: Zero WAL archives found in ${BACKUP_DEST}/wal/!"
-    err "Failing closed: Continuous archiving is not functional or no segments have shipped."
-    exit 1
-  fi
-
-  LATEST_WAL_LINE=$(echo "$WAL_LIST" | grep -v '^[[:space:]]*$' | tail -n 1)
-  log "Latest WAL segment: $LATEST_WAL_LINE"
-
-  WAL_DATE=$(echo "$LATEST_WAL_LINE" | awk '{print $1}')
-  WAL_TIME=$(echo "$LATEST_WAL_LINE" | awk '{print $2}')
-  if [[ -n "$WAL_DATE" && -n "$WAL_TIME" ]]; then
-    WAL_EPOCH=$(date -u -d "${WAL_DATE} ${WAL_TIME}" +%s 2>/dev/null || date -u -j -f "%Y-%m-%d %H:%M:%S" "${WAL_DATE} ${WAL_TIME}" +%s 2>/dev/null || echo "0")
-    if [[ "$WAL_EPOCH" -gt 0 ]]; then
-      WAL_LAG=$(( NOW_EPOCH - WAL_EPOCH ))
-      if [[ "$WAL_LAG" -gt "$MAX_WAL_LAG_SECONDS" ]]; then
-        err "WAL ARCHIVE LAG EXCEEDED: Archive lag is ${WAL_LAG}s (exceeds ${MAX_WAL_LAG_SECONDS}s limit)!"
-        exit 1
-      fi
-      log "WAL archive lag: ${WAL_LAG}s (within ${MAX_WAL_LAG_SECONDS}s limit)."
+  # 4. Prove the archiver transports a newly completed, exact WAL segment.
+  log "Step 3: Running active WAL archive probe in ${BACKUP_DEST}/wal/..."
+  PROBE_WAL=$(force_wal_archive_probe) || exit 1
+  WAL_KEY="postgres/wal/${PROBE_WAL}"
+  WAL_HEAD=""
+  for i in $(seq 1 "$WAL_PROBE_TIMEOUT_SECONDS"); do
+    WAL_HEAD=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$WAL_KEY" "${AWS_ARGS[@]}" 2>/dev/null || true)
+    if [[ -n "$WAL_HEAD" ]]; then
+      log "Exact WAL probe segment ${PROBE_WAL} visible after ${i}s."
+      break
     fi
+    sleep 1
+  done
+  if [[ -z "$WAL_HEAD" ]]; then
+    err "WAL PROBE FAILURE: Exact switched segment ${PROBE_WAL} was not visible within ${WAL_PROBE_TIMEOUT_SECONDS}s."
+    exit 1
   fi
 
   # 5. Verify off-host backup and WAL encryption policy (Blueprint §26 & Issue #5)
   log "Step 4: Verifying off-host backup & WAL encryption policy..."
   BASE_FILENAME=$(echo "$LATEST_BASE_LINE" | awk '{print $4}')
-  WAL_FILENAME=$(echo "$LATEST_WAL_LINE" | awk '{print $4}')
-
   BASE_KEY="postgres/basebackups/${BASE_FILENAME}"
-  WAL_KEY="postgres/wal/${WAL_FILENAME}"
 
   BASE_HEAD=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$BASE_KEY" "${AWS_ARGS[@]}" 2>/dev/null || true)
-  WAL_HEAD=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$WAL_KEY" "${AWS_ARGS[@]}" 2>/dev/null || true)
 
   BASE_ENCRYPTED=false
   if echo "$BASE_HEAD" | grep -iq "ServerSideEncryption"; then
@@ -201,20 +202,20 @@ if [[ -n "${DEADBOLT_WAL_ARCHIVE_DIR:-}" && -z "$S3_BUCKET" ]]; then
     exit 1
   fi
 
-  # Check newest WAL segment
-  NEWEST_WAL=$(find "${DEADBOLT_WAL_ARCHIVE_DIR}" -maxdepth 1 -type f | sort | tail -n 1 || true)
-  if [[ -z "$NEWEST_WAL" ]]; then
-    err "RECOVERY PRECONDITION FAILED: No WAL archives found in ${DEADBOLT_WAL_ARCHIVE_DIR}!"
+  PROBE_WAL=$(force_wal_archive_probe) || exit 1
+  WAL_VISIBLE=false
+  for i in $(seq 1 "$WAL_PROBE_TIMEOUT_SECONDS"); do
+    if [[ -f "${DEADBOLT_WAL_ARCHIVE_DIR}/${PROBE_WAL}" ]]; then
+      WAL_VISIBLE=true
+      log "Exact directory WAL probe ${PROBE_WAL} visible after ${i}s."
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$WAL_VISIBLE" != "true" ]]; then
+    err "WAL PROBE FAILURE: Exact switched segment ${PROBE_WAL} was not visible within ${WAL_PROBE_TIMEOUT_SECONDS}s."
     exit 1
   fi
-
-  WAL_MTIME=$(stat -c %Y "$NEWEST_WAL" 2>/dev/null || stat -f %m "$NEWEST_WAL" 2>/dev/null || echo "$NOW_EPOCH")
-  WAL_LAG=$(( NOW_EPOCH - WAL_MTIME ))
-  if [[ "$WAL_LAG" -gt "$MAX_WAL_LAG_SECONDS" ]]; then
-    err "WAL ARCHIVE LAG EXCEEDED: Archive lag is ${WAL_LAG}s (exceeds ${MAX_WAL_LAG_SECONDS}s limit)!"
-    exit 1
-  fi
-  log "Directory WAL archive lag: ${WAL_LAG}s (within ${MAX_WAL_LAG_SECONDS}s limit)."
 fi
 
 log "SUCCESS: Backup & WAL readiness verification passed (recoverability proven)."

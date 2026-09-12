@@ -739,7 +739,7 @@ func TestDatabaseRolesPrivilegeModel(t *testing.T) {
 
 // TestBackupReadinessScriptFailClosed verifies that scripts/check-backup-readiness.sh
 // fails closed when backup evidence is absent, and passes only when both base backup
-// and fresh WAL archives are proven.
+// and a newly switched exact WAL segment is proven archived.
 func TestBackupReadinessScriptFailClosed(t *testing.T) {
 	scriptPath := "../../scripts/check-backup-readiness.sh"
 
@@ -769,7 +769,7 @@ func TestBackupReadinessScriptFailClosed(t *testing.T) {
 		t.Fatalf("expected 'No base backups found' error message, got: %s", string(out))
 	}
 
-	// 3. Base backup exists, but zero WAL archives -> must FAIL CLOSED
+	// 3. Base backup exists, but a probe that never reaches the archive -> FAIL CLOSED.
 	baseDir := filepath.Join(tmpDir, "basebackups")
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Fatalf("failed to create basebackups dir: %v", err)
@@ -778,20 +778,34 @@ func TestBackupReadinessScriptFailClosed(t *testing.T) {
 		t.Fatalf("failed to write mock base backup: %v", err)
 	}
 
+	mockBin := t.TempDir()
+	mockDocker := filepath.Join(mockBin, "docker")
+	probeWal := "0000000100000000000000AA"
+	mockDockerScript := fmt.Sprintf(`#!/usr/bin/env bash
+if [[ "${MOCK_WAL_PROBE_MODE:-missing}" == "appear" ]]; then
+  touch "${DEADBOLT_WAL_ARCHIVE_DIR}/%s"
+fi
+echo "%s"
+`, probeWal, probeWal)
+	if err := os.WriteFile(mockDocker, []byte(mockDockerScript), 0755); err != nil {
+		t.Fatalf("failed to write mock docker: %v", err)
+	}
 	cmd = exec.Command("/bin/bash", scriptPath)
 	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
+		"PATH=" + mockBin + ":" + os.Getenv("PATH"),
 		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
+		"WAL_PROBE_TIMEOUT_SECONDS=1",
+		"MOCK_WAL_PROBE_MODE=missing",
 	}
 	out, err = cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected check-backup-readiness.sh to fail with missing WAL archives, but succeeded: %s", string(out))
 	}
-	if !strings.Contains(string(out), "No WAL archives found") {
-		t.Fatalf("expected 'No WAL archives found' error message, got: %s", string(out))
+	if !strings.Contains(string(out), "WAL PROBE FAILURE") {
+		t.Fatalf("expected exact WAL probe failure message, got: %s", string(out))
 	}
 
-	// 4. Base backup exists and WAL archive exists with old mtime (>900s) -> must FAIL CLOSED on lag
+	// 4. An idle DB can have an old historical WAL object; a fresh exact probe must pass.
 	oldWalFile := filepath.Join(tmpDir, "000000010000000000000001")
 	if err := os.WriteFile(oldWalFile, []byte("mock-wal"), 0644); err != nil {
 		t.Fatalf("failed to write mock wal file: %v", err)
@@ -803,36 +817,33 @@ func TestBackupReadinessScriptFailClosed(t *testing.T) {
 
 	cmd = exec.Command("/bin/bash", scriptPath)
 	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
+		"PATH=" + mockBin + ":" + os.Getenv("PATH"),
 		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
-		"MAX_WAL_LAG_SECONDS=900",
-	}
-	out, err = cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("expected check-backup-readiness.sh to fail on stale WAL lag, but succeeded: %s", string(out))
-	}
-	if !strings.Contains(string(out), "WAL ARCHIVE LAG EXCEEDED") {
-		t.Fatalf("expected 'WAL ARCHIVE LAG EXCEEDED' error message, got: %s", string(out))
-	}
-
-	// 5. Fresh WAL archive (<900s) -> must PASS
-	freshTime := time.Now()
-	if err := os.Chtimes(oldWalFile, freshTime, freshTime); err != nil {
-		t.Fatalf("failed to set fresh mtime on wal file: %v", err)
-	}
-
-	cmd = exec.Command("/bin/bash", scriptPath)
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
-		"MAX_WAL_LAG_SECONDS=900",
+		"WAL_PROBE_TIMEOUT_SECONDS=1",
+		"MOCK_WAL_PROBE_MODE=appear",
 	}
 	out, err = cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("expected check-backup-readiness.sh to pass with fresh WAL, failed: %v, output: %s", err, string(out))
+		t.Fatalf("expected old historical WAL plus exact probe to pass: %v, output: %s", err, string(out))
 	}
-	if !strings.Contains(string(out), "SUCCESS: Backup & WAL readiness verification passed") {
-		t.Fatalf("expected SUCCESS message, got: %s", string(out))
+	if !strings.Contains(string(out), "Exact directory WAL probe") {
+		t.Fatalf("expected exact probe success message, got: %s", string(out))
+	}
+
+	// 5. A probe that never appears must remain fail-closed regardless of historical WAL age.
+	if err := os.Remove(filepath.Join(tmpDir, probeWal)); err != nil {
+		t.Fatalf("failed to remove prior successful probe WAL: %v", err)
+	}
+	cmd = exec.Command("/bin/bash", scriptPath)
+	cmd.Env = []string{
+		"PATH=" + mockBin + ":" + os.Getenv("PATH"),
+		"DEADBOLT_WAL_ARCHIVE_DIR=" + tmpDir,
+		"WAL_PROBE_TIMEOUT_SECONDS=1",
+		"MOCK_WAL_PROBE_MODE=missing",
+	}
+	out, err = cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "WAL PROBE FAILURE") {
+		t.Fatalf("expected exact missing probe to fail closed, got: %v %s", err, string(out))
 	}
 }
 
@@ -1519,6 +1530,40 @@ exit 0
 		for _, path := range []string{snippetPath, filepath.Join(releaseDir, "active_upstream_port"), filepath.Join(releaseDir, "active_slot")} {
 			if _, err := os.Stat(path); !os.IsNotExist(err) {
 				t.Fatalf("expected first-route restore to remove prior-absent state %s, err=%v", path, err)
+			}
+		}
+	})
+
+	// Scenario 8: A stale route from a failed first deploy is cleared before retry.
+	t.Run("ClearStaleFirstDeployRoute", func(t *testing.T) {
+		binDir := setupMockDocker(t, "running", validMounts, validCaddyfile, 0, 0)
+		workDir := t.TempDir()
+		releaseDir := filepath.Join(workDir, "releases")
+		snippetPath := filepath.Join(workDir, "Deadbolt.caddyfile")
+		if err := os.MkdirAll(releaseDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(snippetPath, []byte("reverse_proxy deadbolt-control-plane-blue:8080\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		for name, value := range map[string]string{"active_upstream_port": "8088\n", "active_slot": "blue\n"} {
+			if err := os.WriteFile(filepath.Join(releaseDir, name), []byte(value), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cmd := exec.Command("/bin/bash", scriptPath, "--clear-deadbolt-route")
+		cmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"DEADBOLT_RELEASE_DIR=" + releaseDir,
+			"DEADBOLT_CADDYFILE_SNIPPET=" + snippetPath,
+			"DEADBOLT_STAGING_DOMAIN=deadbolt.43.218.246.246.nip.io",
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("stale first-deploy route clear failed: %v\n%s", err, out)
+		}
+		for _, path := range []string{snippetPath, filepath.Join(releaseDir, "active_upstream_port"), filepath.Join(releaseDir, "active_slot")} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("expected stale route state removed: %s, err=%v", path, err)
 			}
 		}
 	})

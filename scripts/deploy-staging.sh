@@ -310,6 +310,14 @@ if [[ -s "$ACTIVE_SLOT_FILE" && -s "$CURRENT_RELEASE_FILE" ]]; then
   CURRENT_SLOT=$(cat "$ACTIVE_SLOT_FILE" | tr -d '[:space:]')
 fi
 
+if [[ -z "$CURRENT_SLOT" ]]; then
+  log "No authoritative current release exists; clearing any stale Deadbolt edge route before candidate launch."
+  if ! ./scripts/reload-caddy.sh --clear-deadbolt-route; then
+    err "Unable to prove stale Deadbolt edge state is cleared; refusing to start first-deploy candidate."
+    exit 1
+  fi
+fi
+
 if [[ "$CURRENT_SLOT" == "blue" ]]; then
   CANDIDATE_SLOT="green"
   CANDIDATE_PORT="8089"
