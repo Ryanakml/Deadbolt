@@ -32,7 +32,12 @@ err() {
 }
 
 force_wal_archive_probe() {
-  local wal_file
+  local wal_file probe_name
+  probe_name="deadbolt_wal_probe_$(date -u +%s%N)"
+  if ! docker exec "$POSTGRES_CONTAINER" psql -U deadbolt_admin -d deadbolt_staging -v ON_ERROR_STOP=1 -c "SELECT pg_create_restore_point('${probe_name}');" >/dev/null 2>&1; then
+    err "WAL PROBE FAILURE: Could not create restore point ${probe_name} to generate WAL activity."
+    return 1
+  fi
   wal_file=$(docker exec "$POSTGRES_CONTAINER" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT pg_walfile_name(pg_switch_wal());" 2>/dev/null || true)
   wal_file=$(echo "$wal_file" | tr -d '[:space:]')
   if [[ ! "$wal_file" =~ ^[0-9A-F]{24}$ ]]; then

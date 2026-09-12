@@ -781,12 +781,17 @@ func TestBackupReadinessScriptFailClosed(t *testing.T) {
 	mockBin := t.TempDir()
 	mockDocker := filepath.Join(mockBin, "docker")
 	probeWal := "0000000100000000000000AA"
+	restorePointMarker := filepath.Join(mockBin, "restore-point-created")
 	mockDockerScript := fmt.Sprintf(`#!/usr/bin/env bash
-if [[ "${MOCK_WAL_PROBE_MODE:-missing}" == "appear" ]]; then
+if [[ "$*" == *"pg_create_restore_point"* ]]; then
+  touch %q
+  exit 0
+fi
+if [[ "$*" == *"pg_switch_wal"* ]] && [[ -f %q ]] && [[ "${MOCK_WAL_PROBE_MODE:-missing}" == "appear" ]]; then
   touch "${DEADBOLT_WAL_ARCHIVE_DIR}/%s"
 fi
-echo "%s"
-`, probeWal, probeWal)
+if [[ "$*" == *"pg_switch_wal"* ]]; then echo "%s"; fi
+`, restorePointMarker, restorePointMarker, probeWal, probeWal)
 	if err := os.WriteFile(mockDocker, []byte(mockDockerScript), 0755); err != nil {
 		t.Fatalf("failed to write mock docker: %v", err)
 	}
@@ -828,6 +833,9 @@ echo "%s"
 	}
 	if !strings.Contains(string(out), "Exact directory WAL probe") {
 		t.Fatalf("expected exact probe success message, got: %s", string(out))
+	}
+	if _, err := os.Stat(restorePointMarker); err != nil {
+		t.Fatalf("idle WAL probe must create a restore point before switching WAL: %v", err)
 	}
 
 	// 5. A probe that never appears must remain fail-closed regardless of historical WAL age.
