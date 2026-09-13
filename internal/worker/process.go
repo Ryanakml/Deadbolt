@@ -13,225 +13,223 @@ import (
 )
 
 var (
-	ErrStartAckRejected  = errors.New("START_ACK_REJECTED: Control plane rejected Start request; handler aborted")
-	ErrExecutionTimedOut = errors.New("EXECUTION_TIMED_OUT: Task exceeded allowed execution deadline")
-	ErrProcessTerminated = errors.New("PROCESS_TERMINATED: Process was stopped before completion")
+	ErrStartAckRejected       = errors.New("START_ACK_REJECTED: Control plane rejected Start request; handler aborted")
+	ErrStartAckAmbiguous      = errors.New("START_ACK_AMBIGUOUS: Start decision was not recovered before lease boundary")
+	ErrExecutionTimedOut      = errors.New("EXECUTION_TIMED_OUT: Task exceeded allowed execution deadline")
+	ErrProcessTerminated      = errors.New("PROCESS_TERMINATED: Process was stopped before completion")
+	ErrBundleVerificationNeed = errors.New("BUNDLE_VERIFICATION_REQUIRED: customer code cannot run without verified bundle identity")
 )
 
-// ExecutionLogs captures stdout and stderr emitted by the child process.
-type ExecutionLogs struct {
-	Stdout string
-	Stderr string
-}
+type ExecutionLogs struct{ Stdout, Stderr string }
 
-// ProcessSupervisor coordinates the Node.js runner child process per Blueprint §12.3.
+// ProcessSupervisor is deliberately a bounded lifecycle harness, not a worker
+// service. Gateway callbacks stand in for the future authenticated transport.
 type ProcessSupervisor struct {
-	NodePath      string
-	RunnerPath    string
-	GracePeriod   time.Duration
-	LeaseTracker  *LeaseTracker
-	StartAckFn    StartAckFunc
-	AllowlistKeys []string
+	NodePath, RunnerPath            string
+	GracePeriod, LeaseCheckInterval time.Duration
+	LeaseTracker                    *LeaseTracker
+	StartAckFn                      StartAckFunc // compatibility adapter: any error is authoritative rejection
+	StartFn                         StartDecisionFunc
+	RenewLeaseFn                    RenewLeaseFunc
+	OnProcessStart                  func(pid int) // test-only observation hook
+	AllowlistKeys, TaskEnvAllowlist []string
 }
 
-// NewProcessSupervisor creates a configured supervisor.
 func NewProcessSupervisor(nodePath, runnerPath string) *ProcessSupervisor {
 	if nodePath == "" {
 		nodePath = "node"
 	}
 	return &ProcessSupervisor{
-		NodePath:      nodePath,
-		RunnerPath:    runnerPath,
-		GracePeriod:   10 * time.Second,
-		AllowlistKeys: []string{"NODE_ENV", "DEADBOLT_ENV"},
+		NodePath: nodePath, RunnerPath: runnerPath, GracePeriod: 10 * time.Second,
+		LeaseCheckInterval: 100 * time.Millisecond, AllowlistKeys: []string{"NODE_ENV", "DEADBOLT_ENV"},
 	}
 }
 
-// TerminateProcessGroup terminates the target process and its child tree
-// using SIGTERM followed by SIGKILL after the 10-second grace period.
 func (s *ProcessSupervisor) TerminateProcessGroup(pid int) *StopResult {
-	startTime := time.Now()
-	res := &StopResult{
-		PID:      pid,
-		Duration: 0,
-	}
-
-	// 1. Send SIGTERM / initial abort signal
+	started := time.Now()
+	res := &StopResult{PID: pid}
 	_ = sendSigterm(pid)
-
-	// 2. Poll for termination within grace period
-	graceTimer := time.NewTimer(s.GracePeriod)
-	defer graceTimer.Stop()
-
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
+	deadline := time.NewTimer(s.GracePeriod)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
 	for {
 		select {
-		case <-graceTimer.C:
-			// Grace period expired without clean exit; send SIGKILL
+		case <-deadline.C:
 			res.GraceExceeded = true
 			_ = sendSigkill(pid)
 			res.Stopped = true
-			res.Duration = time.Since(startTime)
+			res.Duration = time.Since(started)
 			return res
-
-		case <-ticker.C:
-			// Check if process has already exited
+		case <-tick.C:
 			if !isProcessAlive(pid) {
 				res.Stopped = true
-				res.Duration = time.Since(startTime)
+				res.Duration = time.Since(started)
 				return res
 			}
 		}
 	}
 }
 
-// ExecuteAttempt runs the task attempt lifecycle with Start ACK gating,
-// lease monitoring, environment allowlisting, and channel isolation.
-func (s *ProcessSupervisor) ExecuteAttempt(
-	ctx context.Context,
-	input *TaskInput,
-	epoch int64,
-) (*TaskCompletion, *ExecutionLogs, error) {
-	// Rule 1: Lease verification before Start
+func (s *ProcessSupervisor) verifyStart(ctx context.Context, attemptID string, epoch int64) error {
+	if s.StartFn == nil {
+		if s.StartAckFn == nil {
+			return nil
+		}
+		if err := s.StartAckFn(ctx, attemptID, epoch); err != nil {
+			return fmt.Errorf("%w: %v", ErrStartAckRejected, err)
+		}
+		return nil
+	}
+	// At most one retry: it is the identical Start request/identity and reads the
+	// durable gateway decision; it does not create a second start.
+	for tries := 0; tries < 2; tries++ {
+		decision, err := s.StartFn(ctx, attemptID, epoch)
+		if err != nil || decision == StartAmbiguous {
+			if tries == 0 {
+				continue
+			}
+			return ErrStartAckAmbiguous
+		}
+		if decision != StartAccepted {
+			return ErrStartAckRejected
+		}
+		return nil
+	}
+	return ErrStartAckAmbiguous
+}
+
+func (s *ProcessSupervisor) verifyBundle(input *TaskInput) error {
+	if input.Bundle == nil {
+		return ErrBundleVerificationNeed
+	}
+	if err := VerifyArchitecture(input.Bundle.TargetArch, ""); err != nil {
+		return err
+	}
+	file, err := os.Open(input.Bundle.Path)
+	if err != nil {
+		return fmt.Errorf("open bundle: %w", err)
+	}
+	defer file.Close()
+	_, err = VerifyBundleDigest(file, input.Bundle.SHA256)
+	return err
+}
+
+func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput, epoch int64) (*TaskCompletion, *ExecutionLogs, error) {
 	if s.LeaseTracker != nil {
-		canStart, err := s.LeaseTracker.CanStart(time.Now())
-		if !canStart || err != nil {
+		if ok, err := s.LeaseTracker.CanStart(time.Time{}); !ok || err != nil {
 			return nil, nil, ErrInsufficientLeaseTTL
 		}
 	}
-
-	// Rule 2: Start ACK gating - Handler NEVER starts without verified ACK from control plane
-	if s.StartAckFn != nil {
-		if err := s.StartAckFn(ctx, input.AttemptID, epoch); err != nil {
-			return nil, nil, fmt.Errorf("%w: %v", ErrStartAckRejected, err)
+	if err := s.verifyStart(ctx, input.AttemptID, epoch); err != nil {
+		return nil, nil, err
+	}
+	// Start ACK can consume the entire budget; never launch based on the old check.
+	if s.LeaseTracker != nil {
+		if ok, err := s.LeaseTracker.CanStart(time.Time{}); !ok || err != nil {
+			return nil, nil, ErrInsufficientLeaseTTL
 		}
 	}
-
-	// Rule 3: Structured result channel (dedicated file/pipe isolation)
-	tempDir := os.TempDir()
-	resultFile := filepath.Join(tempDir, fmt.Sprintf("deadbolt_res_%s_%d.json", input.AttemptID, time.Now().UnixNano()))
-	defer os.Remove(resultFile)
-
-	// Prepare Node runner command
-	args := []string{}
-	if s.RunnerPath != "" {
-		args = append(args, s.RunnerPath)
+	if err := s.verifyBundle(input); err != nil {
+		return nil, nil, err
 	}
-	cmd := exec.Command(s.NodePath, args...)
+	if err := ValidateTaskEnvironment(input.Env, s.TaskEnvAllowlist); err != nil {
+		return nil, nil, err
+	}
 
-	// Configure OS process group
+	if input.TimeoutMs > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(input.TimeoutMs)*time.Millisecond)
+		defer cancel()
+	}
+	resultFile := filepath.Join(os.TempDir(), fmt.Sprintf("deadbolt_res_%s_%d.json", input.AttemptID, time.Now().UnixNano()))
+	defer os.Remove(resultFile)
+	cmd := exec.Command(s.NodePath, s.RunnerPath)
 	configureProcessGroup(cmd)
-
-	// Rule 4: Child environment allowlisting
-	taskEnv := input.Env
-	if taskEnv == nil {
-		taskEnv = make(map[string]string)
+	taskEnv := make(map[string]string, len(input.Env)+1)
+	for k, v := range input.Env {
+		taskEnv[k] = v
 	}
 	taskEnv["DEADBOLT_RESULT_FILE"] = resultFile
-	cmd.Env = SanitizeEnvironment(os.Environ(), taskEnv, s.AllowlistKeys)
-
-	// Separate stdout/stderr log buffers - Rule: arbitrary stdout never becomes result
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
-
-	// Stdin pipe for input payload
-	stdinPipe, err := cmd.StdinPipe()
+	cmd.Env = SanitizeEnvironment(os.Environ(), taskEnv, append(s.AllowlistKeys, "DEADBOLT_RESULT_FILE"))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open stdin pipe: %w", err)
+		return nil, nil, fmt.Errorf("stdin pipe: %w", err)
 	}
-
-	// Start runner process
 	if err := cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("failed to start runner process: %w", err)
+		return nil, nil, fmt.Errorf("start runner: %w", err)
 	}
-
 	pid := cmd.Process.Pid
-
-	// Write input to stdin and close pipe
+	if s.OnProcessStart != nil {
+		s.OnProcessStart(pid)
+	}
 	inputBytes, err := json.Marshal(input)
 	if err != nil {
 		_ = cmd.Process.Kill()
-		return nil, nil, fmt.Errorf("failed to encode task input: %w", err)
+		return nil, nil, fmt.Errorf("encode input: %w", err)
 	}
-	if _, err := stdinPipe.Write(inputBytes); err != nil {
+	if _, err := stdin.Write(inputBytes); err != nil {
 		_ = cmd.Process.Kill()
-		return nil, nil, fmt.Errorf("failed to write input to stdin: %w", err)
+		return nil, nil, fmt.Errorf("write input: %w", err)
 	}
-	_ = stdinPipe.Close()
-
-	// Wait channel for process exit
-	type exitResult struct {
-		err error
+	_ = stdin.Close()
+	exit := make(chan error, 1)
+	go func() { exit <- cmd.Wait() }()
+	interval := s.LeaseCheckInterval
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
 	}
-	exitChan := make(chan exitResult, 1)
-	go func() {
-		err := cmd.Wait()
-		exitChan <- exitResult{err: err}
-	}()
-
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
 	var finalErr error
-
-	// Wait for completion, abort, or context expiration
-	select {
-	case res := <-exitChan:
-		finalErr = res.err
-
-	case <-ctx.Done():
-		// Abort triggered: initiate graceful shutdown -> 10s grace -> SIGKILL
-		_ = s.TerminateProcessGroup(pid)
-		<-exitChan // wait for exit
-		finalErr = ErrProcessTerminated
+	for {
+		select {
+		case finalErr = <-exit:
+			goto done
+		case <-ctx.Done():
+			_ = s.TerminateProcessGroup(pid)
+			<-exit
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) && input.TimeoutMs > 0 {
+				finalErr = ErrExecutionTimedOut
+			} else {
+				finalErr = ErrProcessTerminated
+			}
+			goto done
+		case <-tick.C:
+			if s.LeaseTracker == nil {
+				continue
+			}
+			if s.RenewLeaseFn != nil {
+				renewal, err := s.RenewLeaseFn(ctx, input.AttemptID, epoch)
+				if err == nil {
+					s.LeaseTracker.Renew(renewal.ExpiresAt, renewal.RTT)
+				}
+			}
+			if s.LeaseTracker.IsExpired(time.Time{}) {
+				_ = s.TerminateProcessGroup(pid)
+				<-exit
+				finalErr = ErrLeaseExpired
+				goto done
+			}
+		}
 	}
-
-	logs := &ExecutionLogs{
-		Stdout: stdoutBuf.String(),
-		Stderr: stderrBuf.String(),
-	}
-
-	// Read result strictly from structured channel (result file)
-	rawResult, readErr := os.ReadFile(resultFile)
+done:
+	logs := &ExecutionLogs{Stdout: stdout.String(), Stderr: stderr.String()}
+	raw, readErr := os.ReadFile(resultFile)
 	if readErr != nil {
-		// If result file does not exist, return failure envelope
-		completion := &TaskCompletion{
-			AttemptID: input.AttemptID,
-			Status:    "FAILED",
-			Error: &TaskError{
-				Code:      "NO_RESULT_DELIVERED",
-				Message:   fmt.Sprintf("Process exited without writing to result channel: %v", finalErr),
-				Retryable: false,
-			},
-			Metrics: TaskMetrics{DurationMs: 0},
-		}
-		return completion, logs, finalErr
+		return &TaskCompletion{AttemptID: input.AttemptID, Status: "FAILED", Error: &TaskError{Code: "NO_RESULT_DELIVERED", Message: fmt.Sprintf("Process exited without writing to result channel: %v", finalErr)}, Metrics: TaskMetrics{}}, logs, finalErr
 	}
-
 	var completion TaskCompletion
-	if err := json.Unmarshal(rawResult, &completion); err != nil {
-		completion = TaskCompletion{
-			AttemptID: input.AttemptID,
-			Status:    "FAILED",
-			Error: &TaskError{
-				Code:      "MALFORMED_RESULT_PAYLOAD",
-				Message:   fmt.Sprintf("Structured result payload was not valid JSON: %v", err),
-				Retryable: false,
-			},
-			Metrics: TaskMetrics{DurationMs: 0},
-		}
-		return &completion, logs, err
+	if err := json.Unmarshal(raw, &completion); err != nil {
+		return &TaskCompletion{AttemptID: input.AttemptID, Status: "FAILED", Error: &TaskError{Code: "MALFORMED_RESULT_PAYLOAD", Message: err.Error()}, Metrics: TaskMetrics{}}, logs, err
 	}
-
 	return &completion, logs, finalErr
 }
 
 func isProcessAlive(pid int) bool {
 	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Windows proc.FindProcess always succeeds.
-	// We can check with os.FindProcess or Signal(0) on Unix.
-	return checkProcessAliveOS(proc, pid)
+	return err == nil && checkProcessAliveOS(proc, pid)
 }

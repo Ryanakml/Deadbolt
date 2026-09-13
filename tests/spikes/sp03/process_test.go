@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sync/atomic"
@@ -15,6 +16,16 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
+
+func bundleFor(t *testing.T, path string) *worker.BundleSpec {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	return &worker.BundleSpec{Path: path, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture()}
+}
 
 func resolveRunnerPath(t *testing.T) string {
 	t.Helper()
@@ -53,6 +64,7 @@ func TestSP03_StartAckGating(t *testing.T) {
 		OperationID: "op_start_ack_fail",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{"test": true},
 	}
 
@@ -105,6 +117,7 @@ func TestSP03_MonotonicLeaseBudgetSafety(t *testing.T) {
 		OperationID: "op_short_lease",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{},
 	}
 
@@ -143,6 +156,7 @@ func TestSP03_StructuredResultChannelIsolation(t *testing.T) {
 		OperationID: "op_noisy_001",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{"payloadKey": "payloadValue"},
 	}
 
@@ -176,6 +190,7 @@ func TestSP03_EnvironmentSanitizationAndAllowlist(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "env-check.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	supervisor.TaskEnvAllowlist = []string{"CUSTOM_CONFIG"}
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
 	}
@@ -185,6 +200,7 @@ func TestSP03_EnvironmentSanitizationAndAllowlist(t *testing.T) {
 		OperationID: "op_env_001",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{},
 		Env: map[string]string{
 			"CUSTOM_CONFIG": "allowlisted_value",
@@ -231,6 +247,7 @@ func TestSP03_ProcessGroupShutdownWithinGrace(t *testing.T) {
 		OperationID: "op_hung_001",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{},
 	}
 
@@ -278,6 +295,7 @@ func TestSP03_CrashSoakAndNoLeakedProcesses(t *testing.T) {
 			OperationID: fmt.Sprintf("op_soak_%03d", i),
 			TaskName:    "default",
 			Entrypoint:  fixturePath,
+			Bundle:      bundleFor(t, fixturePath),
 			Input:       map[string]any{"index": i},
 		}
 

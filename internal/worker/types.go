@@ -14,6 +14,15 @@ type TaskInput struct {
 	Input       any               `json:"input"`
 	TimeoutMs   int64             `json:"timeoutMs,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
+	Bundle      *BundleSpec       `json:"bundle,omitempty"`
+}
+
+// BundleSpec is the manifest-pinned artifact identity the supervisor verifies
+// before it permits customer code to start.
+type BundleSpec struct {
+	Path       string `json:"path"`
+	SHA256     string `json:"sha256"`
+	TargetArch string `json:"targetArch"`
 }
 
 // TaskError represents structured failure details.
@@ -49,3 +58,22 @@ type StopResult struct {
 
 // StartAckFunc represents the callback to verify Start ACK with control plane.
 type StartAckFunc func(ctx context.Context, attemptID string, epoch int64) error
+
+type StartDecision string
+
+const (
+	StartAccepted  StartDecision = "ACCEPTED"
+	StartRejected  StartDecision = "REJECTED"
+	StartAmbiguous StartDecision = "AMBIGUOUS"
+)
+
+// StartDecisionFunc models the gateway result. An ambiguous transport result
+// is retried with the same attempt identity; reject is authoritative.
+type StartDecisionFunc func(ctx context.Context, attemptID string, epoch int64) (StartDecision, error)
+
+type LeaseRenewal struct {
+	ExpiresAt time.Time
+	RTT       time.Duration
+}
+
+type RenewLeaseFunc func(ctx context.Context, attemptID string, epoch int64) (LeaseRenewal, error)

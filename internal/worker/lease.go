@@ -12,77 +12,82 @@ var (
 )
 
 const (
-	// DefaultSafetyMargin is the conservative margin required by Blueprint §13.1.
 	DefaultSafetyMargin = 2 * time.Second
-	// DefaultEstimatedRTT is the baseline round-trip time allowance.
 	DefaultEstimatedRTT = 500 * time.Millisecond
 )
 
-// LeaseTracker evaluates monotonic conservative lease duration per Blueprint §13.1.
-// The agent calculates safe TTL = (expires_at - now) - RTT - 2s margin.
+// LeaseTracker turns a server wall-clock expiry into a local duration at the
+// Start/renewal ACK boundary. From then on it consumes only a monotonic elapsed
+// clock, so a wall-clock correction cannot extend execution rights.
 type LeaseTracker struct {
 	mu           sync.RWMutex
-	expiresAt    time.Time
+	budget       time.Duration
 	safetyMargin time.Duration
 	estimatedRTT time.Duration
-	lastRenewed  time.Time
+	ackElapsed   time.Duration
+	elapsed      func() time.Duration
+	now          func() time.Time
 }
 
-// NewLeaseTracker creates a tracker with explicit or default safety margins.
-func NewLeaseTracker(expiresAt time.Time, rtt time.Duration, margin time.Duration) *LeaseTracker {
+func NewLeaseTracker(expiresAt time.Time, rtt, margin time.Duration) *LeaseTracker {
+	started := time.Now()
+	return NewLeaseTrackerWithElapsed(expiresAt, rtt, margin, func() time.Duration { return time.Since(started) })
+}
+
+// NewLeaseTrackerWithElapsed exists for deterministic lifecycle tests. elapsed
+// must be monotonic; time.Since is used by production code.
+func NewLeaseTrackerWithElapsed(expiresAt time.Time, rtt, margin time.Duration, elapsed func() time.Duration) *LeaseTracker {
 	if margin <= 0 {
 		margin = DefaultSafetyMargin
 	}
 	if rtt <= 0 {
 		rtt = DefaultEstimatedRTT
 	}
-
+	if elapsed == nil {
+		started := time.Now()
+		elapsed = func() time.Duration { return time.Since(started) }
+	}
+	wallNow := time.Now()
 	return &LeaseTracker{
-		expiresAt:    expiresAt,
-		safetyMargin: margin,
-		estimatedRTT: rtt,
-		lastRenewed:  time.Now(),
+		budget: expiresAt.Sub(wallNow), safetyMargin: margin, estimatedRTT: rtt,
+		ackElapsed: elapsed(), elapsed: elapsed, now: time.Now,
 	}
 }
 
-// SafeRemainingTTL computes the conservative remaining duration before expiration.
-// If the safe remaining duration is <= 0, ErrInsufficientLeaseTTL is returned.
-func (lt *LeaseTracker) SafeRemainingTTL(now time.Time) (time.Duration, error) {
-	lt.mu.RLock()
-	defer lt.mu.RUnlock()
-
-	rawRemaining := lt.expiresAt.Sub(now)
-	safeRemaining := rawRemaining - lt.estimatedRTT - lt.safetyMargin
-
-	if safeRemaining <= 0 {
+func (lt *LeaseTracker) safeRemainingLocked() (time.Duration, error) {
+	raw := lt.budget - (lt.elapsed() - lt.ackElapsed)
+	safe := raw - lt.estimatedRTT - lt.safetyMargin
+	if safe <= 0 {
 		return 0, ErrInsufficientLeaseTTL
 	}
-	return safeRemaining, nil
+	return safe, nil
 }
 
-// CanStart asserts whether the attempt has adequate safe TTL to begin execution.
-func (lt *LeaseTracker) CanStart(now time.Time) (bool, error) {
-	safe, err := lt.SafeRemainingTTL(now)
-	if err != nil {
-		return false, err
-	}
-	return safe > 0, nil
+// SafeRemainingTTL keeps its argument for source compatibility. It is ignored:
+// caller-provided wall time is not an execution authority.
+func (lt *LeaseTracker) SafeRemainingTTL(_ time.Time) (time.Duration, error) {
+	lt.mu.RLock()
+	defer lt.mu.RUnlock()
+	return lt.safeRemainingLocked()
 }
 
-// Renew updates the authoritative lease expiry and measured RTT after a successful heartbeat.
+func (lt *LeaseTracker) CanStart(_ time.Time) (bool, error) {
+	_, err := lt.SafeRemainingTTL(time.Time{})
+	return err == nil, err
+}
+
+// Renew establishes a fresh monotonic budget at a verified renewal ACK.
 func (lt *LeaseTracker) Renew(newExpiresAt time.Time, measuredRTT time.Duration) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
-
-	lt.expiresAt = newExpiresAt
+	lt.budget = newExpiresAt.Sub(lt.now())
 	if measuredRTT > 0 {
 		lt.estimatedRTT = measuredRTT
 	}
-	lt.lastRenewed = time.Now()
+	lt.ackElapsed = lt.elapsed()
 }
 
-// IsExpired checks if the lease has exceeded its conservative safe boundary.
-func (lt *LeaseTracker) IsExpired(now time.Time) bool {
-	_, err := lt.SafeRemainingTTL(now)
+func (lt *LeaseTracker) IsExpired(_ time.Time) bool {
+	_, err := lt.SafeRemainingTTL(time.Time{})
 	return err != nil
 }

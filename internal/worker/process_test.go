@@ -2,7 +2,10 @@ package worker_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -10,6 +13,16 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
+
+func bundleFor(t *testing.T, path string) *worker.BundleSpec {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	return &worker.BundleSpec{Path: path, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture()}
+}
 
 func resolveRunnerPath(t *testing.T) string {
 	t.Helper()
@@ -45,6 +58,7 @@ func TestStartAckGating(t *testing.T) {
 		OperationID: "op_001",
 		TaskName:    "sampleTask",
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{"x": 5, "y": 10},
 	}
 
@@ -78,6 +92,7 @@ func TestLeaseGatingBeforeStart(t *testing.T) {
 		OperationID: "op_002",
 		TaskName:    "sampleTask",
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{"x": 1, "y": 2},
 	}
 
@@ -108,6 +123,7 @@ func TestExecuteAttemptSuccessAndChannelIsolation(t *testing.T) {
 		OperationID: "op_003",
 		TaskName:    "noisyTask", // task that writes arbitrary noise to stdout/stderr
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{},
 	}
 
@@ -151,6 +167,7 @@ func TestProcessTerminationOnContextCancel(t *testing.T) {
 		OperationID: "op_004",
 		TaskName:    "slowTask", // slow task that waits 5 seconds
 		Entrypoint:  fixturePath,
+		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{},
 	}
 

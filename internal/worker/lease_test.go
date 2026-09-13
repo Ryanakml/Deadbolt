@@ -39,3 +39,17 @@ func TestLeaseTrackerMonotonicSafety(t *testing.T) {
 		t.Fatalf("expected renewed lease to permit start: %v", err)
 	}
 }
+
+func TestLeaseTrackerConsumesInjectedMonotonicElapsed(t *testing.T) {
+	var elapsed time.Duration
+	tracker := worker.NewLeaseTrackerWithElapsed(time.Now().Add(10*time.Second), 500*time.Millisecond, 2*time.Second, func() time.Duration { return elapsed })
+	before, err := tracker.SafeRemainingTTL(time.Now().Add(-24 * time.Hour)) // hostile wall-clock input is ignored
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed = 8 * time.Second
+	after, err := tracker.SafeRemainingTTL(time.Now().Add(24 * time.Hour))
+	if err == nil || after != 0 {
+		t.Fatalf("clock jump extended lease: before=%v after=%v err=%v", before, after, err)
+	}
+}

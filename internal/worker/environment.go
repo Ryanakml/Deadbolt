@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -33,6 +34,31 @@ var BlockedParentKeywords = []string{
 	"DEADBOLT_SESSION",
 	"DATABASE_URL",
 	"POSTGRES",
+}
+
+var ReservedRunnerKeys = map[string]bool{
+	"DEADBOLT_RESULT_FILE": true,
+	"DEADBOLT_RESULT_FD":   true,
+	"NODE_OPTIONS":         true,
+}
+
+// ValidateTaskEnvironment enforces the manifest-approved task variable names.
+// A task cannot smuggle a runner control variable or override agent runtime.
+func ValidateTaskEnvironment(declared map[string]string, approved []string) error {
+	allowed := make(map[string]bool, len(approved))
+	for _, key := range approved {
+		allowed[strings.ToUpper(strings.TrimSpace(key))] = true
+	}
+	for key := range declared {
+		normalized := strings.ToUpper(strings.TrimSpace(key))
+		if ReservedRunnerKeys[normalized] {
+			return fmt.Errorf("TASK_ENV_RESERVED_KEY: %s", key)
+		}
+		if !allowed[normalized] {
+			return fmt.Errorf("TASK_ENV_NOT_DECLARED: %s", key)
+		}
+	}
+	return nil
 }
 
 // SanitizeEnvironment filters the parent process environment and merges only

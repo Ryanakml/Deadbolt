@@ -72,23 +72,19 @@ On Windows, process group termination is executed via recursive process tree ter
 
 ---
 
-## 4. Empirical Benchmark & Validation Results
+## 4. Lifecycle Harness Coverage
 
-Validation tests were executed via `tests/spikes/sp03/process_test.go` and `runner/node/tests/runner.test.js`:
+The following are executable acceptance tests, not historical benchmark measurements. A fresh CI run is required before reporting measured timings or leak counts.
 
 ### Benchmark 1: Start ACK Gating (`TestSP03_StartAckGating`)
 
 - **Objective:** Verify that task handlers never execute without control plane approval.
-- **Measurements:**
-  - Control plane rejection (`409 STALE_OWNERSHIP`): Child process execution was blocked 100% of the time (0 task handlers invoked).
-  - Control plane approval (`200 OK`): Execution proceeded normally to `SUCCEEDED` status.
+- Covers authoritative reject, ambiguous-response retry using the identical Start identity, and re-checking lease after Start ACK before launch.
 
 ### Benchmark 2: Monotonic Conservative Lease Budget (`TestSP03_MonotonicLeaseBudgetSafety`)
 
 - **Objective:** Verify conservative lease deadline gating per Blueprint §13.1.
-- **Measurements:**
-  - Lease duration $< 2.5\text{s}$ (safety margin $2.0\text{s}$ + estimated RTT $0.5\text{s}$): Execution rejected immediately with `ErrInsufficientLeaseTTL`.
-  - Lease renewal to $20\text{s}$: Execution allowed immediately.
+- The tracker deducts an injected monotonic elapsed budget from the ACK boundary; supplied wall-clock values cannot extend it.
 
 ### Benchmark 3: Structured Result Channel vs. Stdout Noise (`TestSP03_StructuredResultChannelIsolation`)
 
@@ -111,19 +107,11 @@ Validation tests were executed via `tests/spikes/sp03/process_test.go` and `runn
 
 - **Objective:** Verify hung processes are terminated within grace period via SIGKILL.
 - **Workload:** Node task with infinite loop ignoring SIGTERM with $1.5\text{s}$ grace period.
-- **Result:**
-  - Grace period observed: $1.81\text{s}$ (300ms context timeout + 1500ms grace).
-  - Termination status: Process group killed cleanly via SIGKILL.
-  - Leaked processes: **0**.
+- The harness asserts the SIGTERM → bounded grace → SIGKILL path. It does not claim protection from deliberately detached hostile subprocesses.
 
-### Benchmark 6: Crash Soak Stress Test (`TestSP03_CrashSoakAndNoLeakedProcesses`)
+### Benchmark 6: Crash/abort soak
 
-- **Objective:** Verify zero process leaks or file descriptor exhaustion under rapid cycles.
-- **Workload:** 20 rapid sequential executions of task attempts with dynamic result channels.
-- **Result:**
-  - Completed attempts: **20 / 20 (100%)**.
-  - Leaked child processes: **0**.
-  - Leaked file descriptors / temp files: **0**.
+- **Status:** The former test covered only successful executions, so it is not evidence of crash/abort leak behavior. No zero-leak or FD claim is made until the mixed-outcome soak measures known PIDs, result-file cleanup, and FD growth.
 
 ---
 
@@ -150,15 +138,15 @@ test -z "$(gofmt -l internal/worker tests/spikes/sp03 runner/node)"
 ## 6. Delivery Boundaries & Status
 
 - **Implemented:**
-  - Dedicated Node.js runner workspace package in [`runner/node/`](file:///d:/Project/Tf-low/runner/node/) with `TaskContext`, structured logger, signal handlers, and result channel writer.
-  - Go worker supervisor in [`internal/worker/`](file:///d:/Project/Tf-low/internal/worker/) implementing `ProcessSupervisor`, `LeaseTracker`, `BundleVerifier`, and `SanitizeEnvironment`.
+  - Dedicated Node.js runner workspace package in `runner/node/` with `TaskContext`, structured logger, signal handlers, and result channel writer.
+  - Go worker supervisor in `internal/worker/` implementing `ProcessSupervisor`, monotonic `LeaseTracker`, bundle execution gate, and allowlisted environment injection.
   - Process group management with POSIX `-pgid` signalling and Windows process tree termination.
   - Dedicated result channel with fallback to environment-configured result file (`DEADBOLT_RESULT_FILE`).
-  - Empirical SP-03 test harness in [`tests/spikes/sp03/process_test.go`](file:///d:/Project/Tf-low/tests/spikes/sp03/process_test.go).
-- **Automated Tests:** All 13 unit and SP-03 test cases pass with zero failures.
+  - Empirical SP-03 test harness in `tests/spikes/sp03/process_test.go`.
+- **Automated Tests:** Run the commands above on the exact branch/merge result; this report intentionally does not carry forward a stale pass count.
 - **Invariant Traceability:**
   - `REQ-DUR-01`: Start ACK gating and conservative lease bounds guarantee no phantom executions without valid ownership.
-  - `REQ-VERSION-01`: Bundle SHA-256 digest and architecture compatibility enforced before execution.
+  - `REQ-VERSION-01`: Bundle SHA-256 digest and architecture compatibility are execution gates. Real Linux amd64/arm64 native-addon packaging remains a separate CI acceptance requirement, not a proven local claim.
   - `INV-01`: Multi-tenant boundary preserved; parent agent credentials never leak to child runner.
   - `INV-03`: Single active ownership enforced; expired lease stops runner before background lease reclamation.
   - `INV-07`: Bundles are verified immutable artifacts with cryptographic checksums.
