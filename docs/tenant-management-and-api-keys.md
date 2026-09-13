@@ -254,50 +254,110 @@ All endpoints are prefixed with `/api/v1`.
 
 - **Machine Identity:** `Authorization: Bearer db_<env>_<8hex>_<secret>`
 - **Human Identity:** Cookie `__Host-runtime_session` (Go BFF session) + header `X-Organization-ID: <uuid>`.
+- **Dual-Mounted Routing:** To ensure strict compatibility with both OpenAPI specifications (`/api/v1/...`) and root v1 consumers (`/v1/...`), all routes are registered under both path prefixes.
 
 ### 6.2 Endpoint Catalog
 
-| Method   | Path                                           | Required Role / Capability      | Description                                               |
-| :------- | :--------------------------------------------- | :------------------------------ | :-------------------------------------------------------- |
-| `POST`   | `/api/v1/organizations`                        | Human Identity                  | Creates a new organization; assigns caller as `Owner`.    |
-| `GET`    | `/api/v1/organizations`                        | Human Identity                  | Lists all organizations where caller is an active member. |
-| `GET`    | `/api/v1/organizations/{id}`                   | `CapOrgRead`                    | Gets organization metadata.                               |
-| `PATCH`  | `/api/v1/organizations/{id}`                   | `CapOrgUpdate` (Admin/Owner)    | Updates organization name.                                |
-| `DELETE` | `/api/v1/organizations/{id}`                   | `CapOrgDelete` (Owner only)     | Permanently deletes organization and cascades all data.   |
-| `GET`    | `/api/v1/organizations/{id}/members`           | `CapOrgRead`                    | Lists organization members and roles.                     |
-| `POST`   | `/api/v1/organizations/{id}/members`           | `CapAdminMember` (Admin/Owner)  | Adds a user to the organization.                          |
-| `PATCH`  | `/api/v1/organizations/{id}/members/{userId}`  | `CapAdminMember` (Admin/Owner)  | Updates member role (enforces Last Owner defense).        |
-| `DELETE` | `/api/v1/organizations/{id}/members/{userId}`  | `CapAdminMember` (Admin/Owner)  | Removes a member (enforces Last Owner defense).           |
-| `GET`    | `/api/v1/projects`                             | `CapOrgRead`                    | Lists projects in the active organization.                |
-| `POST`   | `/api/v1/projects`                             | `CapAdminProject` (Admin/Owner) | Creates a new project in the active organization.         |
-| `GET`    | `/api/v1/projects/{projectId}/environments`    | `CapOrgRead`                    | Lists environments and concurrency quotas.                |
-| `POST`   | `/api/v1/projects/{projectId}/environments`    | `CapAdminProject` (Admin/Owner) | Creates environment and provisions admission quota.       |
-| `POST`   | `/api/v1/environments/{envId}/api-keys`        | `CapAdminKey` (Admin/Owner)     | Generates a 256-bit API key (returns plaintext once).     |
-| `GET`    | `/api/v1/environments/{envId}/api-keys`        | `CapAdminKey` (Admin/Owner)     | Lists redacted API key summaries (no plaintext, no hash). |
-| `DELETE` | `/api/v1/api-keys/{id}`                        | `CapAdminKey` (Admin/Owner)     | Revokes an API key immediately.                           |
-| `GET`    | `/api/v1/environments/{envId}/payload-preview` | `CapPayloadRead`                | Demonstrates payload access protection for Viewers.       |
+| Method   | Path                                           | Required Role / Capability      | Description                                                                    |
+| :------- | :--------------------------------------------- | :------------------------------ | :----------------------------------------------------------------------------- |
+| `POST`   | `/api/v1/organizations`                        | Human Identity                  | Creates a new organization; assigns caller as `Owner`.                         |
+| `GET`    | `/api/v1/organizations`                        | Human Identity                  | Lists all organizations where caller is an active member.                      |
+| `GET`    | `/api/v1/organizations/{id}`                   | `CapOrgRead`                    | Gets organization metadata.                                                    |
+| `PATCH`  | `/api/v1/organizations/{id}`                   | `CapOrgUpdate` (Admin/Owner)    | Updates organization name.                                                     |
+| `DELETE` | `/api/v1/organizations/{id}`                   | `CapOrgDelete` (Owner only)     | Permanently deletes organization and cascades all data.                        |
+| `GET`    | `/api/v1/organizations/{id}/members`           | `CapOrgRead`                    | Lists organization members and roles.                                          |
+| `POST`   | `/api/v1/organizations/{id}/members`           | `CapAdminMember` (Admin/Owner)  | Adds a user to the organization.                                               |
+| `PATCH`  | `/api/v1/organizations/{id}/members/{userId}`  | `CapAdminMember` (Admin/Owner)  | Updates member role (enforces serialized Last Owner defense).                  |
+| `PATCH`  | `/api/v1/organizations/{id}/members/{userId}/status` | `CapAdminMember` (Admin/Owner) | Updates member status (`ACTIVE`/`SUSPENDED`, enforces Last Owner defense).   |
+| `DELETE` | `/api/v1/organizations/{id}/members/{userId}`  | `CapAdminMember` (Admin/Owner)  | Removes a member (enforces serialized Last Owner defense).                     |
+| `GET`    | `/api/v1/projects`                             | `CapOrgRead`                    | Lists projects in the active organization.                                     |
+| `POST`   | `/api/v1/projects`                             | `CapAdminProject` (Admin/Owner) | Creates a new project in the active organization.                              |
+| `GET`    | `/api/v1/projects/{projectId}/environments`    | `CapOrgRead`                    | Lists environments and concurrency quotas.                                     |
+| `POST`   | `/api/v1/projects/{projectId}/environments`    | `CapAdminProject` (Admin/Owner) | Creates environment and provisions admission quota.                            |
+| `POST`   | `/api/v1/environments/{envId}/api-keys`        | `CapAdminKey` (Admin/Owner)     | Generates a 256-bit API key (returns plaintext once).                          |
+| `GET`    | `/api/v1/environments/{envId}/api-keys`        | `CapAdminKey` (Admin/Owner)     | Lists redacted API key summaries (no plaintext, no hash).                      |
+| `POST`   | `/api/v1/api-keys/{id}/rotate`                 | `CapAdminKey` (Admin/Owner)     | Atomically revokes existing key and returns newly generated replacement key.    |
+| `DELETE` | `/api/v1/api-keys/{id}`                        | `CapAdminKey` (Admin/Owner)     | Revokes an API key immediately.                                                |
+| `GET`    | `/api/v1/environments/{envId}/payload-preview` | `CapPayloadRead`                | Demonstrates payload access protection for Viewers.                            |
+
+### 6.3 Standardized OpenAPI 3.1.0 Error Envelope (Blueprint §20.1)
+
+All error responses strictly adhere to the top-level schema contract defined in `contracts/openapi/control-plane.yaml`:
+
+```json
+{
+  "code": "FORBIDDEN",
+  "message": "Access denied",
+  "requestId": "req_01j...",
+  "details": {},
+  "retryable": false
+}
+```
+
+- `code`: Machine-readable SCREAMING_SNAKE_CASE code (e.g., `UNAUTHENTICATED`, `FORBIDDEN`, `ENVIRONMENT_MISMATCH`, `LAST_OWNER_DEMOTION_FORBIDDEN`).
+- `message`: Human-readable description.
+- `requestId`: Distributed tracing and log-correlation ID extracted from `X-Request-ID` or automatically generated via UUIDv7/v4.
+- `details`: Structured payload map.
+- `retryable`: Boolean indicator helping clients distinguish transient errors from permanent policy violations.
 
 ---
 
-## 7. Verification & Automated Test Results
+## 7. Hardening & Security Safeguards
 
-The implementation is verified by an exhaustive integration test suite in [`tests/integration/tenant_test.go`](file:///d:/Project/Tf-low/tests/integration/tenant_test.go) executed against real PostgreSQL instances:
+### 7.1 Cross-Site Request Forgery (CSRF) and Origin Gate
 
-| Suite                                       | Test Objective                                                                                                                                  | Outcome  |
-| :------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
-| `TestOrganizationBootstrapAndOwnerCreation` | Verifies atomic organization creation and binding of caller as active `Owner`.                                                                  | **PASS** |
-| `TestProjectAndEnvironmentProvisioning`     | Verifies project creation, `development`/`staging`/`production` environments, admission quota rows, and rejection of invalid names.             | **PASS** |
-| `TestAPIKeyGenerationAndEntropy`            | Asserts 256-bit entropy (32 random bytes), `db_<env>_<8hex>` prefixing, SHA-256 hash persistence, and redacted summary output.                  | **PASS** |
-| `TestAPIKeyAuthenticationAndScoping`        | Tests successful authentication, timestamp updating on `last_used_at`, and rejection of tampered/unknown keys with `401 Unauthorized`.          | **PASS** |
-| `TestExpiredAndRevokedAPIKeys`              | Asserts revoked keys fail with `API_KEY_REVOKED` and expired keys fail with `API_KEY_EXPIRED`.                                                  | **PASS** |
-| `TestCrossTenantDenial`                     | Validates that an API key or session from Org A cannot access or query resources from Org B (RLS zero rows & `403 Forbidden`).                  | **PASS** |
-| `TestRBACPermissionMatrix`                  | Verifies full capability matrix across all 5 canonical roles and verifies that `Viewer` cannot access payload endpoints without `payload:read`. | **PASS** |
-| `TestLastOwnerDefense`                      | Proves that demoting or removing the sole remaining active Owner fails with `LAST_OWNER_DEMOTION_FORBIDDEN` / `LAST_OWNER_REMOVAL_FORBIDDEN`.   | **PASS** |
-| `TestMachineKeyApprovalRestriction`         | Proves that attempting to create machine keys with `approval:decide` or `reconciliation:resolve` fails with `MACHINE_KEY_UNAUTHORIZED`.         | **PASS** |
-| `TestHTTPTenantEndpoints`                   | End-to-end HTTP validation for listing summaries and revoking API keys over REST.                                                               | **PASS** |
+State-mutating HTTP operations (`POST`, `PATCH`, `DELETE`) authenticated via ambient human session cookies require strict Origin and CSRF validation:
+- The `Origin` header must match configured trusted origins (`AllowedOrigins`). Untrusted or absent origins trigger `403 ORIGIN_FORBIDDEN`.
+- The `X-CSRF-Token` header must match the session's cryptographically bound CSRF token hash. Missing or invalid tokens trigger `403 CSRF_TOKEN_INVALID`.
+- Headless Bearer API keys are explicitly exempted from ambient cookie CSRF checks.
+
+### 7.2 Strict Environment Mismatch Prevention
+
+API keys are permanently bound to a single environment (`development`, `staging`, or `production`). If a request authenticated by an API key specifies an environment (via path parameter `envId`, query parameter `environment`/`env_id`, or headers `X-Environment`/`X-Environment-ID`) that does not match the key's assigned environment, the request is immediately rejected with HTTP `403 Forbidden` (`ENVIRONMENT_MISMATCH`).
+
+### 7.3 Concurrency Serialization for Last Owner Defense
+
+To eliminate time-of-check to time-of-use (TOCTOU) race conditions when multiple administrators concurrently demote, suspend, or remove owners:
+- All owner-affecting mutations execute within `WithTenantTx`.
+- The transaction acquires a row-level lock on the organization record (`SELECT id FROM organizations WHERE id = $1 FOR UPDATE`).
+- Parallel requests are fully serialized at the PostgreSQL engine level, guaranteeing that the active Owner count cannot drop below 1.
+
+### 7.4 Timing Side-Channel Resistance & Write Throttling
+
+- When authenticating API keys, unknown key prefixes trigger a constant-time dummy comparison (`DummyHash`) to prevent prefix enumeration via response-time variance.
+- Updates to `last_used_at` timestamps are throttled to a minimum interval of 60 seconds per key, eliminating database row-lock contention under heavy parallel execution traffic.
+
+---
+
+## 8. Verification & Automated Test Results
+
+The implementation is verified by 18 exhaustive integration test suites in [`tests/integration/tenant_test.go`](file:///d:/Project/Tf-low/tests/integration/tenant_test.go) executed against real PostgreSQL instances:
+
+| # | Suite                                         | Test Objective                                                                                                                                  | Outcome  |
+| - | :-------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
+| 1 | `TestOrganizationBootstrapAndOwnerCreation`   | Verifies atomic organization creation and binding of caller as active `Owner`.                                                                  | **PASS** |
+| 2 | `TestProjectAndEnvironmentProvisioning`       | Verifies project creation, `development`/`staging`/`production` environments, admission quota rows, and rejection of invalid names.             | **PASS** |
+| 3 | `TestAPIKeyGenerationAndEntropy`              | Asserts 256-bit entropy (32 random bytes), `db_<env>_<8hex>` prefixing, SHA-256 hash persistence, and redacted summary output.                  | **PASS** |
+| 4 | `TestAPIKeyAuthenticationAndScoping`          | Tests successful authentication, timestamp updating on `last_used_at`, and rejection of tampered/unknown keys with `401 Unauthorized`.          | **PASS** |
+| 5 | `TestExpiredAndRevokedAPIKeys`                | Asserts revoked keys fail with `API_KEY_REVOKED` and expired keys fail with `API_KEY_EXPIRED`.                                                  | **PASS** |
+| 6 | `TestCrossTenantDenial`                       | Validates that an API key or session from Org A cannot access or query resources from Org B (RLS zero rows & `403 Forbidden`).                  | **PASS** |
+| 7 | `TestRBACPermissionMatrix`                    | Verifies full capability matrix across all 5 canonical roles and verifies that `Viewer` cannot access payload endpoints without `payload:read`. | **PASS** |
+| 8 | `TestLastOwnerDefense`                        | Proves that demoting or removing the sole remaining active Owner fails with `LAST_OWNER_DEMOTION_FORBIDDEN` / `LAST_OWNER_REMOVAL_FORBIDDEN`.   | **PASS** |
+| 9 | `TestMachineKeyApprovalRestriction`           | Proves that attempting to create machine keys with `approval:decide` or `reconciliation:resolve` fails with `MACHINE_KEY_UNAUTHORIZED`.         | **PASS** |
+| 10 | `TestHTTPTenantEndpoints`                    | End-to-end HTTP validation for listing summaries and revoking API keys over REST.                                                               | **PASS** |
+| 11 | `TestErrorEnvelopeFormat`                    | Validates canonical OpenAPI error envelope: `{ code, message, requestId, details, retryable }`.                                                 | **PASS** |
+| 12 | `TestEnvironmentMismatchRejection`           | Verifies 403 `ENVIRONMENT_MISMATCH` rejection across path parameter, query parameters, and request headers.                                    | **PASS** |
+| 13 | `TestCSRFAndOriginEnforcementOnMutations`    | Tests that cookie-authenticated mutations without Origin or valid CSRF tokens fail with 403 `ORIGIN_FORBIDDEN` / `CSRF_TOKEN_INVALID`.         | **PASS** |
+| 14 | `TestAPIKeyRotation`                         | Tests atomic key rotation via `POST /api/v1/api-keys/{id}/rotate`, revoking prior key and returning active replacement key.                    | **PASS** |
+| 15 | `TestMemberStatusAndLastOwnerSuspension`     | Validates member status transitions (`ACTIVE`/`SUSPENDED`) and prevents suspending the sole remaining active Owner.                             | **PASS** |
+| 16 | `TestLastOwnerDefenseConcurrentRace`         | Executes 10 concurrent goroutines attempting to remove/demote owners; verifies serialized lock prevents orphan organization.                    | **PASS** |
+| 17 | `TestAPIKeyLastUsedAtThrottling`             | Confirms high-frequency authentications update `last_used_at` with a 60-second cooldown window to prevent DB lock contention.                    | **PASS** |
+| 18 | `TestDualRouteMounting`                      | Proves identical routing and security enforcement across `/api/v1/...` and `/v1/...` routes.                                                    | **PASS** |
 
 ### Workspace Health Check
 
-- Full Go test suite (`go test -v ./...`): **100% Passed**
-- Code formatting (`gofmt -l internal tests`): **0 diffs (100% compliant)**
-- Markdown formatting (`prettier --check docs/permission-matrix.md`): **100% compliant**
+- All Tenant & RLS integration tests: **100% Passed (26/26 tests)**
+- Full Auth integration tests: **100% Passed**
+- Go compiler / vet (`go vet ./internal/tenant/...`): **Clean (exit code 0)**
+- Code formatting (`gofmt -l`): **100% compliant**
+

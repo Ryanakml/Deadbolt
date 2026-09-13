@@ -107,6 +107,26 @@ func ValidateKeyCapabilities(caps []string, isMachineKey bool) error {
 	return nil
 }
 
+// DummyHash is a fixed 64-character SHA-256 hex string used for constant-time comparison on nonexistent keys.
+const DummyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// SanitizeCapabilities deduplicates and trims capabilities.
+func SanitizeCapabilities(caps []string) []string {
+	seen := make(map[string]struct{}, len(caps))
+	var result []string
+	for _, c := range caps {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if _, exists := seen[c]; !exists {
+			seen[c] = struct{}{}
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
 // DefaultExpiryDuration returns the default 90-day expiry duration per Blueprint §24.4.
 const DefaultExpiryDays = 90
 

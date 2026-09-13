@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
@@ -17,6 +18,7 @@ type contextKey string
 
 const (
 	callerIdentityKey contextKey = "deadbolt.tenant.caller_identity"
+	requestIDKey      contextKey = "deadbolt.tenant.request_id"
 )
 
 type IdentityType string
@@ -28,12 +30,13 @@ const (
 
 // CallerIdentity captures the verified identity and authorized scope for a request.
 type CallerIdentity struct {
-	Type           IdentityType `json:"type"`
-	UserID         string       `json:"user_id,omitempty"`
-	Role           string       `json:"role,omitempty"`
-	OrganizationID string       `json:"organization_id"`
-	EnvironmentID  string       `json:"environment_id,omitempty"`
-	Capabilities   []string     `json:"capabilities"`
+	Type            IdentityType `json:"type"`
+	UserID          string       `json:"user_id,omitempty"`
+	Role            string       `json:"role,omitempty"`
+	OrganizationID  string       `json:"organization_id"`
+	EnvironmentID   string       `json:"environment_id,omitempty"`
+	EnvironmentName string       `json:"environment_name,omitempty"`
+	Capabilities    []string     `json:"capabilities"`
 }
 
 // CallerFromContext extracts the authenticated CallerIdentity from context.
@@ -65,43 +68,70 @@ func NewHTTPHandler(service *Service, pool *pgxpool.Pool, sessionStore *auth.Ses
 	}
 }
 
-// Routes mounts all tenant management routes onto an http.Handler.
+// WithRequestID injects or generates an X-Request-ID header and stores it in context.
+func (h *HTTPHandler) WithRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			var err error
+			reqID, err = NewUUID()
+			if err != nil {
+				reqID = fmt.Sprintf("req-%d", time.Now().UnixNano())
+			}
+		}
+		w.Header().Set("X-Request-ID", reqID)
+		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// Routes mounts all tenant management routes onto an http.Handler with dual /api/v1 and /v1 prefixes.
 func (h *HTTPHandler) Routes() http.Handler {
 	mux := http.NewServeMux()
 
+	register := func(pattern string, handler http.HandlerFunc) {
+		parts := strings.SplitN(pattern, " ", 2)
+		method, path := parts[0], parts[1]
+		mux.HandleFunc(method+" /api/v1"+path, handler)
+		mux.HandleFunc(method+" /v1"+path, handler)
+	}
+
 	// Organization CRUD
-	mux.HandleFunc("POST /api/v1/organizations", h.RequireAuth(h.HandleCreateOrganization))
-	mux.HandleFunc("GET /api/v1/organizations", h.RequireAuth(h.HandleListOrganizations))
-	mux.HandleFunc("GET /api/v1/organizations/{id}", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleGetOrganization)))
-	mux.HandleFunc("PATCH /api/v1/organizations/{id}", h.RequireAuth(h.RequireOrgScope(CapOrgUpdate, h.HandleUpdateOrganization)))
-	mux.HandleFunc("DELETE /api/v1/organizations/{id}", h.RequireAuth(h.RequireOrgScope(CapOrgDelete, h.HandleDeleteOrganization)))
+	register("POST /organizations", h.RequireAuth(h.HandleCreateOrganization))
+	register("GET /organizations", h.RequireAuth(h.HandleListOrganizations))
+	register("GET /organizations/{id}", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleGetOrganization)))
+	register("PATCH /organizations/{id}", h.RequireAuth(h.RequireOrgScope(CapOrgUpdate, h.HandleUpdateOrganization)))
+	register("DELETE /organizations/{id}", h.RequireAuth(h.RequireOrgScope(CapOrgDelete, h.HandleDeleteOrganization)))
 
 	// Organization Members
-	mux.HandleFunc("GET /api/v1/organizations/{id}/members", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleListMembers)))
-	mux.HandleFunc("POST /api/v1/organizations/{id}/members", h.RequireAuth(h.RequireOrgScope(CapAdminMember, h.HandleAddMember)))
-	mux.HandleFunc("PATCH /api/v1/organizations/{id}/members/{userId}", h.RequireAuth(h.RequireOrgScope(CapAdminMember, h.HandleUpdateMemberRole)))
-	mux.HandleFunc("DELETE /api/v1/organizations/{id}/members/{userId}", h.RequireAuth(h.RequireOrgScope(CapAdminMember, h.HandleRemoveMember)))
+	register("GET /organizations/{id}/members", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleListMembers)))
+	register("POST /organizations/{id}/members", h.RequireAuth(h.RequireOrgScope(CapAdminMember, h.HandleAddMember)))
+	register("PATCH /organizations/{id}/members/{userId}", h.RequireAuth(h.RequireOrgScope(CapAdminMember, h.HandleUpdateMemberRole)))
+	register("PATCH /organizations/{id}/members/{userId}/status", h.RequireAuth(h.RequireOrgScope(CapAdminMember, h.HandleUpdateMemberStatus)))
+	register("DELETE /organizations/{id}/members/{userId}", h.RequireAuth(h.RequireOrgScope(CapAdminMember, h.HandleRemoveMember)))
 
 	// Projects
-	mux.HandleFunc("GET /api/v1/projects", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleListProjects)))
-	mux.HandleFunc("POST /api/v1/projects", h.RequireAuth(h.RequireOrgScope(CapAdminProject, h.HandleCreateProject)))
+	register("GET /projects", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleListProjects)))
+	register("POST /projects", h.RequireAuth(h.RequireOrgScope(CapAdminProject, h.HandleCreateProject)))
 
 	// Environments
-	mux.HandleFunc("GET /api/v1/projects/{projectId}/environments", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleListEnvironments)))
-	mux.HandleFunc("POST /api/v1/projects/{projectId}/environments", h.RequireAuth(h.RequireOrgScope(CapAdminProject, h.HandleCreateEnvironment)))
+	register("GET /projects/{projectId}/environments", h.RequireAuth(h.RequireOrgScope(CapOrgRead, h.HandleListEnvironments)))
+	register("POST /projects/{projectId}/environments", h.RequireAuth(h.RequireOrgScope(CapAdminProject, h.HandleCreateEnvironment)))
 
 	// API Keys
-	mux.HandleFunc("POST /api/v1/environments/{envId}/api-keys", h.RequireAuth(h.RequireOrgScope(CapAdminKey, h.HandleCreateAPIKey)))
-	mux.HandleFunc("GET /api/v1/environments/{envId}/api-keys", h.RequireAuth(h.RequireOrgScope(CapAdminKey, h.HandleListAPIKeys)))
-	mux.HandleFunc("DELETE /api/v1/api-keys/{id}", h.RequireAuth(h.RequireOrgScope(CapAdminKey, h.HandleRevokeAPIKey)))
+	register("POST /environments/{envId}/api-keys", h.RequireAuth(h.RequireOrgScope(CapAdminKey, h.HandleCreateAPIKey)))
+	register("GET /environments/{envId}/api-keys", h.RequireAuth(h.RequireOrgScope(CapAdminKey, h.HandleListAPIKeys)))
+	register("POST /api-keys/{id}/rotate", h.RequireAuth(h.RequireOrgScope(CapAdminKey, h.HandleRotateAPIKey)))
+	register("DELETE /api-keys/{id}", h.RequireAuth(h.RequireOrgScope(CapAdminKey, h.HandleRevokeAPIKey)))
 
 	// Viewer Payload Protection Demonstration / Enforcement Endpoint
-	mux.HandleFunc("GET /api/v1/environments/{envId}/payload-preview", h.RequireAuth(h.RequireOrgScope(CapPayloadRead, h.HandlePayloadPreview)))
+	register("GET /environments/{envId}/payload-preview", h.RequireAuth(h.RequireOrgScope(CapPayloadRead, h.HandlePayloadPreview)))
 
-	return mux
+	return h.WithRequestID(mux)
 }
 
 // RequireAuth authenticates the caller via Bearer API Key or Session Cookie.
+// Enforces CSRF & Origin validation for human session mutations (Blueprint §24.1).
 func (h *HTTPHandler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -113,22 +143,23 @@ func (h *HTTPHandler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			apiKey, err := h.service.AuthenticateAPIKey(ctx, rawKey)
 			if err != nil {
 				if errors.Is(err, ErrKeyRevoked) {
-					writeJSONError(w, http.StatusUnauthorized, "API_KEY_REVOKED", err.Error())
+					writeJSONError(w, r, http.StatusUnauthorized, "API_KEY_REVOKED", err.Error())
 					return
 				}
 				if errors.Is(err, ErrKeyExpired) {
-					writeJSONError(w, http.StatusUnauthorized, "API_KEY_EXPIRED", err.Error())
+					writeJSONError(w, r, http.StatusUnauthorized, "API_KEY_EXPIRED", err.Error())
 					return
 				}
-				writeJSONError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Invalid or unrecognized API key")
+				writeJSONError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "Invalid or unrecognized API key")
 				return
 			}
 
 			caller := &CallerIdentity{
-				Type:           IdentityTypeMachine,
-				OrganizationID: apiKey.OrganizationID,
-				EnvironmentID:  apiKey.EnvironmentID,
-				Capabilities:   apiKey.Capabilities,
+				Type:            IdentityTypeMachine,
+				OrganizationID:  apiKey.OrganizationID,
+				EnvironmentID:   apiKey.EnvironmentID,
+				EnvironmentName: apiKey.EnvironmentName,
+				Capabilities:    apiKey.Capabilities,
 			}
 			next.ServeHTTP(w, r.WithContext(ContextWithCaller(ctx, caller)))
 			return
@@ -139,6 +170,25 @@ func (h *HTTPHandler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if err == nil && cookie.Value != "" && h.sessionStore != nil {
 			sess, err := h.sessionStore.ValidateSession(ctx, cookie.Value, h.authCfg.SessionIdleTimeout)
 			if err == nil && sess != nil {
+				// Enforce CSRF token and Origin verification for mutating HTTP methods per Blueprint §24.1
+				method := strings.ToUpper(r.Method)
+				if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
+					origin := r.Header.Get("Origin")
+					if origin == "" {
+						origin = r.Header.Get("Referer")
+					}
+					if origin == "" || !h.authCfg.IsOriginAllowed(origin) {
+						writeJSONError(w, r, http.StatusForbidden, "ORIGIN_FORBIDDEN", fmt.Sprintf("Origin %q is not allowlisted", origin))
+						return
+					}
+
+					csrfToken := r.Header.Get("X-CSRF-Token")
+					if csrfToken == "" || !auth.ValidateCSRFToken(sess, csrfToken) {
+						writeJSONError(w, r, http.StatusForbidden, "CSRF_VALIDATION_FAILED", "Missing or invalid X-CSRF-Token header")
+						return
+					}
+				}
+
 				caller := &CallerIdentity{
 					Type:   IdentityTypeHuman,
 					UserID: sess.UserID,
@@ -151,22 +201,25 @@ func (h *HTTPHandler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		writeJSONError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		writeJSONError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
 	}
 }
 
 // RequireOrgScope resolves the active organization ID, checks tenant membership, and enforces RBAC capability.
+// Also strictly enforces that API key environment scope matches the request (Blueprint §20.1 & §24.3).
 func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		caller, ok := CallerFromContext(r.Context())
 		if !ok || caller == nil {
-			writeJSONError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Caller identity not found")
+			writeJSONError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "Caller identity not found")
 			return
 		}
 
 		var targetOrgID string
-		if strings.HasPrefix(r.URL.Path, "/api/v1/organizations/") {
-			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/organizations/"), "/")
+		cleanPath := strings.TrimPrefix(r.URL.Path, "/api/v1")
+		cleanPath = strings.TrimPrefix(cleanPath, "/v1")
+		if strings.HasPrefix(cleanPath, "/organizations/") {
+			parts := strings.Split(strings.TrimPrefix(cleanPath, "/organizations/"), "/")
 			if len(parts) > 0 && parts[0] != "" {
 				targetOrgID = parts[0]
 			}
@@ -182,26 +235,51 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 		}
 
 		if targetOrgID == "" {
-			writeJSONError(w, http.StatusBadRequest, "MISSING_ORGANIZATION_ID", "Organization context is required")
+			writeJSONError(w, r, http.StatusBadRequest, "MISSING_ORGANIZATION_ID", "Organization context is required")
 			return
 		}
 
-		// Machine identity cross-tenant and capability check
+		// Machine identity cross-tenant, environment mismatch, and capability check
 		if caller.Type == IdentityTypeMachine {
 			if caller.OrganizationID != targetOrgID {
-				writeJSONError(w, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "API key does not belong to target organization")
+				writeJSONError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "API key does not belong to target organization")
 				return
 			}
 
-			// Check environment scope if envId is in path
+			// Strict Environment Mismatch Enforcement (Blueprint §20.1)
 			routeEnvID := r.PathValue("envId")
 			if routeEnvID != "" && caller.EnvironmentID != "" && caller.EnvironmentID != routeEnvID {
-				writeJSONError(w, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "API key does not belong to target environment")
+				writeJSONError(w, r, http.StatusForbidden, "ENVIRONMENT_MISMATCH", "API key does not belong to target environment")
+				return
+			}
+
+			queryEnv := r.URL.Query().Get("environment")
+			queryEnvID := r.URL.Query().Get("env_id")
+			if queryEnvID == "" {
+				queryEnvID = r.URL.Query().Get("envId")
+			}
+			if queryEnvID != "" && queryEnvID != caller.EnvironmentID {
+				writeJSONError(w, r, http.StatusForbidden, "ENVIRONMENT_MISMATCH", "Environment query parameter does not match the API key's scoped environment")
+				return
+			}
+			if queryEnv != "" && queryEnv != caller.EnvironmentName && queryEnv != caller.EnvironmentID {
+				writeJSONError(w, r, http.StatusForbidden, "ENVIRONMENT_MISMATCH", "Environment query parameter does not match the API key's scoped environment")
+				return
+			}
+
+			hdrEnvID := r.Header.Get("X-Environment-ID")
+			hdrEnv := r.Header.Get("X-Environment")
+			if hdrEnvID != "" && hdrEnvID != caller.EnvironmentID {
+				writeJSONError(w, r, http.StatusForbidden, "ENVIRONMENT_MISMATCH", "Environment header does not match the API key's scoped environment")
+				return
+			}
+			if hdrEnv != "" && hdrEnv != caller.EnvironmentName && hdrEnv != caller.EnvironmentID {
+				writeJSONError(w, r, http.StatusForbidden, "ENVIRONMENT_MISMATCH", "Environment header does not match the API key's scoped environment")
 				return
 			}
 
 			if requiredCap != "" && !CanAPIKeyPerform(caller.Capabilities, requiredCap) {
-				writeJSONError(w, http.StatusForbidden, "FORBIDDEN", fmt.Sprintf("API key lacks required capability %q", requiredCap))
+				writeJSONError(w, r, http.StatusForbidden, "FORBIDDEN", fmt.Sprintf("API key lacks required capability %q", requiredCap))
 				return
 			}
 
@@ -212,7 +290,7 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 		// Human identity role and capability check
 		member, err := h.service.GetMember(r.Context(), targetOrgID, caller.UserID)
 		if err != nil || member.Status != StatusActive {
-			writeJSONError(w, http.StatusForbidden, "FORBIDDEN_ORGANIZATION_MEMBERSHIP", "User is not an active member of the target organization")
+			writeJSONError(w, r, http.StatusForbidden, "FORBIDDEN_ORGANIZATION_MEMBERSHIP", "User is not an active member of the target organization")
 			return
 		}
 
@@ -221,7 +299,7 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 		caller.Capabilities = RoleCapabilities(member.Role)
 
 		if requiredCap != "" && !CanRolePerform(caller.Role, requiredCap) {
-			writeJSONError(w, http.StatusForbidden, "FORBIDDEN", fmt.Sprintf("Role %q lacks required capability %q", caller.Role, requiredCap))
+			writeJSONError(w, r, http.StatusForbidden, "FORBIDDEN", fmt.Sprintf("Role %q lacks required capability %q", caller.Role, requiredCap))
 			return
 		}
 
@@ -236,7 +314,7 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 func (h *HTTPHandler) HandleCreateOrganization(w http.ResponseWriter, r *http.Request) {
 	caller, _ := CallerFromContext(r.Context())
 	if caller.Type != IdentityTypeHuman {
-		writeJSONError(w, http.StatusForbidden, "MACHINE_CREATION_FORBIDDEN", "Only human users can create organizations")
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_CREATION_FORBIDDEN", "Only human users can create organizations")
 		return
 	}
 
@@ -244,13 +322,13 @@ func (h *HTTPHandler) HandleCreateOrganization(w http.ResponseWriter, r *http.Re
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "Organization name is required")
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Organization name is required")
 		return
 	}
 
 	org, err := h.service.CreateOrganization(r.Context(), caller.UserID, req.Name)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 
@@ -260,13 +338,13 @@ func (h *HTTPHandler) HandleCreateOrganization(w http.ResponseWriter, r *http.Re
 func (h *HTTPHandler) HandleListOrganizations(w http.ResponseWriter, r *http.Request) {
 	caller, _ := CallerFromContext(r.Context())
 	if caller.Type != IdentityTypeHuman {
-		writeJSONError(w, http.StatusForbidden, "MACHINE_LIST_FORBIDDEN", "Only human users can enumerate organizations")
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_LIST_FORBIDDEN", "Only human users can enumerate organizations")
 		return
 	}
 
 	memberships, err := storage.DiscoverUserMemberships(r.Context(), h.pool, caller.UserID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to discover memberships")
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to discover memberships")
 		return
 	}
 
@@ -280,10 +358,10 @@ func (h *HTTPHandler) HandleGetOrganization(w http.ResponseWriter, r *http.Reque
 	org, err := h.service.GetOrganization(r.Context(), orgID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "Organization not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Organization not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, org)
@@ -295,17 +373,17 @@ func (h *HTTPHandler) HandleUpdateOrganization(w http.ResponseWriter, r *http.Re
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "Organization name is required")
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Organization name is required")
 		return
 	}
 
 	org, err := h.service.UpdateOrganization(r.Context(), orgID, req.Name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "Organization not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Organization not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, org)
@@ -316,10 +394,10 @@ func (h *HTTPHandler) HandleDeleteOrganization(w http.ResponseWriter, r *http.Re
 	err := h.service.DeleteOrganization(r.Context(), orgID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "Organization not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Organization not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -333,7 +411,7 @@ func (h *HTTPHandler) HandleListMembers(w http.ResponseWriter, r *http.Request) 
 	orgID := r.PathValue("id")
 	members, err := h.service.ListMembers(r.Context(), orgID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
@@ -346,17 +424,17 @@ func (h *HTTPHandler) HandleAddMember(w http.ResponseWriter, r *http.Request) {
 		Role   string `json:"role"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" || req.Role == "" {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "user_id and role are required")
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "user_id and role are required")
 		return
 	}
 
 	member, err := h.service.AddMember(r.Context(), orgID, req.UserID, req.Role)
 	if err != nil {
 		if errors.Is(err, ErrInvalidRole) {
-			writeJSONError(w, http.StatusBadRequest, "INVALID_ROLE", err.Error())
+			writeJSONError(w, r, http.StatusBadRequest, "INVALID_ROLE", err.Error())
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, member)
@@ -369,25 +447,56 @@ func (h *HTTPHandler) HandleUpdateMemberRole(w http.ResponseWriter, r *http.Requ
 		Role string `json:"role"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Role == "" {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "role is required")
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "role is required")
 		return
 	}
 
 	err := h.service.UpdateMemberRole(r.Context(), orgID, targetUserID, req.Role)
 	if err != nil {
 		if errors.Is(err, ErrLastOwnerDemotion) {
-			writeJSONError(w, http.StatusForbidden, "LAST_OWNER_DEMOTION_FORBIDDEN", err.Error())
+			writeJSONError(w, r, http.StatusForbidden, "LAST_OWNER_DEMOTION_FORBIDDEN", err.Error())
 			return
 		}
 		if errors.Is(err, ErrInvalidRole) {
-			writeJSONError(w, http.StatusBadRequest, "INVALID_ROLE", err.Error())
+			writeJSONError(w, r, http.StatusBadRequest, "INVALID_ROLE", err.Error())
 			return
 		}
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "Member not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Member not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+func (h *HTTPHandler) HandleUpdateMemberStatus(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	targetUserID := r.PathValue("userId")
+	var req struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Status == "" {
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "status is required")
+		return
+	}
+
+	err := h.service.UpdateMemberStatus(r.Context(), orgID, targetUserID, req.Status)
+	if err != nil {
+		if errors.Is(err, ErrLastOwnerSuspension) {
+			writeJSONError(w, r, http.StatusForbidden, "LAST_OWNER_SUSPENSION_FORBIDDEN", err.Error())
+			return
+		}
+		if errors.Is(err, ErrInvalidStatus) {
+			writeJSONError(w, r, http.StatusBadRequest, "INVALID_STATUS", err.Error())
+			return
+		}
+		if errors.Is(err, ErrNotFound) {
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Member not found")
+			return
+		}
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -400,14 +509,14 @@ func (h *HTTPHandler) HandleRemoveMember(w http.ResponseWriter, r *http.Request)
 	err := h.service.RemoveMember(r.Context(), orgID, targetUserID)
 	if err != nil {
 		if errors.Is(err, ErrLastOwnerRemoval) {
-			writeJSONError(w, http.StatusForbidden, "LAST_OWNER_REMOVAL_FORBIDDEN", err.Error())
+			writeJSONError(w, r, http.StatusForbidden, "LAST_OWNER_REMOVAL_FORBIDDEN", err.Error())
 			return
 		}
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "Member not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Member not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -421,7 +530,7 @@ func (h *HTTPHandler) HandleListProjects(w http.ResponseWriter, r *http.Request)
 	caller, _ := CallerFromContext(r.Context())
 	projects, err := h.service.ListProjects(r.Context(), caller.OrganizationID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
@@ -433,13 +542,13 @@ func (h *HTTPHandler) HandleCreateProject(w http.ResponseWriter, r *http.Request
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "Project name is required")
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Project name is required")
 		return
 	}
 
 	project, err := h.service.CreateProject(r.Context(), caller.OrganizationID, req.Name)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, project)
@@ -455,7 +564,7 @@ func (h *HTTPHandler) HandleListEnvironments(w http.ResponseWriter, r *http.Requ
 
 	envs, err := h.service.ListEnvironments(r.Context(), caller.OrganizationID, projectID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"environments": envs})
@@ -469,21 +578,21 @@ func (h *HTTPHandler) HandleCreateEnvironment(w http.ResponseWriter, r *http.Req
 		MaxConcurrency int    `json:"max_concurrency"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "Environment name is required")
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Environment name is required")
 		return
 	}
 
 	env, err := h.service.CreateEnvironment(r.Context(), caller.OrganizationID, projectID, req.Name, req.MaxConcurrency)
 	if err != nil {
 		if errors.Is(err, ErrInvalidEnvironment) {
-			writeJSONError(w, http.StatusBadRequest, "INVALID_ENVIRONMENT", err.Error())
+			writeJSONError(w, r, http.StatusBadRequest, "INVALID_ENVIRONMENT", err.Error())
 			return
 		}
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "Project not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Project not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, env)
@@ -502,21 +611,21 @@ func (h *HTTPHandler) HandleCreateAPIKey(w http.ResponseWriter, r *http.Request)
 		ExpiryDays   int      `json:"expiry_days"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid JSON payload")
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Invalid JSON payload")
 		return
 	}
 
 	key, err := h.service.CreateAPIKey(r.Context(), caller.OrganizationID, envID, req.Capabilities, req.ExpiryDays)
 	if err != nil {
 		if errors.Is(err, ErrMachineKeyRestricted) {
-			writeJSONError(w, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", err.Error())
+			writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", err.Error())
 			return
 		}
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "Environment not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Environment not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 
@@ -529,10 +638,36 @@ func (h *HTTPHandler) HandleListAPIKeys(w http.ResponseWriter, r *http.Request) 
 
 	keys, err := h.service.ListAPIKeys(r.Context(), caller.OrganizationID, envID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"api_keys": keys})
+}
+
+func (h *HTTPHandler) HandleRotateAPIKey(w http.ResponseWriter, r *http.Request) {
+	caller, _ := CallerFromContext(r.Context())
+	keyID := r.PathValue("id")
+
+	var req struct {
+		ExpiryDays int `json:"expiry_days"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	key, err := h.service.RotateAPIKey(r.Context(), caller.OrganizationID, keyID, req.ExpiryDays)
+	if err != nil {
+		if errors.Is(err, ErrKeyRevoked) {
+			writeJSONError(w, r, http.StatusBadRequest, "API_KEY_REVOKED", "Cannot rotate an already revoked API key")
+			return
+		}
+		if errors.Is(err, ErrNotFound) {
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "API key not found")
+			return
+		}
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, key)
 }
 
 func (h *HTTPHandler) HandleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
@@ -542,10 +677,10 @@ func (h *HTTPHandler) HandleRevokeAPIKey(w http.ResponseWriter, r *http.Request)
 	err := h.service.RevokeAPIKey(r.Context(), caller.OrganizationID, keyID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "API key not found")
+			writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "API key not found")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -569,13 +704,29 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+func writeJSONError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]string{
-			"code":    code,
-			"message": message,
-		},
+
+	reqID := ""
+	if r != nil {
+		if id, ok := r.Context().Value(requestIDKey).(string); ok && id != "" {
+			reqID = id
+		} else {
+			reqID = r.Header.Get("X-Request-ID")
+		}
+	}
+	if reqID == "" {
+		reqID = "req-unknown"
+	}
+
+	retryable := status >= 500 || status == http.StatusTooManyRequests
+
+	_ = json.NewEncoder(w).Encode(ErrorEnvelope{
+		Code:      code,
+		Message:   message,
+		RequestID: reqID,
+		Details:   map[string]any{},
+		Retryable: retryable,
 	})
 }

@@ -54,9 +54,12 @@ API keys are machine credentials intended for headless CI/CD pipelines and self-
 ### 2.2 Environment Scoping & Expiry
 
 - **Single Environment Binding:** Each API key belongs to **exactly one** environment (e.g. `staging` or `production`). Keys cannot cross environment boundaries.
+- **Strict Environment Mismatch Rejection:** Requests carrying an API key that specify a mismatched environment in path parameters (`envId`), query parameters (`environment`, `env_id`), or HTTP headers (`X-Environment`, `X-Environment-ID`) are strictly rejected with HTTP `403 Forbidden` (`ENVIRONMENT_MISMATCH`), preventing accidental or cross-environment operational hazards (Blueprint §20.1).
 - **Default Expiry:** Keys default to a 90-day expiration window.
 - **Revocation:** Keys can be immediately revoked via `DELETE /api/v1/api-keys/{id}`. Revocation is checked on every invocation.
-- **Last-Used Auditing:** `last_used_at` timestamps are updated on successful authentication within the tenant's transaction-local context.
+- **Atomic Rotation:** API keys can be atomically rotated via `POST /api/v1/api-keys/{id}/rotate`. In a single atomic database transaction, the existing key is marked as revoked (`revoked_at = clock_timestamp()`) and a fresh replacement key is generated with identical environment scoping and capabilities, returning the new plaintext key exactly once.
+- **Timing Side-Channel Protection:** Key authentication executes a dummy constant-time comparison even when a prefix lookup yields zero results, preventing timing-based enumeration of valid key prefixes.
+- **Write Throttling for High Concurrency:** `last_used_at` timestamps are throttled to update at most once per 60 seconds per key, preventing row-level lock contention and write amplification under heavy parallel traffic.
 
 ### 2.3 Machine Key Authorization Restrictions
 
@@ -77,15 +80,24 @@ API keys are machine credentials intended for headless CI/CD pipelines and self-
 - Any query executed without this context evaluates to `NULL`, failing closed with zero rows returned.
 - Composite foreign keys (e.g., `(organization_id, id)`) prevent resources owned by Organization A from referencing projects or environments belonging to Organization B.
 
-### 3.2 Last Owner Defense
+### 3.2 Last Owner Defense & Concurrency Serialization
 
-To prevent accidental tenant abandonment, Deadbolt strictly enforces the **Last Owner Defense**:
+To prevent accidental tenant abandonment or orphan organizations, Deadbolt strictly enforces the **Last Owner Defense**:
 
 - Rejects any attempt to demote the sole remaining active `Owner` of an organization (`LAST_OWNER_DEMOTION_FORBIDDEN`).
+- Rejects any attempt to suspend the sole remaining active `Owner` (`LAST_OWNER_SUSPENSION_FORBIDDEN`).
 - Rejects any attempt to remove the sole remaining active `Owner` (`LAST_OWNER_REMOVAL_FORBIDDEN`).
-- An organization must always retain at least one active Owner identity.
+- **Serialized Concurrency (Row-Level Locking):** All membership mutations that affect Owner roles (`UpdateMemberRole`, `UpdateMemberStatus`, `RemoveMember`) acquire an explicit row-level lock on the organization record (`SELECT id FROM organizations WHERE id = $1 FOR UPDATE`) within the tenant transaction. This serializes parallel mutation requests and prevents race conditions where two simultaneous removal requests might both pass active Owner counts and orphan the organization.
 
-### 3.3 Restricted Discovery Functions
+### 3.3 CSRF & Origin Defense for Human Sessions
+
+In accordance with Blueprint §24.1:
+- State-mutating HTTP requests (`POST`, `PATCH`, `DELETE`) authenticated via ambient human session cookies (`__Host-runtime_session` or `runtime_session`) require:
+  1. A valid `Origin` header matching the platform's configured allowlist (rejects untrusted or absent origins with `403 ORIGIN_FORBIDDEN`).
+  2. A valid `X-CSRF-Token` header cryptographically verified against the session's HMAC-SHA256 token hash (rejects missing or mismatched tokens with `403 CSRF_TOKEN_INVALID`).
+- Bearer API keys used by headless automation are explicitly exempt from ambient browser CSRF and Origin checks.
+
+### 3.4 Restricted Discovery Functions
 
 - Discovery of user memberships and API key resolution execute narrowly scoped `SECURITY DEFINER` functions with locked-down `search_path = app, public, pg_temp`:
   - `app.discover_user_memberships(p_user_id UUID)`: Returns only organizations where the verified user is an active member.

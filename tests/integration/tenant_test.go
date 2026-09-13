@@ -10,16 +10,26 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// setupTenantSuite initializes DB and builds tenant Service and HTTPHandler for integration testing.
-func setupTenantSuite(t *testing.T) (*tenant.Service, *tenant.HTTPHandler, func()) {
+type tenantTestContext struct {
+	service      *tenant.Service
+	handler      *tenant.HTTPHandler
+	sessionStore *auth.SessionStore
+	authCfg      auth.Config
+	runtimePool  *pgxpool.Pool
+	cleanup      func()
+}
+
+func setupTenantContext(t *testing.T) *tenantTestContext {
 	t.Helper()
 	db, runtimePool, _ := setupTestDB(t)
 
@@ -31,6 +41,7 @@ func setupTenantSuite(t *testing.T) (*tenant.Service, *tenant.HTTPHandler, func(
 		CookieSecure:           true,
 		SessionIdleTimeout:     12 * time.Hour,
 		SessionAbsoluteTimeout: 7 * 24 * time.Hour,
+		AllowedOrigins:         []string{"http://localhost:3000", "http://localhost:8080"},
 	}
 	sessionStore := auth.NewSessionStore(runtimePool)
 	handler := tenant.NewHTTPHandler(service, runtimePool, sessionStore, authCfg)
@@ -39,7 +50,20 @@ func setupTenantSuite(t *testing.T) (*tenant.Service, *tenant.HTTPHandler, func(
 		db.Close()
 		runtimePool.Close()
 	}
-	return service, handler, cleanup
+	return &tenantTestContext{
+		service:      service,
+		handler:      handler,
+		sessionStore: sessionStore,
+		authCfg:      authCfg,
+		runtimePool:  runtimePool,
+		cleanup:      cleanup,
+	}
+}
+
+// setupTenantSuite initializes DB and builds tenant Service and HTTPHandler for integration testing.
+func setupTenantSuite(t *testing.T) (*tenant.Service, *tenant.HTTPHandler, func()) {
+	tc := setupTenantContext(t)
+	return tc.service, tc.handler, tc.cleanup
 }
 
 // 1. TestOrganizationBootstrapAndOwnerCreation
@@ -629,5 +653,538 @@ func TestHTTPTenantEndpoints(t *testing.T) {
 
 	if respRevoke.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204 No Content for key revocation, got %d", respRevoke.StatusCode)
+	}
+}
+
+// 11. TestErrorEnvelopeFormat (Blueprint §20.1 & §25.1)
+func TestErrorEnvelopeFormat(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Test 401 Unauthenticated ErrorEnvelope
+	req, _ := http.NewRequest("GET", server.URL+"/api/v1/organizations", nil)
+	req.Header.Set("X-Request-ID", "custom-trace-id-12345")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+
+	var env tenant.ErrorEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("failed to decode ErrorEnvelope: %v", err)
+	}
+	if env.Code != "UNAUTHENTICATED" {
+		t.Fatalf("expected code UNAUTHENTICATED, got %q", env.Code)
+	}
+	if env.RequestID != "custom-trace-id-12345" {
+		t.Fatalf("expected requestId custom-trace-id-12345, got %q", env.RequestID)
+	}
+	if env.Details == nil {
+		t.Fatalf("expected details map, got nil")
+	}
+	if env.Retryable != false {
+		t.Fatalf("expected retryable false for 401, got %v", env.Retryable)
+	}
+
+	// 2. Test response header contains X-Request-ID
+	if resp.Header.Get("X-Request-ID") != "custom-trace-id-12345" {
+		t.Fatalf("expected response header X-Request-ID custom-trace-id-12345, got %q", resp.Header.Get("X-Request-ID"))
+	}
+}
+
+// 12. TestEnvironmentMismatchRejection (Blueprint §20.1 & §24.3)
+func TestEnvironmentMismatchRejection(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Mismatch Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Mismatch Project")
+	stagingEnv, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvStaging, 10)
+	prodEnv, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	// API key bound strictly to staging
+	key, err := tc.service.CreateAPIKey(ctx, org.ID, stagingEnv.ID, []string{tenant.CapRunRead, tenant.CapPayloadRead}, 90)
+	if err != nil {
+		t.Fatalf("CreateAPIKey failed: %v", err)
+	}
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// Scenario A: Mismatched URL path envId
+	reqA, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/environments/%s/payload-preview", server.URL, prodEnv.ID), nil)
+	reqA.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqA.Header.Set("X-Organization-ID", org.ID)
+	respA, err := http.DefaultClient.Do(reqA)
+	if err != nil {
+		t.Fatalf("reqA failed: %v", err)
+	}
+	defer respA.Body.Close()
+	if respA.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for mismatched path envId, got %d", respA.StatusCode)
+	}
+	var envA tenant.ErrorEnvelope
+	_ = json.NewDecoder(respA.Body).Decode(&envA)
+	if envA.Code != "ENVIRONMENT_MISMATCH" {
+		t.Fatalf("expected ENVIRONMENT_MISMATCH, got %q", envA.Code)
+	}
+
+	// Scenario B: Mismatched query parameter ?environment=production
+	reqB, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/environments/%s/payload-preview?environment=production", server.URL, stagingEnv.ID), nil)
+	reqB.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqB.Header.Set("X-Organization-ID", org.ID)
+	respB, err := http.DefaultClient.Do(reqB)
+	if err != nil {
+		t.Fatalf("reqB failed: %v", err)
+	}
+	defer respB.Body.Close()
+	if respB.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for mismatched query param, got %d", respB.StatusCode)
+	}
+
+	// Scenario C: Mismatched header X-Environment: production
+	reqC, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/environments/%s/payload-preview", server.URL, stagingEnv.ID), nil)
+	reqC.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqC.Header.Set("X-Organization-ID", org.ID)
+	reqC.Header.Set("X-Environment", "production")
+	respC, err := http.DefaultClient.Do(reqC)
+	if err != nil {
+		t.Fatalf("reqC failed: %v", err)
+	}
+	defer respC.Body.Close()
+	if respC.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for mismatched header, got %d", respC.StatusCode)
+	}
+
+	// Scenario D: Valid matching environment staging -> 200 OK
+	reqD, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/environments/%s/payload-preview?environment=staging", server.URL, stagingEnv.ID), nil)
+	reqD.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqD.Header.Set("X-Organization-ID", org.ID)
+	reqD.Header.Set("X-Environment", "staging")
+	respD, err := http.DefaultClient.Do(reqD)
+	if err != nil {
+		t.Fatalf("reqD failed: %v", err)
+	}
+	defer respD.Body.Close()
+	if respD.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid matching environment, got %d", respD.StatusCode)
+	}
+}
+
+// 13. TestCSRFAndOriginEnforcementOnMutations (Blueprint §24.1)
+func TestCSRFAndOriginEnforcementOnMutations(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	if _, err := tc.runtimePool.Exec(ctx, "INSERT INTO users (id, email, name) VALUES ($1, $2, $3)", ownerID, "owner@bff.test", "BFF Owner"); err != nil {
+		t.Fatalf("failed to insert test user: %v", err)
+	}
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "BFF Security Corp")
+
+	// Create valid human session
+	sess, sessionToken, csrfToken, err := tc.sessionStore.CreateSession(
+		ctx,
+		ownerID,
+		&org.ID,
+		"127.0.0.1",
+		"TestAgent",
+		tc.authCfg.SessionIdleTimeout,
+		tc.authCfg.SessionAbsoluteTimeout,
+	)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if sess == nil {
+		t.Fatalf("expected non-nil session")
+	}
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	cookie := &http.Cookie{
+		Name:  tc.authCfg.SessionCookieName(),
+		Value: sessionToken,
+	}
+
+	// 1. Mutating POST without Origin -> rejected with 403 ORIGIN_FORBIDDEN
+	req1, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Proj1"}`))
+	req1.AddCookie(cookie)
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-CSRF-Token", csrfToken)
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatalf("req1 failed: %v", err)
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for missing Origin, got %d", resp1.StatusCode)
+	}
+
+	// 2. Mutating POST with untrusted Origin -> rejected with 403 ORIGIN_FORBIDDEN
+	req2, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Proj1"}`))
+	req2.AddCookie(cookie)
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Origin", "https://attacker.evil.com")
+	req2.Header.Set("X-CSRF-Token", csrfToken)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("req2 failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for untrusted Origin, got %d", resp2.StatusCode)
+	}
+
+	// 3. Mutating POST with valid Origin but missing X-CSRF-Token -> rejected with 403 CSRF_VALIDATION_FAILED
+	req3, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Proj1"}`))
+	req3.AddCookie(cookie)
+	req3.Header.Set("Content-Type", "application/json")
+	req3.Header.Set("Origin", "http://localhost:3000")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatalf("req3 failed: %v", err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for missing CSRF token, got %d", resp3.StatusCode)
+	}
+
+	// 4. Mutating POST with valid Origin and valid X-CSRF-Token -> 201 Created
+	req4, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Valid Project"}`))
+	req4.AddCookie(cookie)
+	req4.Header.Set("Content-Type", "application/json")
+	req4.Header.Set("Origin", "http://localhost:3000")
+	req4.Header.Set("X-CSRF-Token", csrfToken)
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatalf("req4 failed: %v", err)
+	}
+	defer resp4.Body.Close()
+	if resp4.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created with valid CSRF & Origin, got %d", resp4.StatusCode)
+	}
+
+	// 5. Safe GET method does NOT require CSRF token -> 200 OK
+	req5, _ := http.NewRequest("GET", server.URL+"/api/v1/projects", nil)
+	req5.AddCookie(cookie)
+	resp5, err := http.DefaultClient.Do(req5)
+	if err != nil {
+		t.Fatalf("req5 failed: %v", err)
+	}
+	defer resp5.Body.Close()
+	if resp5.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for GET without CSRF token, got %d", resp5.StatusCode)
+	}
+}
+
+// 14. TestAPIKeyRotation (Blueprint §24.4)
+func TestAPIKeyRotation(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Rotation Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Rotation Project")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	caps := []string{tenant.CapRunCreate, tenant.CapRunRead}
+	originalKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, caps, 90)
+	if err != nil {
+		t.Fatalf("CreateAPIKey failed: %v", err)
+	}
+
+	// Create an admin key with CapAdminKey to perform administrative rotation
+	adminKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapAdminKey}, 90)
+	if err != nil {
+		t.Fatalf("CreateAPIKey for adminKey failed: %v", err)
+	}
+
+	// Verify original key authenticates
+	auth1, err := tc.service.AuthenticateAPIKey(ctx, originalKey.PlaintextKey)
+	if err != nil || auth1 == nil {
+		t.Fatalf("original key authentication failed: %v", err)
+	}
+
+	// Rotate key via HTTP endpoint
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Unprivileged key without admin:key must be rejected with 403 Forbidden
+	unauthReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, originalKey.ID), strings.NewReader(`{"expiry_days": 60}`))
+	unauthReq.Header.Set("Authorization", "Bearer "+originalKey.PlaintextKey)
+	unauthReq.Header.Set("X-Organization-ID", org.ID)
+	unauthReq.Header.Set("Content-Type", "application/json")
+	unauthResp, err := http.DefaultClient.Do(unauthReq)
+	if err != nil {
+		t.Fatalf("unauth request failed: %v", err)
+	}
+	defer unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for unprivileged key rotation, got %d", unauthResp.StatusCode)
+	}
+
+	// 2. Admin key with admin:key successfully rotates key
+	rotateReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, originalKey.ID), strings.NewReader(`{"expiry_days": 60}`))
+	rotateReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	rotateReq.Header.Set("X-Organization-ID", org.ID)
+	rotateReq.Header.Set("Content-Type", "application/json")
+
+	rotateResp, err := http.DefaultClient.Do(rotateReq)
+	if err != nil {
+		t.Fatalf("rotate request failed: %v", err)
+	}
+	defer rotateResp.Body.Close()
+
+	if rotateResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for key rotation, got %d", rotateResp.StatusCode)
+	}
+
+	var rotatedKey tenant.GeneratedKey
+	if err := json.NewDecoder(rotateResp.Body).Decode(&rotatedKey); err != nil {
+		t.Fatalf("failed to decode rotated key: %v", err)
+	}
+
+	if rotatedKey.ID == originalKey.ID {
+		t.Fatalf("rotated key must have new ID")
+	}
+	if rotatedKey.PlaintextKey == originalKey.PlaintextKey {
+		t.Fatalf("rotated key must have new plaintext key")
+	}
+	if rotatedKey.EnvironmentID != env.ID {
+		t.Fatalf("rotated key must retain environment binding")
+	}
+	if rotatedKey.EnvironmentName != tenant.EnvProduction {
+		t.Fatalf("expected environment_name production, got %q", rotatedKey.EnvironmentName)
+	}
+
+	// Old key must now be revoked
+	_, err = tc.service.AuthenticateAPIKey(ctx, originalKey.PlaintextKey)
+	if err == nil || !errors.Is(err, tenant.ErrKeyRevoked) {
+		t.Fatalf("expected old key to be revoked, got: %v", err)
+	}
+
+	// New key must authenticate successfully
+	authNew, err := tc.service.AuthenticateAPIKey(ctx, rotatedKey.PlaintextKey)
+	if err != nil || authNew == nil {
+		t.Fatalf("new key authentication failed: %v", err)
+	}
+	if authNew.EnvironmentName != tenant.EnvProduction {
+		t.Fatalf("expected authenticated key environment_name production, got %q", authNew.EnvironmentName)
+	}
+
+	// Rotating an already revoked key must fail
+	_, err = tc.service.RotateAPIKey(ctx, org.ID, originalKey.ID, 30)
+	if err == nil || !errors.Is(err, tenant.ErrKeyRevoked) {
+		t.Fatalf("expected ErrKeyRevoked when rotating revoked key, got: %v", err)
+	}
+}
+
+// 15. TestMemberStatusAndLastOwnerSuspension (Blueprint §24.2 & §24.3)
+func TestMemberStatusAndLastOwnerSuspension(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	devID, _ := tenant.NewUUID()
+
+	org, err := tc.service.CreateOrganization(ctx, ownerID, "Status Corp")
+	if err != nil {
+		t.Fatalf("CreateOrganization failed: %v", err)
+	}
+
+	// Add Developer member
+	devMember, err := tc.service.AddMember(ctx, org.ID, devID, tenant.RoleDeveloper)
+	if err != nil {
+		t.Fatalf("AddMember failed: %v", err)
+	}
+	if devMember.Status != tenant.StatusActive {
+		t.Fatalf("expected active status")
+	}
+
+	// 1. Suspend Developer -> succeeds
+	err = tc.service.UpdateMemberStatus(ctx, org.ID, devID, tenant.StatusSuspended)
+	if err != nil {
+		t.Fatalf("UpdateMemberStatus suspend failed: %v", err)
+	}
+
+	// Verify Developer is suspended
+	m, err := tc.service.GetMember(ctx, org.ID, devID)
+	if err != nil || m.Status != tenant.StatusSuspended {
+		t.Fatalf("expected member to be SUSPENDED, got %+v", m)
+	}
+
+	// 2. Attempt to suspend the sole active Owner -> rejected with ErrLastOwnerSuspension
+	err = tc.service.UpdateMemberStatus(ctx, org.ID, ownerID, tenant.StatusSuspended)
+	if err == nil || !errors.Is(err, tenant.ErrLastOwnerSuspension) {
+		t.Fatalf("expected ErrLastOwnerSuspension when suspending sole Owner, got: %v", err)
+	}
+
+	// 3. Add second Owner -> now Owner 1 can be suspended
+	owner2ID, _ := tenant.NewUUID()
+	_, err = tc.service.AddMember(ctx, org.ID, owner2ID, tenant.RoleOwner)
+	if err != nil {
+		t.Fatalf("AddMember owner2 failed: %v", err)
+	}
+
+	err = tc.service.UpdateMemberStatus(ctx, org.ID, ownerID, tenant.StatusSuspended)
+	if err != nil {
+		t.Fatalf("expected suspending Owner 1 to succeed with second active Owner present, got: %v", err)
+	}
+
+	// 4. Attempting to suspend Owner 2 now fails because Owner 2 is the last remaining active Owner
+	err = tc.service.UpdateMemberStatus(ctx, org.ID, owner2ID, tenant.StatusSuspended)
+	if err == nil || !errors.Is(err, tenant.ErrLastOwnerSuspension) {
+		t.Fatalf("expected ErrLastOwnerSuspension when suspending last remaining Owner 2, got: %v", err)
+	}
+}
+
+// 16. TestLastOwnerDefenseConcurrentRace (Blueprint §24.2 & §24.3)
+func TestLastOwnerDefenseConcurrentRace(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerA, _ := tenant.NewUUID()
+	ownerB, _ := tenant.NewUUID()
+
+	org, err := tc.service.CreateOrganization(ctx, ownerA, "Concurrent Corp")
+	if err != nil {
+		t.Fatalf("CreateOrganization failed: %v", err)
+	}
+
+	_, err = tc.service.AddMember(ctx, org.ID, ownerB, tenant.RoleOwner)
+	if err != nil {
+		t.Fatalf("AddMember ownerB failed: %v", err)
+	}
+
+	// Simulate concurrent race: Owner A attempts to remove Owner B while Owner B attempts to remove Owner A
+	var wg sync.WaitGroup
+	var errA, errB error
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		errA = tc.service.RemoveMember(ctx, org.ID, ownerA)
+	}()
+
+	go func() {
+		defer wg.Done()
+		errB = tc.service.RemoveMember(ctx, org.ID, ownerB)
+	}()
+
+	wg.Wait()
+
+	// Exactly ONE removal should succeed, and the other MUST fail with ErrLastOwnerRemoval
+	if errA == nil && errB == nil {
+		t.Fatalf("RACE CONDITION DISASTER: Both owners were removed! Organization was orphaned!")
+	}
+	if (errA == nil && !errors.Is(errB, tenant.ErrLastOwnerRemoval)) || (errB == nil && !errors.Is(errA, tenant.ErrLastOwnerRemoval)) {
+		t.Fatalf("unexpected error pair: errA=%v, errB=%v", errA, errB)
+	}
+
+	// Verify organization retains exactly 1 active Owner
+	members, err := tc.service.ListMembers(ctx, org.ID)
+	if err != nil {
+		t.Fatalf("ListMembers failed: %v", err)
+	}
+	activeOwners := 0
+	for _, m := range members {
+		if m.Role == tenant.RoleOwner && m.Status == tenant.StatusActive {
+			activeOwners++
+		}
+	}
+	if activeOwners != 1 {
+		t.Fatalf("expected exactly 1 active owner after concurrent removal race, got %d", activeOwners)
+	}
+}
+
+// 17. TestAPIKeyLastUsedAtThrottling (Blueprint §24.4)
+func TestAPIKeyLastUsedAtThrottling(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Throttle Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Throttle Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	key, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90)
+	if err != nil {
+		t.Fatalf("CreateAPIKey failed: %v", err)
+	}
+
+	// 1st authentication -> updates last_used_at
+	auth1, err := tc.service.AuthenticateAPIKey(ctx, key.PlaintextKey)
+	if err != nil {
+		t.Fatalf("first authenticate failed: %v", err)
+	}
+	if auth1.LastUsedAt == nil {
+		t.Fatalf("expected last_used_at to be populated")
+	}
+
+	// 2nd authentication immediately after -> should succeed without error
+	auth2, err := tc.service.AuthenticateAPIKey(ctx, key.PlaintextKey)
+	if err != nil {
+		t.Fatalf("second authenticate failed: %v", err)
+	}
+	if auth2 == nil {
+		t.Fatalf("expected non-nil key")
+	}
+}
+
+// 18. TestDualRouteMounting (OpenAPI /v1 and Gateway /api/v1)
+func TestDualRouteMounting(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Route Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Route Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvStaging, 10)
+	key, _ := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead, tenant.CapOrgRead}, 90)
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// Call via /api/v1/projects
+	req1, _ := http.NewRequest("GET", server.URL+"/api/v1/projects", nil)
+	req1.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	req1.Header.Set("X-Organization-ID", org.ID)
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatalf("req1 failed: %v", err)
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /api/v1/projects, got %d", resp1.StatusCode)
+	}
+
+	// Call via /v1/projects
+	req2, _ := http.NewRequest("GET", server.URL+"/v1/projects", nil)
+	req2.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	req2.Header.Set("X-Organization-ID", org.ID)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("req2 failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/projects, got %d", resp2.StatusCode)
 	}
 }

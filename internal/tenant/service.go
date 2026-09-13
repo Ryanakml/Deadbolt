@@ -182,6 +182,12 @@ func (s *Service) UpdateMemberRole(ctx context.Context, orgID string, targetUser
 	}
 
 	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		// Acquire row lock on organization to serialize member modifications and prevent race conditions
+		var lockedOrgID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
+			return err
+		}
+
 		// 1. Get current member role and status
 		var currentRole, status string
 		queryCurr := `SELECT role, status FROM organization_members WHERE organization_id = $1 AND user_id = $2`
@@ -226,9 +232,72 @@ func (s *Service) UpdateMemberRole(ctx context.Context, orgID string, targetUser
 	})
 }
 
+// UpdateMemberStatus updates a member's status (ACTIVE / SUSPENDED) while strictly enforcing Last Owner Defense.
+func (s *Service) UpdateMemberStatus(ctx context.Context, orgID string, targetUserID string, newStatus string) error {
+	if newStatus != StatusActive && newStatus != StatusSuspended {
+		return ErrInvalidStatus
+	}
+
+	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		// Acquire row lock on organization to serialize member modifications
+		var lockedOrgID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
+			return err
+		}
+
+		// 1. Get current member role and status
+		var currentRole, status string
+		queryCurr := `SELECT role, status FROM organization_members WHERE organization_id = $1 AND user_id = $2`
+		err := tx.QueryRow(ctx, queryCurr, orgID, targetUserID).Scan(&currentRole, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		// 2. Last Owner Defense: If target user is an active Owner and new status is SUSPENDED
+		if currentRole == RoleOwner && status == StatusActive && newStatus == StatusSuspended {
+			var ownerCount int
+			countQuery := `
+				SELECT COUNT(*)
+				FROM organization_members
+				WHERE organization_id = $1 AND role = $2 AND status = $3
+			`
+			if err := tx.QueryRow(ctx, countQuery, orgID, RoleOwner, StatusActive).Scan(&ownerCount); err != nil {
+				return err
+			}
+			if ownerCount <= 1 {
+				return ErrLastOwnerSuspension
+			}
+		}
+
+		// 3. Update status
+		updateQuery := `
+			UPDATE organization_members
+			SET status = $3, updated_at = clock_timestamp()
+			WHERE organization_id = $1 AND user_id = $2
+		`
+		tag, err := tx.Exec(ctx, updateQuery, orgID, targetUserID, newStatus)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // RemoveMember removes a member while strictly enforcing Last Owner Defense.
 func (s *Service) RemoveMember(ctx context.Context, orgID string, targetUserID string) error {
 	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		// Acquire row lock on organization to serialize member modifications and prevent race conditions
+		var lockedOrgID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
+			return err
+		}
+
 		// 1. Get current member role and status
 		var currentRole, status string
 		queryCurr := `SELECT role, status FROM organization_members WHERE organization_id = $1 AND user_id = $2`
@@ -475,7 +544,8 @@ func (s *Service) GetEnvironment(ctx context.Context, orgID string, envID string
 // CreateAPIKey generates a cryptographically secure, environment-scoped API key.
 // Plaintext secret is returned exactly once in GeneratedKey.
 func (s *Service) CreateAPIKey(ctx context.Context, orgID string, envID string, capabilities []string, expiryDays int) (*GeneratedKey, error) {
-	// 1. Validate capabilities: machine keys barred from approval & reconciliation
+	// 1. Sanitize & validate capabilities: machine keys barred from approval & reconciliation
+	capabilities = SanitizeCapabilities(capabilities)
 	if err := ValidateKeyCapabilities(capabilities, true); err != nil {
 		return nil, err
 	}
@@ -515,6 +585,7 @@ func (s *Service) CreateAPIKey(ctx context.Context, orgID string, envID string, 
 		genKey.PlaintextKey = plaintextKey
 		genKey.Prefix = prefix
 		genKey.EnvironmentID = envID
+		genKey.EnvironmentName = envName
 		genKey.Capabilities = capabilities
 		genKey.ExpiresAt = expiresAt
 		return nil
@@ -530,10 +601,11 @@ func (s *Service) ListAPIKeys(ctx context.Context, orgID string, envID string) (
 	var keys []APIKeySummary
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		query := `
-			SELECT id, environment_id, prefix, capabilities, expires_at, revoked_at, created_at, last_used_at
-			FROM api_keys
-			WHERE organization_id = $1 AND environment_id = $2
-			ORDER BY created_at DESC
+			SELECT ak.id, ak.environment_id, e.name, ak.prefix, ak.capabilities, ak.expires_at, ak.revoked_at, ak.created_at, ak.last_used_at
+			FROM api_keys ak
+			JOIN environments e ON e.id = ak.environment_id AND e.organization_id = ak.organization_id
+			WHERE ak.organization_id = $1 AND ak.environment_id = $2
+			ORDER BY ak.created_at DESC
 		`
 		rows, err := tx.Query(ctx, query, orgID, envID)
 		if err != nil {
@@ -543,7 +615,7 @@ func (s *Service) ListAPIKeys(ctx context.Context, orgID string, envID string) (
 
 		for rows.Next() {
 			var k APIKeySummary
-			if err := rows.Scan(&k.ID, &k.EnvironmentID, &k.Prefix, &k.Capabilities, &k.ExpiresAt, &k.RevokedAt, &k.CreatedAt, &k.LastUsedAt); err != nil {
+			if err := rows.Scan(&k.ID, &k.EnvironmentID, &k.EnvironmentName, &k.Prefix, &k.Capabilities, &k.ExpiresAt, &k.RevokedAt, &k.CreatedAt, &k.LastUsedAt); err != nil {
 				return err
 			}
 			keys = append(keys, k)
@@ -581,18 +653,97 @@ func (s *Service) RevokeAPIKey(ctx context.Context, orgID string, keyID string) 
 	})
 }
 
+// RotateAPIKey atomically revokes the existing key and generates a new key with identical environment & capabilities.
+func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, expiryDays int) (*GeneratedKey, error) {
+	var genKey GeneratedKey
+	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		// 1. Select existing key with row lock
+		var envID string
+		var caps []string
+		var revokedAt *time.Time
+		query := `
+			SELECT environment_id, capabilities, revoked_at
+			FROM api_keys
+			WHERE organization_id = $1 AND id = $2
+			FOR UPDATE
+		`
+		err := tx.QueryRow(ctx, query, orgID, keyID).Scan(&envID, &caps, &revokedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if revokedAt != nil {
+			return ErrKeyRevoked
+		}
+
+		// 2. Lookup environment name
+		var envName string
+		queryEnv := `SELECT name FROM environments WHERE organization_id = $1 AND id = $2`
+		err = tx.QueryRow(ctx, queryEnv, orgID, envID).Scan(&envName)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		// 3. Generate new key material
+		prefix, plaintextKey, hashedSecret, err := GenerateAPIKeyMaterial(envName)
+		if err != nil {
+			return fmt.Errorf("failed to generate key material: %w", err)
+		}
+		expiresAt := CalculateExpiry(expiryDays)
+
+		// 4. Insert new key
+		insertQuery := `
+			INSERT INTO api_keys (organization_id, environment_id, prefix, hashed_secret, capabilities, expires_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING id, created_at
+		`
+		if err := tx.QueryRow(ctx, insertQuery, orgID, envID, prefix, hashedSecret, caps, expiresAt).
+			Scan(&genKey.ID, &genKey.CreatedAt); err != nil {
+			return fmt.Errorf("failed to insert rotated api key: %w", err)
+		}
+
+		// 5. Revoke old key atomically
+		revokeQuery := `
+			UPDATE api_keys
+			SET revoked_at = clock_timestamp()
+			WHERE organization_id = $1 AND id = $2
+		`
+		if _, err := tx.Exec(ctx, revokeQuery, orgID, keyID); err != nil {
+			return fmt.Errorf("failed to revoke rotated api key: %w", err)
+		}
+
+		genKey.PlaintextKey = plaintextKey
+		genKey.Prefix = prefix
+		genKey.EnvironmentID = envID
+		genKey.EnvironmentName = envName
+		genKey.Capabilities = caps
+		genKey.ExpiresAt = expiresAt
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &genKey, nil
+}
+
 // AuthenticateAPIKey verifies a plaintext API key and returns the authenticated APIKey entity.
 // It executes the restricted app.authenticate_api_key discovery function, verifies the hash in constant time,
 // checks revocation and expiration, and updates last_used_at under transaction-local RLS.
 func (s *Service) AuthenticateAPIKey(ctx context.Context, plaintextKey string) (*APIKey, error) {
 	prefix, err := ExtractPrefix(plaintextKey)
 	if err != nil {
+		_ = VerifyAPIKey(plaintextKey, DummyHash)
 		return nil, ErrUnauthorized
 	}
 
 	// 1. Query key record by prefix via restricted SECURITY DEFINER function
 	query := `
-		SELECT id, organization_id, environment_id, prefix, hashed_secret, capabilities, expires_at, revoked_at, created_at, last_used_at
+		SELECT id, organization_id, environment_id, environment_name, prefix, hashed_secret, capabilities, expires_at, revoked_at, created_at, last_used_at
 		FROM app.authenticate_api_key($1)
 	`
 	var key APIKey
@@ -600,6 +751,7 @@ func (s *Service) AuthenticateAPIKey(ctx context.Context, plaintextKey string) (
 		&key.ID,
 		&key.OrganizationID,
 		&key.EnvironmentID,
+		&key.EnvironmentName,
 		&key.Prefix,
 		&key.HashedSecret,
 		&key.Capabilities,
@@ -609,6 +761,7 @@ func (s *Service) AuthenticateAPIKey(ctx context.Context, plaintextKey string) (
 		&key.LastUsedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
+		_ = VerifyAPIKey(plaintextKey, DummyHash)
 		return nil, ErrUnauthorized
 	}
 	if err != nil {
@@ -630,10 +783,15 @@ func (s *Service) AuthenticateAPIKey(ctx context.Context, plaintextKey string) (
 		return nil, ErrKeyExpired
 	}
 
-	// 5. Update last_used_at within transaction-local tenant context
+	// 5. Update last_used_at within transaction-local tenant context (throttled to 1 minute to avoid write lock contention)
 	now := time.Now().UTC()
 	_ = s.pool.WithTenantTx(ctx, key.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE api_keys SET last_used_at = clock_timestamp() WHERE organization_id = $1 AND id = $2`, key.OrganizationID, key.ID)
+		_, err := tx.Exec(ctx, `
+			UPDATE api_keys
+			SET last_used_at = clock_timestamp()
+			WHERE organization_id = $1 AND id = $2
+			  AND (last_used_at IS NULL OR last_used_at < clock_timestamp() - INTERVAL '1 minute')
+		`, key.OrganizationID, key.ID)
 		return err
 	})
 	key.LastUsedAt = &now
