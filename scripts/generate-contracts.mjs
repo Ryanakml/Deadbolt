@@ -45,7 +45,10 @@ for (const [path, text] of [
 ]) {
   if (path.endsWith(".go") && !hasGofmt) continue;
   if (process.argv.includes("--check")) {
-    if (fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n") !== text.replace(/\r\n/g, "\n"))
+    if (
+      fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n") !==
+      text.replace(/\r\n/g, "\n")
+    )
       throw Error(`Generated enums are stale: ${path}`);
   } else fs.writeFileSync(path, text);
 }
