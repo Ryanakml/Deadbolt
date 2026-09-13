@@ -47,6 +47,7 @@ var (
 	ErrLastOwnerRemoval     = errors.New("LAST_OWNER_REMOVAL_FORBIDDEN: Cannot remove the last active Owner of an organization")
 	ErrLastOwnerSuspension  = errors.New("LAST_OWNER_SUSPENSION_FORBIDDEN: Cannot suspend the last active Owner of an organization")
 	ErrMachineKeyRestricted = errors.New("MACHINE_KEY_UNAUTHORIZED: Machine API keys cannot be granted approval or reconciliation capabilities")
+	ErrCapabilityElevation  = errors.New("CAPABILITY_ELEVATION_FORBIDDEN: Requested API key capabilities must be a subset of the creator's capabilities")
 	ErrCrossTenantDenied    = errors.New("CROSS_TENANT_ACCESS_DENIED: Resource does not belong to the authenticated organization")
 	ErrEnvironmentMismatch  = errors.New("ENVIRONMENT_MISMATCH: Provided environment does not match the API key's scoped environment")
 	ErrInvalidRole          = errors.New("INVALID_ROLE: Role must be Viewer, Developer, Operator, Admin, or Owner")
@@ -58,6 +59,13 @@ var (
 	ErrForbidden            = errors.New("FORBIDDEN: Insufficient permissions for requested operation")
 	ErrNotFound             = errors.New("NOT_FOUND: The requested resource was not found")
 )
+
+// AuditContext holds actor identity and correlation metadata for immutable audit logging.
+type AuditContext struct {
+	ActorID       *string // User ID (UUID) or Key ID (UUID)
+	CorrelationID string  // Request ID / X-Request-ID
+	Reason        string  // Optional reason
+}
 
 // Organization represents a top-level tenant entity.
 type Organization struct {

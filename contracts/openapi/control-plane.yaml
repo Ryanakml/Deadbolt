@@ -1479,6 +1479,575 @@ paths:
         "503":
           $ref: "#/components/responses/ErrorResponse"
       security: *a4
+  /organizations:
+    post:
+      summary: Create a new organization
+      operationId: createOrganization
+      parameters:
+        - &a14
+          name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - &a15
+          name: X-CSRF-Token
+          in: header
+          required: false
+          schema:
+            type: string
+          description:
+            Required together with an allowed Origin for BrowserSession
+            authentication; not used for bearer keys.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrganizationRequest"
+      responses:
+        "201":
+          description: Organization created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Organization"
+        "400": &a5
+          $ref: "#/components/responses/ErrorResponse"
+        "401": &a6
+          $ref: "#/components/responses/ErrorResponse"
+        "403": &a7
+          $ref: "#/components/responses/ErrorResponse"
+        "404": &a8
+          $ref: "#/components/responses/ErrorResponse"
+        "409": &a9
+          $ref: "#/components/responses/ErrorResponse"
+        "413": &a10
+          $ref: "#/components/responses/ErrorResponse"
+        "422": &a11
+          $ref: "#/components/responses/ErrorResponse"
+        "429": &a12
+          $ref: "#/components/responses/ErrorResponse"
+        "503": &a13
+          $ref: "#/components/responses/ErrorResponse"
+      x-implemented: false
+      x-required-capability: org:read
+    get:
+      summary: List organizations for authenticated user
+      operationId: listOrganizations
+      responses:
+        "200":
+          description: List of user memberships
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationListResponse"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: org:read
+  /organizations/{id}:
+    get:
+      summary: Get organization details
+      operationId: getOrganization
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Organization details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Organization"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: org:read
+    patch:
+      summary: Update organization settings
+      operationId: updateOrganization
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateOrganizationRequest"
+      responses:
+        "200":
+          description: Organization updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Organization"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: org:update
+    delete:
+      summary: Delete organization
+      operationId: deleteOrganization
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      responses:
+        "204":
+          description: Organization deleted
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: org:delete
+  /organizations/{id}/members:
+    get:
+      summary: List members of an organization
+      operationId: listMembers
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Members list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemberListResponse"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: org:read
+    post:
+      summary: Add member to organization
+      operationId: addMember
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddMemberRequest"
+      responses:
+        "201":
+          description: Member added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Member"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:member
+  /organizations/{id}/members/{userId}:
+    patch:
+      summary: Update member role
+      operationId: updateMemberRole
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateMemberRoleRequest"
+      responses:
+        "200":
+          description: Member role updated
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:member
+    delete:
+      summary: Remove member from organization
+      operationId: removeMember
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      responses:
+        "204":
+          description: Member removed
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:member
+  /organizations/{id}/members/{userId}/status:
+    patch:
+      summary: Update member status
+      operationId: updateMemberStatus
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateMemberStatusRequest"
+      responses:
+        "200":
+          description: Member status updated
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:member
+  /projects:
+    get:
+      summary: List projects in active organization
+      operationId: listProjects
+      responses:
+        "200":
+          description: Projects list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListResponse"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: org:read
+    post:
+      summary: Create project
+      operationId: createProject
+      parameters:
+        - *a14
+        - *a15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+      responses:
+        "201":
+          description: Project created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:project
+  /projects/{projectId}/environments:
+    get:
+      summary: List environments in project
+      operationId: listEnvironments
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Environments list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentListResponse"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: org:read
+    post:
+      summary: Create environment in project
+      operationId: createEnvironment
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateEnvironmentRequest"
+      responses:
+        "201":
+          description: Environment created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Environment"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:project
+  /environments/{envId}/api-keys:
+    get:
+      summary: List API keys for environment
+      operationId: listAPIKeys
+      parameters:
+        - name: envId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: API key summaries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyListResponse"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:key
+    post:
+      summary: Create an API key
+      operationId: createAPIKey
+      parameters:
+        - name: envId
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAPIKeyRequest"
+      responses:
+        "201":
+          description: API key generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GeneratedKeyResponse"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:key
+  /api-keys/{id}/rotate:
+    post:
+      summary: Atomically rotate API key
+      operationId: rotateAPIKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateAPIKeyRequest"
+      responses:
+        "200":
+          description: API key rotated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GeneratedKeyResponse"
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:key
+  /api-keys/{id}:
+    delete:
+      summary: Revoke API key
+      operationId: revokeAPIKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - *a14
+        - *a15
+      responses:
+        "204":
+          description: API key revoked
+        "400": *a5
+        "401": *a6
+        "403": *a7
+        "404": *a8
+        "409": *a9
+        "413": *a10
+        "422": *a11
+        "429": *a12
+        "503": *a13
+      x-implemented: false
+      x-required-capability: admin:key
 components:
   responses:
     ErrorResponse:
@@ -1850,6 +2419,324 @@ components:
         - url
         - enabled
         - eventTypes
+      additionalProperties: false
+    Organization:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - createdAt
+        - updatedAt
+      additionalProperties: false
+    CreateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+      required:
+        - name
+      additionalProperties: false
+    UpdateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+      required:
+        - name
+      additionalProperties: false
+    OrganizationListResponse:
+      type: object
+      properties:
+        organizations:
+          type: array
+          items:
+            type: object
+            properties:
+              organization_id:
+                type: string
+              organization_name:
+                type: string
+              role:
+                type: string
+              status:
+                type: string
+            required:
+              - organization_id
+              - organization_name
+              - role
+              - status
+      required:
+        - organizations
+      additionalProperties: false
+    Member:
+      type: object
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        user_id:
+          type: string
+        role:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - organization_id
+        - user_id
+        - role
+        - status
+        - created_at
+        - updated_at
+      additionalProperties: false
+    AddMemberRequest:
+      type: object
+      properties:
+        user_id:
+          type: string
+        role:
+          type: string
+      required:
+        - user_id
+        - role
+      additionalProperties: false
+    UpdateMemberRoleRequest:
+      type: object
+      properties:
+        role:
+          type: string
+      required:
+        - role
+      additionalProperties: false
+    UpdateMemberStatusRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+            - ACTIVE
+            - SUSPENDED
+      required:
+        - status
+      additionalProperties: false
+    MemberListResponse:
+      type: object
+      properties:
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/Member"
+      required:
+        - members
+      additionalProperties: false
+    Project:
+      type: object
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - organization_id
+        - name
+        - created_at
+        - updated_at
+      additionalProperties: false
+    CreateProjectRequest:
+      type: object
+      properties:
+        name:
+          type: string
+      required:
+        - name
+      additionalProperties: false
+    ProjectListResponse:
+      type: object
+      properties:
+        projects:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+      required:
+        - projects
+      additionalProperties: false
+    Environment:
+      type: object
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        project_id:
+          type: string
+        name:
+          type: string
+          enum:
+            - development
+            - staging
+            - production
+        max_concurrency:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - organization_id
+        - project_id
+        - name
+        - max_concurrency
+        - created_at
+        - updated_at
+      additionalProperties: false
+    CreateEnvironmentRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          enum:
+            - development
+            - staging
+            - production
+        max_concurrency:
+          type: integer
+      required:
+        - name
+        - max_concurrency
+      additionalProperties: false
+    EnvironmentListResponse:
+      type: object
+      properties:
+        environments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Environment"
+      required:
+        - environments
+      additionalProperties: false
+    APIKeySummary:
+      type: object
+      properties:
+        id:
+          type: string
+        environment_id:
+          type: string
+        environment_name:
+          type: string
+        prefix:
+          type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - environment_id
+        - prefix
+        - capabilities
+        - created_at
+      additionalProperties: false
+    APIKeyListResponse:
+      type: object
+      properties:
+        api_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/APIKeySummary"
+      required:
+        - api_keys
+      additionalProperties: false
+    CreateAPIKeyRequest:
+      type: object
+      properties:
+        capabilities:
+          type: array
+          items:
+            type: string
+        expiry_days:
+          type: integer
+      required:
+        - capabilities
+        - expiry_days
+      additionalProperties: false
+    RotateAPIKeyRequest:
+      type: object
+      properties:
+        expiry_days:
+          type: integer
+      additionalProperties: false
+    GeneratedKeyResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        prefix:
+          type: string
+        environment_id:
+          type: string
+        environment_name:
+          type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - key
+        - prefix
+        - environment_id
+        - capabilities
+        - created_at
       additionalProperties: false
   securitySchemes:
     EnvironmentKey:

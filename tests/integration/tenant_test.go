@@ -21,6 +21,7 @@ import (
 )
 
 type tenantTestContext struct {
+	pool         *storage.Pool
 	service      *tenant.Service
 	handler      *tenant.HTTPHandler
 	sessionStore *auth.SessionStore
@@ -51,6 +52,7 @@ func setupTenantContext(t *testing.T) *tenantTestContext {
 		runtimePool.Close()
 	}
 	return &tenantTestContext{
+		pool:         pool,
 		service:      service,
 		handler:      handler,
 		sessionStore: sessionStore,
@@ -185,7 +187,7 @@ func TestAPIKeyGenerationAndEntropy(t *testing.T) {
 
 	// Generate key with 256-bit entropy and valid machine capabilities
 	caps := []string{tenant.CapRunCreate, tenant.CapRunRead, tenant.CapPayloadRead}
-	genKey, err := service.CreateAPIKey(ctx, org.ID, prodEnv.ID, caps, 90)
+	genKey, err := service.CreateAPIKey(ctx, org.ID, prodEnv.ID, caps, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
@@ -265,7 +267,7 @@ func TestAPIKeyAuthenticationAndScoping(t *testing.T) {
 	stagingEnv, _ := service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvStaging, 10)
 
 	caps := []string{tenant.CapRunCreate, tenant.CapRunRead}
-	genKey, err := service.CreateAPIKey(ctx, org.ID, stagingEnv.ID, caps, 90)
+	genKey, err := service.CreateAPIKey(ctx, org.ID, stagingEnv.ID, caps, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
@@ -302,52 +304,53 @@ func TestAPIKeyAuthenticationAndScoping(t *testing.T) {
 
 // 5. TestExpiredAndRevokedAPIKeys
 func TestExpiredAndRevokedAPIKeys(t *testing.T) {
-	service, _, cleanup := setupTenantSuite(t)
-	defer cleanup()
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
 
 	ctx := context.Background()
 	ownerID, _ := tenant.NewUUID()
-	org, _ := service.CreateOrganization(ctx, ownerID, "Lifecycle Corp")
-	proj, _ := service.CreateProject(ctx, org.ID, "Lifecycle Project")
-	env, _ := service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvDevelopment, 10)
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Lifecycle Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Lifecycle Project")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvDevelopment, 10)
 
 	// 1. Test Revoked Key
-	keyToRevoke, err := service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90)
+	keyToRevoke, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
-	if err := service.RevokeAPIKey(ctx, org.ID, keyToRevoke.ID); err != nil {
+	if err := tc.service.RevokeAPIKey(ctx, org.ID, keyToRevoke.ID, "", nil); err != nil {
 		t.Fatalf("RevokeAPIKey failed: %v", err)
 	}
-	_, err = service.AuthenticateAPIKey(ctx, keyToRevoke.PlaintextKey)
+	_, err = tc.service.AuthenticateAPIKey(ctx, keyToRevoke.PlaintextKey)
 	if err == nil || !errors.Is(err, tenant.ErrKeyRevoked) {
 		t.Fatalf("expected ErrKeyRevoked, got: %v", err)
 	}
 
-	// 2. Test Expired Key
-	expiredKey, err := service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, -10)
+	// 2. Test Expired Key persisted in DB
+	expiredKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
-	// Note: CalculateExpiry with negative input defaults to 90 days, so let's manually expire it
-	// via direct SQL to test the authentication check branch.
-	_, _ = service.GetOrganization(ctx, org.ID)
-	// Authenticate key to get ID
-	ak, err := service.AuthenticateAPIKey(ctx, expiredKey.PlaintextKey)
-	if err != nil {
-		t.Fatalf("initial authenticate failed: %v", err)
-	}
 
-	// Set expires_at in the past
+	// Persist expired expires_at timestamp directly into the database within tenant RLS context
 	pastTime := time.Now().UTC().Add(-2 * time.Hour)
-	ak.ExpiresAt = &pastTime
-	if !time.Now().UTC().After(*ak.ExpiresAt) {
-		t.Fatalf("time calculation mismatch")
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		tag, err := tx.Exec(ctx, "UPDATE api_keys SET expires_at = $1 WHERE id = $2", pastTime, expiredKey.ID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("no rows affected when updating expires_at")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to update expires_at in DB: %v", err)
 	}
 
-	// Verify VerifyAPIKey still works on the hash
-	if !tenant.VerifyAPIKey(expiredKey.PlaintextKey, ak.HashedSecret) {
-		t.Fatalf("VerifyAPIKey failed")
+	_, err = tc.service.AuthenticateAPIKey(ctx, expiredKey.PlaintextKey)
+	if err == nil || !errors.Is(err, tenant.ErrKeyExpired) {
+		t.Fatalf("expected ErrKeyExpired from AuthenticateAPIKey on expired DB row, got: %v", err)
 	}
 }
 
@@ -373,7 +376,7 @@ func TestCrossTenantDenial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateEnvironment A failed: %v", err)
 	}
-	keyA, err := service.CreateAPIKey(ctx, orgA.ID, envA.ID, []string{tenant.CapRunRead, tenant.CapAdminKey}, 90)
+	keyA, err := service.CreateAPIKey(ctx, orgA.ID, envA.ID, []string{tenant.CapRunRead, tenant.CapAdminKey}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey A failed: %v", err)
 	}
@@ -493,21 +496,20 @@ func TestRBACPermissionMatrix(t *testing.T) {
 	}
 
 	// HTTP payload preview protection check: Viewer without payload:read capability
-	_, handler, cleanup := setupTenantSuite(t)
-	defer cleanup()
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
 
-	server := httptest.NewServer(handler.Routes())
+	server := httptest.NewServer(tc.handler.Routes())
 	defer server.Close()
 
-	// Machine key with only run:read attempting to read payload preview
-	service, _, _ := setupTenantSuite(t)
 	ctx := context.Background()
 	ownerID, _ := tenant.NewUUID()
-	org, _ := service.CreateOrganization(ctx, ownerID, "Payload Corp")
-	proj, _ := service.CreateProject(ctx, org.ID, "TestProj")
-	env, _ := service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Payload Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "TestProj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
 
-	viewerKey, err := service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90)
+	// 1. Machine key with only run:read attempting to read payload preview -> 403
+	viewerKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
@@ -523,7 +525,48 @@ func TestRBACPermissionMatrix(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("VIEWER SECURITY VIOLATION: expected 403 Forbidden for Viewer reading payload, got %d", resp.StatusCode)
+		t.Fatalf("MACHINE VIEWER SECURITY VIOLATION: expected 403 Forbidden for Viewer reading payload, got %d", resp.StatusCode)
+	}
+
+	// 2. Human session with RoleViewer attempting to read payload preview -> 403
+	viewerUserID, _ := tenant.NewUUID()
+	if _, err := tc.runtimePool.Exec(ctx, "INSERT INTO users (id, email, name) VALUES ($1, $2, $3)", viewerUserID, "viewer@corp.test", "Corp Viewer"); err != nil {
+		t.Fatalf("failed to insert viewer user: %v", err)
+	}
+	if _, err := tc.service.AddMember(ctx, org.ID, viewerUserID, tenant.RoleViewer); err != nil {
+		t.Fatalf("AddMember RoleViewer failed: %v", err)
+	}
+
+	sess, sessionToken, _, err := tc.sessionStore.CreateSession(
+		ctx,
+		viewerUserID,
+		&org.ID,
+		"127.0.0.1",
+		"TestAgent",
+		tc.authCfg.SessionIdleTimeout,
+		tc.authCfg.SessionAbsoluteTimeout,
+	)
+	if err != nil || sess == nil {
+		t.Fatalf("CreateSession for viewer failed: %v", err)
+	}
+
+	cookie := &http.Cookie{
+		Name:  tc.authCfg.SessionCookieName(),
+		Value: sessionToken,
+	}
+
+	humanReq, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/environments/%s/payload-preview", server.URL, env.ID), nil)
+	humanReq.AddCookie(cookie)
+	humanReq.Header.Set("Origin", "http://localhost:3000")
+
+	humanResp, err := http.DefaultClient.Do(humanReq)
+	if err != nil {
+		t.Fatalf("human session request failed: %v", err)
+	}
+	defer humanResp.Body.Close()
+
+	if humanResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("HUMAN VIEWER SECURITY VIOLATION: expected 403 Forbidden for RoleViewer session reading payload, got %d", humanResp.StatusCode)
 	}
 }
 
@@ -584,13 +627,13 @@ func TestMachineKeyApprovalRestriction(t *testing.T) {
 	env, _ := service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
 
 	// Attempt to create machine key with approval:decide
-	_, err := service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunCreate, tenant.CapApprovalDecide}, 90)
+	_, err := service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunCreate, tenant.CapApprovalDecide}, 90, nil, nil)
 	if err == nil || !errors.Is(err, tenant.ErrMachineKeyRestricted) {
 		t.Fatalf("expected ErrMachineKeyRestricted for approval:decide, got: %v", err)
 	}
 
 	// Attempt to create machine key with reconciliation:resolve
-	_, err = service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunCreate, tenant.CapReconcileResolve}, 90)
+	_, err = service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunCreate, tenant.CapReconcileResolve}, 90, nil, nil)
 	if err == nil || !errors.Is(err, tenant.ErrMachineKeyRestricted) {
 		t.Fatalf("expected ErrMachineKeyRestricted for reconciliation:resolve, got: %v", err)
 	}
@@ -607,7 +650,7 @@ func TestHTTPTenantEndpoints(t *testing.T) {
 	proj, _ := service.CreateProject(ctx, org.ID, "HTTP Project")
 	env, _ := service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvDevelopment, 10)
 
-	apiKey, err := service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunRead}, 90)
+	apiKey, err := service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunRead}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
@@ -713,7 +756,7 @@ func TestEnvironmentMismatchRejection(t *testing.T) {
 	prodEnv, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
 
 	// API key bound strictly to staging
-	key, err := tc.service.CreateAPIKey(ctx, org.ID, stagingEnv.ID, []string{tenant.CapRunRead, tenant.CapPayloadRead}, 90)
+	key, err := tc.service.CreateAPIKey(ctx, org.ID, stagingEnv.ID, []string{tenant.CapRunRead, tenant.CapPayloadRead}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
@@ -901,13 +944,13 @@ func TestAPIKeyRotation(t *testing.T) {
 	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
 
 	caps := []string{tenant.CapRunCreate, tenant.CapRunRead}
-	originalKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, caps, 90)
+	originalKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, caps, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
 
 	// Create an admin key with CapAdminKey to perform administrative rotation
-	adminKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapAdminKey}, 90)
+	adminKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapAdminKey}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey for adminKey failed: %v", err)
 	}
@@ -986,7 +1029,7 @@ func TestAPIKeyRotation(t *testing.T) {
 	}
 
 	// Rotating an already revoked key must fail
-	_, err = tc.service.RotateAPIKey(ctx, org.ID, originalKey.ID, 30)
+	_, err = tc.service.RotateAPIKey(ctx, org.ID, originalKey.ID, 30, "", nil)
 	if err == nil || !errors.Is(err, tenant.ErrKeyRevoked) {
 		t.Fatalf("expected ErrKeyRevoked when rotating revoked key, got: %v", err)
 	}
@@ -1058,45 +1101,64 @@ func TestLastOwnerDefenseConcurrentRace(t *testing.T) {
 	defer tc.cleanup()
 
 	ctx := context.Background()
-	ownerA, _ := tenant.NewUUID()
-	ownerB, _ := tenant.NewUUID()
+	owner0, _ := tenant.NewUUID()
 
-	org, err := tc.service.CreateOrganization(ctx, ownerA, "Concurrent Corp")
+	org, err := tc.service.CreateOrganization(ctx, owner0, "Concurrent Corp")
 	if err != nil {
 		t.Fatalf("CreateOrganization failed: %v", err)
 	}
 
-	_, err = tc.service.AddMember(ctx, org.ID, ownerB, tenant.RoleOwner)
-	if err != nil {
-		t.Fatalf("AddMember ownerB failed: %v", err)
+	const numOwners = 10
+	ownerIDs := make([]string, numOwners)
+	ownerIDs[0] = owner0
+
+	for i := 1; i < numOwners; i++ {
+		id, _ := tenant.NewUUID()
+		ownerIDs[i] = id
+		if _, err := tc.service.AddMember(ctx, org.ID, id, tenant.RoleOwner); err != nil {
+			t.Fatalf("AddMember owner %d failed: %v", i, err)
+		}
 	}
 
-	// Simulate concurrent race: Owner A attempts to remove Owner B while Owner B attempts to remove Owner A
+	// 10 concurrent goroutines racing to remove each owner simultaneously.
+	// Row-level locking on organizations table must serialize updates such that
+	// exactly 9 removals succeed and exactly 1 fails with ErrLastOwnerRemoval.
 	var wg sync.WaitGroup
-	var errA, errB error
-	wg.Add(2)
+	errs := make([]error, numOwners)
+	startGate := make(chan struct{})
 
-	go func() {
-		defer wg.Done()
-		errA = tc.service.RemoveMember(ctx, org.ID, ownerA)
-	}()
+	for i := 0; i < numOwners; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-startGate
+			errs[idx] = tc.service.RemoveMember(ctx, org.ID, ownerIDs[idx])
+		}(i)
+	}
 
-	go func() {
-		defer wg.Done()
-		errB = tc.service.RemoveMember(ctx, org.ID, ownerB)
-	}()
-
+	close(startGate)
 	wg.Wait()
 
-	// Exactly ONE removal should succeed, and the other MUST fail with ErrLastOwnerRemoval
-	if errA == nil && errB == nil {
-		t.Fatalf("RACE CONDITION DISASTER: Both owners were removed! Organization was orphaned!")
-	}
-	if (errA == nil && !errors.Is(errB, tenant.ErrLastOwnerRemoval)) || (errB == nil && !errors.Is(errA, tenant.ErrLastOwnerRemoval)) {
-		t.Fatalf("unexpected error pair: errA=%v, errB=%v", errA, errB)
+	successCount := 0
+	lastOwnerErrCount := 0
+	for i, err := range errs {
+		if err == nil {
+			successCount++
+		} else if errors.Is(err, tenant.ErrLastOwnerRemoval) {
+			lastOwnerErrCount++
+		} else {
+			t.Errorf("unexpected error for owner %d: %v", i, err)
+		}
 	}
 
-	// Verify organization retains exactly 1 active Owner
+	if successCount != numOwners-1 {
+		t.Fatalf("expected exactly %d successful removals, got %d", numOwners-1, successCount)
+	}
+	if lastOwnerErrCount != 1 {
+		t.Fatalf("expected exactly 1 ErrLastOwnerRemoval rejection, got %d", lastOwnerErrCount)
+	}
+
+	// Verify organization in database retains exactly 1 active Owner
 	members, err := tc.service.ListMembers(ctx, org.ID)
 	if err != nil {
 		t.Fatalf("ListMembers failed: %v", err)
@@ -1123,12 +1185,12 @@ func TestAPIKeyLastUsedAtThrottling(t *testing.T) {
 	proj, _ := tc.service.CreateProject(ctx, org.ID, "Throttle Proj")
 	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
 
-	key, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90)
+	key, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKey failed: %v", err)
 	}
 
-	// 1st authentication -> updates last_used_at
+	// 1st authentication -> updates last_used_at in DB
 	auth1, err := tc.service.AuthenticateAPIKey(ctx, key.PlaintextKey)
 	if err != nil {
 		t.Fatalf("first authenticate failed: %v", err)
@@ -1137,13 +1199,34 @@ func TestAPIKeyLastUsedAtThrottling(t *testing.T) {
 		t.Fatalf("expected last_used_at to be populated")
 	}
 
-	// 2nd authentication immediately after -> should succeed without error
+	var dbLastUsed1 time.Time
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, "SELECT last_used_at FROM api_keys WHERE id = $1", key.ID).Scan(&dbLastUsed1)
+	})
+	if err != nil {
+		t.Fatalf("failed to query last_used_at after 1st auth: %v", err)
+	}
+
+	// 2nd authentication immediately after -> throttled (60s window)
 	auth2, err := tc.service.AuthenticateAPIKey(ctx, key.PlaintextKey)
 	if err != nil {
 		t.Fatalf("second authenticate failed: %v", err)
 	}
 	if auth2 == nil {
 		t.Fatalf("expected non-nil key")
+	}
+
+	var dbLastUsed2 time.Time
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, "SELECT last_used_at FROM api_keys WHERE id = $1", key.ID).Scan(&dbLastUsed2)
+	})
+	if err != nil {
+		t.Fatalf("failed to query last_used_at after 2nd auth: %v", err)
+	}
+
+	// Assert timestamp in PostgreSQL did NOT advance
+	if !dbLastUsed1.Equal(dbLastUsed2) {
+		t.Fatalf("throttling violation: last_used_at advanced from %v to %v despite 60s throttle window", dbLastUsed1, dbLastUsed2)
 	}
 }
 
@@ -1157,7 +1240,7 @@ func TestDualRouteMounting(t *testing.T) {
 	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Route Corp")
 	proj, _ := tc.service.CreateProject(ctx, org.ID, "Route Proj")
 	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvStaging, 10)
-	key, _ := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead, tenant.CapOrgRead}, 90)
+	key, _ := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead, tenant.CapOrgRead}, 90, nil, nil)
 
 	server := httptest.NewServer(tc.handler.Routes())
 	defer server.Close()
@@ -1186,5 +1269,219 @@ func TestDualRouteMounting(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK for /v1/projects, got %d", resp2.StatusCode)
+	}
+}
+
+// 19. TestCapabilityElevationForbidden
+func TestCapabilityElevationForbidden(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Elevation Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Elevation Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	// 1. Direct Service Call: Creator with [run:read] cannot create key with [run:read, run:create]
+	creatorCaps := []string{tenant.CapRunRead}
+	reqCaps := []string{tenant.CapRunRead, tenant.CapRunCreate}
+	_, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, reqCaps, 90, creatorCaps, nil)
+	if err == nil || !errors.Is(err, tenant.ErrCapabilityElevation) {
+		t.Fatalf("expected ErrCapabilityElevation, got: %v", err)
+	}
+
+	// 2. HTTP Endpoint Call: Caller machine key has [admin:key, run:read], attempts to create key with [run:create]
+	callerKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunRead}, 90, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create caller key: %v", err)
+	}
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	payload := `{"capabilities":["run:read","run:create"],"expiry_days":90}`
+	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/environments/%s/api-keys", server.URL, env.ID), strings.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+callerKey.PlaintextKey)
+	req.Header.Set("X-Organization-ID", org.ID)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for capability elevation, got %d", resp.StatusCode)
+	}
+	var envErr tenant.ErrorEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&envErr); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if envErr.Code != "CAPABILITY_ELEVATION_FORBIDDEN" {
+		t.Fatalf("expected code CAPABILITY_ELEVATION_FORBIDDEN, got %q", envErr.Code)
+	}
+}
+
+// 20. TestEnvironmentMismatchOnKeyLifecycle
+func TestEnvironmentMismatchOnKeyLifecycle(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Scope Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Scope Proj")
+	stagingEnv, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvStaging, 10)
+	prodEnv, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	// Machine admin key scoped strictly to stagingEnv
+	stagingAdminKey, err := tc.service.CreateAPIKey(ctx, org.ID, stagingEnv.ID, []string{tenant.CapAdminKey, tenant.CapRunRead}, 90, nil, nil)
+	if err != nil {
+		t.Fatalf("Create staging admin key failed: %v", err)
+	}
+
+	// Production key owned by prodEnv
+	prodKey, err := tc.service.CreateAPIKey(ctx, org.ID, prodEnv.ID, []string{tenant.CapRunRead}, 90, nil, nil)
+	if err != nil {
+		t.Fatalf("Create prod key failed: %v", err)
+	}
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Attempt to rotate prod key using staging admin key -> 403 ENVIRONMENT_MISMATCH
+	rotateReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, prodKey.ID), strings.NewReader(`{}`))
+	rotateReq.Header.Set("Authorization", "Bearer "+stagingAdminKey.PlaintextKey)
+	rotateReq.Header.Set("X-Organization-ID", org.ID)
+	rotateReq.Header.Set("Content-Type", "application/json")
+
+	rotateResp, err := http.DefaultClient.Do(rotateReq)
+	if err != nil {
+		t.Fatalf("rotate request failed: %v", err)
+	}
+	defer rotateResp.Body.Close()
+
+	if rotateResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on cross-env rotate, got %d", rotateResp.StatusCode)
+	}
+	var rotErr tenant.ErrorEnvelope
+	_ = json.NewDecoder(rotateResp.Body).Decode(&rotErr)
+	if rotErr.Code != "ENVIRONMENT_MISMATCH" {
+		t.Fatalf("expected ENVIRONMENT_MISMATCH, got %q", rotErr.Code)
+	}
+
+	// 2. Attempt to revoke prod key using staging admin key -> 403 ENVIRONMENT_MISMATCH
+	revokeReq, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, prodKey.ID), nil)
+	revokeReq.Header.Set("Authorization", "Bearer "+stagingAdminKey.PlaintextKey)
+	revokeReq.Header.Set("X-Organization-ID", org.ID)
+
+	revokeResp, err := http.DefaultClient.Do(revokeReq)
+	if err != nil {
+		t.Fatalf("revoke request failed: %v", err)
+	}
+	defer revokeResp.Body.Close()
+
+	if revokeResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on cross-env revoke, got %d", revokeResp.StatusCode)
+	}
+	var revErr tenant.ErrorEnvelope
+	_ = json.NewDecoder(revokeResp.Body).Decode(&revErr)
+	if revErr.Code != "ENVIRONMENT_MISMATCH" {
+		t.Fatalf("expected ENVIRONMENT_MISMATCH, got %q", revErr.Code)
+	}
+}
+
+// 21. TestAuditedKeyLifecycleEvents
+func TestAuditedKeyLifecycleEvents(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Audit Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Audit Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	auditCtx := &tenant.AuditContext{
+		ActorID:       &ownerID,
+		CorrelationID: "test-corr-12345",
+		Reason:        "unit-test-lifecycle",
+	}
+
+	// 1. Create API key with audit
+	key1, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunRead}, 90, nil, auditCtx)
+	if err != nil {
+		t.Fatalf("CreateAPIKey failed: %v", err)
+	}
+
+	// 2. Rotate API key with audit
+	key2, err := tc.service.RotateAPIKey(ctx, org.ID, key1.ID, 30, "", auditCtx)
+	if err != nil {
+		t.Fatalf("RotateAPIKey failed: %v", err)
+	}
+
+	// 3. Revoke API key with audit
+	err = tc.service.RevokeAPIKey(ctx, org.ID, key2.ID, "", auditCtx)
+	if err != nil {
+		t.Fatalf("RevokeAPIKey failed: %v", err)
+	}
+
+	// Query audit_events table within tenant RLS context
+	type eventRow struct {
+		action        string
+		targetType    string
+		targetID      string
+		actorID       string
+		correlationID string
+		metaText      string
+	}
+	var events []eventRow
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		query := `
+			SELECT action, target_type, target_id, actor_id, correlation_id, metadata::text
+			FROM audit_events
+			WHERE organization_id = $1 AND target_type = 'api_key'
+			ORDER BY created_at ASC
+		`
+		rows, err := tx.Query(ctx, query, org.ID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var e eventRow
+			if err := rows.Scan(&e.action, &e.targetType, &e.targetID, &e.actorID, &e.correlationID, &e.metaText); err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatalf("failed to query audit_events: %v", err)
+	}
+
+	if len(events) != 3 {
+		t.Fatalf("expected exactly 3 audit events, got %d", len(events))
+	}
+
+	expectedActions := []string{"api_key.create", "api_key.rotate", "api_key.revoke"}
+	for i, exp := range expectedActions {
+		if events[i].action != exp {
+			t.Errorf("event %d: expected action %s, got %s", i, exp, events[i].action)
+		}
+		if events[i].actorID != ownerID {
+			t.Errorf("event %d: expected actor %s, got %s", i, ownerID, events[i].actorID)
+		}
+		if events[i].correlationID != "test-corr-12345" {
+			t.Errorf("event %d: expected correlationId test-corr-12345, got %s", i, events[i].correlationID)
+		}
+		// Strict check: metadata MUST NOT contain plaintext secret or full secret key
+		if strings.Contains(events[i].metaText, key1.PlaintextKey) || strings.Contains(events[i].metaText, key2.PlaintextKey) {
+			t.Fatalf("CRITICAL SECURITY VIOLATION: plaintext API key found in audit_events metadata: %s", events[i].metaText)
+		}
 	}
 }

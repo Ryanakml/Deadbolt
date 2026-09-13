@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -543,16 +544,30 @@ func (s *Service) GetEnvironment(ctx context.Context, orgID string, envID string
 
 // CreateAPIKey generates a cryptographically secure, environment-scoped API key.
 // Plaintext secret is returned exactly once in GeneratedKey.
-func (s *Service) CreateAPIKey(ctx context.Context, orgID string, envID string, capabilities []string, expiryDays int) (*GeneratedKey, error) {
-	// 1. Sanitize & validate capabilities: machine keys barred from approval & reconciliation
+// Requested capabilities must be a subset of creatorCapabilities, and machine-only restrictions apply.
+func (s *Service) CreateAPIKey(ctx context.Context, orgID string, envID string, capabilities []string, expiryDays int, creatorCaps []string, audit *AuditContext) (*GeneratedKey, error) {
+	// 1. Sanitize & check creator capability subset (prevent privilege elevation)
 	capabilities = SanitizeCapabilities(capabilities)
+	if len(creatorCaps) > 0 {
+		creatorMap := make(map[string]bool, len(creatorCaps))
+		for _, c := range creatorCaps {
+			creatorMap[c] = true
+		}
+		for _, reqCap := range capabilities {
+			if !creatorMap[reqCap] {
+				return nil, ErrCapabilityElevation
+			}
+		}
+	}
+
+	// 2. Machine keys barred from approval & reconciliation
 	if err := ValidateKeyCapabilities(capabilities, true); err != nil {
 		return nil, err
 	}
 
 	var genKey GeneratedKey
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		// 2. Look up environment to get name for prefix
+		// 3. Look up environment to get name for prefix
 		var envName string
 		queryEnv := `SELECT name FROM environments WHERE organization_id = $1 AND id = $2`
 		err := tx.QueryRow(ctx, queryEnv, orgID, envID).Scan(&envName)
@@ -563,7 +578,7 @@ func (s *Service) CreateAPIKey(ctx context.Context, orgID string, envID string, 
 			return err
 		}
 
-		// 3. Generate key material (>= 256 bits entropy, prefix, plaintext, and SHA-256 hash)
+		// 4. Generate key material (>= 256 bits entropy, prefix, plaintext, and SHA-256 hash)
 		prefix, plaintextKey, hashedSecret, err := GenerateAPIKeyMaterial(envName)
 		if err != nil {
 			return fmt.Errorf("failed to generate key material: %w", err)
@@ -571,7 +586,7 @@ func (s *Service) CreateAPIKey(ctx context.Context, orgID string, envID string, 
 
 		expiresAt := CalculateExpiry(expiryDays)
 
-		// 4. Insert into database
+		// 5. Insert into database
 		insertQuery := `
 			INSERT INTO api_keys (organization_id, environment_id, prefix, hashed_secret, capabilities, expires_at)
 			VALUES ($1, $2, $3, $4, $5, $6)
@@ -580,6 +595,25 @@ func (s *Service) CreateAPIKey(ctx context.Context, orgID string, envID string, 
 		if err := tx.QueryRow(ctx, insertQuery, orgID, envID, prefix, hashedSecret, capabilities, expiresAt).
 			Scan(&genKey.ID, &genKey.CreatedAt); err != nil {
 			return fmt.Errorf("failed to insert api key: %w", err)
+		}
+
+		// 6. Write immutable audit event atomically (secrets strictly excluded)
+		if audit != nil {
+			metaBytes, _ := json.Marshal(map[string]any{
+				"environment_id": envID,
+				"environment":    envName,
+				"prefix":         prefix,
+				"capabilities":   capabilities,
+				"expires_at":     expiresAt,
+			})
+			auditQuery := `
+				INSERT INTO audit_events (
+					organization_id, actor_id, action, target_type, target_id, correlation_id, reason, metadata
+				) VALUES ($1, $2, 'api_key.create', 'api_key', $3, $4, $5, $6)
+			`
+			if _, err := tx.Exec(ctx, auditQuery, orgID, audit.ActorID, genKey.ID, audit.CorrelationID, audit.Reason, metaBytes); err != nil {
+				return fmt.Errorf("failed to write audit event for api key create: %w", err)
+			}
 		}
 
 		genKey.PlaintextKey = plaintextKey
@@ -628,33 +662,59 @@ func (s *Service) ListAPIKeys(ctx context.Context, orgID string, envID string) (
 	return keys, nil
 }
 
-// RevokeAPIKey revokes an API key.
-func (s *Service) RevokeAPIKey(ctx context.Context, orgID string, keyID string) error {
+// RevokeAPIKey revokes an API key, verifying caller environment scope if caller is a machine key.
+func (s *Service) RevokeAPIKey(ctx context.Context, orgID string, keyID string, callerEnvID string, audit *AuditContext) error {
 	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		// 1. Resolve target key's environment to enforce authoritative environment scoping
+		var envID string
+		var prefix string
+		checkQuery := `SELECT environment_id, prefix FROM api_keys WHERE organization_id = $1 AND id = $2`
+		err := tx.QueryRow(ctx, checkQuery, orgID, keyID).Scan(&envID, &prefix)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		if callerEnvID != "" && envID != callerEnvID {
+			return ErrEnvironmentMismatch
+		}
+
+		// 2. Revoke key
 		query := `
 			UPDATE api_keys
 			SET revoked_at = clock_timestamp()
 			WHERE organization_id = $1 AND id = $2 AND revoked_at IS NULL
 		`
-		tag, err := tx.Exec(ctx, query, orgID, keyID)
-		if err != nil {
+		if _, err := tx.Exec(ctx, query, orgID, keyID); err != nil {
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			// Check if already revoked or not found
-			var exists int
-			check := `SELECT 1 FROM api_keys WHERE organization_id = $1 AND id = $2`
-			if err := tx.QueryRow(ctx, check, orgID, keyID).Scan(&exists); errors.Is(err, pgx.ErrNoRows) {
-				return ErrNotFound
+
+		// 3. Write immutable audit event atomically
+		if audit != nil {
+			metaBytes, _ := json.Marshal(map[string]any{
+				"key_id":         keyID,
+				"environment_id": envID,
+				"prefix":         prefix,
+			})
+			auditQuery := `
+				INSERT INTO audit_events (
+					organization_id, actor_id, action, target_type, target_id, correlation_id, reason, metadata
+				) VALUES ($1, $2, 'api_key.revoke', 'api_key', $3, $4, $5, $6)
+			`
+			if _, err := tx.Exec(ctx, auditQuery, orgID, audit.ActorID, keyID, audit.CorrelationID, audit.Reason, metaBytes); err != nil {
+				return fmt.Errorf("failed to write audit event for api key revoke: %w", err)
 			}
-			// Already revoked is idempotent
 		}
+
 		return nil
 	})
 }
 
 // RotateAPIKey atomically revokes the existing key and generates a new key with identical environment & capabilities.
-func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, expiryDays int) (*GeneratedKey, error) {
+// Authoritative environment check ensures machine callers cannot rotate keys outside their scoped environment.
+func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, expiryDays int, callerEnvID string, audit *AuditContext) (*GeneratedKey, error) {
 	var genKey GeneratedKey
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		// 1. Select existing key with row lock
@@ -678,7 +738,12 @@ func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, 
 			return ErrKeyRevoked
 		}
 
-		// 2. Lookup environment name
+		// 2. Authoritative Environment check for machine callers
+		if callerEnvID != "" && envID != callerEnvID {
+			return ErrEnvironmentMismatch
+		}
+
+		// 3. Lookup environment name
 		var envName string
 		queryEnv := `SELECT name FROM environments WHERE organization_id = $1 AND id = $2`
 		err = tx.QueryRow(ctx, queryEnv, orgID, envID).Scan(&envName)
@@ -689,14 +754,14 @@ func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, 
 			return err
 		}
 
-		// 3. Generate new key material
+		// 4. Generate new key material
 		prefix, plaintextKey, hashedSecret, err := GenerateAPIKeyMaterial(envName)
 		if err != nil {
 			return fmt.Errorf("failed to generate key material: %w", err)
 		}
 		expiresAt := CalculateExpiry(expiryDays)
 
-		// 4. Insert new key
+		// 5. Insert new key
 		insertQuery := `
 			INSERT INTO api_keys (organization_id, environment_id, prefix, hashed_secret, capabilities, expires_at)
 			VALUES ($1, $2, $3, $4, $5, $6)
@@ -707,7 +772,7 @@ func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, 
 			return fmt.Errorf("failed to insert rotated api key: %w", err)
 		}
 
-		// 5. Revoke old key atomically
+		// 6. Revoke old key atomically
 		revokeQuery := `
 			UPDATE api_keys
 			SET revoked_at = clock_timestamp()
@@ -715,6 +780,27 @@ func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, 
 		`
 		if _, err := tx.Exec(ctx, revokeQuery, orgID, keyID); err != nil {
 			return fmt.Errorf("failed to revoke rotated api key: %w", err)
+		}
+
+		// 7. Write immutable audit event atomically
+		if audit != nil {
+			metaBytes, _ := json.Marshal(map[string]any{
+				"old_key_id":     keyID,
+				"new_key_id":     genKey.ID,
+				"environment_id": envID,
+				"environment":    envName,
+				"new_prefix":     prefix,
+				"capabilities":   caps,
+				"expires_at":     expiresAt,
+			})
+			auditQuery := `
+				INSERT INTO audit_events (
+					organization_id, actor_id, action, target_type, target_id, correlation_id, reason, metadata
+				) VALUES ($1, $2, 'api_key.rotate', 'api_key', $3, $4, $5, $6)
+			`
+			if _, err := tx.Exec(ctx, auditQuery, orgID, audit.ActorID, genKey.ID, audit.CorrelationID, audit.Reason, metaBytes); err != nil {
+				return fmt.Errorf("failed to write audit event for api key rotate: %w", err)
+			}
 		}
 
 		genKey.PlaintextKey = plaintextKey

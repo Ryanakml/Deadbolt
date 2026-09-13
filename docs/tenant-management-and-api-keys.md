@@ -329,36 +329,80 @@ To eliminate time-of-check to time-of-use (TOCTOU) race conditions when multiple
 - When authenticating API keys, unknown key prefixes trigger a constant-time dummy comparison (`DummyHash`) to prevent prefix enumeration via response-time variance.
 - Updates to `last_used_at` timestamps are throttled to a minimum interval of 60 seconds per key, eliminating database row-lock contention under heavy parallel execution traffic.
 
+### 7.5 Capability Elevation Defense (Blueprint §24.2)
+
+- When an API key is created (by either a human user or an existing machine key with `admin:key`), the requested capabilities are validated to ensure $\text{requestedCapabilities} \subseteq \text{creatorEffectiveCapabilities}$.
+- Creators cannot grant permissions they do not possess.
+- Violations are rejected with HTTP `403 Forbidden` (`CAPABILITY_ELEVATION_FORBIDDEN` / `ErrCapabilityElevation`).
+
+### 7.6 Authoritative Environment Scope on Resource IDs (Blueprint §20.1 & §24.3)
+
+- On resource-ID-targeted routes lacking an explicit `/environments/{envId}` path prefix (such as `POST /api-keys/{id}/rotate` and `DELETE /api-keys/{id}`):
+  - The control plane authoritatively resolves the target key's environment binding from PostgreSQL.
+  - If the caller is a machine API key, the target key's environment must match the caller's scoped environment.
+  - Cross-environment rotation or revocation attempts are rejected with HTTP `403 Forbidden` (`ENVIRONMENT_MISMATCH`).
+
+### 7.7 Immutable Lifecycle Audit Trail (Blueprint §18.1 & §24.3)
+
+- All API key mutations (`api_key.create`, `api_key.rotate`, `api_key.revoke`) append immutable audit events to the `audit_events` table within the same atomic database transaction (`WithTenantTx`).
+- Plaintext secrets, entropy payloads, and cryptographic hashes are strictly excluded from audit event metadata.
+- Audit records capture `organization_id`, `actor_id` (human user UUID or creator key UUID), `action`, `target_type: api_key`, `target_id`, `correlation_id` (`X-Request-ID`), and sanitized metadata (`key_id`, `environment_id`, `prefix`).
+
+### 7.8 Internal Error Sanitization & Request Tracing (Blueprint §20.1 & §25.1)
+
+- In compliance with RFC/OpenAPI 3.1.0 security hygiene, internal server errors (`500 Internal Server Error`) never expose raw backend driver messages or PostgreSQL stack traces to clients.
+- Errors are logged server-side with structured fields and the active `requestId`.
+- Clients receive a standardized, sanitized envelope:
+  ```json
+  {
+    "code": "INTERNAL_SERVER_ERROR",
+    "message": "An internal server error occurred",
+    "requestId": "req_...",
+    "details": {},
+    "retryable": false
+  }
+  ```
+
+### 7.9 Gate M0 Dependency Clarification
+
+- Issue #8 builds upon the Foundation Contracts milestone (Gate M0, Pull Request #52).
+- Tenant OpenAPI contracts in `contracts/openapi/control-plane.yaml` strictly declare `x-implemented: false` until their respective Milestone gates are promoted.
+- The control plane codebase compiles cleanly and passes all local contract and parity checks without modifying M0 baseline artifacts.
+
 ---
 
 ## 8. Verification & Automated Test Results
 
-The implementation is verified by 18 exhaustive integration test suites in [`tests/integration/tenant_test.go`](file:///d:/Project/Tf-low/tests/integration/tenant_test.go) executed against real PostgreSQL instances:
+The implementation is verified by 21 exhaustive integration test suites in [`tests/integration/tenant_test.go`](file:///d:/Project/Tf-low/tests/integration/tenant_test.go) executed against real PostgreSQL instances:
 
-| #   | Suite                                       | Test Objective                                                                                                                                  | Outcome  |
-| --- | :------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
-| 1   | `TestOrganizationBootstrapAndOwnerCreation` | Verifies atomic organization creation and binding of caller as active `Owner`.                                                                  | **PASS** |
-| 2   | `TestProjectAndEnvironmentProvisioning`     | Verifies project creation, `development`/`staging`/`production` environments, admission quota rows, and rejection of invalid names.             | **PASS** |
-| 3   | `TestAPIKeyGenerationAndEntropy`            | Asserts 256-bit entropy (32 random bytes), `db_<env>_<8hex>` prefixing, SHA-256 hash persistence, and redacted summary output.                  | **PASS** |
-| 4   | `TestAPIKeyAuthenticationAndScoping`        | Tests successful authentication, timestamp updating on `last_used_at`, and rejection of tampered/unknown keys with `401 Unauthorized`.          | **PASS** |
-| 5   | `TestExpiredAndRevokedAPIKeys`              | Asserts revoked keys fail with `API_KEY_REVOKED` and expired keys fail with `API_KEY_EXPIRED`.                                                  | **PASS** |
-| 6   | `TestCrossTenantDenial`                     | Validates that an API key or session from Org A cannot access or query resources from Org B (RLS zero rows & `403 Forbidden`).                  | **PASS** |
-| 7   | `TestRBACPermissionMatrix`                  | Verifies full capability matrix across all 5 canonical roles and verifies that `Viewer` cannot access payload endpoints without `payload:read`. | **PASS** |
-| 8   | `TestLastOwnerDefense`                      | Proves that demoting or removing the sole remaining active Owner fails with `LAST_OWNER_DEMOTION_FORBIDDEN` / `LAST_OWNER_REMOVAL_FORBIDDEN`.   | **PASS** |
-| 9   | `TestMachineKeyApprovalRestriction`         | Proves that attempting to create machine keys with `approval:decide` or `reconciliation:resolve` fails with `MACHINE_KEY_UNAUTHORIZED`.         | **PASS** |
-| 10  | `TestHTTPTenantEndpoints`                   | End-to-end HTTP validation for listing summaries and revoking API keys over REST.                                                               | **PASS** |
-| 11  | `TestErrorEnvelopeFormat`                   | Validates canonical OpenAPI error envelope: `{ code, message, requestId, details, retryable }`.                                                 | **PASS** |
-| 12  | `TestEnvironmentMismatchRejection`          | Verifies 403 `ENVIRONMENT_MISMATCH` rejection across path parameter, query parameters, and request headers.                                     | **PASS** |
-| 13  | `TestCSRFAndOriginEnforcementOnMutations`   | Tests that cookie-authenticated mutations without Origin or valid CSRF tokens fail with 403 `ORIGIN_FORBIDDEN` / `CSRF_TOKEN_INVALID`.          | **PASS** |
-| 14  | `TestAPIKeyRotation`                        | Tests atomic key rotation via `POST /api/v1/api-keys/{id}/rotate`, revoking prior key and returning active replacement key.                     | **PASS** |
-| 15  | `TestMemberStatusAndLastOwnerSuspension`    | Validates member status transitions (`ACTIVE`/`SUSPENDED`) and prevents suspending the sole remaining active Owner.                             | **PASS** |
-| 16  | `TestLastOwnerDefenseConcurrentRace`        | Executes 10 concurrent goroutines attempting to remove/demote owners; verifies serialized lock prevents orphan organization.                    | **PASS** |
-| 17  | `TestAPIKeyLastUsedAtThrottling`            | Confirms high-frequency authentications update `last_used_at` with a 60-second cooldown window to prevent DB lock contention.                   | **PASS** |
-| 18  | `TestDualRouteMounting`                     | Proves identical routing and security enforcement across `/api/v1/...` and `/v1/...` routes.                                                    | **PASS** |
+| #   | Suite                                       | Test Objective                                                                                                                                | Outcome  |
+| --- | :------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
+| 1   | `TestOrganizationBootstrapAndOwnerCreation` | Verifies atomic organization creation and binding of caller as active `Owner`.                                                                | **PASS** |
+| 2   | `TestProjectAndEnvironmentProvisioning`     | Verifies project creation, `development`/`staging`/`production` environments, admission quota rows, and rejection of invalid names.           | **PASS** |
+| 3   | `TestAPIKeyGenerationAndEntropy`            | Asserts 256-bit entropy (32 random bytes), `db_<env>_<8hex>` prefixing, SHA-256 hash persistence, and redacted summary output.                | **PASS** |
+| 4   | `TestAPIKeyAuthenticationAndScoping`        | Tests successful authentication, timestamp updating on `last_used_at`, and rejection of tampered/unknown keys with `401 Unauthorized`.        | **PASS** |
+| 5   | `TestExpiredAndRevokedAPIKeys`              | Asserts revoked keys fail with `API_KEY_REVOKED` and expired keys fail with `API_KEY_EXPIRED` (verified on DB row).                           | **PASS** |
+| 6   | `TestCrossTenantDenial`                     | Validates that an API key or session from Org A cannot access or query resources from Org B (RLS zero rows & `403 Forbidden`).                | **PASS** |
+| 7   | `TestRBACPermissionMatrix`                  | Verifies full capability matrix across all 5 canonical roles and verifies that `Viewer` cannot access payload endpoints (machine and human).  | **PASS** |
+| 8   | `TestLastOwnerDefense`                      | Proves that demoting or removing the sole remaining active Owner fails with `LAST_OWNER_DEMOTION_FORBIDDEN` / `LAST_OWNER_REMOVAL_FORBIDDEN`. | **PASS** |
+| 9   | `TestMachineKeyApprovalRestriction`         | Proves that attempting to create machine keys with `approval:decide` or `reconciliation:resolve` fails with `MACHINE_KEY_UNAUTHORIZED`.       | **PASS** |
+| 10  | `TestHTTPTenantEndpoints`                   | End-to-end HTTP validation for listing summaries and revoking API keys over REST.                                                             | **PASS** |
+| 11  | `TestErrorEnvelopeFormat`                   | Validates canonical OpenAPI error envelope: `{ code, message, requestId, details, retryable }`.                                               | **PASS** |
+| 12  | `TestEnvironmentMismatchRejection`          | Verifies 403 `ENVIRONMENT_MISMATCH` rejection across path parameter, query parameters, and request headers.                                   | **PASS** |
+| 13  | `TestCSRFAndOriginEnforcementOnMutations`   | Tests that cookie-authenticated mutations without Origin or valid CSRF tokens fail with 403 `ORIGIN_FORBIDDEN` / `CSRF_TOKEN_INVALID`.        | **PASS** |
+| 14  | `TestAPIKeyRotation`                        | Tests atomic key rotation via `POST /api/v1/api-keys/{id}/rotate`, revoking prior key and returning active replacement key.                   | **PASS** |
+| 15  | `TestMemberStatusAndLastOwnerSuspension`    | Validates member status transitions (`ACTIVE`/`SUSPENDED`) and prevents suspending the sole remaining active Owner.                           | **PASS** |
+| 16  | `TestLastOwnerDefenseConcurrentRace`        | Executes 10 concurrent goroutines attempting to remove owners; verifies serialized row-lock prevents orphan organization.                     | **PASS** |
+| 17  | `TestAPIKeyLastUsedAtThrottling`            | Confirms high-frequency authentications update `last_used_at` with a 60-second cooldown window (asserted DB column does not advance).         | **PASS** |
+| 18  | `TestDualRouteMounting`                     | Proves identical routing and security enforcement across `/api/v1/...` and `/v1/...` routes.                                                  | **PASS** |
+| 19  | `TestCapabilityElevationForbidden`          | Tests capability elevation rejection in both direct service and HTTP endpoint (403 `CAPABILITY_ELEVATION_FORBIDDEN`).                         | **PASS** |
+| 20  | `TestEnvironmentMismatchOnKeyLifecycle`     | Verifies machine callers cannot rotate or revoke keys outside their environment (403 `ENVIRONMENT_MISMATCH`).                                 | **PASS** |
+| 21  | `TestAuditedKeyLifecycleEvents`             | Proves atomic append-only audit trail logging for create, rotate, and revoke events without secret leakage.                                   | **PASS** |
 
 ### Workspace Health Check
 
-- All Tenant & RLS integration tests: **100% Passed (26/26 tests)**
+- All Tenant & RLS integration tests: **100% Passed (29/29 tests)**
 - Full Auth integration tests: **100% Passed**
-- Go compiler / vet (`go vet ./internal/tenant/...`): **Clean (exit code 0)**
+- Go compiler / vet (`go vet ./internal/tenant/... ./tests/integration/...`): **Clean (exit code 0)**
 - Code formatting (`gofmt -l`): **100% compliant**
+- OpenAPI Contract Validation: **100% compliant (`check-contracts.mjs` rules)**
