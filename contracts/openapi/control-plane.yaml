@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Deadbolt / tf-low Control Plane API
   version: 1.0.0
-  description:
+  description: >-
     Versioned target HTTP contracts (M0). No endpoints are implemented
     by this PR. Authentication, tenant authorization, transactions, and runtime
     capability gates are implemented by their owning issues.
