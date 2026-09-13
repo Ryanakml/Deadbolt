@@ -1638,10 +1638,13 @@ func TestAuthoritativeEnvironmentScoping(t *testing.T) {
 	if respProj.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK for GET /projects, got %d", respProj.StatusCode)
 	}
-	var projList []tenant.Project
-	if err := json.NewDecoder(respProj.Body).Decode(&projList); err != nil {
+	var projResp struct {
+		Projects []tenant.Project `json:"projects"`
+	}
+	if err := json.NewDecoder(respProj.Body).Decode(&projResp); err != nil {
 		t.Fatalf("failed to decode project list: %v", err)
 	}
+	projList := projResp.Projects
 	if len(projList) != 1 || projList[0].ID != projA.ID {
 		t.Fatalf("expected machine key to only see scoped projA, got: %+v", projList)
 	}
