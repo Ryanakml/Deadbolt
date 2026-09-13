@@ -1,0 +1,29 @@
+# Enforce LF line endings for all text files to prevent gofmt/prettier drift on Windows
+* text=auto eol=lf
+
+# Go source files — always LF
+*.go text eol=lf
+
+# JavaScript / TypeScript — always LF
+*.js text eol=lf
+*.mjs text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.json text eol=lf
+
+# Markdown / YAML / SQL — always LF
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sql text eol=lf
+
+# Shell scripts — always LF
+*.sh text eol=lf
+
+# Makefile — always LF
+Makefile text eol=lf
+
+# Binary files — no conversion
+*.png binary
+*.jpg binary
+*.ico binary

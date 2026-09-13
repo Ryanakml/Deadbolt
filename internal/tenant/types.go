@@ -36,7 +36,7 @@ const (
 	CapRunsReconcile = "runs:reconcile"
 
 	// Payload & Artifacts
-	CapPayloadRead   = "payload:read"
+	CapPayloadRead    = "payload:read"
 	CapArtifactsWrite = "artifacts:write"
 
 	// Deployments

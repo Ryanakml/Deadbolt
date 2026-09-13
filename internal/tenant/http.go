@@ -23,7 +23,6 @@ const (
 	requestIDKey      contextKey = "deadbolt.tenant.request_id"
 )
 
-
 // CallerIdentity captures the verified identity and authorized scope for a request.
 type CallerIdentity struct {
 	Type            IdentityType `json:"type"`
