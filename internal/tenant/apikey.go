@@ -72,22 +72,60 @@ func ExtractPrefix(plaintextKey string) (string, error) {
 
 // ValidCanonicalCapabilities contains all permitted capability strings per Blueprint §24.2.
 var ValidCanonicalCapabilities = map[string]struct{}{
-	CapRunCreate:             {},
-	CapRunRead:               {},
-	CapRunControl:            {},
-	CapPayloadRead:           {},
-	CapDeployRegister:        {},
-	CapDeployActivateStaging: {},
-	CapDeployActivateProd:    {},
-	CapWorkerDrain:           {},
-	CapApprovalDecide:        {},
-	CapReconcileResolve:      {},
-	CapOrgRead:               {},
-	CapOrgUpdate:             {},
-	CapOrgDelete:             {},
-	CapAdminMember:           {},
-	CapAdminKey:              {},
-	CapAdminProject:          {},
+	CapRunsCreate:                 {},
+	CapRunsRead:                   {},
+	CapRunsControl:                {},
+	CapRunsReconcile:              {},
+	CapPayloadRead:                {},
+	CapArtifactsWrite:             {},
+	CapDeploymentsWrite:           {},
+	CapDeploymentsRegister:        {},
+	CapDeploymentsActivateStaging: {},
+	CapDeploymentsActivateProd:    {},
+	CapWorkflowsRead:              {},
+	CapWorkersRead:                {},
+	CapWorkersDrain:               {},
+	CapApprovalsDecide:            {},
+	CapSchedulesWrite:             {},
+	CapWebhooksWrite:              {},
+	CapOrgRead:                    {},
+	CapOrgUpdate:                  {},
+	CapOrgDelete:                  {},
+	CapAdminMember:                {},
+	CapAdminKey:                   {},
+	CapAdminProject:               {},
+}
+
+// AllCapabilities contains every canonical capability in a slice.
+var AllCapabilities = []string{
+	CapRunsCreate,
+	CapRunsRead,
+	CapRunsControl,
+	CapRunsReconcile,
+	CapPayloadRead,
+	CapArtifactsWrite,
+	CapDeploymentsWrite,
+	CapDeploymentsRegister,
+	CapDeploymentsActivateStaging,
+	CapDeploymentsActivateProd,
+	CapWorkflowsRead,
+	CapWorkersRead,
+	CapWorkersDrain,
+	CapApprovalsDecide,
+	CapSchedulesWrite,
+	CapWebhooksWrite,
+	CapOrgRead,
+	CapOrgUpdate,
+	CapOrgDelete,
+	CapAdminMember,
+	CapAdminKey,
+	CapAdminProject,
+}
+
+// IsValidCapability returns true if the capability is a recognized canonical capability.
+func IsValidCapability(capability string) bool {
+	_, ok := ValidCanonicalCapabilities[capability]
+	return ok
 }
 
 // ValidateKeyCapabilities checks that:

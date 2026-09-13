@@ -1530,7 +1530,7 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503": &a13
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:read
     get:
       summary: List organizations for authenticated user
@@ -1551,7 +1551,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:read
   /organizations/{id}:
     get:
@@ -1579,7 +1579,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:read
     patch:
       summary: Update organization settings
@@ -1614,7 +1614,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:update
     delete:
       summary: Delete organization
@@ -1639,7 +1639,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:delete
   /organizations/{id}/members:
     get:
@@ -1667,7 +1667,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:read
     post:
       summary: Add member to organization
@@ -1702,7 +1702,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:member
   /organizations/{id}/members/{userId}:
     patch:
@@ -1739,7 +1739,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:member
     delete:
       summary: Remove member from organization
@@ -1769,7 +1769,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:member
   /organizations/{id}/members/{userId}/status:
     patch:
@@ -1806,7 +1806,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:member
   /projects:
     get:
@@ -1828,7 +1828,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:read
     post:
       summary: Create project
@@ -1858,7 +1858,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:project
   /projects/{projectId}/environments:
     get:
@@ -1886,7 +1886,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: org:read
     post:
       summary: Create environment in project
@@ -1921,7 +1921,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:project
   /environments/{envId}/api-keys:
     get:
@@ -1949,7 +1949,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:key
     post:
       summary: Create an API key
@@ -1984,7 +1984,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:key
   /api-keys/{id}/rotate:
     post:
@@ -2020,7 +2020,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:key
   /api-keys/{id}:
     delete:
@@ -2046,7 +2046,7 @@ paths:
         "422": *a11
         "429": *a12
         "503": *a13
-      x-implemented: false
+      x-implemented: true
       x-required-capability: admin:key
 components:
   responses:

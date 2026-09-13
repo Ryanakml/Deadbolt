@@ -27,18 +27,52 @@ const (
 	EnvProduction  = "production"
 )
 
-// Canonical Capabilities per Blueprint §24.2
+// Canonical Capabilities per Blueprint §20.1, §24.2, and contracts/openapi/control-plane.yaml
 const (
-	CapRunCreate             = "run:create"
-	CapRunRead               = "run:read"
-	CapRunControl            = "run:control"
-	CapPayloadRead           = "payload:read"
-	CapDeployRegister        = "deployment:register"
-	CapDeployActivateStaging = "deployment:activate:staging"
-	CapDeployActivateProd    = "deployment:activate:production"
-	CapWorkerDrain           = "worker:drain"
-	CapApprovalDecide        = "approval:decide"
-	CapReconcileResolve      = "reconciliation:resolve"
+	// Workflow Runs
+	CapRunsCreate    = "runs:create"
+	CapRunsRead      = "runs:read"
+	CapRunsControl   = "runs:control"
+	CapRunsReconcile = "runs:reconcile"
+
+	// Payload & Artifacts
+	CapPayloadRead   = "payload:read"
+	CapArtifactsWrite = "artifacts:write"
+
+	// Deployments
+	CapDeploymentsWrite           = "deployments:write"
+	CapDeploymentsRegister        = "deployments:register"
+	CapDeploymentsActivateStaging = "deployments:activate:staging"
+	CapDeploymentsActivateProd    = "deployments:activate:production"
+
+	// Workflows & Workers
+	CapWorkflowsRead = "workflows:read"
+	CapWorkersRead   = "workers:read"
+	CapWorkersDrain  = "workers:drain"
+
+	// Approvals, Schedules, Webhooks
+	CapApprovalsDecide = "approvals:decide"
+	CapSchedulesWrite  = "schedules:write"
+	CapWebhooksWrite   = "webhooks:write"
+
+	// Administrative capabilities
+	CapOrgRead      = "org:read"
+	CapOrgUpdate    = "org:update"
+	CapOrgDelete    = "org:delete"
+	CapAdminMember  = "admin:member"
+	CapAdminKey     = "admin:key"
+	CapAdminProject = "admin:project"
+
+	// Backward-compatible aliases
+	CapRunCreate             = CapRunsCreate
+	CapRunRead               = CapRunsRead
+	CapRunControl            = CapRunsControl
+	CapDeployRegister        = CapDeploymentsRegister
+	CapDeployActivateStaging = CapDeploymentsActivateStaging
+	CapDeployActivateProd    = CapDeploymentsActivateProd
+	CapWorkerDrain           = CapWorkersDrain
+	CapApprovalDecide        = CapApprovalsDecide
+	CapReconcileResolve      = CapRunsReconcile
 )
 
 // Domain Errors
@@ -58,13 +92,24 @@ var (
 	ErrUnauthorized         = errors.New("UNAUTHORIZED: Authentication is required")
 	ErrForbidden            = errors.New("FORBIDDEN: Insufficient permissions for requested operation")
 	ErrNotFound             = errors.New("NOT_FOUND: The requested resource was not found")
+	ErrAuditRequired        = errors.New("AUDIT_REQUIRED: Audit context is required for lifecycle mutation")
+)
+
+type IdentityType string
+
+const (
+	IdentityTypeHuman   IdentityType = "HUMAN"
+	IdentityTypeMachine IdentityType = "MACHINE"
 )
 
 // AuditContext holds actor identity and correlation metadata for immutable audit logging.
 type AuditContext struct {
-	ActorID       *string // User ID (UUID) or Key ID (UUID)
-	CorrelationID string  // Request ID / X-Request-ID
-	Reason        string  // Optional reason
+	ActorID       *string      // User ID (UUID) or Key ID (UUID)
+	ActorType     IdentityType // HUMAN or MACHINE
+	Role          string       // e.g. "Admin", "Owner", or "" for machine
+	Capabilities  []string     // effective capabilities at time of action
+	CorrelationID string       // Request ID / X-Request-ID / Idempotency-Key
+	Reason        string       // Optional reason
 }
 
 // Organization represents a top-level tenant entity.

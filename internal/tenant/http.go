@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -22,12 +23,6 @@ const (
 	requestIDKey      contextKey = "deadbolt.tenant.request_id"
 )
 
-type IdentityType string
-
-const (
-	IdentityTypeHuman   IdentityType = "HUMAN"
-	IdentityTypeMachine IdentityType = "MACHINE"
-)
 
 // CallerIdentity captures the verified identity and authorized scope for a request.
 type CallerIdentity struct {
@@ -98,15 +93,14 @@ func (h *HTTPHandler) WithRequestID(next http.Handler) http.Handler {
 	})
 }
 
-// Routes mounts all tenant management routes onto an http.Handler with dual /api/v1 and /v1 prefixes.
-func (h *HTTPHandler) Routes() http.Handler {
-	mux := http.NewServeMux()
-
+// RegisterRoutes mounts all tenant management routes onto the provided mux with dual /api/v1 and /v1 prefixes.
+func (h *HTTPHandler) RegisterRoutes(mux *http.ServeMux) {
 	register := func(pattern string, handler http.HandlerFunc) {
 		parts := strings.SplitN(pattern, " ", 2)
 		method, path := parts[0], parts[1]
-		mux.HandleFunc(method+" /api/v1"+path, handler)
-		mux.HandleFunc(method+" /v1"+path, handler)
+		wrapped := h.WithRequestID(handler)
+		mux.Handle(method+" /api/v1"+path, wrapped)
+		mux.Handle(method+" /v1"+path, wrapped)
 	}
 
 	// Organization CRUD
@@ -139,8 +133,35 @@ func (h *HTTPHandler) Routes() http.Handler {
 
 	// Viewer Payload Protection Demonstration / Enforcement Endpoint
 	register("GET /environments/{envId}/payload-preview", h.RequireAuth(h.RequireOrgScope(CapPayloadRead, h.HandlePayloadPreview)))
+}
 
-	return h.WithRequestID(mux)
+// Routes mounts all tenant management routes onto an http.Handler with dual /api/v1 and /v1 prefixes.
+func (h *HTTPHandler) Routes() http.Handler {
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	return mux
+}
+
+// enforceIdempotency validates that mutating requests supply an Idempotency-Key header
+// and detects replay conflicts via stored audit records (OpenAPI & Blueprint §24.3).
+func (h *HTTPHandler) enforceIdempotency(w http.ResponseWriter, r *http.Request, orgID string) (string, bool) {
+	method := strings.ToUpper(r.Method)
+	if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
+		return "", true
+	}
+	idempKey := r.Header.Get("Idempotency-Key")
+	if idempKey == "" {
+		writeJSONError(w, r, http.StatusBadRequest, "MISSING_IDEMPOTENCY_KEY", "Idempotency-Key header is required for mutating requests")
+		return "", false
+	}
+	if orgID != "" {
+		exists, err := h.service.CheckIdempotency(r.Context(), orgID, idempKey)
+		if err == nil && exists {
+			writeJSONError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Mutation with this Idempotency-Key has already been processed")
+			return "", false
+		}
+	}
+	return idempKey, true
 }
 
 // RequireAuth authenticates the caller via Bearer API Key or Session Cookie.
@@ -253,6 +274,10 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 			return
 		}
 
+		if _, ok := h.enforceIdempotency(w, r, targetOrgID); !ok {
+			return
+		}
+
 		// Machine identity cross-tenant, environment mismatch, and capability check
 		if caller.Type == IdentityTypeMachine {
 			if caller.OrganizationID != targetOrgID {
@@ -326,6 +351,9 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 // -------------------------------------------------------------------------
 
 func (h *HTTPHandler) HandleCreateOrganization(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.enforceIdempotency(w, r, ""); !ok {
+		return
+	}
 	caller, _ := CallerFromContext(r.Context())
 	if caller.Type != IdentityTypeHuman {
 		writeJSONError(w, r, http.StatusForbidden, "MACHINE_CREATION_FORBIDDEN", "Only human users can create organizations")
@@ -422,6 +450,11 @@ func (h *HTTPHandler) HandleDeleteOrganization(w http.ResponseWriter, r *http.Re
 // -------------------------------------------------------------------------
 
 func (h *HTTPHandler) HandleListMembers(w http.ResponseWriter, r *http.Request) {
+	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", "Machine API keys are not permitted to manage organization members")
+		return
+	}
 	orgID := r.PathValue("id")
 	members, err := h.service.ListMembers(r.Context(), orgID)
 	if err != nil {
@@ -432,6 +465,11 @@ func (h *HTTPHandler) HandleListMembers(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *HTTPHandler) HandleAddMember(w http.ResponseWriter, r *http.Request) {
+	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", "Machine API keys are not permitted to manage organization members")
+		return
+	}
 	orgID := r.PathValue("id")
 	var req struct {
 		UserID string `json:"user_id"`
@@ -455,6 +493,11 @@ func (h *HTTPHandler) HandleAddMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HTTPHandler) HandleUpdateMemberRole(w http.ResponseWriter, r *http.Request) {
+	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", "Machine API keys are not permitted to manage organization members")
+		return
+	}
 	orgID := r.PathValue("id")
 	targetUserID := r.PathValue("userId")
 	var req struct {
@@ -486,6 +529,11 @@ func (h *HTTPHandler) HandleUpdateMemberRole(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *HTTPHandler) HandleUpdateMemberStatus(w http.ResponseWriter, r *http.Request) {
+	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", "Machine API keys are not permitted to manage organization members")
+		return
+	}
 	orgID := r.PathValue("id")
 	targetUserID := r.PathValue("userId")
 	var req struct {
@@ -517,6 +565,11 @@ func (h *HTTPHandler) HandleUpdateMemberStatus(w http.ResponseWriter, r *http.Re
 }
 
 func (h *HTTPHandler) HandleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", "Machine API keys are not permitted to manage organization members")
+		return
+	}
 	orgID := r.PathValue("id")
 	targetUserID := r.PathValue("userId")
 
@@ -542,6 +595,19 @@ func (h *HTTPHandler) HandleRemoveMember(w http.ResponseWriter, r *http.Request)
 
 func (h *HTTPHandler) HandleListProjects(w http.ResponseWriter, r *http.Request) {
 	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		proj, err := h.service.GetProjectForEnvironment(r.Context(), caller.OrganizationID, caller.EnvironmentID)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				writeJSON(w, http.StatusOK, map[string]any{"projects": []Project{}})
+				return
+			}
+			writeInternalError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"projects": []Project{*proj}})
+		return
+	}
 	projects, err := h.service.ListProjects(r.Context(), caller.OrganizationID)
 	if err != nil {
 		writeInternalError(w, r, err)
@@ -552,6 +618,10 @@ func (h *HTTPHandler) HandleListProjects(w http.ResponseWriter, r *http.Request)
 
 func (h *HTTPHandler) HandleCreateProject(w http.ResponseWriter, r *http.Request) {
 	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", "Machine API keys are not permitted to create projects")
+		return
+	}
 	var req struct {
 		Name string `json:"name"`
 	}
@@ -576,6 +646,29 @@ func (h *HTTPHandler) HandleListEnvironments(w http.ResponseWriter, r *http.Requ
 	caller, _ := CallerFromContext(r.Context())
 	projectID := r.PathValue("projectId")
 
+	if caller.Type == IdentityTypeMachine {
+		proj, err := h.service.GetProjectForEnvironment(r.Context(), caller.OrganizationID, caller.EnvironmentID)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				writeJSONError(w, r, http.StatusNotFound, "NOT_FOUND", "Project not found")
+				return
+			}
+			writeInternalError(w, r, err)
+			return
+		}
+		if proj.ID != projectID {
+			writeJSONError(w, r, http.StatusForbidden, "ENVIRONMENT_MISMATCH", "API key cannot access environments of another project")
+			return
+		}
+		env, err := h.service.GetEnvironment(r.Context(), caller.OrganizationID, caller.EnvironmentID)
+		if err != nil {
+			writeInternalError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"environments": []Environment{*env}})
+		return
+	}
+
 	envs, err := h.service.ListEnvironments(r.Context(), caller.OrganizationID, projectID)
 	if err != nil {
 		writeInternalError(w, r, err)
@@ -586,6 +679,10 @@ func (h *HTTPHandler) HandleListEnvironments(w http.ResponseWriter, r *http.Requ
 
 func (h *HTTPHandler) HandleCreateEnvironment(w http.ResponseWriter, r *http.Request) {
 	caller, _ := CallerFromContext(r.Context())
+	if caller.Type == IdentityTypeMachine {
+		writeJSONError(w, r, http.StatusForbidden, "MACHINE_KEY_UNAUTHORIZED", "Machine API keys are not permitted to create environments")
+		return
+	}
 	projectID := r.PathValue("projectId")
 	var req struct {
 		Name           string `json:"name"`
@@ -630,18 +727,37 @@ func (h *HTTPHandler) HandleCreateAPIKey(w http.ResponseWriter, r *http.Request)
 	}
 
 	reqID := RequestIDFromContext(r.Context())
-	var actorID *string
-	if caller.UserID != "" {
-		actorID = &caller.UserID
-	} else if caller.KeyID != "" {
-		actorID = &caller.KeyID
-	}
-	audit := &AuditContext{
-		ActorID:       actorID,
-		CorrelationID: reqID,
+	idempKey := r.Header.Get("Idempotency-Key")
+	if idempKey == "" {
+		idempKey = reqID
 	}
 
-	key, err := h.service.CreateAPIKey(r.Context(), caller.OrganizationID, envID, req.Capabilities, req.ExpiryDays, caller.Capabilities, audit)
+	var actorID *string
+	var creatorCaps []string
+	if caller.Type == IdentityTypeMachine {
+		actorID = &caller.KeyID
+		creatorCaps = caller.Capabilities
+	} else {
+		if caller.UserID != "" {
+			actorID = &caller.UserID
+		}
+		if len(caller.Capabilities) > 0 {
+			creatorCaps = caller.Capabilities
+		} else if caller.Role != "" {
+			creatorCaps = RoleCapabilities(caller.Role)
+		}
+	}
+
+	audit := &AuditContext{
+		ActorID:       actorID,
+		ActorType:     caller.Type,
+		Role:          caller.Role,
+		Capabilities:  creatorCaps,
+		CorrelationID: idempKey,
+		Reason:        r.Header.Get("X-Audit-Reason"),
+	}
+
+	key, err := h.service.CreateAPIKey(r.Context(), caller.OrganizationID, envID, req.Capabilities, req.ExpiryDays, creatorCaps, audit)
 	if err != nil {
 		if errors.Is(err, ErrCapabilityElevation) {
 			writeJSONError(w, r, http.StatusForbidden, "CAPABILITY_ELEVATION_FORBIDDEN", err.Error())
@@ -681,24 +797,53 @@ func (h *HTTPHandler) HandleRotateAPIKey(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		ExpiryDays int `json:"expiry_days"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil && r.ContentLength != 0 {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeJSONError(w, r, http.StatusBadRequest, "MALFORMED_JSON", "Request body contains invalid JSON: "+err.Error())
+			return
+		}
+	}
 
 	var callerEnvID string
 	var actorID *string
+	var callerCaps []string
 	if caller.Type == IdentityTypeMachine {
 		callerEnvID = caller.EnvironmentID
-	} else if caller.UserID != "" {
-		actorID = &caller.UserID
+		actorID = &caller.KeyID
+		callerCaps = caller.Capabilities
+	} else {
+		if caller.UserID != "" {
+			actorID = &caller.UserID
+		}
+		if len(caller.Capabilities) > 0 {
+			callerCaps = caller.Capabilities
+		} else if caller.Role != "" {
+			callerCaps = RoleCapabilities(caller.Role)
+		}
 	}
 
 	reqID := RequestIDFromContext(r.Context())
+	idempKey := r.Header.Get("Idempotency-Key")
+	if idempKey == "" {
+		idempKey = reqID
+	}
 	audit := &AuditContext{
 		ActorID:       actorID,
-		CorrelationID: reqID,
+		ActorType:     caller.Type,
+		Role:          caller.Role,
+		Capabilities:  callerCaps,
+		CorrelationID: idempKey,
+		Reason:        r.Header.Get("X-Audit-Reason"),
 	}
 
-	key, err := h.service.RotateAPIKey(r.Context(), caller.OrganizationID, keyID, req.ExpiryDays, callerEnvID, audit)
+	key, err := h.service.RotateAPIKey(r.Context(), caller.OrganizationID, keyID, req.ExpiryDays, callerCaps, callerEnvID, audit)
 	if err != nil {
+		if errors.Is(err, ErrCapabilityElevation) {
+			writeJSONError(w, r, http.StatusForbidden, "CAPABILITY_ELEVATION_FORBIDDEN", err.Error())
+			return
+		}
 		if errors.Is(err, ErrEnvironmentMismatch) {
 			writeJSONError(w, r, http.StatusForbidden, "ENVIRONMENT_MISMATCH", "API key cannot rotate keys outside its scoped environment")
 			return
@@ -724,16 +869,34 @@ func (h *HTTPHandler) HandleRevokeAPIKey(w http.ResponseWriter, r *http.Request)
 
 	var callerEnvID string
 	var actorID *string
+	var callerCaps []string
 	if caller.Type == IdentityTypeMachine {
 		callerEnvID = caller.EnvironmentID
-	} else if caller.UserID != "" {
-		actorID = &caller.UserID
+		actorID = &caller.KeyID
+		callerCaps = caller.Capabilities
+	} else {
+		if caller.UserID != "" {
+			actorID = &caller.UserID
+		}
+		if len(caller.Capabilities) > 0 {
+			callerCaps = caller.Capabilities
+		} else if caller.Role != "" {
+			callerCaps = RoleCapabilities(caller.Role)
+		}
 	}
 
 	reqID := RequestIDFromContext(r.Context())
+	idempKey := r.Header.Get("Idempotency-Key")
+	if idempKey == "" {
+		idempKey = reqID
+	}
 	audit := &AuditContext{
 		ActorID:       actorID,
-		CorrelationID: reqID,
+		ActorType:     caller.Type,
+		Role:          caller.Role,
+		Capabilities:  callerCaps,
+		CorrelationID: idempKey,
+		Reason:        r.Header.Get("X-Audit-Reason"),
 	}
 
 	err := h.service.RevokeAPIKey(r.Context(), caller.OrganizationID, keyID, callerEnvID, audit)

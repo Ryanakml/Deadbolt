@@ -167,13 +167,14 @@ API keys belong to **exactly one environment**. An API key issued for `staging` 
 
 Blueprint §24.2 mandates that sensitive human-in-the-loop decisions require an identifiable human actor:
 
-- **Barred Capabilities:** Machine API keys **cannot** be granted `approval:decide` (human approval decisions) or `reconciliation:resolve` (manual side-effect reconciliation).
+- **Barred Capabilities:** Machine API keys **cannot** be granted `approvals:decide` (human approval decisions) or `runs:reconcile` (manual side-effect reconciliation).
 - **Enforcement:** If a request attempts to generate an API key with either of these capabilities, the request is immediately rejected with `403 Forbidden` (`MACHINE_KEY_UNAUTHORIZED`).
 
 ### 3.5 Expiration & Revocation Mechanics
 
 - **Default Lifetime:** Defaults to 90 days (`DefaultExpiryDays = 90`) unless explicitly configured.
 - **Immediate Revocation:** Any key can be instantly revoked via `DELETE /api/v1/api-keys/{id}`. The timestamp is recorded in `revoked_at`.
+- **Atomic Rotation & Privilege Escalation Defense:** API keys can be atomically rotated via `POST /api/v1/api-keys/{id}/rotate`. Rotation verifies that all capabilities of the target key are a subset of the caller's effective capabilities ($\text{targetCaps} \subseteq \text{callerCaps}$), rejecting privilege escalation attempts with `403 Forbidden` (`CAPABILITY_ELEVATION_FORBIDDEN`).
 - **Last-Used Auditing:** Upon successful authentication, `last_used_at` is updated within the tenant transaction.
 
 ---
@@ -184,18 +185,18 @@ Blueprint §24.2 mandates that sensitive human-in-the-loop decisions require an 
 
 Deadbolt enforces role-based access control across five canonical roles:
 
-| Capability                       | Identifier                                           |  Viewer  | Developer | Operator |  Admin  |  Owner  |
-| :------------------------------- | :--------------------------------------------------- | :------: | :-------: | :------: | :-----: | :-----: |
-| Read Status & History            | `run:read`, `org:read`                               | **Yes**  |  **Yes**  | **Yes**  | **Yes** | **Yes** |
-| Read Payload & Logs              | `payload:read`                                       | **No**\* |  **Yes**  | **Yes**  | **Yes** | **Yes** |
-| Run & Control Execution          | `run:create`, `run:control`                          |  **No**  |  **Yes**  | **Yes**  | **Yes** | **Yes** |
-| Deploy to Staging                | `deployment:register`, `deployment:activate:staging` |  **No**  |  **Yes**  | **Yes**  | **Yes** | **Yes** |
-| Deploy to Production             | `deployment:activate:production`                     |  **No**  |  **No**   | **Yes**  | **Yes** | **Yes** |
-| Worker Drain                     | `worker:drain`                                       |  **No**  |  **No**   | **Yes**  | **Yes** | **Yes** |
-| Human Approvals & Reconciliation | `approval:decide`, `reconciliation:resolve`          |  **No**  |  **No**   | **Yes**  | **Yes** | **Yes** |
-| Manage Members & API Keys        | `admin:member`, `admin:key`, `admin:project`         |  **No**  |  **No**   |  **No**  | **Yes** | **Yes** |
-| Modify Organization Settings     | `org:update`                                         |  **No**  |  **No**   |  **No**  | **Yes** | **Yes** |
-| Delete Organization              | `org:delete`                                         |  **No**  |  **No**   |  **No**  | **No**  | **Yes** |
+| Capability                       | Identifier                                                |  Viewer  | Developer | Operator |  Admin  |  Owner  |
+| :------------------------------- | :-------------------------------------------------------- | :------: | :-------: | :------: | :-----: | :-----: |
+| Read Status & History            | `runs:read`, `workflows:read`, `workers:read`, `org:read` | **Yes**  |  **Yes**  | **Yes**  | **Yes** | **Yes** |
+| Read Payload & Logs              | `payload:read`                                            | **No**\* |  **Yes**  | **Yes**  | **Yes** | **Yes** |
+| Run & Control Execution          | `runs:create`, `runs:control`                             |  **No**  |  **Yes**  | **Yes**  | **Yes** | **Yes** |
+| Deploy to Staging                | `deployments:register`, `deployments:activate:staging`    |  **No**  |  **Yes**  | **Yes**  | **Yes** | **Yes** |
+| Deploy to Production             | `deployments:activate:production`, `deployments:write`    |  **No**  |  **No**   | **Yes**  | **Yes** | **Yes** |
+| Worker Drain                     | `workers:drain`                                           |  **No**  |  **No**   | **Yes**  | **Yes** | **Yes** |
+| Human Approvals & Reconciliation | `approvals:decide`, `runs:reconcile`                      |  **No**  |  **No**   | **Yes**  | **Yes** | **Yes** |
+| Manage Members & API Keys        | `admin:member`, `admin:key`, `admin:project`              |  **No**  |  **No**   |  **No**  | **Yes** | **Yes** |
+| Modify Organization Settings     | `org:update`                                              |  **No**  |  **No**   |  **No**  | **Yes** | **Yes** |
+| Delete Organization              | `org:delete`                                              |  **No**  |  **No**   |  **No**  | **No**  | **Yes** |
 
 _\*Note: Viewers see execution state, timing, and sanitized error summaries. Inspecting sensitive business payloads, step inputs/outputs, artifacts, or execution logs requires the explicit `payload:read` capability._
 
@@ -385,7 +386,7 @@ The implementation is verified by 21 exhaustive integration test suites in [`tes
 | 6   | `TestCrossTenantDenial`                     | Validates that an API key or session from Org A cannot access or query resources from Org B (RLS zero rows & `403 Forbidden`).                | **PASS** |
 | 7   | `TestRBACPermissionMatrix`                  | Verifies full capability matrix across all 5 canonical roles and verifies that `Viewer` cannot access payload endpoints (machine and human).  | **PASS** |
 | 8   | `TestLastOwnerDefense`                      | Proves that demoting or removing the sole remaining active Owner fails with `LAST_OWNER_DEMOTION_FORBIDDEN` / `LAST_OWNER_REMOVAL_FORBIDDEN`. | **PASS** |
-| 9   | `TestMachineKeyApprovalRestriction`         | Proves that attempting to create machine keys with `approval:decide` or `reconciliation:resolve` fails with `MACHINE_KEY_UNAUTHORIZED`.       | **PASS** |
+| 9   | `TestMachineKeyApprovalRestriction`         | Proves that attempting to create machine keys with `approvals:decide` or `runs:reconcile` fails with `MACHINE_KEY_UNAUTHORIZED`.              | **PASS** |
 | 10  | `TestHTTPTenantEndpoints`                   | End-to-end HTTP validation for listing summaries and revoking API keys over REST.                                                             | **PASS** |
 | 11  | `TestErrorEnvelopeFormat`                   | Validates canonical OpenAPI error envelope: `{ code, message, requestId, details, retryable }`.                                               | **PASS** |
 | 12  | `TestEnvironmentMismatchRejection`          | Verifies 403 `ENVIRONMENT_MISMATCH` rejection across path parameter, query parameters, and request headers.                                   | **PASS** |

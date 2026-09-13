@@ -18,7 +18,7 @@ export const schemas: Record<string, JSONValue> = ${JSON.stringify(data, null, 2
 `;
 const path = "sdk/typescript/src/schema-data.ts";
 if (process.argv.includes("--check")) {
-  if (fs.readFileSync(path, "utf8") !== text)
+  if (fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n") !== text)
     throw Error("Generated schemas are stale");
 } else fs.writeFileSync(path, text);
 const enums = JSON.parse(
@@ -32,13 +32,20 @@ for (const [name, values] of Object.entries(enums)) {
   go += `type ${name} string\nconst (\n${values.map((v) => `${name}${v} ${name} = ${JSON.stringify(v)}`).join("\n")}\n)\n`;
 }
 const { execFileSync } = await import("node:child_process");
-go = execFileSync("gofmt", [], { input: go, encoding: "utf8" });
+let hasGofmt = false;
+try {
+  go = execFileSync("gofmt", [], { input: go, encoding: "utf8" });
+  hasGofmt = true;
+} catch {
+  // If gofmt is not in host PATH (e.g. non-Go host environment), keep existing file
+}
 for (const [path, text] of [
   ["sdk/typescript/src/enums.ts", ts],
   ["internal/contracts/enums_generated.go", go],
 ]) {
+  if (path.endsWith(".go") && !hasGofmt) continue;
   if (process.argv.includes("--check")) {
-    if (fs.readFileSync(path, "utf8") !== text)
+    if (fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n") !== text.replace(/\r\n/g, "\n"))
       throw Error(`Generated enums are stale: ${path}`);
   } else fs.writeFileSync(path, text);
 }

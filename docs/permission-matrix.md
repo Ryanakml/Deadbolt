@@ -9,29 +9,36 @@
 
 Deadbolt enforces role-based access control (RBAC) across five canonical organization roles. Permissions are evaluated against explicit capabilities before any control-plane or data-plane operation is executed.
 
-| Role          | Read Status & History | Read Payload & Log               | Run & Control (`run:create`, `run:control`)    | Reconcile & Approve (`approval:decide`, `reconciliation:resolve`) | Deploy & Activate (`deployment:register`, `deployment:activate:*`) | Administration (`admin:member`, `admin:key`, `worker:drain`) |
-| :------------ | :-------------------- | :------------------------------- | :--------------------------------------------- | :---------------------------------------------------------------- | :----------------------------------------------------------------- | :----------------------------------------------------------- |
-| **Viewer**    | **Yes**               | **No** (requires `payload:read`) | **No**                                         | **No**                                                            | **No**                                                             | **No**                                                       |
-| **Developer** | **Yes**               | **Yes**                          | **Yes** (Create, pause, resume, cancel, rerun) | **No**                                                            | **Register & Staging Only**                                        | **No**                                                       |
-| **Operator**  | **Yes**               | **Yes**                          | **Yes**                                        | **Yes**                                                           | **Yes** (Staging & Production)                                     | **Drain Worker**                                             |
-| **Admin**     | **Yes**               | **Yes**                          | **Yes**                                        | **Yes**                                                           | **Yes**                                                            | **Yes** (except removing last Owner)                         |
-| **Owner**     | **Yes**               | **Yes**                          | **Yes**                                        | **Yes**                                                           | **Yes**                                                            | **Yes** (including Org Deletion)                             |
+| Role          | Read Status & History | Read Payload & Log               | Run & Control (`runs:create`, `runs:control`)  | Reconcile & Approve (`approvals:decide`, `runs:reconcile`) | Deploy & Activate (`deployments:register`, `deployments:activate:*`) | Administration (`admin:member`, `admin:key`, `workers:drain`) |
+| :------------ | :-------------------- | :------------------------------- | :--------------------------------------------- | :--------------------------------------------------------- | :------------------------------------------------------------------- | :------------------------------------------------------------ |
+| **Viewer**    | **Yes**               | **No** (requires `payload:read`) | **No**                                         | **No**                                                     | **No**                                                               | **No**                                                        |
+| **Developer** | **Yes**               | **Yes**                          | **Yes** (Create, pause, resume, cancel, rerun) | **No**                                                     | **Register & Staging Only**                                          | **No**                                                        |
+| **Operator**  | **Yes**               | **Yes**                          | **Yes**                                        | **Yes**                                                    | **Yes** (Staging & Production)                                       | **Drain Worker**                                              |
+| **Admin**     | **Yes**               | **Yes**                          | **Yes**                                        | **Yes**                                                    | **Yes**                                                              | **Yes** (except removing last Owner)                          |
+| **Owner**     | **Yes**               | **Yes**                          | **Yes**                                        | **Yes**                                                    | **Yes**                                                              | **Yes** (including Org Deletion)                              |
 
 ### 1.1 Canonical Capabilities
 
-- `run:create`: Submit and trigger new workflow executions.
-- `run:read`: Query workflow runs, step states, execution events, and metadata.
-- `run:control`: Pause, resume, cancel, or rerun existing workflow executions.
+- `runs:create`: Submit and trigger new workflow executions.
+- `runs:read`: Query workflow runs, step states, execution events, and metadata.
+- `runs:control`: Pause, resume, cancel, or rerun existing workflow executions.
+- `runs:reconcile`: Mark ambiguous side effects as confirmed or failed during reconciliation.
 - `payload:read`: Inspect workflow and step inputs, outputs, diagnostic logs, and artifacts. (Viewers see only metadata and sanitized errors unless explicitly granted this capability).
-- `deployment:register`: Upload and register workflow manifests and bundle digests.
-- `deployment:activate:staging`: Promote registered deployments to the `staging` environment.
-- `deployment:activate:production`: Promote deployments to the `production` environment.
-- `worker:drain`: Issue graceful drain signals to worker pools.
-- `approval:decide`: Submit human decisions (approve / reject) on waiting approval steps.
-- `reconciliation:resolve`: Mark ambiguous side effects as confirmed or failed during reconciliation.
+- `artifacts:write`: Upload and record execution artifacts.
+- `deployments:write`: Register and activate deployments.
+- `deployments:register`: Upload and register workflow manifests and bundle digests.
+- `deployments:activate:staging`: Promote registered deployments to the `staging` environment.
+- `deployments:activate:production`: Promote deployments to the `production` environment.
+- `workflows:read`: Query workflow definitions and schema metadata.
+- `workers:read`: Enumerate active worker processes and capability profiles.
+- `workers:drain`: Issue graceful drain signals to worker pools.
+- `approvals:decide`: Submit human decisions (approve / reject) on waiting approval steps.
+- `schedules:write`: Create, modify, and delete cron schedule triggers.
+- `webhooks:write`: Create, modify, and delete inbound webhook triggers.
 - `admin:member`: Invite, update roles of, and remove team members.
 - `admin:key`: Generate, inspect summaries of, and revoke environment-scoped API keys.
 - `admin:project`: Create projects and configure environment admissions / concurrency limits.
+- `org:read`: View organization details and memberships.
 - `org:update`: Modify organization settings.
 - `org:delete`: Permanently delete an organization and cascade all contained resources (Owner only).
 
@@ -58,12 +65,13 @@ API keys are machine credentials intended for headless CI/CD pipelines and self-
 - **Default Expiry:** Keys default to a 90-day expiration window.
 - **Revocation:** Keys can be immediately revoked via `DELETE /api/v1/api-keys/{id}`. Revocation is checked on every invocation.
 - **Atomic Rotation:** API keys can be atomically rotated via `POST /api/v1/api-keys/{id}/rotate`. In a single atomic database transaction, the existing key is marked as revoked (`revoked_at = clock_timestamp()`) and a fresh replacement key is generated with identical environment scoping and capabilities, returning the new plaintext key exactly once.
+- **Privilege Escalation Defense:** Rotation requires that all capabilities carried by the target key are a subset of the caller's effective capabilities ($\text{targetCaps} \subseteq \text{callerCaps}$). Attempting to rotate a key carrying capabilities not held by the caller is rejected with HTTP `403 Forbidden` (`CAPABILITY_ELEVATION_FORBIDDEN`).
 - **Timing Side-Channel Protection:** Key authentication executes a dummy constant-time comparison even when a prefix lookup yields zero results, preventing timing-based enumeration of valid key prefixes.
 - **Write Throttling for High Concurrency:** `last_used_at` timestamps are throttled to update at most once per 60 seconds per key, preventing row-level lock contention and write amplification under heavy parallel traffic.
 
 ### 2.3 Machine Key Authorization Restrictions
 
-- **No Human Approvals or Reconciliations:** In strict compliance with Blueprint §24.2, machine API keys cannot possess `approval:decide` or `reconciliation:resolve` capabilities. Attempts to create an API key with these capabilities are rejected with `MACHINE_KEY_UNAUTHORIZED`. Human decisions require an identifiable human user session.
+- **No Human Approvals or Reconciliations:** In strict compliance with Blueprint §24.2, machine API keys cannot possess `approvals:decide` or `runs:reconcile` capabilities. Attempts to create an API key with these capabilities are rejected with `MACHINE_KEY_UNAUTHORIZED`. Human decisions require an identifiable human user session.
 
 ---
 
