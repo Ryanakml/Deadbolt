@@ -30,7 +30,7 @@ In accordance with Blueprint §12.3 and §33, three runner packaging candidates 
 | Candidate                                                        | Packaging Model                                                                                                         | Native Dependency Support                                                                               | Contention & Isolation Behavior                                                      | Architectural Assessment                                                                   |
 | :--------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------- |
 | **A. Unbundled Global Scripts**                                  | Global system Node.js executes task files directly from local disk.                                                     | Relies on global or unscoped `node_modules`; breaks across versions.                                    | High risk of environment contamination and dependency pollution across tasks.        | **Rejected:** Violates immutability (`INV-07`) and reproducible deployment.                |
-| **B. Monolithic Single-Binary Runner (e.g. Bun / SEA / pkg)**    | Node runtime bundled into a single standalone binary per task.                                                          | Difficult to compile native C++ addons (`sharp`, `pg-native`) for multi-arch targets (`amd64`/`arm64`). | High disk footprint ($\sim 80\text{MB}$ per task deployment); opaque debugging.      | **Rejected:** Prohibitive storage overhead and poor native dependency compatibility.       |
+| **B. Monolithic Single-Binary Runner (e.g. Bun / SEA / pkg)**    | Node runtime bundled into a single standalone binary per task.                                                          | Native C++ addon packaging is comparatively awkward across `amd64`/`arm64`.             | Larger opaque artifacts and harder debugging; no size benchmark was recorded in SP-03. | **Rejected:** poor native dependency compatibility and weaker operational transparency. |
 | **C. Pinned Runtime with Versioned Immutable Bundle (Selected)** | Dedicated worker runner package (`@runtime/runner` / `runner/node`) executing versioned, SHA-256 verified task bundles. | Native dependencies compiled for target architecture and verified against manifest `targetArch`.        | Clean process-per-attempt isolation, dedicated IPC channel, allowlisted environment. | **Selected Architecture:** Fully conforms to Blueprint §12.3, §22.3, and `REQ-VERSION-01`. |
 
 ---
@@ -74,7 +74,7 @@ On Windows, process group termination is executed via recursive process tree ter
 
 ## 4. Lifecycle Harness Coverage
 
-The following are executable acceptance tests, not historical benchmark measurements. A fresh CI run is required before reporting measured timings or leak counts.
+The following are executable acceptance tests. They passed on the PR merge-result run [34749615973](https://github.com/Ryanakml/Deadbolt/actions/runs/34749615973) at acceptance head `269c96d0a060dc764e3e1ce28de3a52f4dc81e4b`: `contracts`, `SP-03 native addon (amd64)`, and `SP-03 native addon (arm64)` all passed.
 
 ### Benchmark 1: Start ACK Gating (`TestSP03_StartAckGating`)
 
@@ -109,9 +109,17 @@ The following are executable acceptance tests, not historical benchmark measurem
 - **Workload:** Node task with infinite loop ignoring SIGTERM with $1.5\text{s}$ grace period.
 - The harness asserts the SIGTERM → bounded grace → SIGKILL path. It does not claim protection from deliberately detached hostile subprocesses.
 
-### Benchmark 6: Crash/abort soak
+### Benchmark 6: Crash/abort soak (`TestSP03_CrashSoakAndNoLeakedProcesses`)
 
-- **Status:** The former test covered only successful executions, so it is not evidence of crash/abort leak behavior. No zero-leak or FD claim is made until the mixed-outcome soak measures known PIDs, result-file cleanup, and FD growth.
+- **Workload:** 12 bounded cycles covering successful output, an intentional task failure, and non-cooperative hung handlers terminated through the timeout/TERM/grace/KILL path.
+- **Assertions:** every observed runner PID is gone after its cycle; the test-owned result directory is empty after each cycle; on Linux, open FD count may not grow by more than three from the baseline.
+- **Evidence:** the mixed soak ran in the passing `contracts` job of run `34749615973` (`go test -race ./...`). This is bounded process-group evidence, not a hostile-code sandbox claim.
+
+### Benchmark 7: Verified native package on Linux amd64 and arm64 (`TestSP03_VerifiedNativeBundle`)
+
+- **Fixture/package:** CI compiles `native-addon.c` as a target-native N-API `.node` binary, then creates `native-bundle.tar` containing both `native-task.mjs` and `native-addon.node`.
+- **Execution gate:** the supervisor verifies tar SHA-256 and `targetArch`, extracts only the verified archive, then invokes the declared in-bundle entrypoint. Digest and architecture mismatch tests assert no child process starts.
+- **Evidence:** the hosted `SP-03 native addon (amd64)` and `SP-03 native addon (arm64)` jobs both passed in run `34749615973`.
 
 ---
 
@@ -143,11 +151,11 @@ test -z "$(gofmt -l internal/worker tests/spikes/sp03 runner/node)"
   - Process group management with POSIX `-pgid` signalling and Windows process tree termination.
   - Dedicated result channel with fallback to environment-configured result file (`DEADBOLT_RESULT_FILE`).
   - Empirical SP-03 test harness in `tests/spikes/sp03/process_test.go`.
-- **Automated Tests:** Run the commands above on the exact branch/merge result; this report intentionally does not carry forward a stale pass count.
+- **Acceptance evidence:** merge-result CI run [34749615973](https://github.com/Ryanakml/Deadbolt/actions/runs/34749615973) passed all three jobs at head `269c96d0a060dc764e3e1ce28de3a52f4dc81e4b`: `contracts`, native addon amd64, and native addon arm64.
 - **Invariant Traceability:**
   - `REQ-DUR-01`: Start ACK gating and conservative lease bounds guarantee no phantom executions without valid ownership.
-  - `REQ-VERSION-01`: Bundle SHA-256 digest and architecture compatibility are execution gates. Real Linux amd64/arm64 native-addon packaging remains a separate CI acceptance requirement, not a proven local claim.
+  - `REQ-VERSION-01`: Bundle SHA-256 digest and architecture compatibility are execution gates. The selected pinned-runtime + immutable tar bundle was exercised with a real N-API dependency on hosted Linux amd64 and arm64.
   - `INV-01`: Multi-tenant boundary preserved; parent agent credentials never leak to child runner.
   - `INV-03`: Single active ownership enforced; expired lease stops runner before background lease reclamation.
   - `INV-07`: Bundles are verified immutable artifacts with cryptographic checksums.
-  - `INV-10`: 10-second cancellation grace cleanly enforced on process group.
+  - `INV-10`: Cancellation grace is applied to the process group. SP-03 proves same-group child shutdown; deliberately detached hostile subprocesses remain outside this spike's guarantee.
