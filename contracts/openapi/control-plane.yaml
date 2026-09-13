@@ -6,6 +6,10 @@ info:
     Versioned target HTTP contracts (M0). No endpoints are implemented
     by this PR. Authentication, tenant authorization, transactions, and runtime
     capability gates are implemented by their owning issues.
+    Mutating tenant endpoints require Idempotency-Key: an identical retry returns
+    the recorded outcome, while reuse with different request content returns 409.
+    API-key plaintext is returned only by the first successful create or rotation;
+    replay responses are redacted.
 servers:
   - url: /v1
     description: Control Plane v1 API

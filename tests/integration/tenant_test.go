@@ -1849,7 +1849,7 @@ func TestIdempotencyKeyEnforcement(t *testing.T) {
 		t.Fatalf("expected 201 Created on first mutation, got %d", respFirst.StatusCode)
 	}
 
-	// 3. Replay with identical Idempotency-Key -> 409 IDEMPOTENCY_CONFLICT
+	// 3. Identical replay returns the committed redacted outcome, never the secret.
 	reqReplay, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/environments/%s/api-keys", server.URL, env.ID), strings.NewReader(`{"capabilities":["runs:read"]}`))
 	reqReplay.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	reqReplay.Header.Set("X-Organization-ID", org.ID)
@@ -1862,14 +1862,103 @@ func TestIdempotencyKeyEnforcement(t *testing.T) {
 	}
 	defer respReplay.Body.Close()
 
-	if respReplay.StatusCode != http.StatusConflict {
-		t.Fatalf("expected 409 Conflict on replayed Idempotency-Key, got %d", respReplay.StatusCode)
+	if respReplay.StatusCode != http.StatusCreated {
+		t.Fatalf("expected recorded 201 Created on replayed Idempotency-Key, got %d", respReplay.StatusCode)
 	}
-	var conflictEnv tenant.ErrorEnvelope
-	if err := json.NewDecoder(respReplay.Body).Decode(&conflictEnv); err != nil {
-		t.Fatalf("failed to decode conflict envelope: %v", err)
+	var replay tenant.GeneratedKey
+	if err := json.NewDecoder(respReplay.Body).Decode(&replay); err != nil {
+		t.Fatalf("failed to decode replayed key: %v", err)
 	}
-	if conflictEnv.Code != "IDEMPOTENCY_CONFLICT" {
-		t.Fatalf("expected code IDEMPOTENCY_CONFLICT, got %q", conflictEnv.Code)
+	if replay.PlaintextKey != "" {
+		t.Fatal("idempotency replay must not return API-key plaintext")
+	}
+
+	// 4. A reused key cannot be silently applied to different content.
+	reqConflict, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/environments/%s/api-keys", server.URL, env.ID), strings.NewReader(`{"capabilities":["admin:key"]}`))
+	reqConflict.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	reqConflict.Header.Set("X-Organization-ID", org.ID)
+	reqConflict.Header.Set("Content-Type", "application/json")
+	reqConflict.Header.Set("Idempotency-Key", idempKey)
+	respConflict, err := http.DefaultClient.Do(reqConflict)
+	if err != nil {
+		t.Fatalf("conflicting replay failed: %v", err)
+	}
+	defer respConflict.Body.Close()
+	if respConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for mismatched idempotency request, got %d", respConflict.StatusCode)
+	}
+}
+
+func TestIdempotencyConcurrentIdenticalAPIKeyCreateCommitsOnce(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Concurrent Idempotency Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Concurrent Idempotency Project")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+	adminKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunsRead})
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+	key := "idemp-concurrent-" + time.Now().Format("20060102150405.000000")
+	call := func() (int, tenant.GeneratedKey, error) {
+		req, err := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/environments/%s/api-keys", server.URL, env.ID), strings.NewReader(`{"capabilities":["runs:read"]}`))
+		if err != nil {
+			return 0, tenant.GeneratedKey{}, err
+		}
+		req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+		req.Header.Set("X-Organization-ID", org.ID)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, tenant.GeneratedKey{}, err
+		}
+		defer resp.Body.Close()
+		var result tenant.GeneratedKey
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		return resp.StatusCode, result, err
+	}
+
+	type result struct {
+		status int
+		key    tenant.GeneratedKey
+		err    error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() { <-start; status, created, err := call(); results <- result{status, created, err} }()
+	}
+	close(start)
+	firstSecretCount := 0
+	var resourceID string
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent request failed: %v", result.err)
+		}
+		if result.status != http.StatusCreated {
+			t.Fatalf("expected 201, got %d", result.status)
+		}
+		if result.key.PlaintextKey != "" {
+			firstSecretCount++
+		}
+		if resourceID == "" {
+			resourceID = result.key.ID
+		} else if resourceID != result.key.ID {
+			t.Fatalf("replay returned different resource: %s != %s", resourceID, result.key.ID)
+		}
+	}
+	if firstSecretCount != 1 {
+		t.Fatalf("expected exactly one plaintext issuance, got %d", firstSecretCount)
+	}
+	keys, err := tc.service.ListAPIKeys(ctx, org.ID, env.ID)
+	if err != nil {
+		t.Fatalf("list API keys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("expected bootstrap key plus exactly one created key, got %d", len(keys))
 	}
 }

@@ -32,12 +32,16 @@ func (s *Service) CreateOrganization(ctx context.Context, userID string, name st
 	}
 
 	orgID, err := NewUUID()
+	if command, ok := commandFromContext(ctx); ok {
+		orgID = commandOrganizationID(userID, command.Key)
+		err = nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate org id: %w", err)
 	}
 
 	var org Organization
-	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err = s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// 1. Insert organization
 		queryOrg := `
 			INSERT INTO organizations (id, name)
@@ -58,7 +62,7 @@ func (s *Service) CreateOrganization(ctx context.Context, userID string, name st
 		}
 
 		return nil
-	})
+	}, func() any { return &org }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &org) })
 
 	if err != nil {
 		return nil, err
@@ -90,7 +94,7 @@ func (s *Service) UpdateOrganization(ctx context.Context, orgID string, name str
 	}
 
 	var org Organization
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		query := `
 			UPDATE organizations
 			SET name = $2, updated_at = clock_timestamp()
@@ -102,7 +106,7 @@ func (s *Service) UpdateOrganization(ctx context.Context, orgID string, name str
 			return ErrNotFound
 		}
 		return err
-	})
+	}, func() any { return &org }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &org) })
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +115,7 @@ func (s *Service) UpdateOrganization(ctx context.Context, orgID string, name str
 
 // DeleteOrganization deletes an organization and all its cascade-dependent children.
 func (s *Service) DeleteOrganization(ctx context.Context, orgID string) error {
-	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM organizations WHERE id = $1`, orgID)
 		if err != nil {
 			return err
@@ -120,7 +124,8 @@ func (s *Service) DeleteOrganization(ctx context.Context, orgID string) error {
 			return ErrNotFound
 		}
 		return nil
-	})
+	}, func() any { return struct{}{} }, func(raw json.RawMessage) error { return nil })
+	return err
 }
 
 // ListMembers lists all members of an organization.
@@ -161,7 +166,7 @@ func (s *Service) AddMember(ctx context.Context, orgID string, userID string, ro
 	}
 
 	var m Member
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		query := `
 			INSERT INTO organization_members (organization_id, user_id, role, status)
 			VALUES ($1, $2, $3, $4)
@@ -169,7 +174,7 @@ func (s *Service) AddMember(ctx context.Context, orgID string, userID string, ro
 		`
 		return tx.QueryRow(ctx, query, orgID, userID, role, StatusActive).
 			Scan(&m.ID, &m.OrganizationID, &m.UserID, &m.Role, &m.Status, &m.CreatedAt, &m.UpdatedAt)
-	})
+	}, func() any { return &m }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &m) })
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +187,7 @@ func (s *Service) UpdateMemberRole(ctx context.Context, orgID string, targetUser
 		return ErrInvalidRole
 	}
 
-	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// Acquire row lock on organization to serialize member modifications and prevent race conditions
 		var lockedOrgID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
@@ -230,7 +235,8 @@ func (s *Service) UpdateMemberRole(ctx context.Context, orgID string, targetUser
 			return ErrNotFound
 		}
 		return nil
-	})
+	}, func() any { return struct{}{} }, func(raw json.RawMessage) error { return nil })
+	return err
 }
 
 // UpdateMemberStatus updates a member's status (ACTIVE / SUSPENDED) while strictly enforcing Last Owner Defense.
@@ -239,7 +245,7 @@ func (s *Service) UpdateMemberStatus(ctx context.Context, orgID string, targetUs
 		return ErrInvalidStatus
 	}
 
-	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// Acquire row lock on organization to serialize member modifications
 		var lockedOrgID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
@@ -287,12 +293,13 @@ func (s *Service) UpdateMemberStatus(ctx context.Context, orgID string, targetUs
 			return ErrNotFound
 		}
 		return nil
-	})
+	}, func() any { return struct{}{} }, func(raw json.RawMessage) error { return nil })
+	return err
 }
 
 // RemoveMember removes a member while strictly enforcing Last Owner Defense.
 func (s *Service) RemoveMember(ctx context.Context, orgID string, targetUserID string) error {
-	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// Acquire row lock on organization to serialize member modifications and prevent race conditions
 		var lockedOrgID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
@@ -336,7 +343,8 @@ func (s *Service) RemoveMember(ctx context.Context, orgID string, targetUserID s
 			return ErrNotFound
 		}
 		return nil
-	})
+	}, func() any { return struct{}{} }, func(raw json.RawMessage) error { return nil })
+	return err
 }
 
 // GetMember fetches a member by user ID scoped to the organization.
@@ -368,7 +376,7 @@ func (s *Service) CreateProject(ctx context.Context, orgID string, name string) 
 	}
 
 	var p Project
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		query := `
 			INSERT INTO projects (organization_id, name)
 			VALUES ($1, $2)
@@ -376,7 +384,7 @@ func (s *Service) CreateProject(ctx context.Context, orgID string, name string) 
 		`
 		return tx.QueryRow(ctx, query, orgID, name).
 			Scan(&p.ID, &p.OrganizationID, &p.Name, &p.CreatedAt, &p.UpdatedAt)
-	})
+	}, func() any { return &p }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &p) })
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +476,7 @@ func (s *Service) CreateEnvironment(ctx context.Context, orgID string, projectID
 	}
 
 	var env Environment
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// Verify project exists
 		var exists int
 		checkProj := `SELECT 1 FROM projects WHERE organization_id = $1 AND id = $2`
@@ -502,7 +510,7 @@ func (s *Service) CreateEnvironment(ctx context.Context, orgID string, projectID
 
 		env.MaxConcurrency = maxConcurrency
 		return nil
-	})
+	}, func() any { return &env }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &env) })
 	if err != nil {
 		return nil, err
 	}
@@ -624,7 +632,7 @@ func (s *Service) BootstrapAPIKey(ctx context.Context, orgID string, envID strin
 
 func (s *Service) createAPIKeyInternal(ctx context.Context, orgID string, envID string, capabilities []string, expiryDays int, audit *AuditContext) (*GeneratedKey, error) {
 	var genKey GeneratedKey
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// Look up environment to get name for prefix
 		var envName string
 		queryEnv := `SELECT name FROM environments WHERE organization_id = $1 AND id = $2`
@@ -683,7 +691,11 @@ func (s *Service) createAPIKeyInternal(ctx context.Context, orgID string, envID 
 		genKey.Capabilities = capabilities
 		genKey.ExpiresAt = expiresAt
 		return nil
-	})
+	}, func() any {
+		redacted := genKey
+		redacted.PlaintextKey = ""
+		return &redacted
+	}, func(raw json.RawMessage) error { return json.Unmarshal(raw, &genKey) })
 	if err != nil {
 		return nil, err
 	}
@@ -727,7 +739,7 @@ func (s *Service) RevokeAPIKey(ctx context.Context, orgID string, keyID string, 
 	if audit == nil {
 		return ErrAuditRequired
 	}
-	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// 1. Resolve target key's environment to enforce authoritative environment scoping
 		var envID string
 		var prefix string
@@ -774,7 +786,8 @@ func (s *Service) RevokeAPIKey(ctx context.Context, orgID string, keyID string, 
 		}
 
 		return nil
-	})
+	}, func() any { return struct{}{} }, func(raw json.RawMessage) error { return nil })
+	return err
 }
 
 // RotateAPIKey atomically revokes the existing key and generates a new key with identical environment & capabilities.
@@ -789,7 +802,7 @@ func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, 
 	}
 
 	var genKey GeneratedKey
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// 1. Select existing key with row lock
 		var envID string
 		var caps []string
@@ -903,7 +916,11 @@ func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, 
 		genKey.Capabilities = caps
 		genKey.ExpiresAt = expiresAt
 		return nil
-	})
+	}, func() any {
+		redacted := genKey
+		redacted.PlaintextKey = ""
+		return &redacted
+	}, func(raw json.RawMessage) error { return json.Unmarshal(raw, &genKey) })
 	if err != nil {
 		return nil, err
 	}
@@ -976,26 +993,4 @@ func (s *Service) AuthenticateAPIKey(ctx context.Context, plaintextKey string) (
 	key.LastUsedAt = &now
 
 	return &key, nil
-}
-
-// CheckIdempotency returns true if a mutation with the given idempotency key / correlation ID has already been recorded.
-func (s *Service) CheckIdempotency(ctx context.Context, orgID string, idempKey string) (bool, error) {
-	if idempKey == "" || orgID == "" {
-		return false, nil
-	}
-	var found bool
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		var exists int
-		err := tx.QueryRow(ctx, `SELECT 1 FROM audit_events WHERE organization_id = $1 AND correlation_id = $2 LIMIT 1`, orgID, idempKey).Scan(&exists)
-		if errors.Is(err, pgx.ErrNoRows) {
-			found = false
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		found = true
-		return nil
-	})
-	return found, err
 }

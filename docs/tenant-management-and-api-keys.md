@@ -13,6 +13,12 @@ Issue #8 implements the foundational Control Plane domain logic, database securi
 
 This document details the exact technical contract, data models, cryptographic primitives, PostgreSQL Row Level Security (RLS) enforcement, Role-Based Access Control (RBAC) matrix, and API surface implemented in Deadbolt.
 
+### Mutation idempotency
+
+Every Issue #8 mutation requires `Idempotency-Key`. PostgreSQL `tenant_commands` is the replay authority, with a unique `(command_scope, idempotency_key)` boundary. The command claim, request-fingerprint check, domain mutation, outcome recording, and required audit write commit in one tenant transaction. An identical retry returns the recorded outcome without a second mutation; reusing the key with different method/path/body returns `409 IDEMPOTENCY_CONFLICT`. Storage errors fail closed. Audit events remain immutable observability records, not the idempotency store.
+
+For API-key create and rotation, the plaintext secret is returned only by the first successful issuance. The durable command outcome contains only the redacted key resource; an identical replay returns that redacted outcome and can never recover the plaintext.
+
 ```mermaid
 graph TD
     User([Human Identity / OIDC]) -->|BFF Session Cookie| BFF[Go Control Plane API]

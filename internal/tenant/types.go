@@ -93,6 +93,8 @@ var (
 	ErrForbidden            = errors.New("FORBIDDEN: Insufficient permissions for requested operation")
 	ErrNotFound             = errors.New("NOT_FOUND: The requested resource was not found")
 	ErrAuditRequired        = errors.New("AUDIT_REQUIRED: Audit context is required for lifecycle mutation")
+	ErrIdempotencyConflict  = errors.New("IDEMPOTENCY_CONFLICT: Idempotency-Key was already used with different request content")
+	ErrCommandStorage       = errors.New("COMMAND_STORAGE_FAILURE: tenant command storage failed")
 )
 
 type IdentityType string
@@ -182,7 +184,7 @@ type APIKeySummary struct {
 // GeneratedKey is returned exactly once upon API key creation.
 type GeneratedKey struct {
 	ID              string     `json:"id"`
-	PlaintextKey    string     `json:"key"` // Shown only once
+	PlaintextKey    string     `json:"key,omitempty"` // Shown only once
 	Prefix          string     `json:"prefix"`
 	EnvironmentID   string     `json:"environment_id"`
 	EnvironmentName string     `json:"environment_name"`

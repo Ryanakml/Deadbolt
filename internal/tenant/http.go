@@ -1,6 +1,7 @@
 package tenant
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -141,8 +142,8 @@ func (h *HTTPHandler) Routes() http.Handler {
 	return mux
 }
 
-// enforceIdempotency validates that mutating requests supply an Idempotency-Key header
-// and detects replay conflicts via stored audit records (OpenAPI & Blueprint §24.3).
+// enforceIdempotency only validates the header. Claiming and replay happen inside
+// the service transaction together with the mutation; middleware must not preflight.
 func (h *HTTPHandler) enforceIdempotency(w http.ResponseWriter, r *http.Request, orgID string) (string, bool) {
 	method := strings.ToUpper(r.Method)
 	if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
@@ -153,14 +154,18 @@ func (h *HTTPHandler) enforceIdempotency(w http.ResponseWriter, r *http.Request,
 		writeJSONError(w, r, http.StatusBadRequest, "MISSING_IDEMPOTENCY_KEY", "Idempotency-Key header is required for mutating requests")
 		return "", false
 	}
-	if orgID != "" {
-		exists, err := h.service.CheckIdempotency(r.Context(), orgID, idempKey)
-		if err == nil && exists {
-			writeJSONError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Mutation with this Idempotency-Key has already been processed")
-			return "", false
-		}
-	}
 	return idempKey, true
+}
+
+func commandRequest(r *http.Request, scope string) (*http.Request, error) {
+	key := r.Header.Get("Idempotency-Key")
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/v1"), "/v1")
+	return r.WithContext(ContextWithCommand(r.Context(), Command{Scope: scope, Key: key, Operation: r.Method + " " + path, Fingerprint: RequestFingerprint(r.Method, path, body)})), nil
 }
 
 // RequireAuth authenticates the caller via Bearer API Key or Session Cookie.
@@ -276,6 +281,14 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 		if _, ok := h.enforceIdempotency(w, r, targetOrgID); !ok {
 			return
 		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			var err error
+			r, err = commandRequest(r, targetOrgID)
+			if err != nil {
+				writeInternalError(w, r, fmt.Errorf("read idempotency request: %w", err))
+				return
+			}
+		}
 
 		// Machine identity cross-tenant, environment mismatch, and capability check
 		if caller.Type == IdentityTypeMachine {
@@ -356,6 +369,12 @@ func (h *HTTPHandler) HandleCreateOrganization(w http.ResponseWriter, r *http.Re
 	caller, _ := CallerFromContext(r.Context())
 	if caller.Type != IdentityTypeHuman {
 		writeJSONError(w, r, http.StatusForbidden, "MACHINE_CREATION_FORBIDDEN", "Only human users can create organizations")
+		return
+	}
+	var commandErr error
+	r, commandErr = commandRequest(r, "user:"+caller.UserID)
+	if commandErr != nil {
+		writeInternalError(w, r, fmt.Errorf("read idempotency request: %w", commandErr))
 		return
 	}
 
@@ -960,6 +979,10 @@ func writeJSONError(w http.ResponseWriter, r *http.Request, status int, code, me
 }
 
 func writeInternalError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, ErrIdempotencyConflict) {
+		writeJSONError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used with different request content")
+		return
+	}
 	reqID := ""
 	if r != nil {
 		reqID = RequestIDFromContext(r.Context())
