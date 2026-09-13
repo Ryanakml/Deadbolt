@@ -217,11 +217,12 @@ Testing, migrations, Docker, CI/CD, security, and observability grow with every 
 
 ## Start here
 
-This repository contains the blueprint, collaboration guide, and M0 executable Go/TypeScript contracts. See the [clean-clone workspace setup](docs/workspace-setup.md) to build and validate the contracts. To explore the design:
+This repository contains the blueprint, collaboration guide, M0 executable Go/TypeScript contracts, and the [M0 Foundation Acceptance Report](docs/reports/M0-foundation-acceptance.md). See the [clean-clone workspace setup](docs/workspace-setup.md) to build and validate the contracts, or run `./scripts/verify-clean-clone.sh` to execute the full clean-clone verification suite. To explore the design:
 
 ```bash
 git clone https://github.com/Ryanakml/Deadbolt.git
 cd Deadbolt
+./scripts/verify-clean-clone.sh
 ```
 
 Read the [Product & Engineering Blueprint](docs/blueprint.md) for the full design: execution semantics, data model, failure recovery, security, operations, and milestone gates. The blueprint uses **Runtime Cloud** as its original working name; **Deadbolt** is the repository and product identity used here. The `runtime` CLI and `@runtime/sdk` names remain the planned interfaces defined by that blueprint.
