@@ -1,13 +1,18 @@
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 
 export default async function spawningTask(input, ctx) {
   // Same process group by design; detached hostile children are out of SP-03 scope.
-	const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); setInterval(() => {}, 1000)"], {
-    detached: false,
-	stdio: "ignore",
-  });
+  const child = spawn(
+    process.execPath,
+    ["-e", "process.on('SIGTERM',()=>{}); setInterval(() => {}, 1000)"],
+    {
+      detached: false,
+      stdio: "ignore",
+    },
+  );
   if (process.env.CHILD_PID_FILE) {
-    require("node:fs").writeFileSync(process.env.CHILD_PID_FILE, String(child.pid));
+    writeFileSync(process.env.CHILD_PID_FILE, String(child.pid));
   }
 
   return new Promise(() => {

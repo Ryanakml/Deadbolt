@@ -322,6 +322,30 @@ func TestSP03_RenewalFailureAndHangStopAtSafeBoundary(t *testing.T) {
 	}
 }
 
+func TestSP03_VerifiedNativeBundle(t *testing.T) {
+	archive := os.Getenv("SP03_NATIVE_BUNDLE")
+	if archive == "" {
+		t.Skip("native package is built by the Linux architecture matrix")
+	}
+	runnerPath := resolveRunnerPath(t)
+	digestBytes, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(digestBytes)
+	s := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(s)
+	input := &worker.TaskInput{AttemptID: "native", OperationID: "native", TaskName: "default", Entrypoint: "native-task.mjs", Input: map[string]any{}, Bundle: &worker.BundleSpec{Path: archive, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture(), Entrypoint: "native-task.mjs"}}
+	completion, _, err := s.ExecuteAttempt(context.Background(), input, 1)
+	if err != nil || completion.Status != "SUCCEEDED" {
+		t.Fatalf("verified native bundle failed: completion=%v err=%v", completion, err)
+	}
+	output, ok := completion.Output.(map[string]any)
+	if !ok || output["native"] != "native-addon-loaded" {
+		t.Fatalf("unexpected native output: %v", completion.Output)
+	}
+}
+
 // 6. Acceptance Contract: Crash soak with no leaked runners
 func TestSP03_CrashSoakAndNoLeakedProcesses(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {

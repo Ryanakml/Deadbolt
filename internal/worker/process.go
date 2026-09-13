@@ -1,14 +1,17 @@
 package worker
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -115,41 +118,123 @@ func (s *ProcessSupervisor) verifyStart(ctx context.Context, attemptID string, e
 	return ErrStartAckAmbiguous
 }
 
-func (s *ProcessSupervisor) verifyBundle(input *TaskInput) (string, error) {
+func (s *ProcessSupervisor) verifyBundle(input *TaskInput) (string, func(), error) {
 	if input.Bundle == nil {
-		return "", ErrBundleVerificationNeed
+		return "", nil, ErrBundleVerificationNeed
 	}
 	if err := VerifyArchitecture(input.Bundle.TargetArch, ""); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	verifiedPath, err := filepath.Abs(input.Bundle.Path)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if resolved, resolveErr := filepath.EvalSymlinks(verifiedPath); resolveErr == nil {
 		verifiedPath = resolved
 	}
-	entrypoint := input.Entrypoint
-	if entrypoint == "" {
-		entrypoint = verifiedPath
-	}
-	requestedPath, err := filepath.Abs(entrypoint)
-	if err != nil {
-		return "", err
-	}
-	if resolved, resolveErr := filepath.EvalSymlinks(requestedPath); resolveErr == nil {
-		requestedPath = resolved
-	}
-	if requestedPath != verifiedPath {
-		return "", ErrBundleEntrypoint
+	// Legacy single-file fixture: the verified file is the entrypoint itself.
+	if input.Bundle.Entrypoint == "" {
+		entrypoint := input.Entrypoint
+		if entrypoint == "" {
+			entrypoint = verifiedPath
+		}
+		requestedPath, err := filepath.Abs(entrypoint)
+		if err != nil {
+			return "", nil, err
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(requestedPath); resolveErr == nil {
+			requestedPath = resolved
+		}
+		if requestedPath != verifiedPath {
+			return "", nil, ErrBundleEntrypoint
+		}
+		file, err := os.Open(verifiedPath)
+		if err != nil {
+			return "", nil, fmt.Errorf("open bundle: %w", err)
+		}
+		defer file.Close()
+		_, err = VerifyBundleDigest(file, input.Bundle.SHA256)
+		return verifiedPath, func() {}, err
 	}
 	file, err := os.Open(verifiedPath)
 	if err != nil {
-		return "", fmt.Errorf("open bundle: %w", err)
+		return "", nil, fmt.Errorf("open bundle: %w", err)
+	}
+	_, err = VerifyBundleDigest(file, input.Bundle.SHA256)
+	_ = file.Close()
+	if err != nil {
+		return "", nil, err
+	}
+	if input.Entrypoint != input.Bundle.Entrypoint || filepath.IsAbs(input.Bundle.Entrypoint) || strings.HasPrefix(filepath.Clean(input.Bundle.Entrypoint), "..") {
+		return "", nil, ErrBundleEntrypoint
+	}
+	dir, err := os.MkdirTemp("", "deadbolt_bundle_")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	file, err = os.Open(verifiedPath)
+	if err != nil {
+		cleanup()
+		return "", nil, err
 	}
 	defer file.Close()
-	_, err = VerifyBundleDigest(file, input.Bundle.SHA256)
-	return verifiedPath, err
+	reader := tar.NewReader(file)
+	for {
+		header, readErr := reader.Next()
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			cleanup()
+			return "", nil, readErr
+		}
+		name := filepath.Clean(header.Name)
+		if filepath.IsAbs(name) || strings.HasPrefix(name, "..") {
+			cleanup()
+			return "", nil, ErrBundleEntrypoint
+		}
+		target := filepath.Join(dir, name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				cleanup()
+				return "", nil, err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				cleanup()
+				return "", nil, err
+			}
+			out, createErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if createErr != nil {
+				cleanup()
+				return "", nil, createErr
+			}
+			_, copyErr := io.Copy(out, reader)
+			closeErr := out.Close()
+			if copyErr != nil || closeErr != nil {
+				cleanup()
+				return "", nil, fmt.Errorf("extract bundle: %w", firstErr(copyErr, closeErr))
+			}
+		default:
+			cleanup()
+			return "", nil, ErrBundleEntrypoint
+		}
+	}
+	entrypoint := filepath.Join(dir, filepath.Clean(input.Bundle.Entrypoint))
+	if _, err := os.Stat(entrypoint); err != nil {
+		cleanup()
+		return "", nil, ErrBundleEntrypoint
+	}
+	return entrypoint, cleanup, nil
+}
+
+func firstErr(first, second error) error {
+	if first != nil {
+		return first
+	}
+	return second
 }
 
 func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput, epoch int64) (*TaskCompletion, *ExecutionLogs, error) {
@@ -166,10 +251,11 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 	if ok, err := s.LeaseTracker.CanStart(time.Time{}); !ok || err != nil {
 		return nil, nil, ErrInsufficientLeaseTTL
 	}
-	verifiedEntrypoint, err := s.verifyBundle(input)
+	verifiedEntrypoint, bundleCleanup, err := s.verifyBundle(input)
 	if err != nil {
 		return nil, nil, err
 	}
+	defer bundleCleanup()
 	if err := ValidateTaskEnvironment(input.Env, s.TaskEnvAllowlist); err != nil {
 		return nil, nil, err
 	}

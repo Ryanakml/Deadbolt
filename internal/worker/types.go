@@ -23,6 +23,7 @@ type BundleSpec struct {
 	Path       string `json:"path"`
 	SHA256     string `json:"sha256"`
 	TargetArch string `json:"targetArch"`
+	Entrypoint string `json:"entrypoint,omitempty"` // relative path inside a verified tar bundle
 }
 
 // TaskError represents structured failure details.
