@@ -158,7 +158,6 @@ func TestSP03_StructuredResultChannelIsolation(t *testing.T) {
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
 	}
-
 	input := &worker.TaskInput{
 		AttemptID:   "att_noisy_001",
 		OperationID: "op_noisy_001",
@@ -243,14 +242,16 @@ func TestSP03_ProcessGroupShutdownWithinGrace(t *testing.T) {
 	}
 
 	runnerPath := resolveRunnerPath(t)
-	fixturePath := resolveFixturePath(t, "hung-child.js")
+	fixturePath := resolveFixturePath(t, "rogue-subprocesses.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
 	authorize(supervisor)
 	supervisor.GracePeriod = 1500 * time.Millisecond // 1.5s grace for fast test
+	supervisor.TaskEnvAllowlist = []string{"CHILD_PID_FILE"}
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
 	}
+	childPIDFile := filepath.Join(t.TempDir(), "child.pid")
 
 	input := &worker.TaskInput{
 		AttemptID:   "att_hung_001",
@@ -259,13 +260,12 @@ func TestSP03_ProcessGroupShutdownWithinGrace(t *testing.T) {
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
 		Input:       map[string]any{},
+		TimeoutMs:   300,
+		Env:         map[string]string{"CHILD_PID_FILE": childPIDFile},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-
 	start := time.Now()
-	completion, _, err := supervisor.ExecuteAttempt(ctx, input, 1)
+	completion, _, err := supervisor.ExecuteAttempt(context.Background(), input, 1)
 	duration := time.Since(start)
 
 	if err == nil {
@@ -280,6 +280,46 @@ func TestSP03_ProcessGroupShutdownWithinGrace(t *testing.T) {
 	if duration < 1500*time.Millisecond {
 		t.Fatalf("expected termination to respect grace period before SIGKILL, finished in %v", duration)
 	}
+	pidText, readErr := os.ReadFile(childPIDFile)
+	if readErr != nil {
+		t.Fatalf("child pid was not recorded: %v", readErr)
+	}
+	var childPID int
+	if _, err := fmt.Sscan(string(pidText), &childPID); err != nil || processExists(childPID) {
+		t.Fatalf("same-group child survived: pid=%d err=%v", childPID, err)
+	}
+}
+
+func TestSP03_RenewalFailureAndHangStopAtSafeBoundary(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node binary not found")
+	}
+	runnerPath := resolveRunnerPath(t)
+	fixturePath := resolveFixturePath(t, "hung-child.js")
+	for _, renewal := range []worker.RenewLeaseFunc{
+		func(context.Context, string, int64) (worker.LeaseRenewal, error) {
+			return worker.LeaseRenewal{}, errors.New("ambiguous network failure")
+		},
+		func(ctx context.Context, _ string, _ int64) (worker.LeaseRenewal, error) {
+			<-ctx.Done()
+			return worker.LeaseRenewal{}, ctx.Err()
+		},
+	} {
+		s := worker.NewProcessSupervisor("node", runnerPath)
+		s.GracePeriod, s.LeaseCheckInterval = 100*time.Millisecond, 10*time.Millisecond
+		s.StartAckFn = func(context.Context, string, int64) error { return nil }
+		s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(2700*time.Millisecond), 0, 0)
+		s.RenewLeaseFn = renewal
+		input := &worker.TaskInput{AttemptID: "renew", OperationID: "renew", TaskName: "default", Entrypoint: fixturePath, Bundle: bundleFor(t, fixturePath), Input: map[string]any{}}
+		started := time.Now()
+		_, _, err := s.ExecuteAttempt(context.Background(), input, 1)
+		if !errors.Is(err, worker.ErrLeaseExpired) {
+			t.Fatalf("expected lease expiry, got %v", err)
+		}
+		if time.Since(started) > 2*time.Second {
+			t.Fatalf("renewal blocked safety termination")
+		}
+	}
 }
 
 // 6. Acceptance Contract: Crash soak with no leaked runners
@@ -289,36 +329,60 @@ func TestSP03_CrashSoakAndNoLeakedProcesses(t *testing.T) {
 	}
 
 	runnerPath := resolveRunnerPath(t)
-	fixturePath := resolveFixturePath(t, "noisy-task.js")
-
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
 	authorize(supervisor)
-	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
-		return nil
-	}
+	supervisor.GracePeriod = 50 * time.Millisecond
+	supervisor.ResultDir = t.TempDir()
 
-	const soakIterations = 20
-	successCount := 0
+	const soakIterations = 12
+	baselineFDs := fdCount(t)
 
 	for i := 0; i < soakIterations; i++ {
+		fixturePath := resolveFixturePath(t, "noisy-task.js")
+		taskName, timeout := "default", int64(0)
+		switch i % 3 {
+		case 1:
+			fixturePath, taskName = resolveFixturePath(t, "sample-task.js"), "failingTask"
+		case 2:
+			fixturePath, timeout = resolveFixturePath(t, "hung-child.js"), 30
+		}
+		pid := 0
+		supervisor.OnProcessStart = func(value int) { pid = value }
 		input := &worker.TaskInput{
 			AttemptID:   fmt.Sprintf("att_soak_%03d", i),
 			OperationID: fmt.Sprintf("op_soak_%03d", i),
-			TaskName:    "default",
+			TaskName:    taskName,
 			Entrypoint:  fixturePath,
 			Bundle:      bundleFor(t, fixturePath),
 			Input:       map[string]any{"index": i},
+			TimeoutMs:   timeout,
 		}
 
-		completion, _, err := supervisor.ExecuteAttempt(context.Background(), input, int64(i+1))
-		if err == nil && completion != nil && completion.Status == "SUCCEEDED" {
-			successCount++
+		_, _, _ = supervisor.ExecuteAttempt(context.Background(), input, int64(i+1))
+		if pid != 0 && processExists(pid) {
+			t.Fatalf("runner pid %d leaked after cycle %d", pid, i)
+		}
+		entries, err := os.ReadDir(supervisor.ResultDir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("result files leaked after cycle %d: %v", i, entries)
 		}
 	}
-
-	if successCount != soakIterations {
-		t.Fatalf("soak test failed: %d/%d succeeded", successCount, soakIterations)
+	if baselineFDs >= 0 && fdCount(t) > baselineFDs+3 {
+		t.Fatalf("file descriptors grew from %d to %d", baselineFDs, fdCount(t))
 	}
+}
+
+func processExists(pid int) bool {
+	return exec.Command("kill", "-0", fmt.Sprint(pid)).Run() == nil
+}
+
+func fdCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return -1
+	}
+	return len(entries)
 }
 
 // 7. Acceptance Contract: Bundle digest verification

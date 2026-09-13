@@ -35,6 +35,7 @@ type ProcessSupervisor struct {
 	StartFn                         StartDecisionFunc
 	RenewLeaseFn                    RenewLeaseFunc
 	OnProcessStart                  func(pid int) // test-only observation hook
+	ResultDir                       string        // optional test-owned directory for result cleanup assertions
 	AllowlistKeys, TaskEnvAllowlist []string
 }
 
@@ -62,9 +63,17 @@ func (s *ProcessSupervisor) TerminateProcessGroup(pid int) *StopResult {
 		case <-deadline.C:
 			res.GraceExceeded = true
 			_ = sendProcessGroupSignal(pgid, true)
+			goneBy := time.NewTimer(time.Second)
 			for isProcessGroupAlive(pgid) {
-				time.Sleep(10 * time.Millisecond)
+				select {
+				case <-goneBy.C:
+					res.Duration = time.Since(started)
+					return res
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
+			goneBy.Stop()
 			res.Stopped = true
 			res.Duration = time.Since(started)
 			return res
@@ -170,7 +179,11 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(input.TimeoutMs)*time.Millisecond)
 		defer cancel()
 	}
-	resultFile := filepath.Join(os.TempDir(), fmt.Sprintf("deadbolt_res_%s_%d.json", input.AttemptID, time.Now().UnixNano()))
+	resultDir := s.ResultDir
+	if resultDir == "" {
+		resultDir = os.TempDir()
+	}
+	resultFile := filepath.Join(resultDir, fmt.Sprintf("deadbolt_res_%s_%d.json", input.AttemptID, time.Now().UnixNano()))
 	defer os.Remove(resultFile)
 	cmd := exec.Command(s.NodePath, s.RunnerPath)
 	configureProcessGroup(cmd)

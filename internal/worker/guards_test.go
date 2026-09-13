@@ -63,6 +63,38 @@ func TestVerifiedBundleCannotExecuteDifferentEntrypoint(t *testing.T) {
 	}
 }
 
+func TestDigestAndArchitectureRejectBeforeProcessStart(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "bundle-*.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("export default () => 'ok'\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	start := false
+	newSupervisor := func() *worker.ProcessSupervisor {
+		s := worker.NewProcessSupervisor("definitely-not-node", "ignored")
+		s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+		s.StartAckFn = func(context.Context, string, int64) error { return nil }
+		s.OnProcessStart = func(int) { start = true }
+		return s
+	}
+	input := &worker.TaskInput{AttemptID: "a", Entrypoint: file.Name(), Bundle: &worker.BundleSpec{Path: file.Name(), SHA256: "00", TargetArch: worker.CurrentHostArchitecture()}}
+	_, _, err = newSupervisor().ExecuteAttempt(context.Background(), input, 1)
+	if !errors.Is(err, worker.ErrBundleDigestMismatch) || start {
+		t.Fatalf("digest err=%v started=%v", err, start)
+	}
+	input.Bundle.SHA256 = hex.EncodeToString(make([]byte, 32))
+	input.Bundle.TargetArch = "linux/not-this-host"
+	_, _, err = newSupervisor().ExecuteAttempt(context.Background(), input, 1)
+	if !errors.Is(err, worker.ErrArchitectureMismatch) || start {
+		t.Fatalf("arch err=%v started=%v", err, start)
+	}
+}
+
 func TestAmbiguousStartRetriesSameIdentityAndNeverLaunchesWithoutDecision(t *testing.T) {
 	s := worker.NewProcessSupervisor("definitely-not-node", "ignored")
 	s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)

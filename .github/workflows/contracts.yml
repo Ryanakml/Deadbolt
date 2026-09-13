@@ -67,3 +67,27 @@ jobs:
       - name: Scan tracked source and history without printing secrets
         run: |
           bin/gitleaks git --redact --no-banner --log-opts="--all"
+  sp03-native-addon:
+    name: SP-03 native addon (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.21.0
+      - name: Compile and execute the target-native N-API fixture
+        run: |
+          NODE_ROOT="$(dirname "$(dirname "$(node -p 'process.execPath')")")"
+          cc -shared -fPIC -I "$NODE_ROOT/include/node" tests/spikes/sp03/native-addon/native-addon.c -o tests/spikes/sp03/native-addon/native-addon.node
+          test "$(node -p 'process.arch')" = "${{ matrix.arch == 'amd64' && 'x64' || 'arm64' }}"
+          node tests/spikes/sp03/native-addon/native-addon.test.cjs
