@@ -27,6 +27,11 @@ func bundleFor(t *testing.T, path string) *worker.BundleSpec {
 	return &worker.BundleSpec{Path: path, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture()}
 }
 
+func authorize(s *worker.ProcessSupervisor) {
+	s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+	s.StartAckFn = func(context.Context, string, int64) error { return nil }
+}
+
 func resolveRunnerPath(t *testing.T) string {
 	t.Helper()
 	runnerAbs, err := filepath.Abs("../../../runner/node/dist/index.js")
@@ -51,6 +56,7 @@ func TestSP03_StartAckGating(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "noisy-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 
 	// Scenario A: Control plane rejects Start request (e.g. 409 STALE_OWNERSHIP or network loss)
 	startCalled := int32(0)
@@ -104,6 +110,7 @@ func TestSP03_MonotonicLeaseBudgetSafety(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "noisy-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
 	}
@@ -147,6 +154,7 @@ func TestSP03_StructuredResultChannelIsolation(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "noisy-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
 	}
@@ -190,6 +198,7 @@ func TestSP03_EnvironmentSanitizationAndAllowlist(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "env-check.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 	supervisor.TaskEnvAllowlist = []string{"CUSTOM_CONFIG"}
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
@@ -237,6 +246,7 @@ func TestSP03_ProcessGroupShutdownWithinGrace(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "hung-child.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 	supervisor.GracePeriod = 1500 * time.Millisecond // 1.5s grace for fast test
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
@@ -282,6 +292,7 @@ func TestSP03_CrashSoakAndNoLeakedProcesses(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "noisy-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil
 	}

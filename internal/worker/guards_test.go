@@ -2,7 +2,10 @@ package worker_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -26,8 +29,43 @@ func TestStartRechecksMonotonicLeaseBeforeLaunch(t *testing.T) {
 	}
 }
 
+func TestVerifiedBundleCannotExecuteDifferentEntrypoint(t *testing.T) {
+	verified, err := os.CreateTemp(t.TempDir(), "verified-*.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verified.WriteString("export default () => 'verified'\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := verified.Close(); err != nil {
+		t.Fatal(err)
+	}
+	other, err := os.CreateTemp(t.TempDir(), "other-*.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(verified.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	s := worker.NewProcessSupervisor("definitely-not-node", "ignored")
+	s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+	s.StartAckFn = func(context.Context, string, int64) error { return nil }
+	started := false
+	s.OnProcessStart = func(int) { started = true }
+	_, _, err = s.ExecuteAttempt(context.Background(), &worker.TaskInput{AttemptID: "a", Entrypoint: other.Name(), Bundle: &worker.BundleSpec{Path: verified.Name(), SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture()}}, 1)
+	if !errors.Is(err, worker.ErrBundleEntrypoint) || started {
+		t.Fatalf("err=%v started=%v", err, started)
+	}
+}
+
 func TestAmbiguousStartRetriesSameIdentityAndNeverLaunchesWithoutDecision(t *testing.T) {
 	s := worker.NewProcessSupervisor("definitely-not-node", "ignored")
+	s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
 	calls := 0
 	s.StartFn = func(_ context.Context, attemptID string, epoch int64) (worker.StartDecision, error) {
 		if attemptID != "attempt" || epoch != 7 {
@@ -48,6 +86,22 @@ func TestAmbiguousStartRetriesSameIdentityAndNeverLaunchesWithoutDecision(t *tes
 	_, _, err = s.ExecuteAttempt(context.Background(), &worker.TaskInput{AttemptID: "attempt"}, 7)
 	if !errors.Is(err, worker.ErrStartAckAmbiguous) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestExecutionFailsClosedWithoutStartOrLeaseAuthority(t *testing.T) {
+	input := &worker.TaskInput{AttemptID: "never-starts"}
+	s := worker.NewProcessSupervisor("definitely-not-node", "ignored")
+	started := false
+	s.OnProcessStart = func(int) { started = true }
+	_, _, err := s.ExecuteAttempt(context.Background(), input, 1)
+	if !errors.Is(err, worker.ErrLeaseAuthorityMissing) || started {
+		t.Fatalf("err=%v started=%v", err, started)
+	}
+	s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+	_, _, err = s.ExecuteAttempt(context.Background(), input, 1)
+	if !errors.Is(err, worker.ErrStartAuthorityMissing) || started {
+		t.Fatalf("err=%v started=%v", err, started)
 	}
 }
 

@@ -14,21 +14,26 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
-func terminateProcessGroup(pid int, sig syscall.Signal) error {
-	// Negative pid sends signal to entire process group in POSIX
+func processGroupID(pid int) int {
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
-		pgid = pid
+		return pid
+	}
+	return pgid
+}
+
+// sendProcessGroupSignal uses a captured pgid so a surviving child is still
+// observed and killed after its runner parent has exited.
+func sendProcessGroupSignal(pgid int, force bool) error {
+	sig := syscall.SIGTERM
+	if force {
+		sig = syscall.SIGKILL
 	}
 	return syscall.Kill(-pgid, sig)
 }
 
-func sendSigterm(pid int) error {
-	return terminateProcessGroup(pid, syscall.SIGTERM)
-}
-
-func sendSigkill(pid int) error {
-	return terminateProcessGroup(pid, syscall.SIGKILL)
+func isProcessGroupAlive(pgid int) bool {
+	return syscall.Kill(-pgid, syscall.Signal(0)) == nil
 }
 
 func checkProcessAliveOS(proc *os.Process, pid int) bool {

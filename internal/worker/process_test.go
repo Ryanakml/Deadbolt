@@ -24,6 +24,11 @@ func bundleFor(t *testing.T, path string) *worker.BundleSpec {
 	return &worker.BundleSpec{Path: path, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture()}
 }
 
+func authorize(s *worker.ProcessSupervisor) {
+	s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+	s.StartAckFn = func(context.Context, string, int64) error { return nil }
+}
+
 func resolveRunnerPath(t *testing.T) string {
 	t.Helper()
 	runnerAbs, err := filepath.Abs("../../runner/node/dist/index.js")
@@ -47,6 +52,7 @@ func TestStartAckGating(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "sample-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 
 	// Scenario 1: Start ACK Rejected by control plane (e.g. 409 STALE_OWNERSHIP)
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
@@ -82,6 +88,7 @@ func TestLeaseGatingBeforeStart(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "sample-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 
 	// Lease expiring immediately (insufficient safe TTL < 2.5s)
 	now := time.Now()
@@ -114,6 +121,7 @@ func TestExecuteAttemptSuccessAndChannelIsolation(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "sample-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil // 200 OK ACK
 	}
@@ -157,6 +165,7 @@ func TestProcessTerminationOnContextCancel(t *testing.T) {
 	fixturePath := resolveFixturePath(t, "sample-task.js")
 
 	supervisor := worker.NewProcessSupervisor("node", runnerPath)
+	authorize(supervisor)
 	supervisor.GracePeriod = 2 * time.Second
 	supervisor.StartAckFn = func(ctx context.Context, attemptID string, epoch int64) error {
 		return nil

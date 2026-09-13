@@ -18,6 +18,9 @@ var (
 	ErrExecutionTimedOut      = errors.New("EXECUTION_TIMED_OUT: Task exceeded allowed execution deadline")
 	ErrProcessTerminated      = errors.New("PROCESS_TERMINATED: Process was stopped before completion")
 	ErrBundleVerificationNeed = errors.New("BUNDLE_VERIFICATION_REQUIRED: customer code cannot run without verified bundle identity")
+	ErrStartAuthorityMissing  = errors.New("START_AUTHORITY_REQUIRED: customer code cannot run without a Start verifier")
+	ErrLeaseAuthorityMissing  = errors.New("LEASE_AUTHORITY_REQUIRED: customer code cannot run without a lease tracker")
+	ErrBundleEntrypoint       = errors.New("BUNDLE_ENTRYPOINT_MISMATCH: verified artifact is not the requested entrypoint")
 )
 
 type ExecutionLogs struct{ Stdout, Stderr string }
@@ -48,7 +51,8 @@ func NewProcessSupervisor(nodePath, runnerPath string) *ProcessSupervisor {
 func (s *ProcessSupervisor) TerminateProcessGroup(pid int) *StopResult {
 	started := time.Now()
 	res := &StopResult{PID: pid}
-	_ = sendSigterm(pid)
+	pgid := processGroupID(pid)
+	_ = sendProcessGroupSignal(pgid, false)
 	deadline := time.NewTimer(s.GracePeriod)
 	defer deadline.Stop()
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -57,12 +61,15 @@ func (s *ProcessSupervisor) TerminateProcessGroup(pid int) *StopResult {
 		select {
 		case <-deadline.C:
 			res.GraceExceeded = true
-			_ = sendSigkill(pid)
+			_ = sendProcessGroupSignal(pgid, true)
+			for isProcessGroupAlive(pgid) {
+				time.Sleep(10 * time.Millisecond)
+			}
 			res.Stopped = true
 			res.Duration = time.Since(started)
 			return res
 		case <-tick.C:
-			if !isProcessAlive(pid) {
+			if !isProcessGroupAlive(pgid) {
 				res.Stopped = true
 				res.Duration = time.Since(started)
 				return res
@@ -74,7 +81,7 @@ func (s *ProcessSupervisor) TerminateProcessGroup(pid int) *StopResult {
 func (s *ProcessSupervisor) verifyStart(ctx context.Context, attemptID string, epoch int64) error {
 	if s.StartFn == nil {
 		if s.StartAckFn == nil {
-			return nil
+			return ErrStartAuthorityMissing
 		}
 		if err := s.StartAckFn(ctx, attemptID, epoch); err != nil {
 			return fmt.Errorf("%w: %v", ErrStartAckRejected, err)
@@ -99,38 +106,59 @@ func (s *ProcessSupervisor) verifyStart(ctx context.Context, attemptID string, e
 	return ErrStartAckAmbiguous
 }
 
-func (s *ProcessSupervisor) verifyBundle(input *TaskInput) error {
+func (s *ProcessSupervisor) verifyBundle(input *TaskInput) (string, error) {
 	if input.Bundle == nil {
-		return ErrBundleVerificationNeed
+		return "", ErrBundleVerificationNeed
 	}
 	if err := VerifyArchitecture(input.Bundle.TargetArch, ""); err != nil {
-		return err
+		return "", err
 	}
-	file, err := os.Open(input.Bundle.Path)
+	verifiedPath, err := filepath.Abs(input.Bundle.Path)
 	if err != nil {
-		return fmt.Errorf("open bundle: %w", err)
+		return "", err
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(verifiedPath); resolveErr == nil {
+		verifiedPath = resolved
+	}
+	entrypoint := input.Entrypoint
+	if entrypoint == "" {
+		entrypoint = verifiedPath
+	}
+	requestedPath, err := filepath.Abs(entrypoint)
+	if err != nil {
+		return "", err
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(requestedPath); resolveErr == nil {
+		requestedPath = resolved
+	}
+	if requestedPath != verifiedPath {
+		return "", ErrBundleEntrypoint
+	}
+	file, err := os.Open(verifiedPath)
+	if err != nil {
+		return "", fmt.Errorf("open bundle: %w", err)
 	}
 	defer file.Close()
 	_, err = VerifyBundleDigest(file, input.Bundle.SHA256)
-	return err
+	return verifiedPath, err
 }
 
 func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput, epoch int64) (*TaskCompletion, *ExecutionLogs, error) {
-	if s.LeaseTracker != nil {
-		if ok, err := s.LeaseTracker.CanStart(time.Time{}); !ok || err != nil {
-			return nil, nil, ErrInsufficientLeaseTTL
-		}
+	if s.LeaseTracker == nil {
+		return nil, nil, ErrLeaseAuthorityMissing
+	}
+	if ok, err := s.LeaseTracker.CanStart(time.Time{}); !ok || err != nil {
+		return nil, nil, ErrInsufficientLeaseTTL
 	}
 	if err := s.verifyStart(ctx, input.AttemptID, epoch); err != nil {
 		return nil, nil, err
 	}
 	// Start ACK can consume the entire budget; never launch based on the old check.
-	if s.LeaseTracker != nil {
-		if ok, err := s.LeaseTracker.CanStart(time.Time{}); !ok || err != nil {
-			return nil, nil, ErrInsufficientLeaseTTL
-		}
+	if ok, err := s.LeaseTracker.CanStart(time.Time{}); !ok || err != nil {
+		return nil, nil, ErrInsufficientLeaseTTL
 	}
-	if err := s.verifyBundle(input); err != nil {
+	verifiedEntrypoint, err := s.verifyBundle(input)
+	if err != nil {
 		return nil, nil, err
 	}
 	if err := ValidateTaskEnvironment(input.Env, s.TaskEnvAllowlist); err != nil {
@@ -166,7 +194,9 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 	if s.OnProcessStart != nil {
 		s.OnProcessStart(pid)
 	}
-	inputBytes, err := json.Marshal(input)
+	runnerInput := *input
+	runnerInput.Entrypoint = verifiedEntrypoint
+	inputBytes, err := json.Marshal(&runnerInput)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		return nil, nil, fmt.Errorf("encode input: %w", err)
@@ -184,6 +214,15 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
+	safeLease, _ := s.LeaseTracker.SafeRemainingTTL(time.Time{})
+	leaseTimer := time.NewTimer(safeLease)
+	defer leaseTimer.Stop()
+	type renewalResult struct {
+		renewal LeaseRenewal
+		err     error
+	}
+	renewalDone := make(chan renewalResult, 1)
+	renewing := false
 	var finalErr error
 	for {
 		select {
@@ -198,21 +237,37 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 				finalErr = ErrProcessTerminated
 			}
 			goto done
-		case <-tick.C:
-			if s.LeaseTracker == nil {
-				continue
-			}
-			if s.RenewLeaseFn != nil {
-				renewal, err := s.RenewLeaseFn(ctx, input.AttemptID, epoch)
-				if err == nil {
-					s.LeaseTracker.Renew(renewal.ExpiresAt, renewal.RTT)
+		case <-leaseTimer.C:
+			_ = s.TerminateProcessGroup(pid)
+			<-exit
+			finalErr = ErrLeaseExpired
+			goto done
+		case result := <-renewalDone:
+			renewing = false
+			if result.err == nil {
+				s.LeaseTracker.Renew(result.renewal.ExpiresAt, result.renewal.RTT)
+				safe, safeErr := s.LeaseTracker.SafeRemainingTTL(time.Time{})
+				if safeErr != nil {
+					_ = s.TerminateProcessGroup(pid)
+					<-exit
+					finalErr = ErrLeaseExpired
+					goto done
 				}
+				if !leaseTimer.Stop() {
+					select {
+					case <-leaseTimer.C:
+					default:
+					}
+				}
+				leaseTimer.Reset(safe)
 			}
-			if s.LeaseTracker.IsExpired(time.Time{}) {
-				_ = s.TerminateProcessGroup(pid)
-				<-exit
-				finalErr = ErrLeaseExpired
-				goto done
+		case <-tick.C:
+			if s.RenewLeaseFn != nil && !renewing {
+				renewing = true
+				go func() {
+					renewal, renewErr := s.RenewLeaseFn(ctx, input.AttemptID, epoch)
+					renewalDone <- renewalResult{renewal, renewErr}
+				}()
 			}
 		}
 	}
