@@ -54,11 +54,13 @@ The PR records the final commit and actual local/hosted results after these chec
 
 ## Delivery boundaries
 
+- **M1 blocker decision:** **NONE** for this spike's stated contract-conformance scope.
+
 - **Implemented:** versioned contracts, Go/TS validation/mapping/hashing, fixtures, workspace preparation and CI definitions.
 - **Automated tests / security scans:** report only the final executed results in PR evidence, including fixture counts and any failures.
 - **Hosted CI:** only a completed run linked to the final head is evidence; workflow files and a CodeRabbit status are not evidence.
 - **Deployed:** no. There is no application image, database migration or runtime deployment in issues #1–#2.
-- **Acceptance:** executable contract acceptance is separate from live runtime acceptance. External staging selections remain unresolved as documented in `deploy/provisioning.json`; dependent deployment/readiness is blocked until supplied.
+- **Acceptance:** executable contract acceptance is separate from live runtime acceptance. At the time of SP-01, external staging provisioning remained unresolved in `deploy/provisioning.json`; Issue #5 later resolved and accepted the shared-host staging path. That historical condition is not an M1 blocker.
 
 Future control fields do not enable V1 execution. Current/previous-minor compatibility, actual worker auth/fencing, transaction/outbox behavior, object storage and recovery tests belong to their implementing issues. No runtime invariant is claimed proven by a schema file.
 

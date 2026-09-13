@@ -133,6 +133,8 @@ pnpm check:parity
 
 ## 7. Delivery Boundaries & Status
 
+- **M1 blocker decision:** **NONE** for this spike's stated database-contention scope.
+
 - **Implemented:**
   - Four ordered SQL migrations (`00001`–`00004`) covering all M0 and V1 entities.
   - Single-migrator runner with pinned physical session advisory lock (`7142893`).
