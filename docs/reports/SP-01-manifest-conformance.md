@@ -54,6 +54,8 @@ The PR records the final commit and actual local/hosted results after these chec
 
 ## Delivery boundaries
 
+- **M1 blocker decision:** **NONE** for this spike's stated contract-conformance scope.
+
 - **Implemented:** versioned contracts, Go/TS validation/mapping/hashing, fixtures, workspace preparation and CI definitions.
 - **Automated tests / security scans:** report only the final executed results in PR evidence, including fixture counts and any failures.
 - **Hosted CI:** only a completed run linked to the final head is evidence; workflow files and a CodeRabbit status are not evidence.

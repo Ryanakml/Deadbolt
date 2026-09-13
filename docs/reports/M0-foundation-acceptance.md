@@ -33,10 +33,10 @@ In accordance with Blueprint §30 and Issue #7 instructions, foundation readines
 | Layer                      | Status      | Scope & Evidence Summary                                                                                                                                                                                                                                                                             |
 | :------------------------- | :---------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **1. Implemented**         | **YES**     | Monorepo layout, toolchain pins, OpenAPI/worker schemas, canonical enums, Go/TS contract libraries, migrations 00001–00005, RLS policies, OIDC/BFF adapter, local dev-auth isolation, Compose profiles, health/version endpoints, SP-01/02/03 spikes, staging deployment/rollback/retention scripts. |
-| **2. Automated Tests**     | **PASSED**  | **172** TypeScript tests, **165** Go/TS conformance fixtures, Go race-detector suites (`go test -race ./...`), mock Docker/Caddy edge topology tests, PITR drill, SP-03 process group kill soak. Clean clone script `./scripts/verify-clean-clone.sh` passes 100%.                                   |
-| **3. Hosted CI**           | **PASSED**  | GitHub Actions workflows `.github/workflows/contracts.yml` (Foundation CI Run `34686010986`) and `.github/workflows/staging-deploy.yml` build multi-arch images, run all linters/tests, and push immutable artifacts to GHCR.                                                                        |
-| **4. Deployed**            | **PENDING** | Deployed artifact provenance verified in CI; physical deployment to shared AWS EC2 host remains pending private configuration of host credentials (`DEADBOLT_DEPLOY_HOST`, `DEADBOLT_DEPLOY_SSH_KEY`) per `deploy/provisioning.json`.                                                                |
-| **5. Acceptance Verified** | **PENDING** | Automated acceptance test suite passes; final live on-host end-to-end HTTPS staging smoke drill to be executed once host access is provisioned.                                                                                                                                                      |
+| **2. Automated Tests**     | **PASSED**  | **172** TypeScript tests, **165** Go/TS conformance fixtures, Go race-detector suites (`go test -race ./...`), mock Docker/Caddy edge topology tests, PITR drill, and SP-03 process-group soak. `verify-clean-clone.sh` is a fail-closed local wrapper; its result is local evidence, not hosted evidence. |
+| **3. Hosted CI**           | **PASSED**  | [Foundation CI run 34753971360](https://github.com/Ryanakml/Deadbolt/actions/runs/34753971360) passed at the integrated PR head. It runs the contracts workflow, including the clean-clone Compose boot/migrate/readiness smoke. |
+| **4. Deployed**            | **PASSED (reused #5 evidence)** | Issue #5's accepted live shared-host audit records deployed immutable provenance and public `/version` evidence ([final audit](https://github.com/Ryanakml/Deadbolt/pull/54#issuecomment-5646917982); [public endpoint evidence](https://github.com/Ryanakml/Deadbolt/pull/54#issuecomment-5646532200)). PR #55 introduces no deployed behavior and requires no new staging deployment. |
+| **5. Acceptance Verified** | **PASSED (reused #5 evidence)** | The same accepted Issue #5 live shared-host evidence verifies the staging HTTPS path, health/provenance, coexistence, rollback, and retention scope. PR #55 only closes the M0 evidence gate; it does not rerun production-like deployment. |
 
 ---
 
@@ -46,7 +46,7 @@ Per Blueprint §29.1 and §30, a clean clone must boot reliably and fail with cl
 
 ### 3.1 Executable Clean-Clone Verification Suite
 
-A dedicated verification runner [`scripts/verify-clean-clone.sh`](file:///Users/ryanakmalpasya/Documents/BS/Freelance/PROJECTS/SKEM PROJECT/SAAS/deadbolt/scripts/verify-clean-clone.sh) automates the 8 foundational verification stages from a fresh clone:
+A dedicated verification runner [`scripts/verify-clean-clone.sh`](../../scripts/verify-clean-clone.sh) runs the 8 foundational verification stages from a fresh clone. It installs locked dependencies, installs the pinned local security tools, and fails on every missing prerequisite or failed check. Its local result is not a substitute for the hosted CI or reused staging evidence above:
 
 1. Toolchain and configuration consistency checks (`scripts/check-config.mjs`).
 2. OpenAPI, canonical enums, and Go/TS contract parity (`scripts/check-contracts.mjs`, `scripts/check-parity.mjs`, `scripts/check-candidates.mjs`).
@@ -59,7 +59,7 @@ A dedicated verification runner [`scripts/verify-clean-clone.sh`](file:///Users/
 
 ### 3.2 Actionable Startup Failure Contract
 
-Automated integration tests in [`tests/integration/gate_m0_test.go`](file:///Users/ryanakmalpasya/Documents/BS/Freelance/PROJECTS/SKEM PROJECT/SAAS/deadbolt/tests/integration/gate_m0_test.go) (`TestGateM0_CleanCloneActionableConfigErrors`) verify that the control plane fails closed with explicit remediation instructions under all negative configurations:
+Automated integration tests in [`tests/integration/gate_m0_test.go`](../../tests/integration/gate_m0_test.go) (`TestGateM0_CleanCloneActionableConfigErrors`) verify that the control plane fails closed with explicit remediation instructions under all negative configurations:
 
 | Scenario                | Mode   | Config Condition                                   | Observable Exit / Error    | Remediation Guidance Provided                                                                           |
 | :---------------------- | :----- | :------------------------------------------------- | :------------------------- | :------------------------------------------------------------------------------------------------------ |
@@ -133,7 +133,7 @@ flowchart TD
 
 Blueprint §33 defines three mandatory spikes for Milestone 0. Each spike has been resolved empirically with zero unresolved semantic blockers for Milestone 1:
 
-### 5.1 SP-01: Executable Contract Conformance ([Report](file:///Users/ryanakmalpasya/Documents/BS/Freelance/PROJECTS/SKEM PROJECT/SAAS/deadbolt/docs/reports/SP-01-manifest-conformance.md))
+### 5.1 SP-01: Executable Contract Conformance ([Report](SP-01-manifest-conformance.md))
 
 - **Uncertainty:** Whether Go and TypeScript could achieve exact deterministic canonical JSON serialization (RFC 8785 JCS), schema validation, mapping evaluation, and linear DAG verification without arbitrary JavaScript execution on the control plane.
 - **Resolution:**
@@ -143,7 +143,7 @@ Blueprint §33 defines three mandatory spikes for Milestone 0. Each spike has be
   - Rejected arbitrary JS execution; adopted static declarative DAG representation.
 - **Blockers for M1:** **NONE**. Manifest schemas and hashing contracts are fully executable.
 
-### 5.2 SP-02: DB Claim Contention & Lock Order Hierarchy ([Report](file:///Users/ryanakmalpasya/Documents/BS/Freelance/PROJECTS/SKEM PROJECT/SAAS/deadbolt/docs/reports/SP-02-claim-contention.md))
+### 5.2 SP-02: DB Claim Contention & Lock Order Hierarchy ([Report](SP-02-claim-contention.md))
 
 - **Uncertainty:** Concurrency contention, deadlock vulnerability under high worker load, single active lease ownership, and RLS tenant boundary leaks across pooled connections.
 - **Resolution:**
@@ -155,7 +155,7 @@ Blueprint §33 defines three mandatory spikes for Milestone 0. Each spike has be
   - Intermediate schema upgrade from version 2 to 4 validated without data loss.
 - **Blockers for M1:** **NONE**. Database concurrency model and RLS tenant boundaries are validated.
 
-### 5.3 SP-03: Worker Process Lifecycle & Packaging ([Report](file:///Users/ryanakmalpasya/Documents/BS/Freelance/PROJECTS/SKEM PROJECT/SAAS/deadbolt/docs/reports/SP-03-worker-lifecycle.md))
+### 5.3 SP-03: Worker Process Lifecycle & Packaging ([Report](SP-03-worker-lifecycle.md))
 
 - **Uncertainty:** Worker start-ACK gating, monotonic conservative lease budget calculation, process group signal termination with orphan prevention, and native addon packaging compatibility.
 - **Resolution:**
@@ -163,8 +163,8 @@ Blueprint §33 defines three mandatory spikes for Milestone 0. Each spike has be
   - Implemented monotonic conservative lease calculation:
     $$\text{safe\_TTL} = (\text{lease\_expires\_at} - \text{now}) - \text{estimated\_RTT} - 2\text{s margin}$$
     Attempts with $\text{safe\_TTL} \le 0$ are rejected before process launch.
-  - Process group termination (`Setpgid: true`): `SIGTERM` sent to `-pgid`, 10-second grace timer, followed by `SIGKILL` to `-pgid`. Rogue grandchildren and hung processes terminated with zero orphan processes.
-  - Result channel isolation: Task completion delivered exclusively via dedicated file descriptor (FD 3), preventing stdout/stderr diagnostic noise from corrupting task results.
+  - Process group termination (`Setpgid: true`): `SIGTERM` sent to `-pgid`, 10-second grace timer, followed by `SIGKILL` to `-pgid`. This is same-process-group shutdown evidence; deliberately detached hostile subprocesses are outside the spike's guarantee.
+  - Result channel isolation: Task completion is written to the structured `DEADBOLT_RESULT_FILE`; stdout/stderr remain diagnostics and cannot corrupt task results.
   - Allowlisted child environment: Strips parent worker tokens, session secrets, and database credentials.
   - Native addon verification: N-API C++ addon bundle verified on Linux `amd64` and `arm64`.
 - **Blockers for M1:** **NONE**. Worker supervisor architecture is certified for M1 child-process execution.
@@ -179,7 +179,7 @@ Blueprint §33 defines three mandatory spikes for Milestone 0. Each spike has be
 | **SQL / Migration / Integration** | Migrations 00001–00005 apply cleanly with advisory lock; runtime role has no DDL privileges; RLS fails closed.      | `tests/integration/rls_test.go` (`TestCleanDatabaseMigrationAsDeadboltMigrator`, `TestRuntimeNoDDLPrivileges`, `TestRLSFailsClosed`).           | **PASS** |
 | **Container / Config / Security** | Multi-arch Dockerfile builds; Compose profile syntax validated; Gitleaks secret scan zero leaks; Govulncheck clean. | `docker build -f deploy/Dockerfile.control-plane`, `docker compose config`, `bin/gitleaks git --redact`, `bin/govulncheck ./...`.               | **PASS** |
 | **CI & Immutable Artifact**       | GitHub Actions build-once workflow produces immutable container image digest.                                       | `.github/workflows/staging-deploy.yml` (`Build & Publish Immutable GHCR Artifact`, outputs image digest).                                       | **PASS** |
-| **Staging Real Path**             | `/livez`, `/readyz`, and `/version` endpoints truthfully reflect status and immutable commit/digest provenance.     | `tests/integration/deploy_test.go` (`TestControlPlaneHealthEndpoints`, `TestReadyzSchedulerStaleness`), `tests/integration/gate_m0_test.go`.    | **PASS** |
+| **Staging Real Path**             | `/livez`, `/readyz`, and `/version` endpoints truthfully reflect status and immutable commit/digest provenance.     | Endpoint-shape contracts: `tests/integration/deploy_test.go`; live staging provenance: Issue #5 [final audit](https://github.com/Ryanakml/Deadbolt/pull/54#issuecomment-5646917982) and [public `/version` evidence](https://github.com/Ryanakml/Deadbolt/pull/54#issuecomment-5646532200). | **PASS** |
 | **Edge & Rollback Safety**        | External `deadbolt-edge` network, Docker DNS Caddy upstream, blue/green route switch and atomic rollback.           | `tests/integration/deploy_test.go` (`TestContainerizedCaddyMockValidationAndRollback`, `TestRollbackStagingImmutableEdgeSafety`).               | **PASS** |
 | **Headroom & Retention**          | 14-day backup retention, base backup cron, container image retention protecting rollback images.                    | `tests/integration/deploy_test.go` (`TestRetentionProtectsDigestPulledCurrentPreviousAndRunningImages`, `TestRecurringBaseBackupAndRetention`). | **PASS** |
 
@@ -191,7 +191,7 @@ Blueprint §33 defines three mandatory spikes for Milestone 0. Each spike has be
 | :---------------------- | :------------------------------------------------------------------------------------------------- | :---------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------- | :------------ |
 | **`REQ-EXEC-01`**       | Declarative DAG, JSON schema, and mapping consistency across Go and TypeScript.                    | Issues #1, #2 (PR #50), SP-01 | `contracts/fixtures/conformance.json`, `tests/contracts/main.go`, `tests/integration/gate_m0_test.go`.                                          | **SATISFIED** |
 | **`REQ-SEC-01`**        | Tenant, authentication, and permission boundaries. Hosted mode rejects dev auth; RLS fails closed. | Issues #3, #4 (PRs #51, #52)  | `tests/integration/auth_test.go` (`TestHostedStartupRejectsDevAuthAndInsecureCookies`), `tests/integration/rls_test.go` (`TestRLSFailsClosed`). | **SATISFIED** |
-| **`REQ-OPS-01`**        | Observable, deployable, recoverable release with exact SHA/digest `/version` provenance.           | Issues #1, #5 (PRs #50, #54)  | `cmd/control-plane/main.go`, `tests/integration/deploy_test.go` (`TestControlPlaneHealthEndpoints`), `tests/integration/gate_m0_test.go`.       | **SATISFIED** |
+| **`REQ-OPS-01`**        | Observable, deployable, recoverable release with exact SHA/digest `/version` provenance.           | Issues #1, #5 (PRs #50, #54)  | Endpoint-shape contracts in `cmd/control-plane/main.go` and `tests/integration/deploy_test.go`; live provenance in Issue #5 [final audit](https://github.com/Ryanakml/Deadbolt/pull/54#issuecomment-5646917982). | **SATISFIED** |
 | **`INV-01`**            | Tenant isolation at database and API boundary; zero cross-tenant visibility.                       | Issues #3, #4 (PRs #51, #52)  | `tests/integration/rls_test.go` (`TestRLSFailsClosed`), `tests/spikes/sp02/claim_test.go`.                                                      | **SATISFIED** |
 | **`INV-03`**            | Single active lease ownership per step attempt; no duplicate leases.                               | Issues #3, #6 (PRs #51, #53)  | `tests/spikes/sp02/claim_test.go` (`TestClaimContentionAndPrescribedLockOrder`), `tests/spikes/sp03/process_test.go`.                           | **SATISFIED** |
 | **`INV-06`**            | Immutable deployment registration tied to SHA-256 bundle digest.                                   | Issues #2, #5 (PRs #50, #54)  | `contracts/manifest/deployment.schema.json`, `internal/contracts/validator.go`.                                                                 | **SATISFIED** |

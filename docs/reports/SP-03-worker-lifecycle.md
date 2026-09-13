@@ -15,8 +15,8 @@ Spike SP-03 evaluates and resolves the architectural uncertainties surrounding w
 2. **Monotonic Conservative Lease Budget (Blueprint §13.1):** Proves that the worker supervisor calculates safe remaining lease duration using monotonic elapsed time:
    $$\text{safe\_TTL} = (\text{lease\_expires\_at} - \text{now}) - \text{estimated\_RTT} - 2\text{s margin}$$
    If $\text{safe\_TTL} \le 0$, the attempt is rejected with `ErrInsufficientLeaseTTL` prior to launching the task handler.
-3. **Structured Result Channel vs. Log Isolation (Blueprint §12.3):** Demonstrates strict separation between diagnostic log streams (`stdout`/`stderr`) and authoritative task completion. Arbitrary JSON, exceptions, or completion tokens printed to `stdout`/`stderr` are never parsed as task results; results are delivered exclusively via a dedicated structured channel (FD 3 / isolated result channel).
-4. **Process Group Termination & 10s Grace Period (Blueprint §15.2):** Validates that task runners run in dedicated process groups (`Setpgid`). Cancellation or timeout triggers an Abort signal $\rightarrow$ `SIGTERM` $\rightarrow$ 10-second grace period $\rightarrow$ `SIGKILL` to the entire process group (`-pgid`), leaving zero orphan or zombie processes.
+3. **Structured Result Channel vs. Log Isolation (Blueprint §12.3):** Demonstrates strict separation between diagnostic log streams (`stdout`/`stderr`) and authoritative task completion. Arbitrary JSON, exceptions, or completion tokens printed to `stdout`/`stderr` are never parsed as task results; the runner writes the authoritative result to `DEADBOLT_RESULT_FILE`.
+4. **Process Group Termination & 10s Grace Period (Blueprint §15.2):** Validates that task runners run in dedicated process groups (`Setpgid`). Cancellation or timeout triggers an Abort signal $\rightarrow$ `SIGTERM` $\rightarrow$ 10-second grace period $\rightarrow$ `SIGKILL` to the entire process group (`-pgid`). The guarantee is bounded to that process group; deliberately detached hostile subprocesses are outside this spike's scope.
 5. **Crash Soak & Resource Leakage Elimination:** Proves that under rapid repeated crash and abort cycles, the supervisor releases all OS process handles and file descriptors without leaking runners.
 6. **Environment Sanitization (Blueprint §12.3, §24.4):** Proves that sensitive worker agent tokens, database credentials, and session keys are stripped from the child process environment, injecting only explicitly allowlisted and task-declared variables.
 7. **Bundle Digest & Target Architecture Verification:** Verifies SHA-256 bundle integrity and architecture compatibility (`linux/amd64`, `linux/arm64`, etc.) before unpacking or executing.
@@ -43,7 +43,7 @@ On Linux/macOS, the supervisor launches the runner child process with `Setpgid: 
 
 1. **Graceful Abort (`SIGTERM`):** Sent to `-pgid` (`syscall.Kill(-pgid, syscall.SIGTERM)`).
 2. **Grace Timer:** A 10-second timer (`GracePeriod`) monitors the process group.
-3. **Forced Termination (`SIGKILL`):** If the process or any spawned grandchild remains active when the grace period expires, `SIGKILL` is issued to `-pgid`.
+3. **Forced Termination (`SIGKILL`):** If a process in the supervised process group remains active when the grace period expires, `SIGKILL` is issued to `-pgid`.
 
 ```mermaid
 sequenceDiagram
@@ -68,7 +68,7 @@ sequenceDiagram
 
 ### Windows Process Tree Handling
 
-On Windows, process group termination is executed via recursive process tree termination (`taskkill /F /T /PID`), terminating the parent runner and all grandchild child processes spawned by it.
+On Windows, process tree termination uses `taskkill /F /T /PID` for the supervised runner tree. Deliberately detached hostile subprocesses are outside this spike's guarantee.
 
 ---
 
@@ -145,11 +145,13 @@ test -z "$(gofmt -l internal/worker tests/spikes/sp03 runner/node)"
 
 ## 6. Delivery Boundaries & Status
 
+- **M1 blocker decision:** **NONE** for this spike's stated worker-lifecycle scope.
+
 - **Implemented:**
   - Dedicated Node.js runner workspace package in `runner/node/` with `TaskContext`, structured logger, signal handlers, and result channel writer.
   - Go worker supervisor in `internal/worker/` implementing `ProcessSupervisor`, monotonic `LeaseTracker`, bundle execution gate, and allowlisted environment injection.
   - Process group management with POSIX `-pgid` signalling and Windows process tree termination.
-  - Dedicated result channel with fallback to environment-configured result file (`DEADBOLT_RESULT_FILE`).
+  - Structured result file configured by `DEADBOLT_RESULT_FILE`; stdout/stderr are diagnostic-only.
   - Empirical SP-03 test harness in `tests/spikes/sp03/process_test.go`.
 - **Acceptance evidence:** merge-result CI run [34749615973](https://github.com/Ryanakml/Deadbolt/actions/runs/34749615973) passed all three jobs at head `269c96d0a060dc764e3e1ce28de3a52f4dc81e4b`: `contracts`, native addon amd64, and native addon arm64.
 - **Invariant Traceability:**

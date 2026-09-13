@@ -1,30 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# scripts/verify-clean-clone.sh
-# Automated Gate M0 Verification Suite for clean-clone environments.
-# Validates toolchain consistency, executable contracts, configuration boundaries,
-# static analysis, TypeScript build/tests, Go race-detector suites, and secret scanning.
-# Blueprint references: §29.1, §30, §31, §34.
+# Automated Gate M0 verification for a fresh clone. This is a fail-closed local
+# wrapper around the Foundation contracts workflow's checks; it is not hosted CI
+# or staging-deployment evidence.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "[FAIL] Required command not found: $1" >&2
+        exit 1
+    fi
+}
+
+compose() {
+    docker compose -p deadbolt-clean-clone -f deploy/compose/docker-compose.yml --profile core "$@"
+}
+
+compose_logs_and_fail() {
+    compose logs || true
+    exit 1
+}
+
+cleanup_compose() {
+    if [ "${COMPOSE_STARTED:-false}" = "true" ]; then
+        compose down -v || true
+    fi
+}
+
+for command in node pnpm go docker curl; do
+    require_command "$command"
+done
 
 echo "=================================================================="
 echo " [DEADBOLT] Verifying Clean-Clone Foundation & Gate M0 Invariants"
 echo "=================================================================="
 
-# 1. Check Toolchain & Lockfile Consistency
-echo "--> [1/8] Checking configuration and toolchain consistency..."
-if [ -f "scripts/check-config.mjs" ]; then
-    # We attempt check:config; if local node does not match pinned LTS exactly, warn but continue
-    node scripts/check-config.mjs || echo "[WARN] Local node version check failed; verify in CI with pinned node (24.21.0)"
-fi
+echo "--> [1/8] Installing locked dependencies and checking configuration..."
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm check:config
 
 # 2. Executable Contracts & Parser Parity
 echo "--> [2/8] Validating OpenAPI, canonical schemas, and Go/TS contract parity..."
-node scripts/check-contracts.mjs
-node scripts/check-parity.mjs
+pnpm check:contracts
+pnpm check:parity
 node scripts/check-candidates.mjs
 
 # 3. Formatting & Code Style
@@ -34,22 +55,31 @@ test -z "$(gofmt -l contracts internal tests cmd scripts)"
 
 # 4. TypeScript Workspace Build, Typecheck, and Tests
 echo "--> [4/8] Building and testing TypeScript packages..."
-pnpm run build
-pnpm run typecheck
-pnpm -r run test
+pnpm typecheck
+pnpm test
 
 # 5. Go Static Analysis and Race-Detector Tests
-echo "--> [5/8] Running Go vet and race-detector test suites..."
+echo "--> [5/8] Running Go static analysis and race-detector suites..."
+go test -race ./...
 go vet ./...
-go test -race ./internal/...
-go test -race ./tests/integration -run "TestGateM0|TestControlPlane|TestRetention|TestContainerizedCaddy|TestHostedStartup|TestLocalDevAuth|TestDeploymentScriptsGuards"
+go mod verify
+pnpm audit
 
 # 6. SP-03 Worker Process Lifecycle Tests
-echo "--> [6/8] Running SP-03 Worker process lifecycle and gating proofs..."
-go test -race ./tests/spikes/sp03 -run "TestSP03_StartAck|TestSP03_Monotonic|TestSP03_Channel|TestSP03_Graceful|TestSP03_ProcessGroup|TestSP03_Hung|TestSP03_Rogue|TestSP03_Sanitized|TestSP03_CrashSoak"
+echo "--> [6/8] Running the complete SP-03 lifecycle suite..."
+go test -race ./tests/spikes/sp03
 
 # 7. Deployment Configuration and Script Syntax Checks
-echo "--> [7/8] Verifying deployment scripts and rollback safety guards..."
+echo "--> [7/8] Validating deploy configuration and local Compose migration smoke..."
+node scripts/install-tools.mjs sqlc goose gitleaks govulncheck
+bin/sqlc version
+bin/goose -version
+bin/govulncheck ./...
+docker build -f deploy/Dockerfile.control-plane --build-arg COMMIT_SHA="$(git rev-parse HEAD)" -t deadbolt-control-plane:clean-clone .
+docker compose -f deploy/compose/docker-compose.yml --profile core config --quiet
+docker compose -f deploy/compose/docker-compose.yml --profile telemetry config --quiet
+docker compose -f deploy/compose/docker-compose.yml --profile fault config --quiet
+DEADBOLT_DB_ADMIN_PASSWORD=mock_admin DEADBOLT_MIGRATOR_PASSWORD=mock_migrator DEADBOLT_RUNTIME_PASSWORD=mock_runtime DEADBOLT_SYSTEM_PASSWORD=mock_system DATABASE_URL=postgres://deadbolt_runtime:mock_runtime@localhost:5432/mock MIGRATOR_DATABASE_URL=postgres://deadbolt_migrator:mock_migrator@localhost:5432/mock SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system@localhost:5432/mock DEADBOLT_IMAGE=ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_POSTGRES_IMAGE=ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_OIDC_ISSUER=https://i DEADBOLT_OIDC_CLIENT_ID=id DEADBOLT_OIDC_CLIENT_SECRET=s DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud docker compose -f deploy/compose/docker-compose.staging.yml --profile slot-blue --profile slot-green config --quiet
 DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud DEADBOLT_SNIPPET_ONLY=true DRY_RUN=true ./scripts/reload-caddy.sh
 DRY_RUN=true ./scripts/check-backup-readiness.sh
 DRY_RUN=true ./scripts/bootstrap-staging-cluster.sh
@@ -59,14 +89,40 @@ DRY_RUN=true ./scripts/retention.sh
 DRY_RUN=true ./scripts/take-base-backup.sh
 DRY_RUN=true ./scripts/restore-staging-db.sh
 DRY_RUN=true ./scripts/setup-backup-cron.sh
+docker build -f deploy/Dockerfile.postgres .
+
+COMPOSE_STARTED=true
+trap cleanup_compose EXIT
+compose up -d || compose_logs_and_fail
+for i in $(seq 1 30); do
+    if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
+done
+curl -fs http://127.0.0.1:8080/livez >/dev/null || compose_logs_and_fail
+compose exec -T control-plane /usr/local/bin/control-plane --migrate
+READYZ_OK=false
+for i in $(seq 1 15); do
+    if curl -fs http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
+        READYZ_OK=true
+        break
+    fi
+    sleep 1
+done
+if [ "$READYZ_OK" != "true" ]; then
+    compose_logs_and_fail
+fi
+compose stop
+compose start
+curl -fs http://127.0.0.1:8080/livez >/dev/null || compose_logs_and_fail
+compose down -v
+COMPOSE_STARTED=false
+trap - EXIT
 
 # 8. Secret Scan (Redacted)
 echo "--> [8/8] Running Gitleaks secret scan..."
-if [ -f "bin/gitleaks" ]; then
-    bin/gitleaks git --redact --no-banner --log-opts="-n 20"
-else
-    echo "[INFO] bin/gitleaks not installed locally; will run in CI"
-fi
+bin/gitleaks git --redact --no-banner --log-opts="--all"
 
 echo "=================================================================="
 echo " [DEADBOLT] Gate M0 Clean-Clone Verification: ALL GATES PASSED"

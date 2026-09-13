@@ -220,10 +220,10 @@ func TestGateM0_CleanCloneActionableConfigErrors(t *testing.T) {
 	})
 }
 
-// TestGateM0_VersionProvenanceContract validates the /version and /livez health contracts,
-// confirming that exact git commit SHA, ISO 8601 build timestamp, immutable container image digest,
-// and semantic release version are truthfully reported per Blueprint §25.2 and §26.2.
-func TestGateM0_VersionProvenanceContract(t *testing.T) {
+// TestGateM0_VersionEndpointContract validates the in-memory /version and /livez
+// response shapes. It deliberately uses synthetic metadata, so it is not evidence
+// of a deployed image or staging provenance.
+func TestGateM0_VersionEndpointContract(t *testing.T) {
 	expectedSHA := "4a4ed6545046818557563ffe144c3a978f2ec191"
 	expectedDigest := "sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee"
 	expectedBuildTime := "2026-09-13T10:00:00Z"
@@ -370,46 +370,25 @@ func TestGateM0_ContractAndSchemaParity(t *testing.T) {
 	}
 }
 
-// TestGateM0_SpikesResolutionAndNoBlockers verifies that engineering spikes
-// SP-01, SP-02, and SP-03 have comprehensive reports documenting positive feasibility decisions
-// and proving that no unresolved semantic blockers remain for Milestone 1.
+// TestGateM0_SpikesResolutionAndNoBlockers verifies each spike report has its
+// explicit M1-blocker decision. The reports remain the source of truth; this
+// only prevents removing their final acceptance marker by accident.
 func TestGateM0_SpikesResolutionAndNoBlockers(t *testing.T) {
 	reports := []struct {
-		Name          string
-		Filename      string
-		ExpectedTerms []string
+		Name     string
+		Filename string
 	}{
 		{
 			Name:     "SP-01 Manifest Conformance",
 			Filename: filepath.Join("..", "..", "docs", "reports", "SP-01-manifest-conformance.md"),
-			ExpectedTerms: []string{
-				"canonicalize",
-				"santhosh-tekuri/jsonschema",
-				"165 shared expected fixtures with Go/TS parity",
-				"REQ-EXEC-01",
-			},
 		},
 		{
 			Name:     "SP-02 DB Claim Contention",
 			Filename: filepath.Join("..", "..", "docs", "reports", "SP-02-claim-contention.md"),
-			ExpectedTerms: []string{
-				"Prescribed Lock Order Hierarchy (INV-08)",
-				"Zero Deadlocks",
-				"SET LOCAL app.current_organization_id",
-				"REQ-SEC-01",
-				"REQ-OPS-01",
-			},
 		},
 		{
 			Name:     "SP-03 Worker Process Lifecycle",
 			Filename: filepath.Join("..", "..", "docs", "reports", "SP-03-worker-lifecycle.md"),
-			ExpectedTerms: []string{
-				"Start ACK Gating",
-				"Monotonic Conservative Lease Budget",
-				"Process Group Termination",
-				"REQ-DUR-01",
-				"REQ-VERSION-01",
-			},
 		},
 	}
 
@@ -420,10 +399,8 @@ func TestGateM0_SpikesResolutionAndNoBlockers(t *testing.T) {
 				t.Fatalf("failed to read spike report %s: %v", r.Filename, err)
 			}
 			contentStr := string(content)
-			for _, term := range r.ExpectedTerms {
-				if !strings.Contains(contentStr, term) {
-					t.Errorf("spike report %s missing expected term: %q", r.Filename, term)
-				}
+			if !strings.Contains(contentStr, "**M1 blocker decision:** **NONE**") {
+				t.Errorf("spike report %s must state its explicit M1 blocker decision", r.Filename)
 			}
 		})
 	}

@@ -39,7 +39,7 @@
   <br /><sub>Run Inspector — interface concept illustrating the planned recovery experience, not a running application.</sub>
 </p>
 
-> **Repository status:** the product and engineering blueprint is established; M0 contract implementation is in progress. The architecture, stack, interface concept, and SDK example below describe the intended product. There is no installable SDK, released CLI, or production service yet.
+> **Repository status:** the M0 foundation acceptance gate is complete. The architecture, stack, interface concept, and SDK example below describe the intended product; there is no installable SDK, released CLI, or production service yet.
 
 ## The product
 
@@ -217,7 +217,7 @@ Testing, migrations, Docker, CI/CD, security, and observability grow with every 
 
 ## Start here
 
-This repository contains the blueprint, collaboration guide, M0 executable Go/TypeScript contracts, and the [M0 Foundation Acceptance Report](docs/reports/M0-foundation-acceptance.md). See the [clean-clone workspace setup](docs/workspace-setup.md) to build and validate the contracts, or run `./scripts/verify-clean-clone.sh` to execute the full clean-clone verification suite. To explore the design:
+This repository contains the blueprint, collaboration guide, M0 executable Go/TypeScript contracts, and the [M0 Foundation Acceptance Report](docs/reports/M0-foundation-acceptance.md). See the [clean-clone workspace setup](docs/workspace-setup.md) to build and validate the contracts, or run `./scripts/verify-clean-clone.sh` to execute the fail-closed local verification suite. It installs locked Node dependencies and pinned local tools; Go, Docker Compose, and curl must already be available. To explore the design:
 
 ```bash
 git clone https://github.com/Ryanakml/Deadbolt.git

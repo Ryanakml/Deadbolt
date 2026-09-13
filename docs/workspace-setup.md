@@ -1,6 +1,6 @@
 # Clean-clone setup — M0 issues #1 and #2
 
-This workspace currently implements contract validation and conformance tests. It does not yet start the control plane, execute customer tasks, migrate PostgreSQL, or deploy staging. `docs/blueprint.md` remains authoritative.
+This workspace implements contract validation and conformance tests, plus a disposable local Compose boot/migration/readiness smoke in the Foundation workflow. That smoke validates startup and schema readiness only; it does not execute customer tasks or deploy staging. `docs/blueprint.md` remains authoritative.
 
 ## Exact baseline
 
@@ -50,7 +50,7 @@ SQL is pgx + explicit queries/sqlc, not an ORM. There are no migrations to execu
 
 `deploy/images.lock.json` contains registry-resolved immutable multi-architecture index digests for the Go builder, Node runner, PostgreSQL, NATS, and development-only object store. Both Linux amd64 and arm64 were checked in the registry index. The digest, not a floating major tag, fixes the selected content. No hosted artifact bucket is implied by the development image.
 
-Docker with Compose v2 is a prerequisite for the later local-stack/deployment issue, not for these pure contract tests. This PR has no Dockerfile or Compose runtime to build/start. The local Docker daemon was unavailable during review; no container execution or image security result is inferred from registry resolution. The deploying issue must scan/build the exact pinned images, measure host capacity, and record real health/version evidence.
+Docker with Compose v2 is required by `scripts/verify-clean-clone.sh` and the Foundation workflow's local-stack smoke. Those checks build the local images, boot the `core` profile, apply migrations, and require `/livez` then `/readyz`; they are not evidence of a staging deployment. The deploying issue must still record real shared-host health/version evidence separately.
 
 ## Generated files and checks
 
