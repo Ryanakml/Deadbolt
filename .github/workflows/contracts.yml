@@ -127,3 +127,39 @@ jobs:
       - name: Scan tracked source and history without printing secrets
         run: |
           bin/gitleaks git --redact --no-banner --log-opts="--all"
+  sp03-native-addon:
+    name: SP-03 native addon (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.24.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.21.0
+          cache: pnpm
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Compile and execute the target-native N-API fixture
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm --filter @runtime/runner run build
+          NODE_ROOT="$(dirname "$(dirname "$(node -p 'process.execPath')")")"
+          cc -shared -fPIC -DNODE_GYP_MODULE_NAME=native_addon -I "$NODE_ROOT/include/node" tests/spikes/sp03/native-addon/native-addon.c -o tests/spikes/sp03/native-addon/native-addon.node
+          test "$(node -p 'process.arch')" = "${{ matrix.arch == 'amd64' && 'x64' || 'arm64' }}"
+          node tests/spikes/sp03/native-addon/native-addon.test.cjs
+          tar -C tests/spikes/sp03/native-addon -cf tests/spikes/sp03/native-addon/native-bundle.tar native-task.mjs native-addon.node
+          SP03_NATIVE_BUNDLE="$GITHUB_WORKSPACE/tests/spikes/sp03/native-addon/native-bundle.tar" go test ./tests/spikes/sp03 -run TestSP03_VerifiedNativeBundle -count=1
