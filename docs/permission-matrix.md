@@ -92,6 +92,7 @@ To prevent accidental tenant abandonment or orphan organizations, Deadbolt stric
 ### 3.3 CSRF & Origin Defense for Human Sessions
 
 In accordance with Blueprint §24.1:
+
 - State-mutating HTTP requests (`POST`, `PATCH`, `DELETE`) authenticated via ambient human session cookies (`__Host-runtime_session` or `runtime_session`) require:
   1. A valid `Origin` header matching the platform's configured allowlist (rejects untrusted or absent origins with `403 ORIGIN_FORBIDDEN`).
   2. A valid `X-CSRF-Token` header cryptographically verified against the session's HMAC-SHA256 token hash (rejects missing or mismatched tokens with `403 CSRF_TOKEN_INVALID`).
