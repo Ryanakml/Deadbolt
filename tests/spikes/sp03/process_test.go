@@ -50,6 +50,15 @@ func resolveFixturePath(t *testing.T, filename string) string {
 	return fixtureAbs
 }
 
+func resolveRunnerFixturePath(t *testing.T, filename string) string {
+	t.Helper()
+	fixtureAbs, err := filepath.Abs("../../../runner/node/tests/fixtures/" + filename)
+	if err != nil {
+		t.Fatalf("failed to resolve runner fixture path: %v", err)
+	}
+	return fixtureAbs
+}
+
 // 1. Acceptance Contract: Handler never starts without ACK or adequate remaining TTL
 func TestSP03_StartAckGating(t *testing.T) {
 	runnerPath := resolveRunnerPath(t)
@@ -366,7 +375,7 @@ func TestSP03_CrashSoakAndNoLeakedProcesses(t *testing.T) {
 		taskName, timeout := "default", int64(0)
 		switch i % 3 {
 		case 1:
-			fixturePath, taskName = resolveFixturePath(t, "sample-task.js"), "failingTask"
+			fixturePath, taskName = resolveRunnerFixturePath(t, "sample-task.js"), "failingTask"
 		case 2:
 			fixturePath, timeout = resolveFixturePath(t, "hung-child.js"), 30
 		}
