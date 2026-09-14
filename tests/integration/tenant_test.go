@@ -2189,18 +2189,45 @@ func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
 
 	ctx := context.Background()
 	ownerID, _ := tenant.NewUUID()
-	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Project Idemp Corp")
-	projInit, _ := tc.service.CreateProject(ctx, org.ID, "Init Proj")
-	env, _ := tc.service.CreateEnvironment(ctx, org.ID, projInit.ID, tenant.EnvProduction, 10)
-	key := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminProject, tenant.CapOrgRead})
+	_, err := tc.pool.Exec(ctx, `INSERT INTO users (id, email) VALUES ($1, $2)`, ownerID, "owner-proj-idemp@example.com")
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	org, err := tc.service.CreateOrganization(ctx, ownerID, "Project Idemp Corp")
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	sess, sessionToken, csrfToken, err := tc.sessionStore.CreateSession(
+		ctx,
+		ownerID,
+		&org.ID,
+		"127.0.0.1",
+		"TestAgent",
+		tc.authCfg.SessionIdleTimeout,
+		tc.authCfg.SessionAbsoluteTimeout,
+	)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if sess == nil {
+		t.Fatalf("expected non-nil session")
+	}
 
 	server := httptest.NewServer(tc.handler.Routes())
 	defer server.Close()
 
+	cookie := &http.Cookie{
+		Name:  tc.authCfg.SessionCookieName(),
+		Value: sessionToken,
+	}
+
 	// 1. Initial Project Creation
 	idempProjKey := "idemp-proj-create-1"
 	req1, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Alpha"}`))
-	req1.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	req1.AddCookie(cookie)
+	req1.Header.Set("Origin", "http://localhost:3000")
+	req1.Header.Set("X-CSRF-Token", csrfToken)
 	req1.Header.Set("X-Organization-ID", org.ID)
 	req1.Header.Set("Content-Type", "application/json")
 	req1.Header.Set("Idempotency-Key", idempProjKey)
@@ -2220,7 +2247,9 @@ func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
 
 	// 2. Project Replay -> identical project returned
 	reqProjReplay, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Alpha"}`))
-	reqProjReplay.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqProjReplay.AddCookie(cookie)
+	reqProjReplay.Header.Set("Origin", "http://localhost:3000")
+	reqProjReplay.Header.Set("X-CSRF-Token", csrfToken)
 	reqProjReplay.Header.Set("X-Organization-ID", org.ID)
 	reqProjReplay.Header.Set("Content-Type", "application/json")
 	reqProjReplay.Header.Set("Idempotency-Key", idempProjKey)
@@ -2243,7 +2272,9 @@ func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
 
 	// 3. Project Conflicting replay -> 409
 	reqProjConflict, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Beta"}`))
-	reqProjConflict.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqProjConflict.AddCookie(cookie)
+	reqProjConflict.Header.Set("Origin", "http://localhost:3000")
+	reqProjConflict.Header.Set("X-CSRF-Token", csrfToken)
 	reqProjConflict.Header.Set("X-Organization-ID", org.ID)
 	reqProjConflict.Header.Set("Content-Type", "application/json")
 	reqProjConflict.Header.Set("Idempotency-Key", idempProjKey)
@@ -2260,7 +2291,9 @@ func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
 	// 4. Initial Environment Creation
 	idempEnvKey := "idemp-env-create-1"
 	reqEnv1, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj1.ID), strings.NewReader(`{"name":"staging","max_concurrency":15}`))
-	reqEnv1.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqEnv1.AddCookie(cookie)
+	reqEnv1.Header.Set("Origin", "http://localhost:3000")
+	reqEnv1.Header.Set("X-CSRF-Token", csrfToken)
 	reqEnv1.Header.Set("X-Organization-ID", org.ID)
 	reqEnv1.Header.Set("Content-Type", "application/json")
 	reqEnv1.Header.Set("Idempotency-Key", idempEnvKey)
@@ -2280,7 +2313,9 @@ func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
 
 	// 5. Environment Replay -> identical env returned
 	reqEnvReplay, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj1.ID), strings.NewReader(`{"name":"staging","max_concurrency":15}`))
-	reqEnvReplay.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqEnvReplay.AddCookie(cookie)
+	reqEnvReplay.Header.Set("Origin", "http://localhost:3000")
+	reqEnvReplay.Header.Set("X-CSRF-Token", csrfToken)
 	reqEnvReplay.Header.Set("X-Organization-ID", org.ID)
 	reqEnvReplay.Header.Set("Content-Type", "application/json")
 	reqEnvReplay.Header.Set("Idempotency-Key", idempEnvKey)
@@ -2303,7 +2338,9 @@ func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
 
 	// 6. Environment Conflicting Replay -> 409
 	reqEnvConflict, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj1.ID), strings.NewReader(`{"name":"development","max_concurrency":15}`))
-	reqEnvConflict.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqEnvConflict.AddCookie(cookie)
+	reqEnvConflict.Header.Set("Origin", "http://localhost:3000")
+	reqEnvConflict.Header.Set("X-CSRF-Token", csrfToken)
 	reqEnvConflict.Header.Set("X-Organization-ID", org.ID)
 	reqEnvConflict.Header.Set("Content-Type", "application/json")
 	reqEnvConflict.Header.Set("Idempotency-Key", idempEnvKey)
@@ -2456,18 +2493,49 @@ func TestIdempotencyFailedMutationRollbackAndFailClosed(t *testing.T) {
 
 	ctx := context.Background()
 	ownerID, _ := tenant.NewUUID()
-	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Rollback Idemp Corp")
-	proj, _ := tc.service.CreateProject(ctx, org.ID, "Rollback Proj")
-	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
-	adminKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminProject, tenant.CapOrgRead})
+	_, err := tc.pool.Exec(ctx, `INSERT INTO users (id, email) VALUES ($1, $2)`, ownerID, "owner-fail-idemp@example.com")
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	org, err := tc.service.CreateOrganization(ctx, ownerID, "Rollback Idemp Corp")
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	proj, err := tc.service.CreateProject(ctx, org.ID, "Rollback Proj")
+	if err != nil {
+		t.Fatalf("create proj: %v", err)
+	}
+
+	sess, sessionToken, csrfToken, err := tc.sessionStore.CreateSession(
+		ctx,
+		ownerID,
+		&org.ID,
+		"127.0.0.1",
+		"TestAgent",
+		tc.authCfg.SessionIdleTimeout,
+		tc.authCfg.SessionAbsoluteTimeout,
+	)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if sess == nil {
+		t.Fatalf("expected non-nil session")
+	}
 
 	server := httptest.NewServer(tc.handler.Routes())
 	defer server.Close()
 
+	cookie := &http.Cookie{
+		Name:  tc.authCfg.SessionCookieName(),
+		Value: sessionToken,
+	}
+
 	// 1. Failed mutation with invalid environment name -> 400 Bad Request
 	failKey := "idemp-fail-rollback-1"
 	failReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj.ID), strings.NewReader(`{"name":"invalid_env_name"}`))
-	failReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	failReq.AddCookie(cookie)
+	failReq.Header.Set("Origin", "http://localhost:3000")
+	failReq.Header.Set("X-CSRF-Token", csrfToken)
 	failReq.Header.Set("X-Organization-ID", org.ID)
 	failReq.Header.Set("Content-Type", "application/json")
 	failReq.Header.Set("Idempotency-Key", failKey)
@@ -2492,7 +2560,9 @@ func TestIdempotencyFailedMutationRollbackAndFailClosed(t *testing.T) {
 
 	// 2. Retry with same Idempotency-Key and valid payload -> SUCCEEDS (key was not poisoned)
 	retryReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj.ID), strings.NewReader(`{"name":"staging","max_concurrency":10}`))
-	retryReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	retryReq.AddCookie(cookie)
+	retryReq.Header.Set("Origin", "http://localhost:3000")
+	retryReq.Header.Set("X-CSRF-Token", csrfToken)
 	retryReq.Header.Set("X-Organization-ID", org.ID)
 	retryReq.Header.Set("Content-Type", "application/json")
 	retryReq.Header.Set("Idempotency-Key", failKey)
@@ -2508,7 +2578,9 @@ func TestIdempotencyFailedMutationRollbackAndFailClosed(t *testing.T) {
 
 	// 3. Fail closed on missing Idempotency-Key
 	missingReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj.ID), strings.NewReader(`{"name":"production"}`))
-	missingReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	missingReq.AddCookie(cookie)
+	missingReq.Header.Set("Origin", "http://localhost:3000")
+	missingReq.Header.Set("X-CSRF-Token", csrfToken)
 	missingReq.Header.Set("X-Organization-ID", org.ID)
 	missingReq.Header.Set("Content-Type", "application/json")
 
