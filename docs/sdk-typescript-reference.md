@@ -289,3 +289,29 @@ To build and verify:
 ```bash
 node sdk/typescript/examples/linear-pipeline/build.js
 ```
+
+## 8. Acceptance Evidence Boundary
+
+The SDK, local bundle, client, runner, and Go worker protocol evidence for issue #9 is recorded in
+[M1 SDK Bundles Acceptance Evidence](reports/M1-sdk-bundles-acceptance.md).
+
+That report is the source of truth for separating:
+
+- implemented behavior;
+- automated tests passed;
+- hosted CI passed;
+- deployed to staging;
+- acceptance verified.
+
+Local manifest generation and clean-clone CI smoke tests are not treated as proof that the real
+staging control plane accepted and executed the exact immutable artifact. The staging A -> B -> C
+run, provenance capture, recovery exercise, and end-to-end error/security observations must be
+recorded separately before production promotion.
+
+### Rollout and Compatibility Notes
+
+The M1 runner protocol requires `stepId` as a distinct identity from `operationId`. New workers must
+send `stepId`, and new runners reject payloads that omit it before customer code starts. Rollback
+should restore a known-good matching worker/runner artifact or image digest; binary rollback does
+not roll back database state or make synthetic digest manifests equivalent to real artifact
+provenance.
