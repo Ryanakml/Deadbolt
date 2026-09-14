@@ -443,13 +443,24 @@ if ! wait_for_candidate_edge_smoke "$DEADBOLT_STAGING_DOMAIN" "$CANDIDATE_DIGEST
   exit 1
 fi
 
-# 12. Decommission previous slot container
+# 12. Verify the mounted M1 tenant route through the external HTTPS edge.
+log "Step 12: Verifying M1 tenant route through Caddy edge..."
+if ! wait_for_tenant_route_edge_smoke "$DEADBOLT_STAGING_DOMAIN"; then
+  err "TENANT ROUTE EDGE SMOKE FAILED after bounded retry window: expected GET /api/v1/organizations -> HTTP 401 UNAUTHENTICATED."
+  # Route restoration is authoritative: never stop a candidate Caddy may still route to.
+  if ! restore_edge_route_before_stopping_candidate "$OLD_PORT" "$HAS_KNOWN_GOOD_ROUTE"; then
+    exit 1
+  fi
+  exit 1
+fi
+
+# 13. Decommission previous slot container only after both edge smoke gates pass.
 if [[ "$HAS_KNOWN_GOOD_ROUTE" == "true" ]]; then
-  log "Step 12: Stopping previous slot ($OLD_SLOT)..."
+  log "Step 13: Stopping previous slot ($OLD_SLOT)..."
   docker compose -p deadbolt-staging -f "$COMPOSE_FILE" stop "control-plane-$OLD_SLOT" || true
 fi
 
-# 13. Record successful release state
+# 14. Record successful release state
 if [[ -f "$CURRENT_RELEASE_FILE" ]]; then
   cp "$CURRENT_RELEASE_FILE" "$PREVIOUS_RELEASE_FILE"
 fi

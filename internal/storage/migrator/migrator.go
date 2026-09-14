@@ -16,6 +16,9 @@ import (
 // See Blueprint §26.3: "A single migrator uses an advisory lock; app runtime has no DDL permission."
 const MigrationAdvisoryLockID int64 = 7142893
 
+// LatestSchemaVersion defines the expected schema version for readiness and health checks.
+const LatestSchemaVersion int64 = 7
+
 type Runner struct {
 	db            *sql.DB
 	migrationsDir string

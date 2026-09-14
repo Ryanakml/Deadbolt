@@ -20,6 +20,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
+	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
@@ -198,8 +199,8 @@ func run() error {
 	}
 	natsChecker := gateway.NewTCPNATSChecker(natsURL)
 
-	// Latest expected migration in M0 is 5 (00005_auth_and_sessions.sql)
-	healthChecker := gateway.NewHealthChecker(versionInfo, pool, natsChecker, 5)
+	// Latest expected migration in M1 is 6 (00006_api_keys_lookup.sql)
+	healthChecker := gateway.NewHealthChecker(versionInfo, pool, natsChecker, migrator.LatestSchemaVersion)
 
 	// Wire active scheduler freshness ticker through authoritative reconciler sweeps (Blueprint §24.3 & §25.2)
 	systemDBURL := strings.TrimSpace(os.Getenv("SYSTEM_DATABASE_URL"))
@@ -241,23 +242,7 @@ func run() error {
 		}()
 	}
 
-	mux := http.NewServeMux()
-	healthChecker.Routes(mux)
-
-	if pool != nil {
-		store := auth.NewSessionStore(pool)
-		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
-		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)
-		bff.SetLogger(logger)
-
-		mux.Handle("/api/auth/", bff.Routes())
-
-		if cfg.RuntimeMode == auth.ModeLocal && cfg.DevAuthEnabled {
-			devAuth := auth.NewDevAuthHandler(cfg, store, pool)
-			mux.HandleFunc("/api/auth/dev-login", devAuth.HandleDevLogin)
-			logger.Printf("Local developer authentication endpoint enabled at /api/auth/dev-login")
-		}
-	}
+	mux := BuildMux(cfg, pool, healthChecker, logger)
 
 	server := &http.Server{
 		Addr:         listenAddr,
@@ -294,6 +279,11 @@ func run() error {
 
 	logger.Printf("Control plane shutdown cleanly completed.")
 	return nil
+}
+
+// BuildMux wires all production routes onto a new http.ServeMux using the canonical constructor.
+func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, logger *log.Logger) *http.ServeMux {
+	return controlplane.BuildMux(cfg, pool, healthChecker, logger)
 }
 
 // runMigrations executes database schema migrations using DDL-capable migrator credentials

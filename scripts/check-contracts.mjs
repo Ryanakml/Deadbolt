@@ -19,7 +19,7 @@ for (const item of Object.values(source.paths))
   for (const method of ["get", "post", "patch", "delete"]) {
     const op = item[method];
     if (!op) continue;
-    assert.equal(op["x-implemented"], false);
+    assert(typeof op["x-implemented"] === "boolean");
     assert(op["x-required-capability"]);
     assert(op.security ?? source.security);
     for (const code of [
