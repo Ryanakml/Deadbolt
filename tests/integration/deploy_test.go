@@ -1932,6 +1932,12 @@ func TestEdgeSmokeRollbackRouteRestorationInvariant(t *testing.T) {
 	if !strings.Contains(string(deployBytes), "restore_edge_route_before_stopping_candidate \"$OLD_PORT\"") || strings.Contains(string(deployBytes), "./scripts/reload-caddy.sh \"$OLD_PORT\" || true") {
 		t.Fatal("deploy-staging.sh must use the authoritative route-restoration helper without suppressing failure")
 	}
+	versionSmoke := strings.Index(string(deployBytes), "wait_for_candidate_edge_smoke")
+	tenantSmoke := strings.Index(string(deployBytes), "wait_for_tenant_route_edge_smoke")
+	stopPrevious := strings.Index(string(deployBytes), "stop \"control-plane-$OLD_SLOT\"")
+	if tenantSmoke < 0 || versionSmoke < 0 || tenantSmoke < versionSmoke || tenantSmoke > stopPrevious {
+		t.Fatal("tenant-route edge smoke must run after version smoke and before the previous slot is stopped")
+	}
 
 	for _, tc := range []struct {
 		name            string
@@ -2052,6 +2058,63 @@ wait_for_candidate_edge_smoke staging.example.test %q
 	count, _ := os.ReadFile(countPath)
 	if strings.TrimSpace(string(count)) != "3" {
 		t.Fatalf("expected third edge-smoke attempt to pass, got %q", count)
+	}
+}
+
+func TestTenantRouteEdgeSmokeRequiresDeadboltAuthBoundary(t *testing.T) {
+	helperPath, err := filepath.Abs("../../scripts/lib/edge-smoke.sh")
+	if err != nil {
+		t.Fatalf("resolve edge smoke helper: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		status  string
+		body    string
+		wantErr bool
+	}{
+		{name: "accepts canonical unauthenticated response", status: "401", body: `{"code":"UNAUTHENTICATED","message":"Authentication required","requestId":"smoke-test"}`},
+		{name: "rejects arbitrary 4xx", status: "404", body: `{"code":"UNAUTHENTICATED"}`, wantErr: true},
+		{name: "rejects non-Deadbolt 401", status: "401", body: `{"error":"unauthorized"}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			curlPath := filepath.Join(workDir, "curl")
+			mockCurl := fmt.Sprintf(`#!/usr/bin/env bash
+for ((i = 1; i <= $#; i++)); do
+  if [[ "${!i}" == "-o" ]]; then
+    next=$((i + 1))
+    printf '%%s' %q > "${!next}"
+  fi
+done
+printf '%%s' %q
+`, tc.body, tc.status)
+			if err := os.WriteFile(curlPath, []byte(mockCurl), 0755); err != nil {
+				t.Fatal(err)
+			}
+			harness := fmt.Sprintf(`
+set -euo pipefail
+log() { echo "$*"; }
+err() { :; }
+source %q
+wait_for_tenant_route_edge_smoke staging.example.test
+`, helperPath)
+			cmd := exec.Command("/bin/bash", "-c", harness)
+			cmd.Env = append(os.Environ(), "PATH="+workDir+":"+os.Getenv("PATH"), "DEADBOLT_EDGE_SMOKE_ATTEMPTS=1", "DEADBOLT_EDGE_SMOKE_INTERVAL_SECONDS=0")
+			out, err := cmd.CombinedOutput()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected smoke failure, got success: %s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected tenant-route smoke success: %v %s", err, out)
+			}
+			if !strings.Contains(string(out), "Tenant route edge smoke passed: GET /api/v1/organizations -> HTTP 401") {
+				t.Fatalf("expected safe tenant-route smoke evidence, got: %s", out)
+			}
+		})
 	}
 }
 
