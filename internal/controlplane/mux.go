@@ -11,6 +11,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
+	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
 
 // BuildMux wires all production routes onto a new http.ServeMux.
@@ -28,7 +29,8 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 		tenantService := tenant.NewService(storagePool)
 		tenantHandler := tenant.NewHTTPHandler(tenantService, pool, store, cfg)
 		tenantHandler.RegisterRoutes(mux)
-		deploymentHandler := deployment.NewHTTPHandler(deployment.NewService(storagePool, tenantService), tenantService)
+		deploymentSvc := deployment.NewService(storagePool, tenantService)
+		deploymentHandler := deployment.NewHTTPHandler(deploymentSvc, tenantService)
 		mux.Handle("POST /api/v1/deployments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsRegister, deploymentHandler.Register))))
 		mux.Handle("POST /v1/deployments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsRegister, deploymentHandler.Register))))
 		// Activation selects its required staging/production capability only after
@@ -36,6 +38,17 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 		// scoped auth, environment isolation, and durable command idempotency.
 		mux.Handle("POST /api/v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 		mux.Handle("POST /v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
+
+		workerSvc := worker.NewService(storagePool, deploymentSvc)
+		workerHandler := worker.NewHTTPHandler(workerSvc, tenantService)
+		workerHandler.RegisterRoutes(mux)
+
+		mux.Handle("POST /api/v1/environments/{envId}/worker-enrollments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsWrite, workerHandler.HandleCreateEnrollmentToken))))
+		mux.Handle("POST /v1/environments/{envId}/worker-enrollments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsWrite, workerHandler.HandleCreateEnrollmentToken))))
+		mux.Handle("POST /api/v1/workers/{workerId}/revoke", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleRevokeWorker))))
+		mux.Handle("POST /v1/workers/{workerId}/revoke", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleRevokeWorker))))
+		mux.Handle("POST /api/v1/workers/{workerId}/drain", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleDrainWorker))))
+		mux.Handle("POST /v1/workers/{workerId}/drain", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleDrainWorker))))
 
 		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
 		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)
