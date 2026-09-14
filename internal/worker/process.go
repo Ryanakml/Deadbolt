@@ -391,7 +391,10 @@ type cappedBuffer struct {
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
-	if b.Len() >= maxCapturedOutput { b.truncated = true; return len(p), nil }
+	if b.Len() >= maxCapturedOutput {
+		b.truncated = true
+		return len(p), nil
+	}
 	remaining := maxCapturedOutput - b.Len()
 	if len(p) > remaining {
 		_, _ = b.Buffer.Write(p[:remaining])

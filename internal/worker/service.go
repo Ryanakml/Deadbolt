@@ -474,7 +474,10 @@ func (s *Service) claimAssignmentsSQL(ctx context.Context, sessionCtx *WorkerSes
 				return fmt.Errorf("upsert lease: %w", err)
 			}
 
-			var manifestInfo struct { TargetArchitecture string `json:"targetArchitecture"`; SecretNames []string `json:"secretNames"` }
+			var manifestInfo struct {
+				TargetArchitecture string   `json:"targetArchitecture"`
+				SecretNames        []string `json:"secretNames"`
+			}
 			_ = json.Unmarshal(m.manifest, &manifestInfo)
 			assignments = append(assignments, AssignmentDTO{
 				RunID:                m.runID,

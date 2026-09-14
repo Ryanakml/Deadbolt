@@ -472,7 +472,11 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 func resolveTaskSecrets(names []string) (map[string]string, error) {
 	values := make(map[string]string, len(names))
 	for _, name := range names {
-		if value, ok := os.LookupEnv(name); ok { values[name] = value } else { return nil, fmt.Errorf("required task secret %q is not available", name) }
+		if value, ok := os.LookupEnv(name); ok {
+			values[name] = value
+		} else {
+			return nil, fmt.Errorf("required task secret %q is not available", name)
+		}
 	}
 	return values, nil
 }
