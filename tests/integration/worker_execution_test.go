@@ -111,11 +111,7 @@ func TestWorkerEnrollmentLifecycle(t *testing.T) {
 		t.Fatalf("empty challenge nonce returned")
 	}
 
-	// 3. Worker signs nonce with Ed25519 private key
-	sig := ed25519.Sign(privKey, []byte(chalResp.Nonce))
-	sigHex := hex.EncodeToString(sig)
-
-	// Tampered signature must fail with 401
+	// 3. Tampered signature must fail with 401
 	tamperedBody, _ := json.Marshal(worker.EnrollRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "test-enroll-tampered",
@@ -133,13 +129,30 @@ func TestWorkerEnrollmentLifecycle(t *testing.T) {
 		t.Fatalf("expected 401 Unauthorized for tampered signature, got %d", tResp.StatusCode)
 	}
 
-	// 4. Legitimate worker enrolls
+	// 4. Legitimate worker requests a fresh challenge nonce and enrolls
+	chalReqBodyValid, _ := json.Marshal(worker.ChallengeRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion,
+		RequestID:       "test-chal-valid",
+		PublicKey:       pubHex,
+	})
+	cRespValid, err := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(chalReqBodyValid))
+	if err != nil {
+		t.Fatalf("failed to request fresh challenge nonce: %v", err)
+	}
+	var chalRespValid worker.ChallengeResponseDTO
+	if err := json.NewDecoder(cRespValid.Body).Decode(&chalRespValid); err != nil {
+		t.Fatalf("failed to decode fresh challenge response: %v", err)
+	}
+	cRespValid.Body.Close()
+
+	validSig := worker.SignChallenge(privKey, chalRespValid.Nonce)
+
 	validEnrollBody, _ := json.Marshal(worker.EnrollRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "test-enroll-valid",
 		EnrollmentToken: enrollTokenInfo.Token,
-		Nonce:           chalResp.Nonce,
-		Signature:       sigHex,
+		Nonce:           chalRespValid.Nonce,
+		Signature:       validSig,
 		PublicKey:       pubHex,
 	})
 	eResp, err := http.Post(server.URL+"/worker/v1/enroll", "application/json", bytes.NewReader(validEnrollBody))
@@ -170,7 +183,7 @@ func TestWorkerEnrollmentLifecycle(t *testing.T) {
 	_ = json.NewDecoder(cResp2.Body).Decode(&chalResp2)
 	cResp2.Body.Close()
 
-	sig2 := hex.EncodeToString(ed25519.Sign(privKey, []byte(chalResp2.Nonce)))
+	sig2 := worker.SignChallenge(privKey, chalResp2.Nonce)
 	replayBody, _ := json.Marshal(worker.EnrollRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "test-enroll-replay",
@@ -205,10 +218,16 @@ func TestWorkerSessionReauthenticationAndFencing(t *testing.T) {
 	req.Header.Set("X-Organization-ID", orgID)
 	req.Header.Set("Idempotency-Key", "idemp-enroll-token-reauth-1")
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to create enrollment token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for enrollment token, got %d", resp.StatusCode)
+	}
 	var enrollTokenInfo worker.EnrollmentTokenInfo
 	_ = json.NewDecoder(resp.Body).Decode(&enrollTokenInfo)
-	resp.Body.Close()
 
 	pubKey, privKey, _ := ed25519.GenerateKey(nil)
 	pubHex := hex.EncodeToString(pubKey)
@@ -218,12 +237,15 @@ func TestWorkerSessionReauthenticationAndFencing(t *testing.T) {
 		RequestID:       "chal-reauth-1",
 		PublicKey:       pubHex,
 	})
-	cResp, _ := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(chalReqBody))
+	cResp, err := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(chalReqBody))
+	if err != nil {
+		t.Fatalf("failed to get challenge: %v", err)
+	}
 	var chalResp worker.ChallengeResponseDTO
 	_ = json.NewDecoder(cResp.Body).Decode(&chalResp)
 	cResp.Body.Close()
 
-	sigHex := hex.EncodeToString(ed25519.Sign(privKey, []byte(chalResp.Nonce)))
+	sigHex := worker.SignChallenge(privKey, chalResp.Nonce)
 	enrollBody, _ := json.Marshal(worker.EnrollRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "enroll-reauth-1",
@@ -232,10 +254,16 @@ func TestWorkerSessionReauthenticationAndFencing(t *testing.T) {
 		Signature:       sigHex,
 		PublicKey:       pubHex,
 	})
-	eResp, _ := http.Post(server.URL+"/worker/v1/enroll", "application/json", bytes.NewReader(enrollBody))
+	eResp, err := http.Post(server.URL+"/worker/v1/enroll", "application/json", bytes.NewReader(enrollBody))
+	if err != nil {
+		t.Fatalf("failed to enroll: %v", err)
+	}
+	defer eResp.Body.Close()
+	if eResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for enroll, got %d", eResp.StatusCode)
+	}
 	var enrollSuccess worker.SessionResponseDTO
 	_ = json.NewDecoder(eResp.Body).Decode(&enrollSuccess)
-	eResp.Body.Close()
 
 	workerID := enrollSuccess.WorkerID
 	oldSessionToken := enrollSuccess.SessionToken
@@ -251,7 +279,7 @@ func TestWorkerSessionReauthenticationAndFencing(t *testing.T) {
 	_ = json.NewDecoder(cResp3.Body).Decode(&chalResp3)
 	cResp3.Body.Close()
 
-	sig3 := hex.EncodeToString(ed25519.Sign(privKey, []byte(chalResp3.Nonce)))
+	sig3 := worker.SignChallenge(privKey, chalResp3.Nonce)
 	sessReqBody, _ := json.Marshal(worker.SessionRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "sess-req-1",
@@ -336,10 +364,16 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 	req.Header.Set("X-Organization-ID", orgID)
 	req.Header.Set("Idempotency-Key", "idemp-enroll-token-start-1")
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to create enrollment token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for enrollment token, got %d", resp.StatusCode)
+	}
 	var enrollTokenInfo worker.EnrollmentTokenInfo
 	_ = json.NewDecoder(resp.Body).Decode(&enrollTokenInfo)
-	resp.Body.Close()
 
 	pubKey, privKey, _ := ed25519.GenerateKey(nil)
 	pubHex := hex.EncodeToString(pubKey)
@@ -349,12 +383,15 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 		RequestID:       "chal-start-1",
 		PublicKey:       pubHex,
 	})
-	cResp, _ := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(chalReqBody))
+	cResp, err := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(chalReqBody))
+	if err != nil {
+		t.Fatalf("failed to get challenge: %v", err)
+	}
 	var chalResp worker.ChallengeResponseDTO
 	_ = json.NewDecoder(cResp.Body).Decode(&chalResp)
 	cResp.Body.Close()
 
-	sigHex := hex.EncodeToString(ed25519.Sign(privKey, []byte(chalResp.Nonce)))
+	sigHex := worker.SignChallenge(privKey, chalResp.Nonce)
 	enrollBody, _ := json.Marshal(worker.EnrollRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "enroll-start-1",
@@ -363,10 +400,16 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 		Signature:       sigHex,
 		PublicKey:       pubHex,
 	})
-	eResp, _ := http.Post(server.URL+"/worker/v1/enroll", "application/json", bytes.NewReader(enrollBody))
+	eResp, err := http.Post(server.URL+"/worker/v1/enroll", "application/json", bytes.NewReader(enrollBody))
+	if err != nil {
+		t.Fatalf("failed to enroll: %v", err)
+	}
+	defer eResp.Body.Close()
+	if eResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for enroll, got %d", eResp.StatusCode)
+	}
 	var enrollSuccess worker.SessionResponseDTO
 	_ = json.NewDecoder(eResp.Body).Decode(&enrollSuccess)
-	eResp.Body.Close()
 
 	workerID := enrollSuccess.WorkerID
 	sessionID := enrollSuccess.SessionID
@@ -374,7 +417,7 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 
 	// Seed database with a deployment, run, and eligible run_step
 	var deploymentID, runID, stepID string
-	err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	err = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		err := tx.QueryRow(ctx, `
 			INSERT INTO deployments (organization_id, environment_id, manifest_hash, bundle_digest, manifest, protocol_version, runtime_version)
 			VALUES ($1, $2, 'm_hash_1', 'b_digest_1', '{}', 1, '1.0')
@@ -422,6 +465,9 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 		t.Fatalf("poll failed: %v", err)
 	}
 	defer pResp.Body.Close()
+	if pResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for poll, got %d", pResp.StatusCode)
+	}
 
 	var pollResp worker.PollResponseDTO
 	if err := json.NewDecoder(pResp.Body).Decode(&pollResp); err != nil {
@@ -569,10 +615,16 @@ func TestWorkerRevocationAndDraining(t *testing.T) {
 	req.Header.Set("X-Organization-ID", orgID)
 	req.Header.Set("Idempotency-Key", "idemp-enroll-token-drain-1")
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to create enrollment token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for enrollment token, got %d", resp.StatusCode)
+	}
 	var enrollTokenInfo worker.EnrollmentTokenInfo
 	_ = json.NewDecoder(resp.Body).Decode(&enrollTokenInfo)
-	resp.Body.Close()
 
 	pubKey, privKey, _ := ed25519.GenerateKey(nil)
 	pubHex := hex.EncodeToString(pubKey)
@@ -582,12 +634,15 @@ func TestWorkerRevocationAndDraining(t *testing.T) {
 		RequestID:       "chal-drain-1",
 		PublicKey:       pubHex,
 	})
-	cResp, _ := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(chalReqBody))
+	cResp, err := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(chalReqBody))
+	if err != nil {
+		t.Fatalf("failed to get challenge: %v", err)
+	}
 	var chalResp worker.ChallengeResponseDTO
 	_ = json.NewDecoder(cResp.Body).Decode(&chalResp)
 	cResp.Body.Close()
 
-	sigHex := hex.EncodeToString(ed25519.Sign(privKey, []byte(chalResp.Nonce)))
+	sigHex := worker.SignChallenge(privKey, chalResp.Nonce)
 	enrollBody, _ := json.Marshal(worker.EnrollRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "enroll-drain-1",
@@ -596,10 +651,16 @@ func TestWorkerRevocationAndDraining(t *testing.T) {
 		Signature:       sigHex,
 		PublicKey:       pubHex,
 	})
-	eResp, _ := http.Post(server.URL+"/worker/v1/enroll", "application/json", bytes.NewReader(enrollBody))
+	eResp, err := http.Post(server.URL+"/worker/v1/enroll", "application/json", bytes.NewReader(enrollBody))
+	if err != nil {
+		t.Fatalf("failed to enroll: %v", err)
+	}
+	defer eResp.Body.Close()
+	if eResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for enroll, got %d", eResp.StatusCode)
+	}
 	var enrollSuccess worker.SessionResponseDTO
 	_ = json.NewDecoder(eResp.Body).Decode(&enrollSuccess)
-	eResp.Body.Close()
 
 	workerID := enrollSuccess.WorkerID
 	sessionID := enrollSuccess.SessionID

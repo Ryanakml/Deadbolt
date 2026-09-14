@@ -170,6 +170,14 @@ func (a *Agent) ensureIdentity(ctx context.Context) error {
 		}
 		a.privKey = priv
 		a.pubKey = priv.Public().(ed25519.PublicKey)
+		workerID, identityErr := LoadWorkerIdentity(a.cfg.KeyPath)
+		if identityErr == nil {
+			a.workerID = workerID
+		} else if errors.Is(identityErr, os.ErrNotExist) {
+			return fmt.Errorf("worker identity metadata is missing; refusing unauthenticated reconnect")
+		} else {
+			return fmt.Errorf("load worker identity: %w", identityErr)
+		}
 	} else {
 		// Key does not exist: generate keypair and save with 0600
 		if a.cfg.EnrollmentToken == "" {
@@ -217,6 +225,9 @@ func (a *Agent) ensureIdentity(ctx context.Context) error {
 			return fmt.Errorf("enrollment: %w", err)
 		}
 		a.workerID = sessionRes.WorkerID
+		if err := SaveWorkerIdentity(a.cfg.KeyPath, a.workerID); err != nil {
+			return fmt.Errorf("save worker identity: %w", err)
+		}
 		a.sessionID = sessionRes.SessionID
 		a.sessionTok = sessionRes.SessionToken
 		t, _ := time.Parse(time.RFC3339, sessionRes.ExpiresAt)
@@ -299,7 +310,9 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 			Pool:              a.poolName,
 		}
 
-		pollRes, err := a.poll(ctx, pollReq)
+		pollCtx, cancelPoll := context.WithTimeout(ctx, a.cfg.PollTimeout)
+		pollRes, err := a.poll(pollCtx, pollReq)
+		cancelPoll()
 		if err != nil {
 			if errors.Is(err, ErrWorkerRevoked) {
 				a.cfg.Logger.Printf("Worker revoked by control plane. Stopping immediately.")
@@ -315,9 +328,7 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 			go a.executeAssignment(ctx, assignment)
 		}
 
-		if len(pollRes.Assignments) == 0 {
-			time.Sleep(500 * time.Millisecond)
-		}
+		// The control plane holds the request until work arrives or PollTimeout.
 	}
 }
 
@@ -377,10 +388,18 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	bundleSpec := &BundleSpec{
 		Path:       filepath.Join(a.cfg.BundleDir, assignment.BundleDigest+".tar"),
 		SHA256:     assignment.BundleDigest,
-		TargetArch: CurrentHostArchitecture(),
+		TargetArch: assignment.TargetArchitecture,
 		Entrypoint: assignment.TaskEntrypoint,
 	}
+	if bundleSpec.TargetArch == "" {
+		bundleSpec.TargetArch = CurrentHostArchitecture()
+	}
 
+	secretEnv, secretErr := resolveTaskSecrets(assignment.SecretNames)
+	if secretErr != nil {
+		a.cfg.Logger.Printf("Refusing attempt %s: %v", assignment.AttemptID, secretErr)
+		return
+	}
 	taskInput := &TaskInput{
 		AttemptID:   assignment.AttemptID,
 		OperationID: assignment.OperationID,
@@ -390,11 +409,12 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		Input:       assignment.Input,
 		TimeoutMs:   assignment.AttemptTimeoutMs,
 		Bundle:      bundleSpec,
+		Env:         secretEnv,
 	}
 
 	sup := NewProcessSupervisor(a.cfg.NodePath, a.cfg.RunnerPath)
 	sup.LeaseTracker = leaseTracker
-	sup.TaskEnvAllowlist = a.cfg.TaskEnvAllowlist
+	sup.TaskEnvAllowlist = assignment.SecretNames
 	sup.OnProcessStart = func(pid int) {
 		a.mu.Lock()
 		active.pid = pid
@@ -447,6 +467,14 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	}
 
 	_, _ = a.complete(attCtx, compReq)
+}
+
+func resolveTaskSecrets(names []string) (map[string]string, error) {
+	values := make(map[string]string, len(names))
+	for _, name := range names {
+		if value, ok := os.LookupEnv(name); ok { values[name] = value } else { return nil, fmt.Errorf("required task secret %q is not available", name) }
+	}
+	return values, nil
 }
 
 func (a *Agent) startWithRetry(ctx context.Context, req *StartRequestDTO) (*StartResponseDTO, error) {
@@ -606,6 +634,7 @@ func (a *Agent) refreshSession(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	a.stopAllRunners()
 	a.sessionID = res.SessionID
 	a.sessionTok = res.SessionToken
 	t, _ := time.Parse(time.RFC3339, res.ExpiresAt)

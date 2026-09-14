@@ -279,7 +279,7 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 	}
 	taskEnv["DEADBOLT_RESULT_FILE"] = resultFile
 	cmd.Env = SanitizeEnvironment(os.Environ(), taskEnv, append(s.AllowlistKeys, "DEADBOLT_RESULT_FILE"))
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr cappedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	stdin, err := cmd.StdinPipe()
@@ -381,6 +381,24 @@ done:
 		return &TaskCompletion{AttemptID: input.AttemptID, Status: "FAILED", Error: &TaskError{Code: "MALFORMED_RESULT_PAYLOAD", Message: err.Error()}, Metrics: TaskMetrics{}}, logs, err
 	}
 	return &completion, logs, finalErr
+}
+
+const maxCapturedOutput = 1 << 20
+
+type cappedBuffer struct {
+	bytes.Buffer
+	truncated bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.Len() >= maxCapturedOutput { b.truncated = true; return len(p), nil }
+	remaining := maxCapturedOutput - b.Len()
+	if len(p) > remaining {
+		_, _ = b.Buffer.Write(p[:remaining])
+		b.truncated = true
+		return len(p), nil
+	}
+	return b.Buffer.Write(p)
 }
 
 func isProcessAlive(pid int) bool {

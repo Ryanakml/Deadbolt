@@ -75,6 +75,8 @@ type AssignmentDTO struct {
 	AttemptTimeoutMs     int64           `json:"attemptTimeoutMs"`
 	RunDeadlineAt        string          `json:"runDeadlineAt"`
 	TraceContext         TraceContextDTO `json:"traceContext"`
+	TargetArchitecture   string          `json:"targetArchitecture,omitempty"`
+	SecretNames          []string        `json:"secretNames,omitempty"`
 }
 
 type PollResponseDTO struct {

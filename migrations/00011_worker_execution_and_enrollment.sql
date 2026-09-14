@@ -97,7 +97,7 @@ $$;
 -- +goose StatementEnd
 
 -- +goose StatementBegin
-CREATE OR REPLACE FUNCTION app.lookup_worker_for_session(p_worker_id UUID)
+CREATE OR REPLACE FUNCTION app.lookup_worker_for_session(p_worker_id TEXT)
 RETURNS TABLE (
     worker_id UUID,
     organization_id UUID,
@@ -118,14 +118,14 @@ BEGIN
         w.public_key,
         w.status
     FROM workers w
-    WHERE w.id = p_worker_id;
+    WHERE w.id = p_worker_id::uuid;
 END;
 $$;
 -- +goose StatementEnd
 
 REVOKE ALL ON FUNCTION app.consume_enrollment_token(TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.authenticate_worker_session(TEXT) FROM PUBLIC;
-REVOKE ALL ON FUNCTION app.lookup_worker_for_session(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.lookup_worker_for_session(TEXT) FROM PUBLIC;
 
 -- +goose StatementBegin
 DO $$
@@ -133,18 +133,18 @@ BEGIN
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_runtime') THEN
         GRANT EXECUTE ON FUNCTION app.consume_enrollment_token(TEXT) TO deadbolt_runtime;
         GRANT EXECUTE ON FUNCTION app.authenticate_worker_session(TEXT) TO deadbolt_runtime;
-        GRANT EXECUTE ON FUNCTION app.lookup_worker_for_session(UUID) TO deadbolt_runtime;
+        GRANT EXECUTE ON FUNCTION app.lookup_worker_for_session(TEXT) TO deadbolt_runtime;
     END IF;
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_system') THEN
         REVOKE EXECUTE ON FUNCTION app.consume_enrollment_token(TEXT) FROM deadbolt_system;
         REVOKE EXECUTE ON FUNCTION app.authenticate_worker_session(TEXT) FROM deadbolt_system;
-        REVOKE EXECUTE ON FUNCTION app.lookup_worker_for_session(UUID) FROM deadbolt_system;
+        REVOKE EXECUTE ON FUNCTION app.lookup_worker_for_session(TEXT) FROM deadbolt_system;
     END IF;
 END $$;
 -- +goose StatementEnd
 
 -- +goose Down
-DROP FUNCTION IF EXISTS app.lookup_worker_for_session(UUID) CASCADE;
+DROP FUNCTION IF EXISTS app.lookup_worker_for_session(TEXT) CASCADE;
 DROP FUNCTION IF EXISTS app.authenticate_worker_session(TEXT) CASCADE;
 DROP FUNCTION IF EXISTS app.consume_enrollment_token(TEXT) CASCADE;
 ALTER TABLE task_attempts DROP COLUMN IF EXISTS claim_start_deadline_at;

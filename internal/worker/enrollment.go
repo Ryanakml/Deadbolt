@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,27 @@ import (
 	"strings"
 	"time"
 )
+
+type WorkerIdentity struct {
+	WorkerID string `json:"workerId"`
+}
+
+func IdentityPath(keyPath string) string { return keyPath + ".identity" }
+
+func SaveWorkerIdentity(keyPath, workerID string) error {
+	data, err := json.Marshal(WorkerIdentity{WorkerID: workerID})
+	if err != nil { return err }
+	return os.WriteFile(IdentityPath(keyPath), data, 0o600)
+}
+
+func LoadWorkerIdentity(keyPath string) (string, error) {
+	data, err := os.ReadFile(IdentityPath(keyPath))
+	if err != nil { return "", err }
+	var identity WorkerIdentity
+	if err := json.Unmarshal(data, &identity); err != nil { return "", fmt.Errorf("decode worker identity: %w", err) }
+	if identity.WorkerID == "" { return "", fmt.Errorf("worker identity is empty") }
+	return identity.WorkerID, nil
+}
 
 var (
 	ErrInsecureKeyPermissions = errors.New("INSECURE_KEY_PERMISSIONS: Worker private key file must have 0600 permissions")

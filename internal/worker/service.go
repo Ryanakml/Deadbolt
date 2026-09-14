@@ -5,11 +5,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/jackc/pgx/v5"
 )
+
+func manifestTargetArchitecture(arch string) string {
+	arch = strings.ToLower(strings.TrimSpace(arch))
+	if arch == "" {
+		return ""
+	}
+	if arch == "amd64" || arch == "x64" {
+		return runtime.GOOS + "/amd64"
+	}
+	if arch == "arm64" {
+		return runtime.GOOS + "/arm64"
+	}
+	return arch
+}
 
 type DeploymentReconciler interface {
 	ReconcileAvailability(ctx context.Context, orgID, envID string) error
@@ -24,13 +40,16 @@ type EnrollmentTokenInfo struct {
 type Service struct {
 	pool        *storage.Pool
 	deployments DeploymentReconciler
+	engine      ExecutionEngine
 }
 
 func NewService(pool *storage.Pool, deployments DeploymentReconciler) *Service {
-	return &Service{
+	s := &Service{
 		pool:        pool,
 		deployments: deployments,
 	}
+	s.engine = sqlExecutionEngine{service: s}
+	return s
 }
 
 // CreateEnrollmentToken generates a 10-minute single-use hashed enrollment token
@@ -47,7 +66,7 @@ func (s *Service) CreateEnrollmentToken(ctx context.Context, orgID, envID, poolN
 
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		query := `INSERT INTO worker_enrollments (organization_id, environment_id, token_hash, pool_name, expires_at, created_by)
-		          VALUES ($1, $2, $3, $4, $5, $6)`
+		          VALUES ($1::uuid, $2::uuid, $3, $4, $5, ($6)::uuid)`
 		_, err := tx.Exec(ctx, query, orgID, envID, tokenHash, poolName, expiresAt, createdBy)
 		return err
 	})
@@ -140,7 +159,7 @@ func (s *Service) EnrollWorker(ctx context.Context, req *EnrollRequestDTO) (*Ses
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		// Insert worker
 		workerQuery := `INSERT INTO workers (organization_id, environment_id, public_key, pool_name, status, last_seen_at)
-		                VALUES ($1, $2, $3, $4, 'ACTIVE', clock_timestamp())
+		                VALUES ($1::uuid, $2::uuid, $3, $4, 'ACTIVE', clock_timestamp())
 		                RETURNING id::text`
 		if err := tx.QueryRow(ctx, workerQuery, orgID, envID, EncodePublicKey(pubKey), poolName).Scan(&workerID); err != nil {
 			return fmt.Errorf("insert worker: %w", err)
@@ -155,7 +174,7 @@ func (s *Service) EnrollWorker(ctx context.Context, req *EnrollRequestDTO) (*Ses
 		sessionExpiresAt = time.Now().Add(SessionTTL)
 
 		sessionQuery := `INSERT INTO worker_sessions (organization_id, worker_id, environment_id, session_token_hash, expires_at)
-		                 VALUES ($1, $2, $3, $4, $5)
+		                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
 		                 RETURNING id::text`
 		if err := tx.QueryRow(ctx, sessionQuery, orgID, workerID, envID, tokenHash, sessionExpiresAt).Scan(&sessionID); err != nil {
 			return fmt.Errorf("insert worker session: %w", err)
@@ -231,14 +250,14 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		// Revoke old sessions
 		_, err := tx.Exec(ctx, `UPDATE worker_sessions SET revoked_at = clock_timestamp()
-		                        WHERE worker_id = $1 AND organization_id = $2 AND revoked_at IS NULL`, req.WorkerID, orgID)
+		                        WHERE worker_id = $1::uuid AND organization_id = $2::uuid AND revoked_at IS NULL`, req.WorkerID, orgID)
 		if err != nil {
 			return fmt.Errorf("revoke old worker sessions: %w", err)
 		}
 
 		// Clean up active leases from this worker's previous sessions
 		_, err = tx.Exec(ctx, `DELETE FROM task_leases WHERE session_id IN (
-		                         SELECT id FROM worker_sessions WHERE worker_id = $1 AND organization_id = $2
+		                         SELECT id FROM worker_sessions WHERE worker_id = $1::uuid AND organization_id = $2::uuid
 		                       )`, req.WorkerID, orgID)
 		if err != nil {
 			return fmt.Errorf("clean old leases: %w", err)
@@ -253,14 +272,14 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 		sessionExpiresAt = time.Now().Add(SessionTTL)
 
 		sessionQuery := `INSERT INTO worker_sessions (organization_id, worker_id, environment_id, session_token_hash, expires_at)
-		                 VALUES ($1, $2, $3, $4, $5)
+		                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
 		                 RETURNING id::text`
 		if err := tx.QueryRow(ctx, sessionQuery, orgID, req.WorkerID, envID, tokenHash, sessionExpiresAt).Scan(&sessionID); err != nil {
 			return fmt.Errorf("insert worker session: %w", err)
 		}
 
 		// Update worker last_seen_at
-		_, err = tx.Exec(ctx, `UPDATE workers SET last_seen_at = clock_timestamp() WHERE id = $1 AND organization_id = $2`, req.WorkerID, orgID)
+		_, err = tx.Exec(ctx, `UPDATE workers SET last_seen_at = clock_timestamp() WHERE id = $1::uuid AND organization_id = $2::uuid`, req.WorkerID, orgID)
 		return err
 	})
 	if err != nil {
@@ -323,8 +342,23 @@ func (s *Service) AuthenticateSession(ctx context.Context, rawSessionToken strin
 	}, nil
 }
 
-// PollAssignments advertises worker bundle digests and claims eligible assignments.
+// PollAssignments advertises worker bundle digests and waits for eligible assignments.
 func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSessionContext, req *PollRequestDTO) (*PollResponseDTO, error) {
+	deadline := time.NewTimer(DefaultPollTimeout)
+	defer deadline.Stop()
+	for {
+		res, err := s.engine.Claim(ctx, sessionCtx, req)
+		if err != nil || len(res.Assignments) > 0 { return res, err }
+		wait := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done(): wait.Stop(); return res, ctx.Err()
+		case <-deadline.C: wait.Stop(); return res, nil
+		case <-wait.C:
+		}
+	}
+}
+
+func (s *Service) claimAssignmentsSQL(ctx context.Context, sessionCtx *WorkerSessionContext, req *PollRequestDTO) (*PollResponseDTO, error) {
 	if req.WorkerID != sessionCtx.WorkerID || req.SessionID != sessionCtx.SessionID {
 		return nil, ErrUnauthorized
 	}
@@ -333,7 +367,7 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 
 	err := s.pool.WithTenantTx(ctx, sessionCtx.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
 		// Update worker last_seen_at
-		_, err := tx.Exec(ctx, `UPDATE workers SET last_seen_at = clock_timestamp() WHERE id = $1 AND organization_id = $2`,
+		_, err := tx.Exec(ctx, `UPDATE workers SET last_seen_at = clock_timestamp() WHERE id = $1::uuid AND organization_id = $2::uuid`,
 			sessionCtx.WorkerID, sessionCtx.OrganizationID)
 		if err != nil {
 			return err
@@ -342,7 +376,7 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 		// Advertise deployment digests
 		for _, digest := range req.DeploymentDigests {
 			_, err = tx.Exec(ctx, `INSERT INTO worker_deployments (session_id, organization_id, bundle_digest)
-			                       VALUES ($1, $2, $3)
+			                       VALUES ($1::uuid, $2::uuid, $3)
 			                       ON CONFLICT (session_id, bundle_digest) DO NOTHING`,
 				sessionCtx.SessionID, sessionCtx.OrganizationID, digest)
 			if err != nil {
@@ -357,13 +391,13 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 		// Claim ready steps matching advertised bundles
 		// Per Blueprint §13: claim locks environment admission row and fetches eligible tasks FIFO
 		claimQuery := `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
-		                      r.deployment_id::text, d.bundle_digest
+		                      r.deployment_id::text, d.bundle_digest, d.manifest
 		               FROM run_steps rs
 		               JOIN runs r ON r.id = rs.run_id AND r.organization_id = rs.organization_id
 		               JOIN deployments d ON d.id = r.deployment_id AND d.organization_id = r.organization_id
-		               JOIN worker_deployments wd ON wd.session_id = $1 AND wd.bundle_digest = d.bundle_digest
-		               WHERE rs.organization_id = $2
-		                 AND rs.environment_id = $3
+		               JOIN worker_deployments wd ON wd.session_id = $1::uuid AND wd.bundle_digest = d.bundle_digest
+		               WHERE rs.organization_id = $2::uuid
+		                 AND rs.environment_id = $3::uuid
 		                 AND rs.state = 'READY'
 		                 AND rs.eligible_at <= clock_timestamp()
 		               ORDER BY rs.eligible_at ASC, rs.id ASC
@@ -380,13 +414,14 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 			stepID, runID, nodeID string
 			input                 any
 			deploymentID, bundle  string
+			manifest              []byte
 		}
 		var matches []stepMatch
 
 		for rows.Next() {
 			var m stepMatch
 			var rawInput []byte
-			if err := rows.Scan(&m.stepID, &m.runID, &m.nodeID, &rawInput, &m.deploymentID, &m.bundle); err != nil {
+			if err := rows.Scan(&m.stepID, &m.runID, &m.nodeID, &rawInput, &m.deploymentID, &m.bundle, &m.manifest); err != nil {
 				return err
 			}
 			if len(rawInput) > 0 {
@@ -398,7 +433,7 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 
 		for _, m := range matches {
 			// Transition step to RUNNING
-			_, err = tx.Exec(ctx, `UPDATE run_steps SET state = 'RUNNING' WHERE id = $1 AND organization_id = $2`,
+			_, err = tx.Exec(ctx, `UPDATE run_steps SET state = 'RUNNING' WHERE id = $1::uuid AND organization_id = $2::uuid`,
 				m.stepID, sessionCtx.OrganizationID)
 			if err != nil {
 				return err
@@ -406,7 +441,7 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 
 			// Insert attempt
 			var attemptID string
-			var epoch int64 = 1
+			var epoch int64
 			leaseTTL := DefaultLeaseTTL
 			leaseExpiresAt := time.Now().Add(leaseTTL)
 			claimStartDeadline := time.Now().Add(ClaimStartDeadline)
@@ -417,19 +452,19 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 			                    claim_start_deadline_at, deadline_at, created_at
 			                 )
 			                 VALUES (
-			                    $1, $2,
-			                    COALESCE((SELECT MAX(attempt_number)+1 FROM task_attempts WHERE step_id=$2), 1),
-			                    $3, $4, 'CLAIMED', $5, clock_timestamp() + ($6 * INTERVAL '1 millisecond'), clock_timestamp()
+			                    $1::uuid, $2::uuid,
+			                    COALESCE((SELECT MAX(attempt_number)+1 FROM task_attempts WHERE step_id=$2::uuid), 1),
+			                    $3::uuid, (SELECT COALESCE(MAX(epoch)+1, 1) FROM task_attempts WHERE step_id=$2::uuid), 'CLAIMED', $4, clock_timestamp() + ($5 * INTERVAL '1 millisecond'), clock_timestamp()
 			                 )
-			                 RETURNING id::text`
-			err = tx.QueryRow(ctx, attemptQuery, sessionCtx.OrganizationID, m.stepID, sessionCtx.SessionID, epoch, claimStartDeadline, attemptTimeout).Scan(&attemptID)
+			                 RETURNING id::text, epoch`
+			err = tx.QueryRow(ctx, attemptQuery, sessionCtx.OrganizationID, m.stepID, sessionCtx.SessionID, claimStartDeadline, attemptTimeout).Scan(&attemptID, &epoch)
 			if err != nil {
 				return fmt.Errorf("insert attempt: %w", err)
 			}
 
 			// Insert or update task lease
 			leaseQuery := `INSERT INTO task_leases (step_id, organization_id, attempt_id, session_id, epoch, expires_at)
-			               VALUES ($1, $2, $3, $4, $5, $6)
+			               VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6)
 			               ON CONFLICT (step_id) DO UPDATE SET
 			                 attempt_id = EXCLUDED.attempt_id,
 			                 session_id = EXCLUDED.session_id,
@@ -439,6 +474,8 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 				return fmt.Errorf("upsert lease: %w", err)
 			}
 
+			var manifestInfo struct { TargetArchitecture string `json:"targetArchitecture"`; SecretNames []string `json:"secretNames"` }
+			_ = json.Unmarshal(m.manifest, &manifestInfo)
 			assignments = append(assignments, AssignmentDTO{
 				RunID:                m.runID,
 				StepID:               m.stepID,
@@ -455,6 +492,8 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 				AttemptTimeoutMs:     int64(attemptTimeout),
 				RunDeadlineAt:        time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
 				TraceContext:         TraceContextDTO{Traceparent: "00-00000000000000000000000000000000-0000000000000000-01"},
+				TargetArchitecture:   manifestTargetArchitecture(manifestInfo.TargetArchitecture),
+				SecretNames:          manifestInfo.SecretNames,
 			})
 		}
 
@@ -495,7 +534,7 @@ func (s *Service) StartAttempt(ctx context.Context, sessionCtx *WorkerSessionCon
 
 		q := `SELECT a.status, a.epoch, a.session_id::text, a.claim_start_deadline_at, a.deadline_at
 		      FROM task_attempts a
-		      WHERE a.id = $1 AND a.organization_id = $2
+		      WHERE a.id = $1::uuid AND a.organization_id = $2::uuid
 		      FOR UPDATE`
 		err := tx.QueryRow(ctx, q, req.AttemptID, sessionCtx.OrganizationID).Scan(
 			&status, &epoch, &sessionID, &claimStartDeadline, &deadlineAt,
@@ -531,7 +570,7 @@ func (s *Service) StartAttempt(ctx context.Context, sessionCtx *WorkerSessionCon
 		// Mark RUNNING
 		updateQ := `UPDATE task_attempts
 		            SET status = 'RUNNING', started_at = clock_timestamp()
-		            WHERE id = $1 AND organization_id = $2`
+		            WHERE id = $1::uuid AND organization_id = $2::uuid`
 		if _, err := tx.Exec(ctx, updateQ, req.AttemptID, sessionCtx.OrganizationID); err != nil {
 			return err
 		}
@@ -566,7 +605,7 @@ func (s *Service) Heartbeat(ctx context.Context, sessionCtx *WorkerSessionContex
 
 	err := s.pool.WithTenantTx(ctx, sessionCtx.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
 		// Update worker last_seen_at
-		_, err := tx.Exec(ctx, `UPDATE workers SET last_seen_at = clock_timestamp() WHERE id = $1 AND organization_id = $2`,
+		_, err := tx.Exec(ctx, `UPDATE workers SET last_seen_at = clock_timestamp() WHERE id = $1::uuid AND organization_id = $2::uuid`,
 			sessionCtx.WorkerID, sessionCtx.OrganizationID)
 		if err != nil {
 			return err
@@ -580,7 +619,7 @@ func (s *Service) Heartbeat(ctx context.Context, sessionCtx *WorkerSessionContex
 
 			lq := `SELECT epoch, expires_at, session_id::text
 			       FROM task_leases
-			       WHERE attempt_id = $1 AND organization_id = $2
+			       WHERE attempt_id = $1::uuid AND organization_id = $2::uuid
 			       FOR UPDATE`
 			err := tx.QueryRow(ctx, lq, item.AttemptID, sessionCtx.OrganizationID).Scan(&leaseEpoch, &leaseExpiresAt, &leaseSessionID)
 			if err != nil {
@@ -607,7 +646,7 @@ func (s *Service) Heartbeat(ctx context.Context, sessionCtx *WorkerSessionContex
 			// Check for pending stop commands
 			var stopReason string
 			sq := `SELECT reason FROM stop_commands
-			       WHERE attempt_id = $1 AND organization_id = $2 AND acked_at IS NULL
+			       WHERE attempt_id = $1::uuid AND organization_id = $2::uuid AND acked_at IS NULL
 			       LIMIT 1`
 			stopErr := tx.QueryRow(ctx, sq, item.AttemptID, sessionCtx.OrganizationID).Scan(&stopReason)
 			if stopErr == nil {
@@ -622,7 +661,7 @@ func (s *Service) Heartbeat(ctx context.Context, sessionCtx *WorkerSessionContex
 
 			// Renew lease 30s
 			newExpiry := time.Now().Add(DefaultLeaseTTL)
-			uq := `UPDATE task_leases SET expires_at = $1 WHERE attempt_id = $2 AND organization_id = $3`
+			uq := `UPDATE task_leases SET expires_at = $1 WHERE attempt_id = $2::uuid AND organization_id = $3::uuid`
 			if _, err := tx.Exec(ctx, uq, newExpiry, item.AttemptID, sessionCtx.OrganizationID); err != nil {
 				return err
 			}
@@ -650,6 +689,10 @@ func (s *Service) Heartbeat(ctx context.Context, sessionCtx *WorkerSessionContex
 
 // CompleteAttempt commits task outcome and releases the lease.
 func (s *Service) CompleteAttempt(ctx context.Context, sessionCtx *WorkerSessionContext, req *CompleteRequestDTO) (*CompleteResponseDTO, error) {
+	return s.engine.Complete(ctx, sessionCtx, req)
+}
+
+func (s *Service) completeAttemptSQL(ctx context.Context, sessionCtx *WorkerSessionContext, req *CompleteRequestDTO) (*CompleteResponseDTO, error) {
 	if req.WorkerID != sessionCtx.WorkerID || req.SessionID != sessionCtx.SessionID {
 		return nil, ErrUnauthorized
 	}
@@ -662,7 +705,7 @@ func (s *Service) CompleteAttempt(ctx context.Context, sessionCtx *WorkerSession
 
 		lq := `SELECT epoch, expires_at, session_id::text
 		       FROM task_leases
-		       WHERE attempt_id = $1 AND organization_id = $2
+		       WHERE attempt_id = $1::uuid AND organization_id = $2::uuid
 		       FOR UPDATE`
 		err := tx.QueryRow(ctx, lq, req.AttemptID, sessionCtx.OrganizationID).Scan(&leaseEpoch, &leaseExpiresAt, &leaseSessionID)
 		if err != nil {
@@ -681,13 +724,13 @@ func (s *Service) CompleteAttempt(ctx context.Context, sessionCtx *WorkerSession
 
 		uq := `UPDATE task_attempts
 		       SET status = $1, outcome_digest = $2, error = $3, completed_at = clock_timestamp()
-		       WHERE id = $4 AND organization_id = $5`
+		       WHERE id = $4::uuid AND organization_id = $5::uuid`
 		if _, err := tx.Exec(ctx, uq, req.Outcome, req.ResultDigest, errJSON, req.AttemptID, sessionCtx.OrganizationID); err != nil {
 			return err
 		}
 
 		// Release lease
-		if _, err := tx.Exec(ctx, `DELETE FROM task_leases WHERE attempt_id = $1 AND organization_id = $2`, req.AttemptID, sessionCtx.OrganizationID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM task_leases WHERE attempt_id = $1::uuid AND organization_id = $2::uuid`, req.AttemptID, sessionCtx.OrganizationID); err != nil {
 			return err
 		}
 
@@ -696,7 +739,7 @@ func (s *Service) CompleteAttempt(ctx context.Context, sessionCtx *WorkerSession
 		if req.Outcome != "SUCCEEDED" {
 			stepStatus = "FAILED"
 		}
-		stepQ := `UPDATE run_steps SET state = $1 WHERE id = (SELECT step_id FROM task_attempts WHERE id = $2) AND organization_id = $3`
+		stepQ := `UPDATE run_steps SET state = $1 WHERE id = (SELECT step_id FROM task_attempts WHERE id = $2::uuid) AND organization_id = $3::uuid`
 		_, _ = tx.Exec(ctx, stepQ, stepStatus, req.AttemptID, sessionCtx.OrganizationID)
 
 		return nil
@@ -725,7 +768,7 @@ func (s *Service) StopAck(ctx context.Context, sessionCtx *WorkerSessionContext,
 		q := `UPDATE stop_commands
 		      SET acked_at = clock_timestamp(),
 		          termination_confirmed_at = CASE WHEN $1 = true THEN clock_timestamp() ELSE termination_confirmed_at END
-		      WHERE attempt_id = $2 AND organization_id = $3`
+		      WHERE attempt_id = $2::uuid AND organization_id = $3::uuid`
 		_, err := tx.Exec(ctx, q, req.ProcessStopped, req.AttemptID, sessionCtx.OrganizationID)
 		return err
 	})
@@ -757,17 +800,17 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 // RevokeWorker marks a worker REVOKED and revokes all its active sessions and leases.
 func (s *Service) RevokeWorker(ctx context.Context, orgID, workerID string) error {
 	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE workers SET status = 'REVOKED' WHERE id = $1 AND organization_id = $2`, workerID, orgID)
+		_, err := tx.Exec(ctx, `UPDATE workers SET status = 'REVOKED' WHERE id = $1::uuid AND organization_id = $2::uuid`, workerID, orgID)
 		if err != nil {
 			return err
 		}
 
-		_, err = tx.Exec(ctx, `UPDATE worker_sessions SET revoked_at = clock_timestamp() WHERE worker_id = $1 AND organization_id = $2`, workerID, orgID)
+		_, err = tx.Exec(ctx, `UPDATE worker_sessions SET revoked_at = clock_timestamp() WHERE worker_id = $1::uuid AND organization_id = $2::uuid`, workerID, orgID)
 		if err != nil {
 			return err
 		}
 
-		_, err = tx.Exec(ctx, `DELETE FROM task_leases WHERE session_id IN (SELECT id FROM worker_sessions WHERE worker_id = $1 AND organization_id = $2)`, workerID, orgID)
+		_, err = tx.Exec(ctx, `DELETE FROM task_leases WHERE session_id IN (SELECT id FROM worker_sessions WHERE worker_id = $1::uuid AND organization_id = $2::uuid)`, workerID, orgID)
 		return err
 	})
 }
@@ -775,7 +818,7 @@ func (s *Service) RevokeWorker(ctx context.Context, orgID, workerID string) erro
 // DrainWorker marks a worker DRAINING so it finishes active attempts but claims no new work.
 func (s *Service) DrainWorker(ctx context.Context, orgID, workerID string) error {
 	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE workers SET status = 'DRAINING' WHERE id = $1 AND organization_id = $2`, workerID, orgID)
+		_, err := tx.Exec(ctx, `UPDATE workers SET status = 'DRAINING' WHERE id = $1::uuid AND organization_id = $2::uuid`, workerID, orgID)
 		return err
 	})
 }
