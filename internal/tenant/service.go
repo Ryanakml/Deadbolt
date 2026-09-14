@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
@@ -980,17 +981,28 @@ func (s *Service) AuthenticateAPIKey(ctx context.Context, plaintextKey string) (
 	}
 
 	// 5. Update last_used_at within transaction-local tenant context (throttled to 1 minute to avoid write lock contention)
-	now := time.Now().UTC()
-	_ = s.pool.WithTenantTx(ctx, key.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `
+	var updatedTime *time.Time
+	err = s.pool.WithTenantTx(ctx, key.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			UPDATE api_keys
 			SET last_used_at = clock_timestamp()
 			WHERE organization_id = $1 AND id = $2
 			  AND (last_used_at IS NULL OR last_used_at < clock_timestamp() - INTERVAL '1 minute')
 		`, key.OrganizationID, key.ID)
-		return err
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() > 0 {
+			now := time.Now().UTC()
+			updatedTime = &now
+		}
+		return nil
 	})
-	key.LastUsedAt = &now
+	if err != nil {
+		log.Printf("[WARN] failed to update last_used_at for key %s: %v", key.ID, err)
+	} else if updatedTime != nil {
+		key.LastUsedAt = updatedTime
+	}
 
 	return &key, nil
 }

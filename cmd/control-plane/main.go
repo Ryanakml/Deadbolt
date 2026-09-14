@@ -243,28 +243,7 @@ func run() error {
 		}()
 	}
 
-	mux := http.NewServeMux()
-	healthChecker.Routes(mux)
-
-	if pool != nil {
-		store := auth.NewSessionStore(pool)
-		storagePool := storage.NewPool(pool)
-		tenantService := tenant.NewService(storagePool)
-		tenantHandler := tenant.NewHTTPHandler(tenantService, pool, store, cfg)
-		tenantHandler.RegisterRoutes(mux)
-
-		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
-		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)
-		bff.SetLogger(logger)
-
-		mux.Handle("/api/auth/", bff.Routes())
-
-		if cfg.RuntimeMode == auth.ModeLocal && cfg.DevAuthEnabled {
-			devAuth := auth.NewDevAuthHandler(cfg, store, pool)
-			mux.HandleFunc("/api/auth/dev-login", devAuth.HandleDevLogin)
-			logger.Printf("Local developer authentication endpoint enabled at /api/auth/dev-login")
-		}
-	}
+	mux := BuildMux(cfg, pool, healthChecker, logger)
 
 	server := &http.Server{
 		Addr:         listenAddr,
@@ -301,6 +280,40 @@ func run() error {
 
 	logger.Printf("Control plane shutdown cleanly completed.")
 	return nil
+}
+
+// BuildMux wires all production routes onto a new http.ServeMux.
+func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, logger *log.Logger) *http.ServeMux {
+	mux := http.NewServeMux()
+	if healthChecker != nil {
+		healthChecker.Routes(mux)
+	}
+
+	if pool != nil {
+		store := auth.NewSessionStore(pool)
+		storagePool := storage.NewPool(pool)
+		tenantService := tenant.NewService(storagePool)
+		tenantHandler := tenant.NewHTTPHandler(tenantService, pool, store, cfg)
+		tenantHandler.RegisterRoutes(mux)
+
+		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
+		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)
+		if logger != nil {
+			bff.SetLogger(logger)
+		}
+
+		mux.Handle("/api/auth/", bff.Routes())
+
+		if cfg.RuntimeMode == auth.ModeLocal && cfg.DevAuthEnabled {
+			devAuth := auth.NewDevAuthHandler(cfg, store, pool)
+			mux.HandleFunc("/api/auth/dev-login", devAuth.HandleDevLogin)
+			if logger != nil {
+				logger.Printf("Local developer authentication endpoint enabled at /api/auth/dev-login")
+			}
+		}
+	}
+
+	return mux
 }
 
 // runMigrations executes database schema migrations using DDL-capable migrator credentials

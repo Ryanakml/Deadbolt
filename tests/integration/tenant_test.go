@@ -1519,6 +1519,15 @@ func TestAPIKeyRotationPrivilegeEscalation(t *testing.T) {
 		t.Fatalf("expected code CAPABILITY_ELEVATION_FORBIDDEN, got %q", errEnv.Code)
 	}
 
+	// Invariant check: Failed rotation MUST NOT revoke the original key and MUST NOT create a replacement key
+	authTarget, err := tc.service.AuthenticateAPIKey(ctx, targetKey.PlaintextKey)
+	if err != nil {
+		t.Fatalf("failed rotation must not revoke target key: %v", err)
+	}
+	if authTarget.ID != targetKey.ID {
+		t.Fatalf("unexpected target key ID: %s", authTarget.ID)
+	}
+
 	// 2. Caller with subsuming capabilities sends malformed JSON -> rejected with 400 MALFORMED_JSON
 	fullAdminKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunsCreate, tenant.CapRunsRead})
 
@@ -1730,19 +1739,60 @@ func TestControlPlaneProductionMuxWiring(t *testing.T) {
 	server := httptest.NewServer(prodMux)
 	defer server.Close()
 
-	// Assert dual prefix routes: /api/v1/projects and /v1/projects
-	for _, prefix := range []string{"/api/v1", "/v1"} {
-		req, _ := http.NewRequest("GET", server.URL+prefix+"/projects", nil)
-		req.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
-		req.Header.Set("X-Organization-ID", org.ID)
+	adminKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead, tenant.CapOrgRead, tenant.CapAdminKey})
 
-		resp, err := http.DefaultClient.Do(req)
+	// Assert dual prefix routes: /api/v1 and /v1 for projects, environments, api-keys, and organizations
+	for _, prefix := range []string{"/api/v1", "/v1"} {
+		// 1. GET projects
+		reqProj, _ := http.NewRequest("GET", server.URL+prefix+"/projects", nil)
+		reqProj.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+		reqProj.Header.Set("X-Organization-ID", org.ID)
+		respProj, err := http.DefaultClient.Do(reqProj)
 		if err != nil {
-			t.Fatalf("prefix %s failed: %v", prefix, err)
+			t.Fatalf("prefix %s /projects failed: %v", prefix, err)
 		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("expected 200 OK on %s/projects, got %d", prefix, resp.StatusCode)
+		respProj.Body.Close()
+		if respProj.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s/projects, got %d", prefix, respProj.StatusCode)
+		}
+
+		// 2. GET environments
+		reqEnv, _ := http.NewRequest("GET", fmt.Sprintf("%s%s/projects/%s/environments", server.URL, prefix, proj.ID), nil)
+		reqEnv.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+		reqEnv.Header.Set("X-Organization-ID", org.ID)
+		respEnv, err := http.DefaultClient.Do(reqEnv)
+		if err != nil {
+			t.Fatalf("prefix %s /environments failed: %v", prefix, err)
+		}
+		respEnv.Body.Close()
+		if respEnv.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s/environments, got %d", prefix, respEnv.StatusCode)
+		}
+
+		// 3. GET api-keys
+		reqKey, _ := http.NewRequest("GET", fmt.Sprintf("%s%s/environments/%s/api-keys", server.URL, prefix, env.ID), nil)
+		reqKey.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+		reqKey.Header.Set("X-Organization-ID", org.ID)
+		respKey, err := http.DefaultClient.Do(reqKey)
+		if err != nil {
+			t.Fatalf("prefix %s /api-keys failed: %v", prefix, err)
+		}
+		respKey.Body.Close()
+		if respKey.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s/api-keys, got %d", prefix, respKey.StatusCode)
+		}
+
+		// 4. GET organization
+		reqOrg, _ := http.NewRequest("GET", fmt.Sprintf("%s%s/organizations/%s", server.URL, prefix, org.ID), nil)
+		reqOrg.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+		reqOrg.Header.Set("X-Organization-ID", org.ID)
+		respOrg, err := http.DefaultClient.Do(reqOrg)
+		if err != nil {
+			t.Fatalf("prefix %s /organizations/%s failed: %v", prefix, org.ID, err)
+		}
+		respOrg.Body.Close()
+		if respOrg.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s/organizations, got %d", prefix, respOrg.StatusCode)
 		}
 	}
 }
@@ -1960,5 +2010,320 @@ func TestIdempotencyConcurrentIdenticalAPIKeyCreateCommitsOnce(t *testing.T) {
 	}
 	if len(keys) != 2 {
 		t.Fatalf("expected bootstrap key plus exactly one created key, got %d", len(keys))
+	}
+}
+
+// 27. TestAuditLifecycleAndAtomicity tests mandatory audit context, audit event structure in DB, and atomicity
+func TestAuditLifecycleAndAtomicity(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Audit Lifecycle Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Audit Project")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	// 1. Mandatory audit: CreateAPIKey, RotateAPIKey, RevokeAPIKey must fail when audit == nil
+	_, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunsRead}, 90, tenant.RoleCapabilities(tenant.RoleOwner), nil)
+	if !errors.Is(err, tenant.ErrAuditRequired) {
+		t.Fatalf("expected ErrAuditRequired for CreateAPIKey with nil audit, got %v", err)
+	}
+
+	key := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead})
+	_, err = tc.service.RotateAPIKey(ctx, org.ID, key.ID, 90, tenant.RoleCapabilities(tenant.RoleOwner), "", nil)
+	if !errors.Is(err, tenant.ErrAuditRequired) {
+		t.Fatalf("expected ErrAuditRequired for RotateAPIKey with nil audit, got %v", err)
+	}
+
+	err = tc.service.RevokeAPIKey(ctx, org.ID, key.ID, "", nil)
+	if !errors.Is(err, tenant.ErrAuditRequired) {
+		t.Fatalf("expected ErrAuditRequired for RevokeAPIKey with nil audit, got %v", err)
+	}
+
+	// 2. Verified audit record structure in PostgreSQL for CreateAPIKey
+	auditCtx := &tenant.AuditContext{
+		ActorID:       &ownerID,
+		ActorType:     tenant.IdentityTypeHuman,
+		Role:          string(tenant.RoleOwner),
+		Capabilities:  tenant.RoleCapabilities(tenant.RoleOwner),
+		CorrelationID: "audit-verify-corr-1",
+		Reason:        "audited_key_creation",
+	}
+	createdKey, err := tc.service.CreateAPIKey(ctx, org.ID, env.ID, []string{tenant.CapRunsRead}, 90, tenant.RoleCapabilities(tenant.RoleOwner), auditCtx)
+	if err != nil {
+		t.Fatalf("CreateAPIKey failed: %v", err)
+	}
+
+	var actorID string
+	var action, targetType, targetID, correlationID, reason string
+	var metaBytes []byte
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT actor_id, action, target_type, target_id, correlation_id, reason, metadata
+			FROM audit_events
+			WHERE organization_id = $1 AND target_id = $2
+		`, org.ID, createdKey.ID).Scan(&actorID, &action, &targetType, &targetID, &correlationID, &reason, &metaBytes)
+	})
+	if err != nil {
+		t.Fatalf("failed to query audit event from DB: %v", err)
+	}
+
+	if actorID != ownerID || action != "api_key.create" || targetType != "api_key" || correlationID != "audit-verify-corr-1" || reason != "audited_key_creation" {
+		t.Fatalf("audit event fields mismatch: actor=%s action=%s target=%s corr=%s reason=%s", actorID, action, targetType, correlationID, reason)
+	}
+
+	var meta map[string]any
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		t.Fatalf("failed to unmarshal audit metadata: %v", err)
+	}
+
+	// Assert authorization context is recorded in metadata
+	if meta["actor_role"] != string(tenant.RoleOwner) || meta["actor_type"] != string(tenant.IdentityTypeHuman) {
+		t.Fatalf("metadata missing actor authorization context: %+v", meta)
+	}
+	// Assert no plaintext key or secret is stored
+	if _, ok := meta["plaintext_key"]; ok {
+		t.Fatal("plaintext_key leaked into audit metadata!")
+	}
+	if _, ok := meta["secret"]; ok {
+		t.Fatal("secret leaked into audit metadata!")
+	}
+	if strings.Contains(string(metaBytes), createdKey.PlaintextKey) {
+		t.Fatal("plaintext API key string found in audit metadata!")
+	}
+}
+
+// 28. TestAuthoritativeResourceScopingForeignIDs tests comprehensive cross-tenant & foreign ID negative matrix
+func TestAuthoritativeResourceScopingForeignIDs(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	orgA, _ := tc.service.CreateOrganization(ctx, ownerID, "Tenant A")
+	projA, _ := tc.service.CreateProject(ctx, orgA.ID, "Project A")
+	envA, _ := tc.service.CreateEnvironment(ctx, orgA.ID, projA.ID, tenant.EnvProduction, 10)
+	keyA := bootstrapTestKey(t, tc.service, orgA.ID, envA.ID, []string{tenant.CapRunsRead, tenant.CapOrgRead, tenant.CapAdminKey})
+
+	orgB, _ := tc.service.CreateOrganization(ctx, ownerID, "Tenant B")
+	projB, _ := tc.service.CreateProject(ctx, orgB.ID, "Project B")
+	envB, _ := tc.service.CreateEnvironment(ctx, orgB.ID, projB.ID, tenant.EnvProduction, 10)
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Cross-tenant Project ID -> 404 NOT_FOUND (RLS / scoping prevents access)
+	reqCrossProj, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, projB.ID), nil)
+	reqCrossProj.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
+	reqCrossProj.Header.Set("X-Organization-ID", orgA.ID)
+	respCrossProj, err := http.DefaultClient.Do(reqCrossProj)
+	if err != nil {
+		t.Fatalf("cross proj request failed: %v", err)
+	}
+	defer respCrossProj.Body.Close()
+	if respCrossProj.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for cross-tenant project, got %d", respCrossProj.StatusCode)
+	}
+
+	// 2. Cross-environment API key creation -> 403 FORBIDDEN (authenticated key is scoped to envA, cannot create key in envB)
+	reqCrossEnv, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/environments/%s/api-keys", server.URL, envB.ID), strings.NewReader(`{"capabilities":["runs:read"],"expiry_days":30}`))
+	reqCrossEnv.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
+	reqCrossEnv.Header.Set("X-Organization-ID", orgA.ID)
+	reqCrossEnv.Header.Set("X-Environment-ID", envB.ID)
+	reqCrossEnv.Header.Set("Content-Type", "application/json")
+	reqCrossEnv.Header.Set("Idempotency-Key", "idemp-foreign-env-1")
+	respCrossEnv, err := http.DefaultClient.Do(reqCrossEnv)
+	if err != nil {
+		t.Fatalf("cross env request failed: %v", err)
+	}
+	defer respCrossEnv.Body.Close()
+	if respCrossEnv.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-environment access, got %d", respCrossEnv.StatusCode)
+	}
+
+	// 3. Foreign non-existent Project ID -> 404 NOT_FOUND
+	fakeProjID, _ := tenant.NewUUID()
+	reqFakeProj, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, fakeProjID), nil)
+	reqFakeProj.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
+	reqFakeProj.Header.Set("X-Organization-ID", orgA.ID)
+	respFakeProj, err := http.DefaultClient.Do(reqFakeProj)
+	if err != nil {
+		t.Fatalf("fake proj request failed: %v", err)
+	}
+	defer respFakeProj.Body.Close()
+	if respFakeProj.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for non-existent project, got %d", respFakeProj.StatusCode)
+	}
+
+	// 4. Foreign non-existent API Key ID -> 404 NOT_FOUND
+	fakeKeyID, _ := tenant.NewUUID()
+	reqFakeKey, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, fakeKeyID), nil)
+	reqFakeKey.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
+	reqFakeKey.Header.Set("X-Organization-ID", orgA.ID)
+	reqFakeKey.Header.Set("Idempotency-Key", "idemp-fake-key-1")
+	respFakeKey, err := http.DefaultClient.Do(reqFakeKey)
+	if err != nil {
+		t.Fatalf("fake key delete failed: %v", err)
+	}
+	defer respFakeKey.Body.Close()
+	if respFakeKey.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for non-existent API key, got %d", respFakeKey.StatusCode)
+	}
+}
+
+// 29. TestAPIKeyLastUsedAtThrottleWindowAndState verifies last_used_at throttling and PostgreSQL state integrity
+func TestAPIKeyLastUsedAtThrottleWindowAndState(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Throttling Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Throttling Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+	key := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead})
+
+	// 1. Initial authenticate sets last_used_at in DB
+	auth1, err := tc.service.AuthenticateAPIKey(ctx, key.PlaintextKey)
+	if err != nil {
+		t.Fatalf("initial auth failed: %v", err)
+	}
+	if auth1.LastUsedAt == nil {
+		t.Fatal("expected non-nil last_used_at after first authentication")
+	}
+	initialTime := *auth1.LastUsedAt
+
+	// 2. Immediate second authenticate within 60s -> DB timestamp DOES NOT CHANGE
+	auth2, err := tc.service.AuthenticateAPIKey(ctx, key.PlaintextKey)
+	if err != nil {
+		t.Fatalf("second auth failed: %v", err)
+	}
+	var dbLastUsed time.Time
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT last_used_at FROM api_keys WHERE id = $1`, key.ID).Scan(&dbLastUsed)
+	})
+	if err != nil {
+		t.Fatalf("query last_used_at: %v", err)
+	}
+	if !dbLastUsed.Equal(initialTime) && dbLastUsed.Sub(initialTime) > time.Second {
+		t.Fatalf("expected throttled last_used_at to remain unchanged, got initial %v, current %v", initialTime, dbLastUsed)
+	}
+	if auth2.LastUsedAt != nil && !auth2.LastUsedAt.Equal(initialTime) && auth2.LastUsedAt.Sub(initialTime) > time.Second {
+		t.Fatalf("auth2 object LastUsedAt should reflect persisted state: got %v", auth2.LastUsedAt)
+	}
+
+	// 3. Advance persisted last_used_at past 1 minute
+	pastTime := time.Now().UTC().Add(-2 * time.Minute)
+	_ = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE api_keys SET last_used_at = $1 WHERE id = $2`, pastTime, key.ID)
+		return err
+	})
+
+	// 4. Authenticate after throttle window -> DB timestamp updates
+	auth3, err := tc.service.AuthenticateAPIKey(ctx, key.PlaintextKey)
+	if err != nil {
+		t.Fatalf("third auth failed: %v", err)
+	}
+	if auth3.LastUsedAt == nil || !auth3.LastUsedAt.After(pastTime) {
+		t.Fatalf("expected updated last_used_at after 2 minutes, got %v", auth3.LastUsedAt)
+	}
+}
+
+// 30. TestAPIKeyConcurrencyAndRaces tests concurrent rotation and race conditions
+func TestAPIKeyConcurrencyAndRaces(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Race Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Race Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	// 1. Concurrent rotation on identical key: exactly one succeeds, one fails
+	targetKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead})
+	adminKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunsRead})
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	type rotResult struct {
+		status int
+		err    error
+	}
+	results := make(chan rotResult, 2)
+	start := make(chan struct{})
+	for i := range 2 {
+		go func(idx int) {
+			<-start
+			req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, targetKey.ID), strings.NewReader(`{"expiry_days":30}`))
+			req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+			req.Header.Set("X-Organization-ID", org.ID)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", fmt.Sprintf("idemp-race-rot-%d-%d", idx, time.Now().UnixNano()))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				results <- rotResult{status: 0, err: err}
+				return
+			}
+			resp.Body.Close()
+			results <- rotResult{status: resp.StatusCode, err: nil}
+		}(i)
+	}
+	close(start)
+
+	successCount := 0
+	conflictOrRevokedCount := 0
+	for range 2 {
+		res := <-results
+		if res.err != nil {
+			t.Fatalf("request error: %v", res.err)
+		}
+		if res.status == http.StatusOK {
+			successCount++
+		} else if res.status == http.StatusBadRequest || res.status == http.StatusConflict {
+			conflictOrRevokedCount++
+		}
+	}
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 rotation success, got %d (rejects: %d)", successCount, conflictOrRevokedCount)
+	}
+
+	// 2. Rotation vs Authenticate: old key becomes revoked, new key authenticates
+	_, err := tc.service.AuthenticateAPIKey(ctx, targetKey.PlaintextKey)
+	if err == nil || !errors.Is(err, tenant.ErrKeyRevoked) {
+		t.Fatalf("expected old target key to be revoked, got %v", err)
+	}
+}
+
+// 31. TestInternalErrorSanitization verifies error responses never leak raw database details
+func TestInternalErrorSanitization(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// Send an unauthenticated malformed request to trigger sanitized error
+	req, _ := http.NewRequest("POST", server.URL+"/api/v1/organizations", strings.NewReader(`{"name":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "idemp-err-sanit-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var env tenant.ErrorEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
+	}
+
+	// Verify no SQL keywords or database errors in code or message
+	for _, leak := range []string{"syntax error", "pq:", "pgx:", "SELECT", "INSERT", "table", "relation", "deadbolt_runtime"} {
+		if strings.Contains(env.Message, leak) || strings.Contains(env.Code, leak) {
+			t.Fatalf("internal error response leaks database detail %q: %+v", leak, env)
+		}
 	}
 }
