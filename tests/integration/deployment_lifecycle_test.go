@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/deployment"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func deploymentManifest(t *testing.T, bundle string) []byte {
@@ -898,13 +900,49 @@ func TestDeploymentHTTPAcceptanceMatrix(t *testing.T) {
 		t.Fatalf("expected 200 with revision 2, got %d (%+v)", respRevNext.StatusCode, revNextBody)
 	}
 
-	// 19. Referenced deployment deletion protection:
-	// Trying to delete active deployment prodDep.ID must be blocked by foreign key ON DELETE RESTRICT
+	// 19. Referenced deployment deletion protection while runs remain active (Issue #10 invariant):
+	// Seed an active run pinned to prodDep.
+	runID, _ := tenant.NewUUID()
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO runs (id,organization_id,environment_id,deployment_id,workflow_name,status) VALUES ($1,$2,$3,$4,'wf','RUNNING')`, runID, org.ID, prodEnv.ID, prodDep.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to seed active run: %v", err)
+	}
+
+	// Remove the workflow channel reference so prodDep is no longer referenced by workflow_channels.
+	// This isolates the runs -> deployments ON DELETE RESTRICT constraint from any channel FK effect.
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM workflow_channels WHERE environment_id = $1 AND workflow_name = $2`, prodEnv.ID, "wf")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to remove active channel reference: %v", err)
+	}
+
+	// Attempting to delete prodDep must now be rejected specifically by the runs foreign key constraint.
 	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `DELETE FROM deployments WHERE id = $1`, prodDep.ID)
 		return err
 	})
 	if err == nil {
-		t.Fatal("expected deletion of active referenced deployment to fail with foreign key restriction")
+		t.Fatal("expected deletion of deployment referenced by active run to fail with foreign key restriction")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23503" || !strings.Contains(pgErr.ConstraintName, "runs") {
+		t.Fatalf("expected foreign key violation on runs table (23503, constraint containing 'runs'), got error: %v", err)
+	}
+
+	// Once the referencing run is removed, deletion of the unreferenced deployment succeeds.
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `DELETE FROM runs WHERE id = $1`, runID); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `DELETE FROM deployments WHERE id = $1`, prodDep.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("expected deployment deletion to succeed once run reference is removed: %v", err)
 	}
 }
