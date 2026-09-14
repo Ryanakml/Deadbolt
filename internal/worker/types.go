@@ -9,6 +9,7 @@ import (
 type TaskInput struct {
 	AttemptID   string            `json:"attemptId"`
 	OperationID string            `json:"operationId"`
+	StepID      string            `json:"stepId"`
 	TaskName    string            `json:"taskName"`
 	Entrypoint  string            `json:"entrypoint,omitempty"`
 	Input       any               `json:"input"`
