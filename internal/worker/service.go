@@ -348,7 +348,9 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 	defer deadline.Stop()
 	for {
 		res, err := s.engine.Claim(ctx, sessionCtx, req)
-		if err != nil || len(res.Assignments) > 0 { return res, err }
+		if err != nil || len(res.Assignments) > 0 {
+			return res, err
+		}
 		wait := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-ctx.Done(): wait.Stop(); return res, ctx.Err()
