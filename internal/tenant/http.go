@@ -172,6 +172,17 @@ func commandRequest(r *http.Request, scope string) (*http.Request, error) {
 	return r.WithContext(ContextWithCommand(r.Context(), Command{Scope: scope, Key: key, Operation: r.Method + " " + path, Fingerprint: RequestFingerprint(r.Method, path, body)})), nil
 }
 
+// isSelfInvalidatingKeyReplay identifies the only mutations a revoked machine
+// key may replay: the command that rotated or revoked that exact key. A revoked
+// credential must not regain authority to replay unrelated old mutations.
+func isSelfInvalidatingKeyReplay(r *http.Request, keyID string) bool {
+	path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/v1"), "/v1")
+	if r.Method == http.MethodPost {
+		return path == "/api-keys/"+keyID+"/rotate"
+	}
+	return r.Method == http.MethodDelete && path == "/api-keys/"+keyID
+}
+
 // RequireAuth authenticates the caller via Bearer API Key or Session Cookie.
 // Enforces CSRF & Origin validation for human session mutations (Blueprint §24.1).
 func (h *HTTPHandler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -187,7 +198,7 @@ func (h *HTTPHandler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 				var revokedErr *RevokedKeyError
 				if errors.As(err, &revokedErr) {
 					idempKey := r.Header.Get("Idempotency-Key")
-					if idempKey != "" && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+					if idempKey != "" && isSelfInvalidatingKeyReplay(r, revokedErr.Key.ID) {
 						cmdScope := "org:" + revokedErr.Key.OrganizationID + ":key:" + revokedErr.Key.ID
 						var body []byte
 						if r.Body != nil {

@@ -3292,3 +3292,61 @@ func TestIdempotencyAPIKeySelfRotationAndSelfRevocationReplay(t *testing.T) {
 		t.Fatalf("expected 401 API_KEY_REVOKED for new command on revoked key, got %d", revDiffResp.StatusCode)
 	}
 }
+
+// A revoked key may replay only the mutation that revoked or rotated itself.
+// It must not retain authority to replay a separate completed mutation.
+func TestRevokedAPIKeyCannotReplayPriorMutation(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Revoked Replay Boundary Org")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Revoked Replay Boundary Project")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+	key := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunsRead})
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	createKey := "idemp-prior-create-replay"
+	createRequest := func() *http.Request {
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/environments/%s/api-keys", server.URL, env.ID), strings.NewReader(`{"capabilities":["runs:read"]}`))
+		req.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+		req.Header.Set("X-Organization-ID", org.ID)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", createKey)
+		return req
+	}
+
+	createResp, err := http.DefaultClient.Do(createRequest())
+	if err != nil {
+		t.Fatalf("complete prior mutation: %v", err)
+	}
+	createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for prior mutation, got %d", createResp.StatusCode)
+	}
+
+	revokeReq, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, key.ID), nil)
+	revokeReq.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	revokeReq.Header.Set("X-Organization-ID", org.ID)
+	revokeReq.Header.Set("Idempotency-Key", "idemp-self-revoke-boundary")
+	revokeResp, err := http.DefaultClient.Do(revokeReq)
+	if err != nil {
+		t.Fatalf("self revoke: %v", err)
+	}
+	revokeResp.Body.Close()
+	if revokeResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 for self revoke, got %d", revokeResp.StatusCode)
+	}
+
+	replayResp, err := http.DefaultClient.Do(createRequest())
+	if err != nil {
+		t.Fatalf("replay prior mutation: %v", err)
+	}
+	defer replayResp.Body.Close()
+	if replayResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 API_KEY_REVOKED for prior-mutation replay, got %d", replayResp.StatusCode)
+	}
+}
