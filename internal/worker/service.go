@@ -353,8 +353,12 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 		}
 		wait := time.NewTimer(100 * time.Millisecond)
 		select {
-		case <-ctx.Done(): wait.Stop(); return res, ctx.Err()
-		case <-deadline.C: wait.Stop(); return res, nil
+		case <-ctx.Done():
+			wait.Stop()
+			return res, ctx.Err()
+		case <-deadline.C:
+			wait.Stop()
+			return res, nil
 		case <-wait.C:
 		}
 	}
