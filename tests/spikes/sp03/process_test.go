@@ -77,6 +77,7 @@ func TestSP03_StartAckGating(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_start_ack_fail",
 		OperationID: "op_start_ack_fail",
+		StepID:      "step_start_ack_fail",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -131,6 +132,7 @@ func TestSP03_MonotonicLeaseBudgetSafety(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_short_lease",
 		OperationID: "op_short_lease",
+		StepID:      "step_short_lease",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -170,6 +172,7 @@ func TestSP03_StructuredResultChannelIsolation(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_noisy_001",
 		OperationID: "op_noisy_001",
+		StepID:      "step_noisy_001",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -215,6 +218,7 @@ func TestSP03_EnvironmentSanitizationAndAllowlist(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_env_001",
 		OperationID: "op_env_001",
+		StepID:      "step_env_001",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -265,6 +269,7 @@ func TestSP03_ProcessGroupShutdownWithinGrace(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_hung_001",
 		OperationID: "op_hung_001",
+		StepID:      "step_hung_001",
 		TaskName:    "default",
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -319,7 +324,7 @@ func TestSP03_RenewalFailureAndHangStopAtSafeBoundary(t *testing.T) {
 		s.StartAckFn = func(context.Context, string, int64) error { return nil }
 		s.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(2700*time.Millisecond), 0, 0)
 		s.RenewLeaseFn = renewal
-		input := &worker.TaskInput{AttemptID: "renew", OperationID: "renew", TaskName: "default", Entrypoint: fixturePath, Bundle: bundleFor(t, fixturePath), Input: map[string]any{}}
+		input := &worker.TaskInput{AttemptID: "renew", OperationID: "renew", StepID: "step_renew", TaskName: "default", Entrypoint: fixturePath, Bundle: bundleFor(t, fixturePath), Input: map[string]any{}}
 		started := time.Now()
 		_, _, err := s.ExecuteAttempt(context.Background(), input, 1)
 		if !errors.Is(err, worker.ErrLeaseExpired) {
@@ -344,7 +349,7 @@ func TestSP03_VerifiedNativeBundle(t *testing.T) {
 	digest := sha256.Sum256(digestBytes)
 	s := worker.NewProcessSupervisor("node", runnerPath)
 	authorize(s)
-	input := &worker.TaskInput{AttemptID: "native", OperationID: "native", TaskName: "default", Entrypoint: "native-task.mjs", Input: map[string]any{}, Bundle: &worker.BundleSpec{Path: archive, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture(), Entrypoint: "native-task.mjs"}}
+	input := &worker.TaskInput{AttemptID: "native", OperationID: "native", StepID: "step_native", TaskName: "default", Entrypoint: "native-task.mjs", Input: map[string]any{}, Bundle: &worker.BundleSpec{Path: archive, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture(), Entrypoint: "native-task.mjs"}}
 	completion, _, err := s.ExecuteAttempt(context.Background(), input, 1)
 	if err != nil || completion.Status != "SUCCEEDED" {
 		t.Fatalf("verified native bundle failed: completion=%v err=%v", completion, err)
@@ -384,6 +389,7 @@ func TestSP03_CrashSoakAndNoLeakedProcesses(t *testing.T) {
 		input := &worker.TaskInput{
 			AttemptID:   fmt.Sprintf("att_soak_%03d", i),
 			OperationID: fmt.Sprintf("op_soak_%03d", i),
+			StepID:      fmt.Sprintf("step_soak_%03d", i),
 			TaskName:    taskName,
 			Entrypoint:  fixturePath,
 			Bundle:      bundleFor(t, fixturePath),

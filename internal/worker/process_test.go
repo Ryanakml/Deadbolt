@@ -62,6 +62,7 @@ func TestStartAckGating(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_start_ack_rejected",
 		OperationID: "op_001",
+		StepID:      "step_start_ack_rejected",
 		TaskName:    "sampleTask",
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -97,6 +98,7 @@ func TestLeaseGatingBeforeStart(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_insufficient_lease",
 		OperationID: "op_002",
+		StepID:      "step_insufficient_lease",
 		TaskName:    "sampleTask",
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -129,6 +131,7 @@ func TestExecuteAttemptSuccessAndChannelIsolation(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_success_001",
 		OperationID: "op_003",
+		StepID:      "step_success_001",
 		TaskName:    "noisyTask", // task that writes arbitrary noise to stdout/stderr
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
@@ -174,6 +177,7 @@ func TestProcessTerminationOnContextCancel(t *testing.T) {
 	input := &worker.TaskInput{
 		AttemptID:   "att_timeout_001",
 		OperationID: "op_004",
+		StepID:      "step_timeout_001",
 		TaskName:    "slowTask", // slow task that waits 5 seconds
 		Entrypoint:  fixturePath,
 		Bundle:      bundleFor(t, fixturePath),
