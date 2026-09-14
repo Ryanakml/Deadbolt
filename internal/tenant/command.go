@@ -39,6 +39,60 @@ func (s *Service) WithCommandTx(ctx context.Context, orgID string, operation str
 	return s.withCommandTx(ctx, orgID, operation, responseCode, mutate, outcome, replay)
 }
 
+// WithCommandTxDynamic records the response code selected by the authoritative
+// mutation outcome in the same transaction. It is for create-or-return flows
+// where a concurrent winner can turn an otherwise-new request into 200.
+func (s *Service) WithCommandTxDynamic(ctx context.Context, orgID, operation string, mutate func(context.Context, storage.Tx) error, responseCode func() int, outcome func() any, replay func(json.RawMessage) error) (bool, error) {
+	command, ok := commandFromContext(ctx)
+	if !ok {
+		return false, s.pool.WithTenantTx(ctx, orgID, mutate)
+	}
+	if operation != "" && command.Operation != operation {
+		return false, fmt.Errorf("%w: command operation mismatch", ErrCommandStorage)
+	}
+	replayed := false
+	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var insertedID string
+		err := tx.QueryRow(ctx, `INSERT INTO tenant_commands (command_scope,organization_id,idempotency_key,request_fingerprint,operation,status,response_code,outcome) VALUES ($1,NULLIF($2,'')::uuid,$3,$4,$5,'PROCESSING',200,'{}'::jsonb) ON CONFLICT (command_scope,idempotency_key) DO NOTHING RETURNING id::text`, command.Scope, orgID, command.Key, command.Fingerprint, command.Operation).Scan(&insertedID)
+		if err == nil {
+			if err := mutate(ctx, tx); err != nil {
+				return err
+			}
+			encoded, err := json.Marshal(outcome())
+			if err != nil {
+				return fmt.Errorf("%w: encode outcome: %v", ErrCommandStorage, err)
+			}
+			code := responseCode()
+			if code <= 0 {
+				code = http.StatusOK
+			}
+			_, err = tx.Exec(ctx, `UPDATE tenant_commands SET status='COMPLETED',response_code=$3,outcome=$4::jsonb,completed_at=clock_timestamp() WHERE command_scope=$1 AND idempotency_key=$2`, command.Scope, command.Key, code, encoded)
+			return err
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: claim command: %v", ErrCommandStorage, err)
+		}
+		var fp, op, status string
+		var code int
+		var raw []byte
+		if err := tx.QueryRow(ctx, `SELECT status,request_fingerprint,operation,response_code,outcome FROM tenant_commands WHERE command_scope=$1 AND idempotency_key=$2 FOR UPDATE`, command.Scope, command.Key).Scan(&status, &fp, &op, &code, &raw); err != nil {
+			return err
+		}
+		if fp != command.Fingerprint || op != command.Operation {
+			return ErrIdempotencyConflict
+		}
+		if status != "COMPLETED" {
+			return fmt.Errorf("%w: command in unexpected status %q", ErrCommandStorage, status)
+		}
+		if err := replay(raw); err != nil {
+			return err
+		}
+		replayed = true
+		return nil
+	})
+	return replayed, err
+}
+
 func RequestFingerprint(method, path string, body []byte) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(method))

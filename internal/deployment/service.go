@@ -55,7 +55,29 @@ func reconcileAvailabilityTx(ctx context.Context, tx storage.Tx, orgID, envID st
 WHEN EXISTS (SELECT 1 FROM workflow_channels c WHERE c.environment_id=d.environment_id AND c.active_deployment_id=d.id) THEN 'ACTIVE'
 WHEN EXISTS (SELECT 1 FROM worker_sessions ws JOIN workers w ON w.id=ws.worker_id AND w.organization_id=ws.organization_id JOIN worker_deployments wd ON wd.session_id=ws.id AND wd.organization_id=ws.organization_id WHERE ws.organization_id=$1 AND ws.environment_id=d.environment_id AND ws.revoked_at IS NULL AND ws.expires_at>clock_timestamp() AND w.status='ACTIVE' AND wd.bundle_digest=d.bundle_digest) THEN 'AVAILABLE'
 ELSE 'REGISTERED' END WHERE d.organization_id=$1 AND d.environment_id=$2`, orgID, envID)
-	return err
+	if err != nil {
+		return err
+	}
+	// Reset the one-shot warning after compatibility returns, then emit one
+	// durable observable event when an active pointer has lost its last worker.
+	if _, err = tx.Exec(ctx, `UPDATE deployments d SET compatibility_warning_at=NULL WHERE d.organization_id=$1 AND d.environment_id=$2 AND d.status='ACTIVE' AND d.compatibility_warning_at IS NOT NULL AND EXISTS (SELECT 1 FROM worker_sessions ws JOIN workers w ON w.id=ws.worker_id AND w.organization_id=ws.organization_id JOIN worker_deployments wd ON wd.session_id=ws.id AND wd.organization_id=ws.organization_id WHERE ws.organization_id=$1 AND ws.environment_id=d.environment_id AND ws.revoked_at IS NULL AND ws.expires_at>clock_timestamp() AND w.status='ACTIVE' AND wd.bundle_digest=d.bundle_digest)`, orgID, envID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `UPDATE deployments d SET compatibility_warning_at=clock_timestamp() WHERE d.organization_id=$1 AND d.environment_id=$2 AND d.status='ACTIVE' AND d.compatibility_warning_at IS NULL AND NOT EXISTS (SELECT 1 FROM worker_sessions ws JOIN workers w ON w.id=ws.worker_id AND w.organization_id=ws.organization_id JOIN worker_deployments wd ON wd.session_id=ws.id AND wd.organization_id=ws.organization_id WHERE ws.organization_id=$1 AND ws.environment_id=d.environment_id AND ws.revoked_at IS NULL AND ws.expires_at>clock_timestamp() AND w.status='ACTIVE' AND wd.bundle_digest=d.bundle_digest) RETURNING id::text`, orgID, envID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO outbox_events (organization_id,subject,payload) VALUES ($1,'deployment.compatibility_lost',jsonb_build_object('deploymentId',$2::text,'environmentId',$3::text))`, orgID, id, envID); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func NewService(pool *storage.Pool, commands *tenant.Service) *Service {
@@ -116,14 +138,7 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 		return nil, false, tenant.ErrAuditRequired
 	}
 	responseCode := 201
-	_ = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		var id string
-		if err := tx.QueryRow(ctx, `SELECT id::text FROM deployments WHERE environment_id=$1 AND manifest_hash=$2`, envID, hash).Scan(&id); err == nil {
-			responseCode = 200
-		}
-		return nil
-	})
-	replayed, err := s.commands.WithCommandTx(ctx, orgID, "", responseCode, func(ctx context.Context, tx storage.Tx) error {
+	replayed, err := s.commands.WithCommandTxDynamic(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// A bundle digest identifies executable immutable bytes. It may not be
 		// rebound to a changed manifest in the same environment.
 		var existingHash string
@@ -135,7 +150,7 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 			return err
 		}
 		err = tx.QueryRow(ctx, `INSERT INTO deployments (organization_id,environment_id,manifest_hash,bundle_digest,manifest,protocol_version,runtime_version)
-			VALUES ($1,$2,$3,$4,$5::jsonb,1,'node:24') ON CONFLICT (environment_id,manifest_hash) DO NOTHING
+			VALUES ($1,$2,$3,$4,$5::jsonb,1,'node:24') ON CONFLICT DO NOTHING
 			RETURNING id::text,manifest_hash,bundle_digest,status,created_at`, orgID, envID, hash, bundle, canonical).Scan(&out.ID, &out.ManifestHash, &out.BundleDigest, &out.Status, &out.CreatedAt)
 		if err == nil {
 			created = true
@@ -151,6 +166,7 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 			}
 		}
 		if !created {
+			responseCode = 200
 			if err := tx.QueryRow(ctx, `SELECT id::text,manifest_hash,bundle_digest,status,created_at FROM deployments WHERE environment_id=$1 AND manifest_hash=$2`, envID, hash).Scan(&out.ID, &out.ManifestHash, &out.BundleDigest, &out.Status, &out.CreatedAt); err != nil {
 				return err
 			}
@@ -195,7 +211,7 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 		meta, _ := json.Marshal(map[string]any{"role": audit.Role, "capabilities": audit.Capabilities, "environment_id": envID})
 		_, err = tx.Exec(ctx, `INSERT INTO audit_events (organization_id,actor_id,action,target_type,target_id,correlation_id,reason,metadata) VALUES ($1,$2,'deployment.register','deployment',$3,$4,$5,$6::jsonb)`, orgID, audit.ActorID, out.ID, audit.CorrelationID, audit.Reason, meta)
 		return err
-	}, func() any { return &out }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &out) })
+	}, func() int { return responseCode }, func() any { return &out }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &out) })
 	if replayed {
 		created = false
 	}
