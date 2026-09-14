@@ -97,6 +97,25 @@ var (
 	ErrCommandStorage       = errors.New("COMMAND_STORAGE_FAILURE: tenant command storage failed")
 )
 
+// RevokedKeyError is returned when an API key was verified by cryptographic hash
+// but has been revoked. Retaining the key reference enables deterministic replay
+// of the mutation (rotation or revocation) that revoked this key (Blueprint §20.1).
+type RevokedKeyError struct {
+	Key *APIKey
+}
+
+func (e *RevokedKeyError) Error() string {
+	return ErrKeyRevoked.Error()
+}
+
+func (e *RevokedKeyError) Unwrap() error {
+	return ErrKeyRevoked
+}
+
+func (e *RevokedKeyError) Is(target error) bool {
+	return target == ErrKeyRevoked
+}
+
 type IdentityType string
 
 const (

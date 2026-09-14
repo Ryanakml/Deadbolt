@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
@@ -42,7 +43,7 @@ func (s *Service) CreateOrganization(ctx context.Context, userID string, name st
 	}
 
 	var org Organization
-	_, err = s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err = s.withCommandTx(ctx, orgID, "", http.StatusCreated, func(ctx context.Context, tx storage.Tx) error {
 		// 1. Insert organization
 		queryOrg := `
 			INSERT INTO organizations (id, name)
@@ -95,7 +96,7 @@ func (s *Service) UpdateOrganization(ctx context.Context, orgID string, name str
 	}
 
 	var org Organization
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusOK, func(ctx context.Context, tx storage.Tx) error {
 		query := `
 			UPDATE organizations
 			SET name = $2, updated_at = clock_timestamp()
@@ -116,7 +117,7 @@ func (s *Service) UpdateOrganization(ctx context.Context, orgID string, name str
 
 // DeleteOrganization deletes an organization and all its cascade-dependent children.
 func (s *Service) DeleteOrganization(ctx context.Context, orgID string) error {
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusNoContent, func(ctx context.Context, tx storage.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM organizations WHERE id = $1`, orgID)
 		if err != nil {
 			return err
@@ -167,7 +168,7 @@ func (s *Service) AddMember(ctx context.Context, orgID string, userID string, ro
 	}
 
 	var m Member
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusCreated, func(ctx context.Context, tx storage.Tx) error {
 		query := `
 			INSERT INTO organization_members (organization_id, user_id, role, status)
 			VALUES ($1, $2, $3, $4)
@@ -188,7 +189,7 @@ func (s *Service) UpdateMemberRole(ctx context.Context, orgID string, targetUser
 		return ErrInvalidRole
 	}
 
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusOK, func(ctx context.Context, tx storage.Tx) error {
 		// Acquire row lock on organization to serialize member modifications and prevent race conditions
 		var lockedOrgID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
@@ -246,7 +247,7 @@ func (s *Service) UpdateMemberStatus(ctx context.Context, orgID string, targetUs
 		return ErrInvalidStatus
 	}
 
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusOK, func(ctx context.Context, tx storage.Tx) error {
 		// Acquire row lock on organization to serialize member modifications
 		var lockedOrgID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
@@ -300,7 +301,7 @@ func (s *Service) UpdateMemberStatus(ctx context.Context, orgID string, targetUs
 
 // RemoveMember removes a member while strictly enforcing Last Owner Defense.
 func (s *Service) RemoveMember(ctx context.Context, orgID string, targetUserID string) error {
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusNoContent, func(ctx context.Context, tx storage.Tx) error {
 		// Acquire row lock on organization to serialize member modifications and prevent race conditions
 		var lockedOrgID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, orgID).Scan(&lockedOrgID); err != nil {
@@ -377,7 +378,7 @@ func (s *Service) CreateProject(ctx context.Context, orgID string, name string) 
 	}
 
 	var p Project
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusCreated, func(ctx context.Context, tx storage.Tx) error {
 		query := `
 			INSERT INTO projects (organization_id, name)
 			VALUES ($1, $2)
@@ -477,7 +478,7 @@ func (s *Service) CreateEnvironment(ctx context.Context, orgID string, projectID
 	}
 
 	var env Environment
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusCreated, func(ctx context.Context, tx storage.Tx) error {
 		// Verify project exists
 		var exists int
 		checkProj := `SELECT 1 FROM projects WHERE organization_id = $1 AND id = $2`
@@ -633,7 +634,7 @@ func (s *Service) BootstrapAPIKey(ctx context.Context, orgID string, envID strin
 
 func (s *Service) createAPIKeyInternal(ctx context.Context, orgID string, envID string, capabilities []string, expiryDays int, audit *AuditContext) (*GeneratedKey, error) {
 	var genKey GeneratedKey
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusCreated, func(ctx context.Context, tx storage.Tx) error {
 		// Look up environment to get name for prefix
 		var envName string
 		queryEnv := `SELECT name FROM environments WHERE organization_id = $1 AND id = $2`
@@ -740,7 +741,7 @@ func (s *Service) RevokeAPIKey(ctx context.Context, orgID string, keyID string, 
 	if audit == nil {
 		return ErrAuditRequired
 	}
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusNoContent, func(ctx context.Context, tx storage.Tx) error {
 		// 1. Resolve target key's environment to enforce authoritative environment scoping
 		var envID string
 		var prefix string
@@ -803,7 +804,7 @@ func (s *Service) RotateAPIKey(ctx context.Context, orgID string, keyID string, 
 	}
 
 	var genKey GeneratedKey
-	_, err := s.withCommandTx(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, err := s.withCommandTx(ctx, orgID, "", http.StatusOK, func(ctx context.Context, tx storage.Tx) error {
 		// 1. Select existing key with row lock
 		var envID string
 		var caps []string
@@ -972,7 +973,7 @@ func (s *Service) AuthenticateAPIKey(ctx context.Context, plaintextKey string) (
 
 	// 3. Check revocation status
 	if key.RevokedAt != nil {
-		return nil, ErrKeyRevoked
+		return nil, &RevokedKeyError{Key: &key}
 	}
 
 	// 4. Check expiration status

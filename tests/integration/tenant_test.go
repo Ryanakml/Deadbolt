@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
+	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -1732,9 +1733,8 @@ func TestControlPlaneProductionMuxWiring(t *testing.T) {
 	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
 	key := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead, tenant.CapOrgRead})
 
-	// Create production mux and wire routes identically to cmd/control-plane/main.go
-	prodMux := http.NewServeMux()
-	tc.handler.RegisterRoutes(prodMux)
+	// Create production mux using the canonical controlplane.BuildMux constructor
+	prodMux := controlplane.BuildMux(tc.authCfg, tc.runtimePool, nil, nil)
 
 	server := httptest.NewServer(prodMux)
 	defer server.Close()
@@ -2905,5 +2905,384 @@ func TestInternalErrorSanitization(t *testing.T) {
 		if strings.Contains(env.Message, leak) || strings.Contains(env.Code, leak) {
 			t.Fatalf("internal error response leaks database detail %q: %+v", leak, env)
 		}
+	}
+}
+
+// 32. TestIdempotencyDeleteOrganizationReplayAndLiveAuth tests destructive mutation replay
+// even when the accepted mutation removed live authorization / organization state (Blueprint §20.1).
+func TestIdempotencyDeleteOrganizationReplayAndLiveAuth(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	_, err := tc.pool.Exec(ctx, `INSERT INTO users (id, email) VALUES ($1, $2)`, ownerID, "owner-del-idemp@example.com")
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	org, err := tc.service.CreateOrganization(ctx, ownerID, "Delete Idemp Corp")
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	_, sessionToken, csrfToken, err := tc.sessionStore.CreateSession(
+		ctx,
+		ownerID,
+		&org.ID,
+		"127.0.0.1",
+		"TestAgent",
+		tc.authCfg.SessionIdleTimeout,
+		tc.authCfg.SessionAbsoluteTimeout,
+	)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	cookie := &http.Cookie{
+		Name:  tc.authCfg.SessionCookieName(),
+		Value: sessionToken,
+	}
+
+	// Create User B (unauthorized for org replay)
+	userBID, _ := tenant.NewUUID()
+	_, _ = tc.pool.Exec(ctx, `INSERT INTO users (id, email) VALUES ($1, $2)`, userBID, "userb@example.com")
+	_, tokenB, csrfB, _ := tc.sessionStore.CreateSession(
+		ctx,
+		userBID,
+		nil,
+		"127.0.0.1",
+		"TestAgent",
+		tc.authCfg.SessionIdleTimeout,
+		tc.authCfg.SessionAbsoluteTimeout,
+	)
+	cookieB := &http.Cookie{
+		Name:  tc.authCfg.SessionCookieName(),
+		Value: tokenB,
+	}
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Initial DELETE /organizations/{id} -> 204 No Content
+	delKey := "idemp-del-org-1"
+	delReq, _ := http.NewRequest("DELETE", server.URL+"/api/v1/organizations/"+org.ID, nil)
+	delReq.AddCookie(cookie)
+	delReq.Header.Set("Origin", "http://localhost:3000")
+	delReq.Header.Set("X-CSRF-Token", csrfToken)
+	delReq.Header.Set("Idempotency-Key", delKey)
+
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatalf("initial delete request failed: %v", err)
+	}
+	defer delResp.Body.Close()
+	if delResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content on initial delete, got %d", delResp.StatusCode)
+	}
+
+	// 2. Identical replay of DELETE /organizations/{id} returns 204 No Content
+	// Even though the organization and membership were deleted, the accepted command replays deterministically!
+	replayReq, _ := http.NewRequest("DELETE", server.URL+"/api/v1/organizations/"+org.ID, nil)
+	replayReq.AddCookie(cookie)
+	replayReq.Header.Set("Origin", "http://localhost:3000")
+	replayReq.Header.Set("X-CSRF-Token", csrfToken)
+	replayReq.Header.Set("Idempotency-Key", delKey)
+
+	replayResp, err := http.DefaultClient.Do(replayReq)
+	if err != nil {
+		t.Fatalf("replay delete request failed: %v", err)
+	}
+	defer replayResp.Body.Close()
+	if replayResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content on replayed delete, got %d", replayResp.StatusCode)
+	}
+
+	// 3. Conflicting replay with different request parameters returns 409 IDEMPOTENCY_CONFLICT
+	conflictReq, _ := http.NewRequest("DELETE", server.URL+"/api/v1/organizations/"+org.ID, strings.NewReader(`{"extra":"conflict"}`))
+	conflictReq.AddCookie(cookie)
+	conflictReq.Header.Set("Origin", "http://localhost:3000")
+	conflictReq.Header.Set("X-CSRF-Token", csrfToken)
+	conflictReq.Header.Set("Content-Type", "application/json")
+	conflictReq.Header.Set("Idempotency-Key", delKey)
+
+	conflictResp, err := http.DefaultClient.Do(conflictReq)
+	if err != nil {
+		t.Fatalf("conflict delete request failed: %v", err)
+	}
+	defer conflictResp.Body.Close()
+	if conflictResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on conflicting delete replay, got %d", conflictResp.StatusCode)
+	}
+
+	// 4. Request with DIFFERENT idempotency key fails closed with 403 (membership gone)
+	newKeyReq, _ := http.NewRequest("DELETE", server.URL+"/api/v1/organizations/"+org.ID, nil)
+	newKeyReq.AddCookie(cookie)
+	newKeyReq.Header.Set("Origin", "http://localhost:3000")
+	newKeyReq.Header.Set("X-CSRF-Token", csrfToken)
+	newKeyReq.Header.Set("Idempotency-Key", "idemp-del-org-new-key")
+
+	newKeyResp, err := http.DefaultClient.Do(newKeyReq)
+	if err != nil {
+		t.Fatalf("new key delete request failed: %v", err)
+	}
+	defer newKeyResp.Body.Close()
+	if newKeyResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for new command on deleted org, got %d", newKeyResp.StatusCode)
+	}
+
+	// 5. Different actor (User B) attempting to use delKey returns 403 (not an auth bypass)
+	unauthReq, _ := http.NewRequest("DELETE", server.URL+"/api/v1/organizations/"+org.ID, nil)
+	unauthReq.AddCookie(cookieB)
+	unauthReq.Header.Set("Origin", "http://localhost:3000")
+	unauthReq.Header.Set("X-CSRF-Token", csrfB)
+	unauthReq.Header.Set("Idempotency-Key", delKey)
+
+	unauthResp, err := http.DefaultClient.Do(unauthReq)
+	if err != nil {
+		t.Fatalf("unauthorized delete request failed: %v", err)
+	}
+	defer unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for different actor replay, got %d", unauthResp.StatusCode)
+	}
+}
+
+// 33. TestIdempotencyCrossActorSameKeyIsolation verifies that two actors in the same organization
+// can safely use the exact same Idempotency-Key without colliding or receiving each other's outcome.
+func TestIdempotencyCrossActorSameKeyIsolation(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerAID, _ := tenant.NewUUID()
+	userBID, _ := tenant.NewUUID()
+	_, _ = tc.pool.Exec(ctx, `INSERT INTO users (id, email) VALUES ($1, $2), ($3, $4)`, ownerAID, "usera@example.com", userBID, "userb@example.com")
+
+	org, err := tc.service.CreateOrganization(ctx, ownerAID, "Shared Key Org")
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	_, err = tc.service.AddMember(ctx, org.ID, userBID, tenant.RoleAdmin)
+	if err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+
+	// Sessions for User A and User B
+	_, tokA, csrfA, _ := tc.sessionStore.CreateSession(ctx, ownerAID, &org.ID, "127.0.0.1", "Agent", tc.authCfg.SessionIdleTimeout, tc.authCfg.SessionAbsoluteTimeout)
+	cookieA := &http.Cookie{Name: tc.authCfg.SessionCookieName(), Value: tokA}
+
+	_, tokB, csrfB, _ := tc.sessionStore.CreateSession(ctx, userBID, &org.ID, "127.0.0.1", "Agent", tc.authCfg.SessionIdleTimeout, tc.authCfg.SessionAbsoluteTimeout)
+	cookieB := &http.Cookie{Name: tc.authCfg.SessionCookieName(), Value: tokB}
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	sharedKey := "shared-actor-idemp-1"
+
+	// 1. User A creates Project Alpha with sharedKey
+	reqA, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Alpha"}`))
+	reqA.AddCookie(cookieA)
+	reqA.Header.Set("Origin", "http://localhost:3000")
+	reqA.Header.Set("X-CSRF-Token", csrfA)
+	reqA.Header.Set("X-Organization-ID", org.ID)
+	reqA.Header.Set("Content-Type", "application/json")
+	reqA.Header.Set("Idempotency-Key", sharedKey)
+
+	respA, err := http.DefaultClient.Do(reqA)
+	if err != nil {
+		t.Fatalf("user A create project failed: %v", err)
+	}
+	defer respA.Body.Close()
+	if respA.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for User A, got %d", respA.StatusCode)
+	}
+	var projA tenant.Project
+	_ = json.NewDecoder(respA.Body).Decode(&projA)
+
+	// 2. User B creates Project Beta with the SAME sharedKey
+	reqB, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Beta"}`))
+	reqB.AddCookie(cookieB)
+	reqB.Header.Set("Origin", "http://localhost:3000")
+	reqB.Header.Set("X-CSRF-Token", csrfB)
+	reqB.Header.Set("X-Organization-ID", org.ID)
+	reqB.Header.Set("Content-Type", "application/json")
+	reqB.Header.Set("Idempotency-Key", sharedKey)
+
+	respB, err := http.DefaultClient.Do(reqB)
+	if err != nil {
+		t.Fatalf("user B create project failed: %v", err)
+	}
+	defer respB.Body.Close()
+	if respB.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for User B, got %d", respB.StatusCode)
+	}
+	var projB tenant.Project
+	_ = json.NewDecoder(respB.Body).Decode(&projB)
+
+	// Assert projects are completely distinct
+	if projA.ID == projB.ID {
+		t.Fatalf("expected distinct project IDs, got same: %s", projA.ID)
+	}
+	if projA.Name != "Project Alpha" || projB.Name != "Project Beta" {
+		t.Fatalf("unexpected project names: A=%s, B=%s", projA.Name, projB.Name)
+	}
+
+	// 3. Replay User A -> gets Project Alpha
+	repA, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Alpha"}`))
+	repA.AddCookie(cookieA)
+	repA.Header.Set("Origin", "http://localhost:3000")
+	repA.Header.Set("X-CSRF-Token", csrfA)
+	repA.Header.Set("X-Organization-ID", org.ID)
+	repA.Header.Set("Content-Type", "application/json")
+	repA.Header.Set("Idempotency-Key", sharedKey)
+
+	respRepA, _ := http.DefaultClient.Do(repA)
+	defer respRepA.Body.Close()
+	var projRepA tenant.Project
+	_ = json.NewDecoder(respRepA.Body).Decode(&projRepA)
+	if projRepA.ID != projA.ID {
+		t.Fatalf("expected User A replay to yield Project Alpha, got %s", projRepA.ID)
+	}
+
+	// 4. Replay User B -> gets Project Beta
+	repB, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Beta"}`))
+	repB.AddCookie(cookieB)
+	repB.Header.Set("Origin", "http://localhost:3000")
+	repB.Header.Set("X-CSRF-Token", csrfB)
+	repB.Header.Set("X-Organization-ID", org.ID)
+	repB.Header.Set("Content-Type", "application/json")
+	repB.Header.Set("Idempotency-Key", sharedKey)
+
+	respRepB, _ := http.DefaultClient.Do(repB)
+	defer respRepB.Body.Close()
+	var projRepB tenant.Project
+	_ = json.NewDecoder(respRepB.Body).Decode(&projRepB)
+	if projRepB.ID != projB.ID {
+		t.Fatalf("expected User B replay to yield Project Beta, got %s", projRepB.ID)
+	}
+}
+
+// 34. TestIdempotencyAPIKeySelfRotationAndSelfRevocationReplay verifies that when a machine key
+// rotates or revokes itself, subsequent identical retries using the now-revoked key succeed deterministically (Blueprint §20.1).
+func TestIdempotencyAPIKeySelfRotationAndSelfRevocationReplay(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Self Key Org")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Self Key Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+
+	// Key 1: will rotate itself
+	key1 := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunsRead})
+	// Key 2: will revoke itself
+	key2 := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunsRead})
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Key 1 rotates itself
+	selfRotKey := "idemp-self-rot-1"
+	rotReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, key1.ID), strings.NewReader(`{"expiry_days":30}`))
+	rotReq.Header.Set("Authorization", "Bearer "+key1.PlaintextKey)
+	rotReq.Header.Set("X-Organization-ID", org.ID)
+	rotReq.Header.Set("Content-Type", "application/json")
+	rotReq.Header.Set("Idempotency-Key", selfRotKey)
+
+	rotResp, err := http.DefaultClient.Do(rotReq)
+	if err != nil {
+		t.Fatalf("self rotate failed: %v", err)
+	}
+	defer rotResp.Body.Close()
+	if rotResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on self rotate, got %d", rotResp.StatusCode)
+	}
+	var rotKey1 tenant.GeneratedKey
+	_ = json.NewDecoder(rotResp.Body).Decode(&rotKey1)
+	if rotKey1.PlaintextKey == "" {
+		t.Fatal("expected plaintext key on first rotation")
+	}
+
+	// 2. Replay identical self-rotation with the now-revoked Key 1 -> succeeds with 200 OK (redacted plaintext)
+	rotRepReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, key1.ID), strings.NewReader(`{"expiry_days":30}`))
+	rotRepReq.Header.Set("Authorization", "Bearer "+key1.PlaintextKey)
+	rotRepReq.Header.Set("X-Organization-ID", org.ID)
+	rotRepReq.Header.Set("Content-Type", "application/json")
+	rotRepReq.Header.Set("Idempotency-Key", selfRotKey)
+
+	rotRepResp, err := http.DefaultClient.Do(rotRepReq)
+	if err != nil {
+		t.Fatalf("replay self rotate failed: %v", err)
+	}
+	defer rotRepResp.Body.Close()
+	if rotRepResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on replayed self rotate, got %d", rotRepResp.StatusCode)
+	}
+	var rotRepKey1 tenant.GeneratedKey
+	_ = json.NewDecoder(rotRepResp.Body).Decode(&rotRepKey1)
+	if rotRepKey1.ID != rotKey1.ID {
+		t.Fatalf("expected identical rotated key ID, got %s vs %s", rotRepKey1.ID, rotKey1.ID)
+	}
+
+	// 3. Calling any other endpoint or using a different idempotency key with revoked Key 1 returns 401 API_KEY_REVOKED
+	diffReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, key1.ID), strings.NewReader(`{"expiry_days":60}`))
+	diffReq.Header.Set("Authorization", "Bearer "+key1.PlaintextKey)
+	diffReq.Header.Set("X-Organization-ID", org.ID)
+	diffReq.Header.Set("Content-Type", "application/json")
+	diffReq.Header.Set("Idempotency-Key", "diff-rot-key")
+
+	diffResp, err := http.DefaultClient.Do(diffReq)
+	if err != nil {
+		t.Fatalf("different key req failed: %v", err)
+	}
+	defer diffResp.Body.Close()
+	if diffResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 API_KEY_REVOKED for new command on revoked key, got %d", diffResp.StatusCode)
+	}
+
+	// 4. Key 2 revokes itself
+	selfRevKey := "idemp-self-rev-1"
+	revReq, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, key2.ID), nil)
+	revReq.Header.Set("Authorization", "Bearer "+key2.PlaintextKey)
+	revReq.Header.Set("X-Organization-ID", org.ID)
+	revReq.Header.Set("Idempotency-Key", selfRevKey)
+
+	revResp, err := http.DefaultClient.Do(revReq)
+	if err != nil {
+		t.Fatalf("self revoke failed: %v", err)
+	}
+	defer revResp.Body.Close()
+	if revResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content on self revoke, got %d", revResp.StatusCode)
+	}
+
+	// 5. Replay identical self-revocation with the now-revoked Key 2 -> succeeds with 204 No Content
+	revRepReq, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, key2.ID), nil)
+	revRepReq.Header.Set("Authorization", "Bearer "+key2.PlaintextKey)
+	revRepReq.Header.Set("X-Organization-ID", org.ID)
+	revRepReq.Header.Set("Idempotency-Key", selfRevKey)
+
+	revRepResp, err := http.DefaultClient.Do(revRepReq)
+	if err != nil {
+		t.Fatalf("replay self revoke failed: %v", err)
+	}
+	defer revRepResp.Body.Close()
+	if revRepResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content on replayed self revoke, got %d", revRepResp.StatusCode)
+	}
+
+	// 6. Calling any other endpoint with revoked Key 2 returns 401 API_KEY_REVOKED
+	revDiffReq, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, key2.ID), nil)
+	revDiffReq.Header.Set("Authorization", "Bearer "+key2.PlaintextKey)
+	revDiffReq.Header.Set("X-Organization-ID", org.ID)
+	revDiffReq.Header.Set("Idempotency-Key", "diff-rev-key")
+
+	revDiffResp, err := http.DefaultClient.Do(revDiffReq)
+	if err != nil {
+		t.Fatalf("diff rev req failed: %v", err)
+	}
+	defer revDiffResp.Body.Close()
+	if revDiffResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 API_KEY_REVOKED for new command on revoked key, got %d", revDiffResp.StatusCode)
 	}
 }

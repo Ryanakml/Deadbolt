@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/jackc/pgx/v5"
@@ -82,10 +83,42 @@ func extractResourceID(v any) *string {
 	return nil
 }
 
+// CompletedCommand represents an authoritative completed mutation command.
+type CompletedCommand struct {
+	Scope        string
+	Key          string
+	Fingerprint  string
+	Operation    string
+	ResponseCode int
+	Outcome      []byte
+}
+
+// GetCompletedCommand checks whether a command was already accepted and completed.
+func (s *Service) GetCompletedCommand(ctx context.Context, orgID string, scope string, key string) (*CompletedCommand, error) {
+	var cmd CompletedCommand
+	cmd.Scope = scope
+	cmd.Key = key
+	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		query := `
+			SELECT request_fingerprint, operation, response_code, outcome
+			FROM tenant_commands
+			WHERE command_scope = $1 AND idempotency_key = $2 AND status = 'COMPLETED'
+		`
+		return tx.QueryRow(ctx, query, scope, key).Scan(&cmd.Fingerprint, &cmd.Operation, &cmd.ResponseCode, &cmd.Outcome)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &cmd, nil
+}
+
 // withCommandTx claims, mutates, records and replays inside one transaction.
 // The unique index serializes simultaneous claims: the loser blocks on the
 // conflicting row, then reads the committed durable outcome.
-func (s *Service) withCommandTx(ctx context.Context, orgID string, operation string, mutate func(context.Context, storage.Tx) error, outcome func() any, replay func(json.RawMessage) error) (bool, error) {
+func (s *Service) withCommandTx(ctx context.Context, orgID string, operation string, responseCode int, mutate func(context.Context, storage.Tx) error, outcome func() any, replay func(json.RawMessage) error) (bool, error) {
 	command, ok := commandFromContext(ctx)
 	if !ok {
 		return false, s.pool.WithTenantTx(ctx, orgID, mutate)
@@ -93,16 +126,19 @@ func (s *Service) withCommandTx(ctx context.Context, orgID string, operation str
 	if operation != "" && command.Operation != operation {
 		return false, fmt.Errorf("%w: command operation mismatch", ErrCommandStorage)
 	}
+	if responseCode <= 0 {
+		responseCode = http.StatusOK
+	}
 
 	replayed := false
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		var insertedID string
 		err := tx.QueryRow(ctx, `
-			INSERT INTO tenant_commands (command_scope, organization_id, idempotency_key, request_fingerprint, operation, status, outcome)
-			VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, 'PROCESSING', '{}'::jsonb)
+			INSERT INTO tenant_commands (command_scope, organization_id, idempotency_key, request_fingerprint, operation, status, response_code, outcome)
+			VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, 'PROCESSING', $6, '{}'::jsonb)
 			ON CONFLICT (command_scope, idempotency_key) DO NOTHING
 			RETURNING id::text
-		`, command.Scope, orgID, command.Key, command.Fingerprint, command.Operation).Scan(&insertedID)
+		`, command.Scope, orgID, command.Key, command.Fingerprint, command.Operation, responseCode).Scan(&insertedID)
 		if err == nil {
 			if err := mutate(ctx, tx); err != nil {
 				return err
@@ -115,9 +151,9 @@ func (s *Service) withCommandTx(ctx context.Context, orgID string, operation str
 			resID := extractResourceID(out)
 			if _, err := tx.Exec(ctx, `
 				UPDATE tenant_commands
-				SET status = 'COMPLETED', resource_id = $3, outcome = $4::jsonb, completed_at = clock_timestamp()
+				SET status = 'COMPLETED', resource_id = $3, response_code = $4, outcome = $5::jsonb, completed_at = clock_timestamp()
 				WHERE command_scope = $1 AND idempotency_key = $2
-			`, command.Scope, command.Key, resID, encoded); err != nil {
+			`, command.Scope, command.Key, resID, responseCode, encoded); err != nil {
 				return fmt.Errorf("%w: record outcome: %v", ErrCommandStorage, err)
 			}
 			return nil
@@ -128,13 +164,14 @@ func (s *Service) withCommandTx(ctx context.Context, orgID string, operation str
 
 		// FOR UPDATE waits for the winning transaction before reading its outcome.
 		var recordedFingerprint, recordedOperation, recordedStatus string
+		var recordedResponseCode int
 		var recordedOutcome []byte
 		if err := tx.QueryRow(ctx, `
-			SELECT status, request_fingerprint, operation, outcome
+			SELECT status, request_fingerprint, operation, response_code, outcome
 			FROM tenant_commands
 			WHERE command_scope = $1 AND idempotency_key = $2
 			FOR UPDATE
-		`, command.Scope, command.Key).Scan(&recordedStatus, &recordedFingerprint, &recordedOperation, &recordedOutcome); err != nil {
+		`, command.Scope, command.Key).Scan(&recordedStatus, &recordedFingerprint, &recordedOperation, &recordedResponseCode, &recordedOutcome); err != nil {
 			return fmt.Errorf("%w: load command: %v", ErrCommandStorage, err)
 		}
 		if recordedFingerprint != command.Fingerprint || recordedOperation != command.Operation {

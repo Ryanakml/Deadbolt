@@ -184,7 +184,36 @@ func (h *HTTPHandler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			rawKey := strings.TrimPrefix(authHeader, "Bearer ")
 			apiKey, err := h.service.AuthenticateAPIKey(ctx, rawKey)
 			if err != nil {
-				if errors.Is(err, ErrKeyRevoked) {
+				var revokedErr *RevokedKeyError
+				if errors.As(err, &revokedErr) {
+					idempKey := r.Header.Get("Idempotency-Key")
+					if idempKey != "" && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+						cmdScope := "org:" + revokedErr.Key.OrganizationID + ":key:" + revokedErr.Key.ID
+						var body []byte
+						if r.Body != nil {
+							body, _ = io.ReadAll(r.Body)
+							r.Body = io.NopCloser(bytes.NewReader(body))
+						}
+						path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/v1"), "/v1")
+						fp := RequestFingerprint(r.Method, path, body)
+						op := r.Method + " " + path
+
+						completedCmd, checkErr := h.service.GetCompletedCommand(ctx, revokedErr.Key.OrganizationID, cmdScope, idempKey)
+						if checkErr == nil && completedCmd != nil {
+							if completedCmd.Fingerprint != fp || completedCmd.Operation != op {
+								writeJSONError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency key has already been used with different request parameters")
+								return
+							}
+							if completedCmd.ResponseCode == http.StatusNoContent {
+								w.WriteHeader(http.StatusNoContent)
+								return
+							}
+							w.Header().Set("Content-Type", "application/json")
+							w.WriteHeader(completedCmd.ResponseCode)
+							_, _ = w.Write(completedCmd.Outcome)
+							return
+						}
+					}
 					writeJSONError(w, r, http.StatusUnauthorized, "API_KEY_REVOKED", err.Error())
 					return
 				}
@@ -285,13 +314,60 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 		if _, ok := h.enforceIdempotency(w, r, targetOrgID); !ok {
 			return
 		}
+
+		actorScope := "user:" + caller.UserID
+		if caller.Type == IdentityTypeMachine {
+			actorScope = "key:" + caller.KeyID
+		}
+		cmdScope := "org:" + targetOrgID + ":" + actorScope
+		idempKey := r.Header.Get("Idempotency-Key")
+
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-			var err error
-			r, err = commandRequest(r, targetOrgID)
-			if err != nil {
-				writeInternalError(w, r, fmt.Errorf("read idempotency request: %w", err))
-				return
+			var body []byte
+			if r.Body != nil {
+				var err error
+				body, err = io.ReadAll(r.Body)
+				if err != nil {
+					writeInternalError(w, r, fmt.Errorf("read idempotency request: %w", err))
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewReader(body))
 			}
+			path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/v1"), "/v1")
+			op := r.Method + " " + path
+			fp := RequestFingerprint(r.Method, path, body)
+
+			// 1. Check for deterministic replay of an already completed command issued by this actor
+			// (Blueprint §20.1: Replays succeed even if the accepted command deleted the organization or membership)
+			if idempKey != "" {
+				completedCmd, err := h.service.GetCompletedCommand(r.Context(), targetOrgID, cmdScope, idempKey)
+				if err != nil {
+					writeInternalError(w, r, fmt.Errorf("lookup idempotency: %w", err))
+					return
+				}
+				if completedCmd != nil {
+					if completedCmd.Fingerprint != fp || completedCmd.Operation != op {
+						writeJSONError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency key has already been used with different request parameters")
+						return
+					}
+					if completedCmd.ResponseCode == http.StatusNoContent {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(completedCmd.ResponseCode)
+					_, _ = w.Write(completedCmd.Outcome)
+					return
+				}
+			}
+
+			// Attach command context for atomic withCommandTx execution
+			r = r.WithContext(ContextWithCommand(r.Context(), Command{
+				Scope:       cmdScope,
+				Key:         idempKey,
+				Operation:   op,
+				Fingerprint: fp,
+			}))
 		}
 
 		// Machine identity cross-tenant, environment mismatch, and capability check
@@ -379,12 +455,45 @@ func (h *HTTPHandler) HandleCreateOrganization(w http.ResponseWriter, r *http.Re
 		writeJSONError(w, r, http.StatusForbidden, "MACHINE_CREATION_FORBIDDEN", "Only human users can create organizations")
 		return
 	}
-	var commandErr error
-	r, commandErr = commandRequest(r, "user:"+caller.UserID)
-	if commandErr != nil {
-		writeInternalError(w, r, fmt.Errorf("read idempotency request: %w", commandErr))
-		return
+	idempKey := r.Header.Get("Idempotency-Key")
+	cmdScope := "user:" + caller.UserID
+
+	var body []byte
+	if r.Body != nil {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			writeInternalError(w, r, fmt.Errorf("read idempotency request: %w", err))
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
+	path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/v1"), "/v1")
+	op := r.Method + " " + path
+	fp := RequestFingerprint(r.Method, path, body)
+
+	// Check completed command replay
+	if idempKey != "" {
+		orgID := commandOrganizationID(caller.UserID, idempKey)
+		completedCmd, err := h.service.GetCompletedCommand(r.Context(), orgID, cmdScope, idempKey)
+		if err == nil && completedCmd != nil {
+			if completedCmd.Fingerprint != fp || completedCmd.Operation != op {
+				writeJSONError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency key has already been used with different request parameters")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(completedCmd.ResponseCode)
+			_, _ = w.Write(completedCmd.Outcome)
+			return
+		}
+	}
+
+	r = r.WithContext(ContextWithCommand(r.Context(), Command{
+		Scope:       cmdScope,
+		Key:         idempKey,
+		Operation:   op,
+		Fingerprint: fp,
+	}))
 
 	var req struct {
 		Name string `json:"name"`

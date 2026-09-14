@@ -11,8 +11,4 @@ stopwords = [
   "sk_test_512345678901234567890",
   "ak_live_1234567890abcdef1234567890abcdef"
 ]
-paths = [
-  '''tests/integration/tenant_test.go''',
-  '''sdk/typescript/tests/bundle.test.js''',
-  '''sdk/typescript/tests/context.test.js'''
-]
+
