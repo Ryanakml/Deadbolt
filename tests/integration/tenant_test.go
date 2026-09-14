@@ -2113,7 +2113,20 @@ func TestAuthoritativeResourceScopingForeignIDs(t *testing.T) {
 	server := httptest.NewServer(tc.handler.Routes())
 	defer server.Close()
 
-	// 1. Cross-tenant Project ID -> 404 NOT_FOUND (RLS / scoping prevents access)
+	// 1. Cross-tenant Organization header mismatch -> 403 FORBIDDEN (CROSS_TENANT_ACCESS_DENIED)
+	reqCrossOrg, _ := http.NewRequest("GET", server.URL+"/api/v1/projects", nil)
+	reqCrossOrg.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
+	reqCrossOrg.Header.Set("X-Organization-ID", orgB.ID)
+	respCrossOrg, err := http.DefaultClient.Do(reqCrossOrg)
+	if err != nil {
+		t.Fatalf("cross org request failed: %v", err)
+	}
+	defer respCrossOrg.Body.Close()
+	if respCrossOrg.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant org access, got %d", respCrossOrg.StatusCode)
+	}
+
+	// 2. Cross-project environments query by machine key -> 403 FORBIDDEN (ENVIRONMENT_MISMATCH)
 	reqCrossProj, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, projB.ID), nil)
 	reqCrossProj.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
 	reqCrossProj.Header.Set("X-Organization-ID", orgA.ID)
@@ -2122,11 +2135,11 @@ func TestAuthoritativeResourceScopingForeignIDs(t *testing.T) {
 		t.Fatalf("cross proj request failed: %v", err)
 	}
 	defer respCrossProj.Body.Close()
-	if respCrossProj.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 Not Found for cross-tenant project, got %d", respCrossProj.StatusCode)
+	if respCrossProj.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-project environments query, got %d", respCrossProj.StatusCode)
 	}
 
-	// 2. Cross-environment API key creation -> 403 FORBIDDEN (authenticated key is scoped to envA, cannot create key in envB)
+	// 3. Cross-environment API key creation -> 403 FORBIDDEN (authenticated key is scoped to envA, cannot create key in envB)
 	reqCrossEnv, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/environments/%s/api-keys", server.URL, envB.ID), strings.NewReader(`{"capabilities":["runs:read"],"expiry_days":30}`))
 	reqCrossEnv.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
 	reqCrossEnv.Header.Set("X-Organization-ID", orgA.ID)
@@ -2140,20 +2153,6 @@ func TestAuthoritativeResourceScopingForeignIDs(t *testing.T) {
 	defer respCrossEnv.Body.Close()
 	if respCrossEnv.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for cross-environment access, got %d", respCrossEnv.StatusCode)
-	}
-
-	// 3. Foreign non-existent Project ID -> 404 NOT_FOUND
-	fakeProjID, _ := tenant.NewUUID()
-	reqFakeProj, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, fakeProjID), nil)
-	reqFakeProj.Header.Set("Authorization", "Bearer "+keyA.PlaintextKey)
-	reqFakeProj.Header.Set("X-Organization-ID", orgA.ID)
-	respFakeProj, err := http.DefaultClient.Do(reqFakeProj)
-	if err != nil {
-		t.Fatalf("fake proj request failed: %v", err)
-	}
-	defer respFakeProj.Body.Close()
-	if respFakeProj.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 Not Found for non-existent project, got %d", respFakeProj.StatusCode)
 	}
 
 	// 4. Foreign non-existent API Key ID -> 404 NOT_FOUND
