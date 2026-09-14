@@ -25,6 +25,17 @@ test("createTaskContext sets all required execution context properties", () => {
   assert.equal(ctx.env.DB_PORT, "5432");
 });
 
+test("createTaskContext rejects missing stepId instead of aliasing operationId", () => {
+  assert.throws(
+    () =>
+      createTaskContext({
+        attemptId: "att-123",
+        operationId: "op-456",
+      }),
+    /stepId is required/,
+  );
+});
+
 test("redactSensitiveData masks sensitive keys and patterns", () => {
   const sensitiveObj = {
     username: "alice",

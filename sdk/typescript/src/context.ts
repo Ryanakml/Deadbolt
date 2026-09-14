@@ -16,7 +16,7 @@ export interface TaskContext {
 }
 
 export interface CreateTaskContextOptions {
-  stepId?: string;
+  stepId: string;
   attemptId: string;
   operationId: string;
   signal?: AbortSignal;
@@ -107,7 +107,10 @@ export function createRedactionAwareLogger(
 export function createTaskContext(
   options: CreateTaskContextOptions,
 ): TaskContext {
-  const stepId = options.stepId ?? options.operationId;
+  const stepId = options.stepId;
+  if (typeof stepId !== "string" || stepId.length === 0) {
+    throw new TypeError("stepId is required");
+  }
   const attemptId = options.attemptId;
   const operationId = options.operationId;
   const signal = options.signal ?? new AbortController().signal;

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { canonicalDigest, canonicalize, sha256Hex } from "./canonical.js";
+import { canonicalDigest } from "./canonical.js";
 import { ContractError, fail, type JSONValue } from "./json.js";
 import { type ObjectValue } from "./schema.js";
 import type { TaskDefinition } from "./task.js";
@@ -128,8 +128,7 @@ export function buildDeploymentBundle(
     if (options.dependencyLockContent !== undefined) {
       dependencyLockDigest = calculateDigest(options.dependencyLockContent);
     } else {
-      // Default deterministic empty lock digest if none provided
-      dependencyLockDigest = calculateDigest("# deadbolt-lock\n");
+      fail("INVALID_MANIFEST");
     }
   }
   if (!HEX_SHA256_REGEX.test(dependencyLockDigest)) {
@@ -160,16 +159,7 @@ export function buildDeploymentBundle(
       }
       bundleDigest = combinedHash.digest("hex");
     } else {
-      // Fallback digest computed canonically from task entrypoints & names
-      bundleDigest = sha256Hex(
-        canonicalize({
-          tasks: taskManifests.map((t) => ({
-            name: t.name,
-            entrypoint: t.entrypoint,
-          })),
-          workflows: workflowManifests.map((w) => w.name),
-        }),
-      );
+      fail("INVALID_MANIFEST");
     }
   }
   if (!HEX_SHA256_REGEX.test(bundleDigest)) {

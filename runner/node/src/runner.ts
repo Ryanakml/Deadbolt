@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { createTaskContext } from "./context.js";
+import { createTaskContext, redactSensitiveData } from "./context.js";
 import type { TaskCompletion, TaskHandler, TaskInput } from "./protocol.js";
 
 function getResultWriter(): (data: string) => void {
@@ -133,6 +133,24 @@ export async function executeTask(
     }, taskInput.timeoutMs);
   }
 
+  if (typeof taskInput.stepId !== "string" || taskInput.stepId.length === 0) {
+    const completion: TaskCompletion = {
+      attemptId: taskInput.attemptId,
+      status: "FAILED",
+      error: {
+        code: "INVALID_INPUT",
+        message: "stepId is required",
+        retryable: false,
+      },
+      metrics: {
+        durationMs: Date.now() - startTime,
+      },
+    };
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    writeResult(JSON.stringify(completion) + "\n");
+    return completion;
+  }
+
   const ctx = createTaskContext(
     taskInput.attemptId,
     taskInput.operationId,
@@ -171,7 +189,9 @@ export async function executeTask(
     const errorCode = isAborted
       ? "ABORTED"
       : err?.code || err?.name || "TASK_EXECUTION_ERROR";
-    const errorMessage = err?.message || String(err);
+    const errorMessage = redactSensitiveData(
+      err?.message || String(err),
+    ) as string;
     const retryable = Boolean(err?.retryable);
 
     completion = {
@@ -181,7 +201,6 @@ export async function executeTask(
         code: errorCode,
         message: errorMessage,
         retryable,
-        details: err?.stack,
       },
       metrics: {
         durationMs: Date.now() - startTime,
@@ -191,6 +210,7 @@ export async function executeTask(
       code: errorCode,
       message: errorMessage,
       retryable,
+      stack: err?.stack,
     });
   } finally {
     if (timeoutTimer) clearTimeout(timeoutTimer);

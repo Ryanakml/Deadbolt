@@ -67,9 +67,12 @@ export function createTaskContext(
   attemptId: string,
   operationId: string,
   signal: AbortSignal,
-  stepId?: string,
+  stepId: string,
   env?: Record<string, string>,
 ): TaskContext {
+  if (typeof stepId !== "string" || stepId.length === 0) {
+    throw new TypeError("stepId is required");
+  }
   const logger = createTaskLogger(attemptId);
   return {
     attemptId,

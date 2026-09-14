@@ -10,6 +10,15 @@ export async function failingTask(input, ctx) {
   throw err;
 }
 
+export async function sensitiveFailingTask(input, ctx) {
+  const err = new Error(
+    "Failed with Bearer supersecrettoken12345678901234567890",
+  );
+  err.code = "SENSITIVE_FAILURE";
+  err.retryable = false;
+  throw err;
+}
+
 export async function noisyTask(input, ctx) {
   // Emit arbitrary noise to stdout and stderr
   console.log("NOISY_STDOUT: Some unformatted user log string");

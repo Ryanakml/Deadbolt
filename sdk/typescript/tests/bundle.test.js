@@ -88,6 +88,10 @@ test("buildDeploymentBundle automatically includes tasks referenced in workflows
   const bundle = buildDeploymentBundle({
     workflows: [workflow], // tasks not explicitly passed; should be inferred from workflow
     targetArchitecture: "arm64",
+    dependencyLockContent: "lockfile-content-v1",
+    bundleFiles: {
+      "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+    },
   });
 
   assert.equal(bundle.manifest.targetArchitecture, "arm64");
@@ -110,6 +114,10 @@ test("buildDeploymentBundle rejects secret values and invalid secret names", () 
         buildDeploymentBundle({
           workflows: [workflow],
           secretNames: [badSecret],
+          dependencyLockContent: "lockfile-content-v1",
+          bundleFiles: {
+            "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+          },
         }),
       (err) => err instanceof ContractError && err.code === "INVALID_MANIFEST",
     );
@@ -122,6 +130,10 @@ test("buildDeploymentBundle rejects unsupported target architecture or OS", () =
       buildDeploymentBundle({
         workflows: [workflow],
         targetOS: "windows",
+        dependencyLockContent: "lockfile-content-v1",
+        bundleFiles: {
+          "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+        },
       }),
     (err) =>
       err instanceof ContractError && err.code === "UNSUPPORTED_CAPABILITY",
@@ -132,6 +144,10 @@ test("buildDeploymentBundle rejects unsupported target architecture or OS", () =
       buildDeploymentBundle({
         workflows: [workflow],
         targetArchitecture: "x86",
+        dependencyLockContent: "lockfile-content-v1",
+        bundleFiles: {
+          "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+        },
       }),
     (err) =>
       err instanceof ContractError && err.code === "UNSUPPORTED_CAPABILITY",
@@ -144,7 +160,63 @@ test("buildDeploymentBundle rejects empty workflows or tasks", () => {
       buildDeploymentBundle({
         workflows: [],
         tasks: [task1],
+        dependencyLockContent: "lockfile-content-v1",
+        bundleFiles: {
+          "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+        },
       }),
     (err) => err instanceof ContractError,
   );
+});
+
+test("buildDeploymentBundle fails closed without real dependency lock material", () => {
+  assert.throws(
+    () =>
+      buildDeploymentBundle({
+        workflows: [workflow],
+        bundleFiles: {
+          "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+        },
+      }),
+    (err) => err instanceof ContractError && err.code === "INVALID_MANIFEST",
+  );
+});
+
+test("buildDeploymentBundle fails closed without executable bundle material", () => {
+  assert.throws(
+    () =>
+      buildDeploymentBundle({
+        workflows: [workflow],
+        dependencyLockContent: "lockfile-content-v1",
+      }),
+    (err) => err instanceof ContractError && err.code === "INVALID_MANIFEST",
+  );
+});
+
+test("buildDeploymentBundle digests are stable for identical bytes and change with byte changes", () => {
+  const baseOptions = {
+    workflows: [workflow],
+    dependencyLockContent: "lockfile-content-v1",
+    bundleFiles: {
+      "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+    },
+  };
+
+  const first = buildDeploymentBundle(baseOptions);
+  const second = buildDeploymentBundle(baseOptions);
+  const changedBundle = buildDeploymentBundle({
+    ...baseOptions,
+    bundleFiles: {
+      "tasks.js": "export const task = async () => ({ msg: 'changed' });",
+    },
+  });
+  const changedLock = buildDeploymentBundle({
+    ...baseOptions,
+    dependencyLockContent: "lockfile-content-v2",
+  });
+
+  assert.equal(first.bundleDigest, second.bundleDigest);
+  assert.equal(first.dependencyLockDigest, second.dependencyLockDigest);
+  assert.notEqual(first.bundleDigest, changedBundle.bundleDigest);
+  assert.notEqual(first.dependencyLockDigest, changedLock.dependencyLockDigest);
 });

@@ -7,7 +7,7 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "node --test tests/*.test.js",
+    "test": "node --test tests",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
