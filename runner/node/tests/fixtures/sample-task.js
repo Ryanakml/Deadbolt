@@ -33,3 +33,16 @@ export async function slowTask(input, ctx) {
     });
   });
 }
+
+export const sampleTaskDef = {
+  name: "sample-task-def",
+  recovery: "safe",
+  handler: async (input, ctx) => {
+    ctx.logger.info("sampleTaskDef invoked", { input });
+    return {
+      message: `hello ${input.name || "world"}`,
+      stepId: ctx.stepId,
+      allowedEnv: ctx.env.TEST_ENV || null,
+    };
+  },
+};

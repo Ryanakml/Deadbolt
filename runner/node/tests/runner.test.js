@@ -112,3 +112,32 @@ test("Task timeout triggers AbortSignal and marks completion FAILED", async () =
   assert.ok(completion.error);
   assert.equal(completion.error.code, "ABORTED");
 });
+
+test("Resolve and execute TaskDefinition object and verify TaskContext", async () => {
+  const fixturePath = path.resolve(__dirname, "fixtures/sample-task.js");
+  let capturedResult = "";
+  const writeResult = (data) => {
+    capturedResult = data;
+  };
+
+  const taskInput = {
+    attemptId: "att_005",
+    operationId: "op_005",
+    stepId: "step_validate",
+    taskName: "sample-task-def",
+    entrypoint: fixturePath,
+    input: { name: "Alice" },
+    env: { TEST_ENV: "active" },
+  };
+
+  const completion = await executeTask(taskInput, writeResult);
+
+  assert.equal(completion.status, "SUCCEEDED");
+  assert.equal(completion.output.message, "hello Alice");
+  assert.equal(completion.output.stepId, "step_validate");
+  assert.equal(completion.output.allowedEnv, "active");
+
+  const parsed = JSON.parse(capturedResult);
+  assert.equal(parsed.status, "SUCCEEDED");
+  assert.equal(parsed.output.message, "hello Alice");
+});

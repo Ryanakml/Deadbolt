@@ -9,6 +9,7 @@ export interface TaskInput {
   attemptId: string;
   operationId: string;
   taskName: string;
+  stepId?: string;
   entrypoint?: string;
   input: unknown;
   timeoutMs?: number;
@@ -37,8 +38,11 @@ export interface TaskLogger {
 }
 
 export interface TaskContext {
-  operationId: string;
-  attemptId: string;
-  signal: AbortSignal;
-  log: TaskLogger;
+  readonly stepId?: string;
+  readonly attemptId: string;
+  readonly operationId: string;
+  readonly signal: AbortSignal;
+  readonly logger: TaskLogger;
+  readonly log: TaskLogger;
+  readonly env: Readonly<Record<string, string>>;
 }

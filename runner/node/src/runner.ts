@@ -38,6 +38,25 @@ function getResultWriter(): (data: string) => void {
   }
 }
 
+function extractHandler(val: unknown): TaskHandler | undefined {
+  if (typeof val === "function") {
+    return val as TaskHandler;
+  }
+  if (
+    val &&
+    typeof val === "object" &&
+    "handler" in val &&
+    typeof (val as any).handler === "function"
+  ) {
+    return (val as any).handler as TaskHandler;
+  }
+  return undefined;
+}
+
+function toCamelCase(str: string): string {
+  return str.replace(/[-_]([a-z0-9])/gi, (_, g) => g.toUpperCase());
+}
+
 export async function resolveHandler(
   entrypoint?: string,
   taskName?: string,
@@ -59,18 +78,34 @@ export async function resolveHandler(
   const fileUrl = pathToFileURL(resolvedPath).href;
   const mod = await import(fileUrl);
 
-  if (taskName && typeof mod[taskName] === "function") {
-    return mod[taskName];
+  if (taskName) {
+    const direct = extractHandler(mod[taskName]);
+    if (direct) return direct;
+
+    const camel = extractHandler(mod[toCamelCase(taskName)]);
+    if (camel) return camel;
+
+    for (const exp of Object.values(mod)) {
+      if (
+        exp &&
+        typeof exp === "object" &&
+        "name" in exp &&
+        (exp as any).name === taskName &&
+        typeof (exp as any).handler === "function"
+      ) {
+        return (exp as any).handler as TaskHandler;
+      }
+    }
   }
-  if (typeof mod.task === "function") {
-    return mod.task;
-  }
-  if (typeof mod.default === "function") {
-    return mod.default;
-  }
-  if (typeof mod.handler === "function") {
-    return mod.handler;
-  }
+
+  const taskFn = extractHandler(mod.task);
+  if (taskFn) return taskFn;
+
+  const defaultFn = extractHandler(mod.default);
+  if (defaultFn) return defaultFn;
+
+  const handlerFn = extractHandler(mod.handler);
+  if (handlerFn) return handlerFn;
 
   throw new Error(
     `HANDLER_NOT_FOUND: No executable task function found in ${entrypoint} for task '${taskName}'`,
@@ -102,6 +137,8 @@ export async function executeTask(
     taskInput.attemptId,
     taskInput.operationId,
     abortController.signal,
+    taskInput.stepId,
+    taskInput.env,
   );
 
   let completion: TaskCompletion;

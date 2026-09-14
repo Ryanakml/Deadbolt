@@ -4,3 +4,8 @@ export * from "./mapping.js";
 export * from "./schema.js";
 export * from "./validator.js";
 export * from "./enums.js";
+export * from "./context.js";
+export * from "./task.js";
+export * from "./workflow.js";
+export * from "./bundle.js";
+export * from "./client.js";
