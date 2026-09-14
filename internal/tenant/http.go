@@ -159,11 +159,15 @@ func (h *HTTPHandler) enforceIdempotency(w http.ResponseWriter, r *http.Request,
 
 func commandRequest(r *http.Request, scope string) (*http.Request, error) {
 	key := r.Header.Get("Idempotency-Key")
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, err
+	var body []byte
+	if r.Body != nil {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
 	path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/v1"), "/v1")
 	return r.WithContext(ContextWithCommand(r.Context(), Command{Scope: scope, Key: key, Operation: r.Method + " " + path, Fingerprint: RequestFingerprint(r.Method, path, body)})), nil
 }
@@ -366,7 +370,11 @@ func (h *HTTPHandler) HandleCreateOrganization(w http.ResponseWriter, r *http.Re
 	if _, ok := h.enforceIdempotency(w, r, ""); !ok {
 		return
 	}
-	caller, _ := CallerFromContext(r.Context())
+	caller, ok := CallerFromContext(r.Context())
+	if !ok || caller == nil || caller.UserID == "" {
+		writeJSONError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication is required")
+		return
+	}
 	if caller.Type != IdentityTypeHuman {
 		writeJSONError(w, r, http.StatusForbidden, "MACHINE_CREATION_FORBIDDEN", "Only human users can create organizations")
 		return

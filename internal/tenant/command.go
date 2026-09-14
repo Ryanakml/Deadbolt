@@ -53,6 +53,35 @@ func commandOrganizationID(userID, key string) string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+func extractResourceID(v any) *string {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case *Organization:
+		if val != nil && val.ID != "" {
+			return &val.ID
+		}
+	case *Project:
+		if val != nil && val.ID != "" {
+			return &val.ID
+		}
+	case *Environment:
+		if val != nil && val.ID != "" {
+			return &val.ID
+		}
+	case *GeneratedKey:
+		if val != nil && val.ID != "" {
+			return &val.ID
+		}
+	case *Member:
+		if val != nil && val.ID != "" {
+			return &val.ID
+		}
+	}
+	return nil
+}
+
 // withCommandTx claims, mutates, records and replays inside one transaction.
 // The unique index serializes simultaneous claims: the loser blocks on the
 // conflicting row, then reads the committed durable outcome.
@@ -67,23 +96,28 @@ func (s *Service) withCommandTx(ctx context.Context, orgID string, operation str
 
 	replayed := false
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		var recordedFingerprint, recordedOperation string
-		var recordedOutcome []byte
+		var insertedID string
 		err := tx.QueryRow(ctx, `
-			INSERT INTO tenant_commands (command_scope, organization_id, idempotency_key, request_fingerprint, operation, outcome)
-			VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, '{}'::jsonb)
+			INSERT INTO tenant_commands (command_scope, organization_id, idempotency_key, request_fingerprint, operation, status, outcome)
+			VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, 'PROCESSING', '{}'::jsonb)
 			ON CONFLICT (command_scope, idempotency_key) DO NOTHING
-			RETURNING request_fingerprint
-		`, command.Scope, orgID, command.Key, command.Fingerprint, command.Operation).Scan(&recordedFingerprint)
+			RETURNING id::text
+		`, command.Scope, orgID, command.Key, command.Fingerprint, command.Operation).Scan(&insertedID)
 		if err == nil {
 			if err := mutate(ctx, tx); err != nil {
 				return err
 			}
-			encoded, err := json.Marshal(outcome())
+			out := outcome()
+			encoded, err := json.Marshal(out)
 			if err != nil {
 				return fmt.Errorf("%w: encode outcome: %v", ErrCommandStorage, err)
 			}
-			if _, err := tx.Exec(ctx, `UPDATE tenant_commands SET outcome = $3::jsonb, completed_at = clock_timestamp() WHERE command_scope = $1 AND idempotency_key = $2`, command.Scope, command.Key, encoded); err != nil {
+			resID := extractResourceID(out)
+			if _, err := tx.Exec(ctx, `
+				UPDATE tenant_commands
+				SET status = 'COMPLETED', resource_id = $3, outcome = $4::jsonb, completed_at = clock_timestamp()
+				WHERE command_scope = $1 AND idempotency_key = $2
+			`, command.Scope, command.Key, resID, encoded); err != nil {
 				return fmt.Errorf("%w: record outcome: %v", ErrCommandStorage, err)
 			}
 			return nil
@@ -93,11 +127,21 @@ func (s *Service) withCommandTx(ctx context.Context, orgID string, operation str
 		}
 
 		// FOR UPDATE waits for the winning transaction before reading its outcome.
-		if err := tx.QueryRow(ctx, `SELECT request_fingerprint, operation, outcome FROM tenant_commands WHERE command_scope = $1 AND idempotency_key = $2 FOR UPDATE`, command.Scope, command.Key).Scan(&recordedFingerprint, &recordedOperation, &recordedOutcome); err != nil {
+		var recordedFingerprint, recordedOperation, recordedStatus string
+		var recordedOutcome []byte
+		if err := tx.QueryRow(ctx, `
+			SELECT status, request_fingerprint, operation, outcome
+			FROM tenant_commands
+			WHERE command_scope = $1 AND idempotency_key = $2
+			FOR UPDATE
+		`, command.Scope, command.Key).Scan(&recordedStatus, &recordedFingerprint, &recordedOperation, &recordedOutcome); err != nil {
 			return fmt.Errorf("%w: load command: %v", ErrCommandStorage, err)
 		}
 		if recordedFingerprint != command.Fingerprint || recordedOperation != command.Operation {
 			return ErrIdempotencyConflict
+		}
+		if recordedStatus != "COMPLETED" {
+			return fmt.Errorf("%w: command in unexpected status %q", ErrCommandStorage, recordedStatus)
 		}
 		if err := replay(recordedOutcome); err != nil {
 			return fmt.Errorf("%w: decode outcome: %v", ErrCommandStorage, err)

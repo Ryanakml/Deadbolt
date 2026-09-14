@@ -10,7 +10,10 @@ CREATE TABLE tenant_commands (
     idempotency_key TEXT NOT NULL,
     request_fingerprint TEXT NOT NULL,
     operation TEXT NOT NULL,
-    outcome JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PROCESSING',
+    resource_id TEXT,
+    response_code INT NOT NULL DEFAULT 200,
+    outcome JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT tenant_commands_scope_key_unique UNIQUE (command_scope, idempotency_key)

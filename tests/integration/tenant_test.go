@@ -2013,6 +2013,515 @@ func TestIdempotencyConcurrentIdenticalAPIKeyCreateCommitsOnce(t *testing.T) {
 	}
 }
 
+// 26a. TestIdempotencyOrganizationCreationReplayAndConflict tests organization creation idempotency
+func TestIdempotencyOrganizationCreationReplayAndConflict(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	_, err := tc.pool.Exec(ctx, `INSERT INTO users (id, email) VALUES ($1, $2)`, ownerID, "idemp-owner@example.com")
+	if err != nil {
+		t.Fatalf("failed to insert test user: %v", err)
+	}
+
+	sess, sessionToken, csrfToken, err := tc.sessionStore.CreateSession(
+		ctx,
+		ownerID,
+		nil,
+		"127.0.0.1",
+		"TestAgent",
+		tc.authCfg.SessionIdleTimeout,
+		tc.authCfg.SessionAbsoluteTimeout,
+	)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("expected non-nil session")
+	}
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	cookie := &http.Cookie{
+		Name:  tc.authCfg.SessionCookieName(),
+		Value: sessionToken,
+	}
+
+	// 1. Initial Organization Creation
+	idempKey := "idemp-org-create-1"
+	req1, _ := http.NewRequest("POST", server.URL+"/api/v1/organizations", strings.NewReader(`{"name":"Acme Robotics"}`))
+	req1.AddCookie(cookie)
+	req1.Header.Set("Origin", "http://localhost:3000")
+	req1.Header.Set("X-CSRF-Token", csrfToken)
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", idempKey)
+
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatalf("initial org create request failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on initial org create, got %d", resp1.StatusCode)
+	}
+	var org1 tenant.Organization
+	if err := json.NewDecoder(resp1.Body).Decode(&org1); err != nil {
+		t.Fatalf("failed to decode org: %v", err)
+	}
+	if org1.ID == "" || org1.Name != "Acme Robotics" {
+		t.Fatalf("unexpected org data: %+v", org1)
+	}
+
+	// 2. Identical replay returns deterministic recorded result (org1)
+	reqReplay, _ := http.NewRequest("POST", server.URL+"/api/v1/organizations", strings.NewReader(`{"name":"Acme Robotics"}`))
+	reqReplay.AddCookie(cookie)
+	reqReplay.Header.Set("Origin", "http://localhost:3000")
+	reqReplay.Header.Set("X-CSRF-Token", csrfToken)
+	reqReplay.Header.Set("Content-Type", "application/json")
+	reqReplay.Header.Set("Idempotency-Key", idempKey)
+
+	respReplay, err := http.DefaultClient.Do(reqReplay)
+	if err != nil {
+		t.Fatalf("replay org create request failed: %v", err)
+	}
+	defer respReplay.Body.Close()
+
+	if respReplay.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on replayed org create, got %d", respReplay.StatusCode)
+	}
+	var orgReplay tenant.Organization
+	if err := json.NewDecoder(respReplay.Body).Decode(&orgReplay); err != nil {
+		t.Fatalf("failed to decode replayed org: %v", err)
+	}
+	if orgReplay.ID != org1.ID || orgReplay.Name != org1.Name {
+		t.Fatalf("expected identical org on replay, got %+v vs %+v", orgReplay, org1)
+	}
+
+	// 3. Conflicting replay with different name returns 409 IDEMPOTENCY_CONFLICT
+	reqConflict, _ := http.NewRequest("POST", server.URL+"/api/v1/organizations", strings.NewReader(`{"name":"Different Name Corp"}`))
+	reqConflict.AddCookie(cookie)
+	reqConflict.Header.Set("Origin", "http://localhost:3000")
+	reqConflict.Header.Set("X-CSRF-Token", csrfToken)
+	reqConflict.Header.Set("Content-Type", "application/json")
+	reqConflict.Header.Set("Idempotency-Key", idempKey)
+
+	respConflict, err := http.DefaultClient.Do(reqConflict)
+	if err != nil {
+		t.Fatalf("conflict org create request failed: %v", err)
+	}
+	defer respConflict.Body.Close()
+
+	if respConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for mismatched idempotency request, got %d", respConflict.StatusCode)
+	}
+	var conflictEnv tenant.ErrorEnvelope
+	if err := json.NewDecoder(respConflict.Body).Decode(&conflictEnv); err != nil {
+		t.Fatalf("failed to decode error envelope: %v", err)
+	}
+	if conflictEnv.Code != "IDEMPOTENCY_CONFLICT" {
+		t.Fatalf("expected code IDEMPOTENCY_CONFLICT, got %q", conflictEnv.Code)
+	}
+
+	// 4. Assert DB contains only ONE organization for this owner
+	var orgCount int
+	err = tc.pool.QueryRow(ctx, `SELECT COUNT(*) FROM organization_members WHERE user_id = $1`, ownerID).Scan(&orgCount)
+	if err != nil {
+		t.Fatalf("failed to count orgs: %v", err)
+	}
+	if orgCount != 1 {
+		t.Fatalf("expected exactly 1 organization in DB, got %d", orgCount)
+	}
+
+	// 5. Concurrent identical organization creation: exactly ONE commits
+	raceKey := "idemp-org-race-1"
+	type raceResult struct {
+		status int
+		org    tenant.Organization
+		err    error
+	}
+	raceCh := make(chan raceResult, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			req, _ := http.NewRequest("POST", server.URL+"/api/v1/organizations", strings.NewReader(`{"name":"Concurrent Org"}`))
+			req.AddCookie(cookie)
+			req.Header.Set("Origin", "http://localhost:3000")
+			req.Header.Set("X-CSRF-Token", csrfToken)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", raceKey)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				raceCh <- raceResult{err: err}
+				return
+			}
+			defer resp.Body.Close()
+			var o tenant.Organization
+			err = json.NewDecoder(resp.Body).Decode(&o)
+			raceCh <- raceResult{status: resp.StatusCode, org: o, err: err}
+		}()
+	}
+	close(start)
+
+	var firstOrgID string
+	for range 2 {
+		res := <-raceCh
+		if res.err != nil {
+			t.Fatalf("concurrent org request failed: %v", res.err)
+		}
+		if res.status != http.StatusCreated {
+			t.Fatalf("expected 201 Created on concurrent org create, got %d", res.status)
+		}
+		if firstOrgID == "" {
+			firstOrgID = res.org.ID
+		} else if firstOrgID != res.org.ID {
+			t.Fatalf("concurrent requests created different org IDs: %s != %s", firstOrgID, res.org.ID)
+		}
+	}
+}
+
+// 26b. TestIdempotencyProjectAndEnvironmentReplayAndConflict tests project and environment idempotency
+func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Project Idemp Corp")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, org.ID, tenant.EnvProduction, 10)
+	key := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminProject, tenant.CapOrgRead})
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Initial Project Creation
+	idempProjKey := "idemp-proj-create-1"
+	req1, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Alpha"}`))
+	req1.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	req1.Header.Set("X-Organization-ID", org.ID)
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", idempProjKey)
+
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatalf("create project failed: %v", err)
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for project, got %d", resp1.StatusCode)
+	}
+	var proj1 tenant.Project
+	if err := json.NewDecoder(resp1.Body).Decode(&proj1); err != nil {
+		t.Fatalf("decode proj: %v", err)
+	}
+
+	// 2. Project Replay -> identical project returned
+	reqProjReplay, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Alpha"}`))
+	reqProjReplay.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqProjReplay.Header.Set("X-Organization-ID", org.ID)
+	reqProjReplay.Header.Set("Content-Type", "application/json")
+	reqProjReplay.Header.Set("Idempotency-Key", idempProjKey)
+
+	respProjReplay, err := http.DefaultClient.Do(reqProjReplay)
+	if err != nil {
+		t.Fatalf("replay project failed: %v", err)
+	}
+	defer respProjReplay.Body.Close()
+	if respProjReplay.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for replayed project, got %d", respProjReplay.StatusCode)
+	}
+	var projReplay tenant.Project
+	if err := json.NewDecoder(respProjReplay.Body).Decode(&projReplay); err != nil {
+		t.Fatalf("decode proj replay: %v", err)
+	}
+	if projReplay.ID != proj1.ID {
+		t.Fatalf("expected identical project ID, got %s vs %s", projReplay.ID, proj1.ID)
+	}
+
+	// 3. Project Conflicting replay -> 409
+	reqProjConflict, _ := http.NewRequest("POST", server.URL+"/api/v1/projects", strings.NewReader(`{"name":"Project Beta"}`))
+	reqProjConflict.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqProjConflict.Header.Set("X-Organization-ID", org.ID)
+	reqProjConflict.Header.Set("Content-Type", "application/json")
+	reqProjConflict.Header.Set("Idempotency-Key", idempProjKey)
+
+	respProjConflict, err := http.DefaultClient.Do(reqProjConflict)
+	if err != nil {
+		t.Fatalf("conflict project failed: %v", err)
+	}
+	defer respProjConflict.Body.Close()
+	if respProjConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for conflicting project idempotency, got %d", respProjConflict.StatusCode)
+	}
+
+	// 4. Initial Environment Creation
+	idempEnvKey := "idemp-env-create-1"
+	reqEnv1, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj1.ID), strings.NewReader(`{"name":"staging","max_concurrency":15}`))
+	reqEnv1.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqEnv1.Header.Set("X-Organization-ID", org.ID)
+	reqEnv1.Header.Set("Content-Type", "application/json")
+	reqEnv1.Header.Set("Idempotency-Key", idempEnvKey)
+
+	respEnv1, err := http.DefaultClient.Do(reqEnv1)
+	if err != nil {
+		t.Fatalf("create env failed: %v", err)
+	}
+	defer respEnv1.Body.Close()
+	if respEnv1.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for env, got %d", respEnv1.StatusCode)
+	}
+	var env1 tenant.Environment
+	if err := json.NewDecoder(respEnv1.Body).Decode(&env1); err != nil {
+		t.Fatalf("decode env: %v", err)
+	}
+
+	// 5. Environment Replay -> identical env returned
+	reqEnvReplay, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj1.ID), strings.NewReader(`{"name":"staging","max_concurrency":15}`))
+	reqEnvReplay.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqEnvReplay.Header.Set("X-Organization-ID", org.ID)
+	reqEnvReplay.Header.Set("Content-Type", "application/json")
+	reqEnvReplay.Header.Set("Idempotency-Key", idempEnvKey)
+
+	respEnvReplay, err := http.DefaultClient.Do(reqEnvReplay)
+	if err != nil {
+		t.Fatalf("replay env failed: %v", err)
+	}
+	defer respEnvReplay.Body.Close()
+	if respEnvReplay.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created on replayed env create, got %d", respEnvReplay.StatusCode)
+	}
+	var envReplay tenant.Environment
+	if err := json.NewDecoder(respEnvReplay.Body).Decode(&envReplay); err != nil {
+		t.Fatalf("decode env replay: %v", err)
+	}
+	if envReplay.ID != env1.ID {
+		t.Fatalf("expected identical env ID, got %s vs %s", envReplay.ID, env1.ID)
+	}
+
+	// 6. Environment Conflicting Replay -> 409
+	reqEnvConflict, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj1.ID), strings.NewReader(`{"name":"development","max_concurrency":15}`))
+	reqEnvConflict.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	reqEnvConflict.Header.Set("X-Organization-ID", org.ID)
+	reqEnvConflict.Header.Set("Content-Type", "application/json")
+	reqEnvConflict.Header.Set("Idempotency-Key", idempEnvKey)
+
+	respEnvConflict, err := http.DefaultClient.Do(reqEnvConflict)
+	if err != nil {
+		t.Fatalf("conflict env failed: %v", err)
+	}
+	defer respEnvConflict.Body.Close()
+	if respEnvConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on conflicting env create, got %d", respEnvConflict.StatusCode)
+	}
+}
+
+// 26c. TestIdempotencyAPIKeyRotationAndRevocationReplay tests key rotation and revocation idempotency
+func TestIdempotencyAPIKeyRotationAndRevocationReplay(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Key Idemp Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Key Idemp Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+	adminKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminKey, tenant.CapRunsRead})
+	targetKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead})
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Initial Key Rotation
+	idempRotKey := "idemp-rot-rep-1"
+	rotReq1, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, targetKey.ID), strings.NewReader(`{"expiry_days":30}`))
+	rotReq1.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	rotReq1.Header.Set("X-Organization-ID", org.ID)
+	rotReq1.Header.Set("Content-Type", "application/json")
+	rotReq1.Header.Set("Idempotency-Key", idempRotKey)
+
+	rotResp1, err := http.DefaultClient.Do(rotReq1)
+	if err != nil {
+		t.Fatalf("rotate key failed: %v", err)
+	}
+	defer rotResp1.Body.Close()
+	if rotResp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on key rotation, got %d", rotResp1.StatusCode)
+	}
+	var rot1 tenant.GeneratedKey
+	if err := json.NewDecoder(rotResp1.Body).Decode(&rot1); err != nil {
+		t.Fatalf("decode rotated key: %v", err)
+	}
+	if rot1.PlaintextKey == "" {
+		t.Fatal("expected plaintext key on first rotation")
+	}
+
+	// 2. Identical Rotation Replay returns same key with REDACTED plaintext
+	rotReqReplay, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, targetKey.ID), strings.NewReader(`{"expiry_days":30}`))
+	rotReqReplay.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	rotReqReplay.Header.Set("X-Organization-ID", org.ID)
+	rotReqReplay.Header.Set("Content-Type", "application/json")
+	rotReqReplay.Header.Set("Idempotency-Key", idempRotKey)
+
+	rotRespReplay, err := http.DefaultClient.Do(rotReqReplay)
+	if err != nil {
+		t.Fatalf("replay rotate failed: %v", err)
+	}
+	defer rotRespReplay.Body.Close()
+	if rotRespReplay.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on replayed rotation, got %d", rotRespReplay.StatusCode)
+	}
+	var rotReplay tenant.GeneratedKey
+	if err := json.NewDecoder(rotRespReplay.Body).Decode(&rotReplay); err != nil {
+		t.Fatalf("decode rot replay: %v", err)
+	}
+	if rotReplay.ID != rot1.ID {
+		t.Fatalf("expected same key ID on rotation replay, got %s vs %s", rotReplay.ID, rot1.ID)
+	}
+	if rotReplay.PlaintextKey != "" {
+		t.Fatal("plaintext key must be redacted on rotation replay")
+	}
+
+	// 3. Conflicting Rotation Replay -> 409
+	rotReqConflict, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/api-keys/%s/rotate", server.URL, targetKey.ID), strings.NewReader(`{"expiry_days":60}`))
+	rotReqConflict.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	rotReqConflict.Header.Set("X-Organization-ID", org.ID)
+	rotReqConflict.Header.Set("Content-Type", "application/json")
+	rotReqConflict.Header.Set("Idempotency-Key", idempRotKey)
+
+	rotRespConflict, err := http.DefaultClient.Do(rotReqConflict)
+	if err != nil {
+		t.Fatalf("conflict rotate failed: %v", err)
+	}
+	defer rotRespConflict.Body.Close()
+	if rotRespConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on conflicting rotate, got %d", rotRespConflict.StatusCode)
+	}
+
+	// 4. Initial Key Revocation -> 204 No Content
+	keyToRevoke := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead})
+	idempRevKey := "idemp-rev-rep-1"
+	revReq1, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, keyToRevoke.ID), nil)
+	revReq1.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	revReq1.Header.Set("X-Organization-ID", org.ID)
+	revReq1.Header.Set("Idempotency-Key", idempRevKey)
+
+	revResp1, err := http.DefaultClient.Do(revReq1)
+	if err != nil {
+		t.Fatalf("revoke key failed: %v", err)
+	}
+	defer revResp1.Body.Close()
+	if revResp1.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content on key revocation, got %d", revResp1.StatusCode)
+	}
+
+	// 5. Identical Revocation Replay -> 204 No Content (deterministic replay, not 404)
+	revReqReplay, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, keyToRevoke.ID), nil)
+	revReqReplay.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	revReqReplay.Header.Set("X-Organization-ID", org.ID)
+	revReqReplay.Header.Set("Idempotency-Key", idempRevKey)
+
+	revRespReplay, err := http.DefaultClient.Do(revReqReplay)
+	if err != nil {
+		t.Fatalf("replay revoke failed: %v", err)
+	}
+	defer revRespReplay.Body.Close()
+	if revRespReplay.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content on replayed revocation, got %d", revRespReplay.StatusCode)
+	}
+
+	// 6. Conflicting Revocation Replay on different key ID -> 409 Conflict
+	otherKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapRunsRead})
+	revReqConflict, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/api-keys/%s", server.URL, otherKey.ID), nil)
+	revReqConflict.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	revReqConflict.Header.Set("X-Organization-ID", org.ID)
+	revReqConflict.Header.Set("Idempotency-Key", idempRevKey)
+
+	revRespConflict, err := http.DefaultClient.Do(revReqConflict)
+	if err != nil {
+		t.Fatalf("conflict revoke failed: %v", err)
+	}
+	defer revRespConflict.Body.Close()
+	if revRespConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on conflicting revocation, got %d", revRespConflict.StatusCode)
+	}
+}
+
+// 26d. TestIdempotencyFailedMutationRollbackAndFailClosed tests rollback atomicity and fail-closed
+func TestIdempotencyFailedMutationRollbackAndFailClosed(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	ownerID, _ := tenant.NewUUID()
+	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Rollback Idemp Corp")
+	proj, _ := tc.service.CreateProject(ctx, org.ID, "Rollback Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, proj.ID, tenant.EnvProduction, 10)
+	adminKey := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminProject, tenant.CapOrgRead})
+
+	server := httptest.NewServer(tc.handler.Routes())
+	defer server.Close()
+
+	// 1. Failed mutation with invalid environment name -> 400 Bad Request
+	failKey := "idemp-fail-rollback-1"
+	failReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj.ID), strings.NewReader(`{"name":"invalid_env_name"}`))
+	failReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	failReq.Header.Set("X-Organization-ID", org.ID)
+	failReq.Header.Set("Content-Type", "application/json")
+	failReq.Header.Set("Idempotency-Key", failKey)
+
+	failResp, err := http.DefaultClient.Do(failReq)
+	if err != nil {
+		t.Fatalf("failed req: %v", err)
+	}
+	defer failResp.Body.Close()
+	if failResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for invalid env, got %d", failResp.StatusCode)
+	}
+
+	// Verify no completed command was stored in tenant_commands for failKey
+	var commandCount int
+	_ = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM tenant_commands WHERE organization_id = $1 AND idempotency_key = $2 AND status = 'COMPLETED'`, org.ID, failKey).Scan(&commandCount)
+	})
+	if commandCount != 0 {
+		t.Fatalf("expected 0 completed commands after failed mutation, got %d", commandCount)
+	}
+
+	// 2. Retry with same Idempotency-Key and valid payload -> SUCCEEDS (key was not poisoned)
+	retryReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj.ID), strings.NewReader(`{"name":"staging","max_concurrency":10}`))
+	retryReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	retryReq.Header.Set("X-Organization-ID", org.ID)
+	retryReq.Header.Set("Content-Type", "application/json")
+	retryReq.Header.Set("Idempotency-Key", failKey)
+
+	retryResp, err := http.DefaultClient.Do(retryReq)
+	if err != nil {
+		t.Fatalf("retry req failed: %v", err)
+	}
+	defer retryResp.Body.Close()
+	if retryResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for retried mutation, got %d", retryResp.StatusCode)
+	}
+
+	// 3. Fail closed on missing Idempotency-Key
+	missingReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/projects/%s/environments", server.URL, proj.ID), strings.NewReader(`{"name":"production"}`))
+	missingReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	missingReq.Header.Set("X-Organization-ID", org.ID)
+	missingReq.Header.Set("Content-Type", "application/json")
+
+	missingResp, err := http.DefaultClient.Do(missingReq)
+	if err != nil {
+		t.Fatalf("missing req failed: %v", err)
+	}
+	defer missingResp.Body.Close()
+	if missingResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for missing Idempotency-Key, got %d", missingResp.StatusCode)
+	}
+}
+
 // 27. TestAuditLifecycleAndAtomicity tests mandatory audit context, audit event structure in DB, and atomicity
 func TestAuditLifecycleAndAtomicity(t *testing.T) {
 	tc := setupTenantContext(t)
