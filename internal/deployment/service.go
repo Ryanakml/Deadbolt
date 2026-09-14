@@ -13,7 +13,6 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -68,16 +67,24 @@ ELSE 'REGISTERED' END WHERE d.organization_id=$1 AND d.environment_id=$2`, orgID
 		return err
 	}
 	defer rows.Close()
+	var lostIDs []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return err
 		}
+		lostIDs = append(lostIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range lostIDs {
 		if _, err := tx.Exec(ctx, `INSERT INTO outbox_events (organization_id,subject,payload) VALUES ($1,'deployment.compatibility_lost',jsonb_build_object('deploymentId',$2::text,'environmentId',$3::text))`, orgID, id, envID); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 func NewService(pool *storage.Pool, commands *tenant.Service) *Service {
@@ -119,26 +126,26 @@ func integer(v any, key string, d int) int {
 
 // Register validates before writing, canonically hashes the exact manifest, and
 // atomically persists its definitions. Replays return the original row.
-func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte, audit *tenant.AuditContext) (*Deployment, bool, error) {
+func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte, audit *tenant.AuditContext) (*Deployment, int, error) {
 	v, err := contracts.ParseJSON(raw)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	if err := contracts.ValidateDeployment(v); err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	canonical, hash, err := contracts.Digest(raw)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	bundle := str(v, "bundleDigest")
 	var out Deployment
 	created := false
 	if audit == nil {
-		return nil, false, tenant.ErrAuditRequired
+		return nil, 0, tenant.ErrAuditRequired
 	}
 	responseCode := 201
-	replayed, err := s.commands.WithCommandTxDynamic(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
+	_, recordedCode, err := s.commands.WithCommandTxDynamic(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// A bundle digest identifies executable immutable bytes. It may not be
 		// rebound to a changed manifest in the same environment.
 		var existingHash string
@@ -155,21 +162,18 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 		if err == nil {
 			created = true
 		} else if !errors.Is(err, pgx.ErrNoRows) {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				if lookupErr := tx.QueryRow(ctx, `SELECT manifest_hash FROM deployments WHERE environment_id=$1 AND bundle_digest=$2`, envID, bundle).Scan(&existingHash); lookupErr == nil && existingHash != hash {
-					return ErrImmutable
-				}
-				// A concurrent equal-manifest winner is handled by the idempotent read below.
-			} else {
-				return err
-			}
+			return err
 		}
 		if !created {
 			responseCode = 200
-			if err := tx.QueryRow(ctx, `SELECT id::text,manifest_hash,bundle_digest,status,created_at FROM deployments WHERE environment_id=$1 AND manifest_hash=$2`, envID, hash).Scan(&out.ID, &out.ManifestHash, &out.BundleDigest, &out.Status, &out.CreatedAt); err != nil {
+			var existing Deployment
+			if err := tx.QueryRow(ctx, `SELECT id::text,manifest_hash,bundle_digest,status,created_at FROM deployments WHERE environment_id=$1 AND bundle_digest=$2`, envID, bundle).Scan(&existing.ID, &existing.ManifestHash, &existing.BundleDigest, &existing.Status, &existing.CreatedAt); err != nil {
 				return err
 			}
+			if existing.ManifestHash != hash {
+				return ErrImmutable
+			}
+			out = existing
 			return nil
 		}
 		for _, task := range arr(v, "tasks") {
@@ -212,10 +216,7 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 		_, err = tx.Exec(ctx, `INSERT INTO audit_events (organization_id,actor_id,action,target_type,target_id,correlation_id,reason,metadata) VALUES ($1,$2,'deployment.register','deployment',$3,$4,$5,$6::jsonb)`, orgID, audit.ActorID, out.ID, audit.CorrelationID, audit.Reason, meta)
 		return err
 	}, func() int { return responseCode }, func() any { return &out }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &out) })
-	if replayed {
-		created = false
-	}
-	return &out, created, err
+	return &out, recordedCode, err
 }
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
 

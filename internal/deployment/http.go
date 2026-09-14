@@ -43,12 +43,12 @@ func (h *HTTPHandler) Register(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, r, 400, "INVALID_MANIFEST", "Invalid manifest")
 		return
 	}
-	d, created, err := h.service.Register(r.Context(), caller.OrganizationID, env, body, auditFromCaller(caller, r))
+	d, statusCode, err := h.service.Register(r.Context(), caller.OrganizationID, env, body, auditFromCaller(caller, r))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}
-	writeJSON(w, map[bool]int{true: 201, false: 200}[created], d)
+	writeJSON(w, statusCode, d)
 }
 func (h *HTTPHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	caller, ok := tenant.CallerFromContext(r.Context())

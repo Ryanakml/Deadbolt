@@ -42,15 +42,17 @@ func (s *Service) WithCommandTx(ctx context.Context, orgID string, operation str
 // WithCommandTxDynamic records the response code selected by the authoritative
 // mutation outcome in the same transaction. It is for create-or-return flows
 // where a concurrent winner can turn an otherwise-new request into 200.
-func (s *Service) WithCommandTxDynamic(ctx context.Context, orgID, operation string, mutate func(context.Context, storage.Tx) error, responseCode func() int, outcome func() any, replay func(json.RawMessage) error) (bool, error) {
+func (s *Service) WithCommandTxDynamic(ctx context.Context, orgID, operation string, mutate func(context.Context, storage.Tx) error, responseCode func() int, outcome func() any, replay func(json.RawMessage) error) (bool, int, error) {
 	command, ok := commandFromContext(ctx)
 	if !ok {
-		return false, s.pool.WithTenantTx(ctx, orgID, mutate)
+		err := s.pool.WithTenantTx(ctx, orgID, mutate)
+		return false, responseCode(), err
 	}
 	if operation != "" && command.Operation != operation {
-		return false, fmt.Errorf("%w: command operation mismatch", ErrCommandStorage)
+		return false, 0, fmt.Errorf("%w: command operation mismatch", ErrCommandStorage)
 	}
 	replayed := false
+	recordedCode := 0
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		var insertedID string
 		err := tx.QueryRow(ctx, `INSERT INTO tenant_commands (command_scope,organization_id,idempotency_key,request_fingerprint,operation,status,response_code,outcome) VALUES ($1,NULLIF($2,'')::uuid,$3,$4,$5,'PROCESSING',200,'{}'::jsonb) ON CONFLICT (command_scope,idempotency_key) DO NOTHING RETURNING id::text`, command.Scope, orgID, command.Key, command.Fingerprint, command.Operation).Scan(&insertedID)
@@ -66,6 +68,7 @@ func (s *Service) WithCommandTxDynamic(ctx context.Context, orgID, operation str
 			if code <= 0 {
 				code = http.StatusOK
 			}
+			recordedCode = code
 			_, err = tx.Exec(ctx, `UPDATE tenant_commands SET status='COMPLETED',response_code=$3,outcome=$4::jsonb,completed_at=clock_timestamp() WHERE command_scope=$1 AND idempotency_key=$2`, command.Scope, command.Key, code, encoded)
 			return err
 		}
@@ -88,9 +91,10 @@ func (s *Service) WithCommandTxDynamic(ctx context.Context, orgID, operation str
 			return err
 		}
 		replayed = true
+		recordedCode = code
 		return nil
 	})
-	return replayed, err
+	return replayed, recordedCode, err
 }
 
 func RequestFingerprint(method, path string, body []byte) string {

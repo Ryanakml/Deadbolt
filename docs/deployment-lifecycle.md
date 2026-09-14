@@ -28,6 +28,11 @@ for registration, `deployments:activate:staging` outside production, and
 own environment. Customer secret values are never part of this API or manifest;
 only the SDK-declared secret names are stored.
 
-Migration `00008_deployment_lifecycle.sql` is additive: it adds a status and
-indexes only. Binary rollback must not run its down migration; an older binary
-can ignore the additive column and indexes.
+Migrations `00008_deployment_lifecycle.sql`, `00009_deployment_definition_completeness.sql`,
+and `00010_deployment_compatibility_warning.sql` are additive:
+
+- `00008_deployment_lifecycle.sql` adds the deployment status column (`REGISTERED`, `AVAILABLE`, `ACTIVE`) and lookup/immutability indexes.
+- `00009_deployment_definition_completeness.sql` adds `task_definitions.idempotency_window_ms` and `workflow_definitions.output_mapping` to persist complete normalized definitions.
+- `00010_deployment_compatibility_warning.sql` adds `deployments.compatibility_warning_at` for observable compatibility loss when active deployments lose their last compatible worker.
+
+Binary rollback must not run down migrations; older binaries ignore the additive columns and indexes.
