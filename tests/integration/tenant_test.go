@@ -3135,7 +3135,10 @@ func TestIdempotencyCrossActorSameKeyIsolation(t *testing.T) {
 	repA.Header.Set("Content-Type", "application/json")
 	repA.Header.Set("Idempotency-Key", sharedKey)
 
-	respRepA, _ := http.DefaultClient.Do(repA)
+	respRepA, err := http.DefaultClient.Do(repA)
+	if err != nil {
+		t.Fatalf("replay user A failed: %v", err)
+	}
 	defer respRepA.Body.Close()
 	var projRepA tenant.Project
 	_ = json.NewDecoder(respRepA.Body).Decode(&projRepA)
@@ -3152,7 +3155,10 @@ func TestIdempotencyCrossActorSameKeyIsolation(t *testing.T) {
 	repB.Header.Set("Content-Type", "application/json")
 	repB.Header.Set("Idempotency-Key", sharedKey)
 
-	respRepB, _ := http.DefaultClient.Do(repB)
+	respRepB, err := http.DefaultClient.Do(repB)
+	if err != nil {
+		t.Fatalf("replay user B failed: %v", err)
+	}
 	defer respRepB.Body.Close()
 	var projRepB tenant.Project
 	_ = json.NewDecoder(respRepB.Body).Decode(&projRepB)
