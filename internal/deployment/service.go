@@ -115,7 +115,15 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 	if audit == nil {
 		return nil, false, tenant.ErrAuditRequired
 	}
-	replayed, err := s.commands.WithCommandTx(ctx, orgID, "", 201, func(ctx context.Context, tx storage.Tx) error {
+	responseCode := 201
+	_ = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var id string
+		if err := tx.QueryRow(ctx, `SELECT id::text FROM deployments WHERE environment_id=$1 AND manifest_hash=$2`, envID, hash).Scan(&id); err == nil {
+			responseCode = 200
+		}
+		return nil
+	})
+	replayed, err := s.commands.WithCommandTx(ctx, orgID, "", responseCode, func(ctx context.Context, tx storage.Tx) error {
 		// A bundle digest identifies executable immutable bytes. It may not be
 		// rebound to a changed manifest in the same environment.
 		var existingHash string

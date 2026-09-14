@@ -31,8 +31,11 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 		deploymentHandler := deployment.NewHTTPHandler(deployment.NewService(storagePool, tenantService), tenantService)
 		mux.Handle("POST /api/v1/deployments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsRegister, deploymentHandler.Register))))
 		mux.Handle("POST /v1/deployments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsRegister, deploymentHandler.Register))))
-		mux.Handle("POST /api/v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsActivateStaging, deploymentHandler.Activate))))
-		mux.Handle("POST /v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsActivateStaging, deploymentHandler.Activate))))
+		// Activation selects its required staging/production capability only after
+		// resolving the authoritative environment. This middleware still supplies
+		// scoped auth, environment isolation, and durable command idempotency.
+		mux.Handle("POST /api/v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
+		mux.Handle("POST /v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 
 		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
 		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)

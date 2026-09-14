@@ -57,6 +57,26 @@ func TestDeploymentRegistrationIsImmutableAndPersistsCompleteDefinitions(t *test
 	if _, _, err := svc.Register(ctx, org.ID, env.ID, altered, audit); err != deployment.ErrImmutable {
 		t.Fatalf("expected immutable conflict, got %v", err)
 	}
+	// An existing deployment accepted under a fresh idempotency key records and
+	// replays 200, not the create-path 201.
+	cmdKey := "existing-manifest-replay"
+	cmdCtx := tenant.ContextWithCommand(ctx, tenant.Command{Scope: "org:" + org.ID + ":user:" + owner, Key: cmdKey, Operation: "POST /deployments?environment=" + env.ID, Fingerprint: tenant.RequestFingerprint("POST", "/deployments?environment="+env.ID, deploymentManifest(t, bundle))})
+	if _, created, err := svc.Register(cmdCtx, org.ID, env.ID, deploymentManifest(t, bundle), audit); err != nil || created {
+		t.Fatalf("existing command registration: created=%v err=%v", created, err)
+	}
+	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		var code int
+		if err := tx.QueryRow(ctx, `SELECT response_code FROM tenant_commands WHERE idempotency_key=$1`, cmdKey).Scan(&code); err != nil {
+			return err
+		}
+		if code != 200 {
+			t.Fatalf("expected recorded 200, got %d", code)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
 		var window int64
 		var mapping []byte
