@@ -20,6 +20,7 @@
   },
   "devDependencies": {
     "@apidevtools/swagger-parser": "13.0.0",
+    "@octokit/rest": "^22.0.1",
     "prettier": "3.6.2",
     "yaml": "2.9.0"
   }

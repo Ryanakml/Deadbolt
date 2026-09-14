@@ -87,4 +87,8 @@ BEGIN
         REVOKE ALL ON FUNCTION app.enumerate_scheduler_tenants() FROM PUBLIC, deadbolt_runtime;
         GRANT EXECUTE ON FUNCTION app.enumerate_scheduler_tenants() TO deadbolt_system;
     END IF;
+    IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'app' AND p.proname = 'authenticate_api_key') THEN
+        REVOKE ALL ON FUNCTION app.authenticate_api_key(TEXT) FROM PUBLIC, deadbolt_system;
+        GRANT EXECUTE ON FUNCTION app.authenticate_api_key(TEXT) TO deadbolt_runtime;
+    END IF;
 END $$;
