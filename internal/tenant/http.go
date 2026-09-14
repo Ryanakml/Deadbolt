@@ -345,6 +345,11 @@ func (h *HTTPHandler) RequireOrgScope(requiredCap string, next http.HandlerFunc)
 				r.Body = io.NopCloser(bytes.NewReader(body))
 			}
 			path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/v1"), "/v1")
+			// Query selectors such as deployment environment are part of a command's
+			// semantic identity; never replay an accepted mutation across scopes.
+			if query := r.URL.Query().Encode(); query != "" {
+				path += "?" + query
+			}
 			op := r.Method + " " + path
 			fp := RequestFingerprint(r.Method, path, body)
 
