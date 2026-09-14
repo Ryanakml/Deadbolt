@@ -52,7 +52,7 @@ func TestWorkerEnrollmentLifecycle(t *testing.T) {
 	defer tc.cleanup()
 	defer server.Close()
 
-	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain})
+	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain, tenant.CapAdminKey})
 
 	// 1. Admin generates enrollment token
 	enrollReqBody, _ := json.Marshal(map[string]any{
@@ -61,6 +61,7 @@ func TestWorkerEnrollmentLifecycle(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/environments/%s/worker-enrollments", server.URL, envID), bytes.NewReader(enrollReqBody))
 	req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	req.Header.Set("X-Organization-ID", orgID)
+	req.Header.Set("Idempotency-Key", "idemp-enroll-token-lifecycle-1")
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -195,13 +196,14 @@ func TestWorkerSessionReauthenticationAndFencing(t *testing.T) {
 	defer tc.cleanup()
 	defer server.Close()
 
-	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain})
+	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain, tenant.CapAdminKey})
 
 	// Generate enrollment token and enroll worker
 	enrollReqBody, _ := json.Marshal(map[string]any{"poolName": "default"})
 	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/environments/%s/worker-enrollments", server.URL, envID), bytes.NewReader(enrollReqBody))
 	req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	req.Header.Set("X-Organization-ID", orgID)
+	req.Header.Set("Idempotency-Key", "idemp-enroll-token-reauth-1")
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	var enrollTokenInfo worker.EnrollmentTokenInfo
@@ -325,13 +327,14 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain})
+	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain, tenant.CapAdminKey})
 
 	// Enroll worker
 	enrollReqBody, _ := json.Marshal(map[string]any{"poolName": "default"})
 	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/environments/%s/worker-enrollments", server.URL, envID), bytes.NewReader(enrollReqBody))
 	req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	req.Header.Set("X-Organization-ID", orgID)
+	req.Header.Set("Idempotency-Key", "idemp-enroll-token-start-1")
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	var enrollTokenInfo worker.EnrollmentTokenInfo
@@ -557,13 +560,14 @@ func TestWorkerRevocationAndDraining(t *testing.T) {
 	defer tc.cleanup()
 	defer server.Close()
 
-	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain})
+	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain, tenant.CapAdminKey})
 
 	// Enroll worker
 	enrollReqBody, _ := json.Marshal(map[string]any{"poolName": "default"})
 	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/environments/%s/worker-enrollments", server.URL, envID), bytes.NewReader(enrollReqBody))
 	req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	req.Header.Set("X-Organization-ID", orgID)
+	req.Header.Set("Idempotency-Key", "idemp-enroll-token-drain-1")
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	var enrollTokenInfo worker.EnrollmentTokenInfo
@@ -605,6 +609,7 @@ func TestWorkerRevocationAndDraining(t *testing.T) {
 	drainReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/workers/%s/drain", server.URL, workerID), nil)
 	drainReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	drainReq.Header.Set("X-Organization-ID", orgID)
+	drainReq.Header.Set("Idempotency-Key", "idemp-drain-worker-1")
 	dResp, err := http.DefaultClient.Do(drainReq)
 	if err != nil {
 		t.Fatalf("failed to drain worker: %v", err)
@@ -618,6 +623,7 @@ func TestWorkerRevocationAndDraining(t *testing.T) {
 	revokeReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/workers/%s/revoke", server.URL, workerID), nil)
 	revokeReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	revokeReq.Header.Set("X-Organization-ID", orgID)
+	revokeReq.Header.Set("Idempotency-Key", "idemp-revoke-worker-1")
 	rResp, err := http.DefaultClient.Do(revokeReq)
 	if err != nil {
 		t.Fatalf("failed to revoke worker: %v", err)

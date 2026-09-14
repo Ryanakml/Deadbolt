@@ -120,14 +120,12 @@ func (s *Service) EnrollWorker(ctx context.Context, req *EnrollRequestDTO) (*Ses
 		return nil, ErrInvalidSignature
 	}
 
-	// 3. Verify and consume enrollment token
+	// 3. Verify and consume enrollment token via security definer function
 	tokenHash := HashToken(req.EnrollmentToken)
-	var orgID, envID, poolName string
-	tokenQuery := `UPDATE worker_enrollments
-	               SET used_at = clock_timestamp()
-	               WHERE token_hash = $1 AND used_at IS NULL AND expires_at > clock_timestamp()
-	               RETURNING organization_id::text, environment_id::text, pool_name`
-	err = s.pool.QueryRow(ctx, tokenQuery, tokenHash).Scan(&orgID, &envID, &poolName)
+	var orgID, envID, poolName, enrollmentID string
+	tokenQuery := `SELECT id::text, organization_id::text, environment_id::text, pool_name
+	               FROM app.consume_enrollment_token($1)`
+	err = s.pool.QueryRow(ctx, tokenQuery, tokenHash).Scan(&enrollmentID, &orgID, &envID, &poolName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrEnrollmentInvalid
@@ -201,12 +199,11 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 		return nil, fmt.Errorf("verify challenge: %w", err)
 	}
 
-	// 2. Fetch worker info
-	var orgID, envID, pubKeyHex, status string
-	workerQuery := `SELECT organization_id::text, environment_id::text, public_key, status
-	                FROM workers
-	                WHERE id = $1`
-	err = s.pool.QueryRow(ctx, workerQuery, req.WorkerID).Scan(&orgID, &envID, &pubKeyHex, &status)
+	// 2. Fetch worker info via security definer function
+	var workerID, orgID, envID, pubKeyHex, status string
+	workerQuery := `SELECT worker_id::text, organization_id::text, environment_id::text, public_key, status
+	                FROM app.lookup_worker_for_session($1)`
+	err = s.pool.QueryRow(ctx, workerQuery, req.WorkerID).Scan(&workerID, &orgID, &envID, &pubKeyHex, &status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrWorkerNotFound
@@ -288,11 +285,9 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 // AuthenticateSession verifies a Bearer session token against database records.
 func (s *Service) AuthenticateSession(ctx context.Context, rawSessionToken string) (*WorkerSessionContext, error) {
 	tokenHash := HashToken(rawSessionToken)
-	query := `SELECT ws.id::text, ws.worker_id::text, ws.organization_id::text, ws.environment_id::text,
-	                 w.pool_name, ws.expires_at, ws.revoked_at, w.status
-	          FROM worker_sessions ws
-	          JOIN workers w ON w.id = ws.worker_id AND w.organization_id = ws.organization_id
-	          WHERE ws.session_token_hash = $1`
+	query := `SELECT session_id::text, worker_id::text, organization_id::text, environment_id::text,
+	                 pool_name, expires_at, revoked_at, worker_status
+	          FROM app.authenticate_worker_session($1)`
 
 	var sessionID, workerID, orgID, envID, poolName, workerStatus string
 	var expiresAt time.Time
@@ -361,9 +356,8 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 
 		// Claim ready steps matching advertised bundles
 		// Per Blueprint §13: claim locks environment admission row and fetches eligible tasks FIFO
-		claimQuery := `SELECT rs.id::text, rs.run_id::text, rs.task_name, rs.input,
-		                      r.deployment_id::text, d.bundle_digest,
-		                      COALESCE(rs.operation_id, gen_random_uuid()::text)
+		claimQuery := `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
+		                      r.deployment_id::text, d.bundle_digest
 		               FROM run_steps rs
 		               JOIN runs r ON r.id = rs.run_id AND r.organization_id = rs.organization_id
 		               JOIN deployments d ON d.id = r.deployment_id AND d.organization_id = r.organization_id
@@ -383,17 +377,16 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 		defer rows.Close()
 
 		type stepMatch struct {
-			stepID, runID, taskName string
-			input                   any
-			deploymentID, bundle    string
-			operationID             string
+			stepID, runID, nodeID string
+			input                 any
+			deploymentID, bundle  string
 		}
 		var matches []stepMatch
 
 		for rows.Next() {
 			var m stepMatch
 			var rawInput []byte
-			if err := rows.Scan(&m.stepID, &m.runID, &m.taskName, &rawInput, &m.deploymentID, &m.bundle, &m.operationID); err != nil {
+			if err := rows.Scan(&m.stepID, &m.runID, &m.nodeID, &rawInput, &m.deploymentID, &m.bundle); err != nil {
 				return err
 			}
 			if len(rawInput) > 0 {
@@ -404,8 +397,8 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 		rows.Close()
 
 		for _, m := range matches {
-			// Transition step to CLAIMED
-			_, err = tx.Exec(ctx, `UPDATE run_steps SET state = 'CLAIMED' WHERE id = $1 AND organization_id = $2`,
+			// Transition step to RUNNING
+			_, err = tx.Exec(ctx, `UPDATE run_steps SET state = 'RUNNING' WHERE id = $1 AND organization_id = $2`,
 				m.stepID, sessionCtx.OrganizationID)
 			if err != nil {
 				return err
@@ -451,11 +444,11 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 				StepID:               m.stepID,
 				AttemptID:            attemptID,
 				OwnershipEpoch:       epoch,
-				TaskEntrypoint:       m.taskName,
+				TaskEntrypoint:       m.nodeID,
 				Input:                m.input,
 				DeploymentDigest:     m.bundle,
 				BundleDigest:         m.bundle,
-				OperationID:          m.operationID,
+				OperationID:          m.stepID,
 				LeaseTTLMs:           leaseTTL.Milliseconds(),
 				LeaseExpiresAt:       leaseExpiresAt.UTC().Format(time.RFC3339),
 				ClaimStartDeadlineAt: claimStartDeadline.UTC().Format(time.RFC3339),
