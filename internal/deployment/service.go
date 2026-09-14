@@ -263,7 +263,7 @@ func (s *Service) Activate(ctx context.Context, orgID, envID, name, deploymentID
 			return err
 		}
 		meta, _ := json.Marshal(map[string]any{"role": audit.Role, "capabilities": audit.Capabilities, "environment_id": envID, "revision": out.Revision})
-		_, err = tx.Exec(ctx, `INSERT INTO audit_events (organization_id,actor_id,action,target_type,target_id,correlation_id,reason,metadata) VALUES ($1,$2,'deployment.activate','workflow_channel',$3,$4,$5,$6::jsonb)`, orgID, audit.ActorID, name, audit.CorrelationID, audit.Reason, meta)
+		_, err = tx.Exec(ctx, `INSERT INTO audit_events (organization_id,actor_id,action,target_type,target_id,correlation_id,reason,metadata) VALUES ($1,$2,'deployment.activate','deployment',$3,$4,$5,$6::jsonb)`, orgID, audit.ActorID, deploymentID, audit.CorrelationID, audit.Reason, meta)
 		return err
 	}, func() any { return &out }, func(raw json.RawMessage) error { return json.Unmarshal(raw, &out) })
 	return &out, err
