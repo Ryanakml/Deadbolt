@@ -18,10 +18,13 @@ var (
 	ErrStaleOwnership        = errors.New("STALE_OWNERSHIP: Attempt ownership epoch or session does not match active lease")
 	ErrStartDeadlineExceeded = errors.New("START_DEADLINE_EXCEEDED: Start request was not received within 5s of claim")
 	ErrChallengeExpired      = errors.New("CHALLENGE_EXPIRED: Challenge nonce is invalid, expired, or already used")
+	ErrChallengeInvalid      = errors.New("CHALLENGE_INVALID: Specify exactly one valid workerId or publicKey")
 	ErrEnrollmentInvalid     = errors.New("ENROLLMENT_TOKEN_INVALID: Enrollment token is invalid, expired, or already used")
 	ErrWorkerNotFound        = errors.New("WORKER_NOT_FOUND: Worker identity not found")
 	ErrAttemptNotFound       = errors.New("ATTEMPT_NOT_FOUND: Attempt not found or outside session scope")
 	ErrLeaseExpiredServer    = errors.New("LEASE_EXPIRED: Lease has expired on the control plane")
+	ErrResultConflict        = errors.New("RESULT_CONFLICT: Attempt already has a different terminal result")
+	ErrInvalidOutcome        = errors.New("INVALID_OUTCOME: Attempt outcome is not supported")
 )
 
 const (

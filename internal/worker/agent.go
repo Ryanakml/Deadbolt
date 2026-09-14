@@ -398,6 +398,23 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	secretEnv, secretErr := resolveTaskSecrets(assignment.SecretNames)
 	if secretErr != nil {
 		a.cfg.Logger.Printf("Refusing attempt %s: %v", assignment.AttemptID, secretErr)
+		digest := sha256.Sum256([]byte(secretErr.Error()))
+		_, _ = a.complete(attCtx, &CompleteRequestDTO{
+			ProtocolVersion: ProtocolVersion,
+			RequestID:       fmt.Sprintf("req_comp_preflight_%d", time.Now().UnixNano()),
+			WorkerID:        a.workerID,
+			SessionID:       a.sessionID,
+			AttemptID:       assignment.AttemptID,
+			OwnershipEpoch:  assignment.OwnershipEpoch,
+			Outcome:         "FAILED",
+			ResultDigest:    hex.EncodeToString(digest[:]),
+			Error: &TaskErrorDTO{
+				Code:         "MISSING_REQUIRED_SECRET",
+				Message:      secretErr.Error(),
+				Retryable:    false,
+				EffectStatus: "NOT_APPLIED",
+			},
+		})
 		return
 	}
 	taskInput := &TaskInput{
@@ -462,6 +479,13 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 			Message:      completion.Error.Message,
 			Retryable:    completion.Error.Retryable,
 			Details:      completion.Error.Details,
+			EffectStatus: "NOT_APPLIED",
+		}
+	} else if execErr != nil {
+		compReq.Error = &TaskErrorDTO{
+			Code:         "WORKER_PREFLIGHT_FAILED",
+			Message:      execErr.Error(),
+			Retryable:    false,
 			EffectStatus: "NOT_APPLIED",
 		}
 	}

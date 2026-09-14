@@ -90,6 +90,10 @@ func (h *HTTPHandler) HandleChallenge(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.CreateChallenge(r.Context(), &req)
 	if err != nil {
+		if errors.Is(err, ErrChallengeInvalid) {
+			h.writeError(w, r, http.StatusBadRequest, "CHALLENGE_INVALID", err.Error(), false)
+			return
+		}
 		h.writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), true)
 		return
 	}
@@ -173,6 +177,14 @@ func (h *HTTPHandler) HandlePoll(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.PollAssignments(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrSessionRevoked) || errors.Is(err, ErrSessionExpired) {
+			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
+			return
+		}
+		if errors.Is(err, ErrWorkerRevoked) {
+			h.writeError(w, r, http.StatusForbidden, "WORKER_REVOKED", err.Error(), false)
+			return
+		}
 		h.writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), true)
 		return
 	}
@@ -192,6 +204,10 @@ func (h *HTTPHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.StartAttempt(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
+			return
+		}
 		if errors.Is(err, ErrAttemptNotFound) {
 			h.writeError(w, r, http.StatusNotFound, "ATTEMPT_NOT_FOUND", err.Error(), false)
 			return
@@ -223,6 +239,10 @@ func (h *HTTPHandler) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.Heartbeat(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
+			return
+		}
 		h.writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), true)
 		return
 	}
@@ -242,6 +262,22 @@ func (h *HTTPHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.CompleteAttempt(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
+			return
+		}
+		if errors.Is(err, ErrAttemptNotFound) {
+			h.writeError(w, r, http.StatusNotFound, "ATTEMPT_NOT_FOUND", err.Error(), false)
+			return
+		}
+		if errors.Is(err, ErrInvalidOutcome) {
+			h.writeError(w, r, http.StatusBadRequest, "INVALID_OUTCOME", err.Error(), false)
+			return
+		}
+		if errors.Is(err, ErrResultConflict) {
+			h.writeError(w, r, http.StatusConflict, "RESULT_CONFLICT", err.Error(), false)
+			return
+		}
 		if errors.Is(err, ErrStaleOwnership) {
 			h.writeError(w, r, http.StatusConflict, "STALE_OWNERSHIP", err.Error(), false)
 			return
@@ -265,6 +301,10 @@ func (h *HTTPHandler) HandleStopAck(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.StopAck(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
+			return
+		}
 		h.writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), true)
 		return
 	}
@@ -284,6 +324,10 @@ func (h *HTTPHandler) HandleLogs(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.RecordLogs(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
+			return
+		}
 		h.writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), true)
 		return
 	}

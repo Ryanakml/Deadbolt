@@ -330,7 +330,7 @@ func TestWorkerSessionReauthenticationAndFencing(t *testing.T) {
 		RequestID:       "poll-new",
 		WorkerID:        workerID,
 		SessionID:       newSession.SessionID,
-		AvailableSlots:  2,
+		AvailableSlots:  0,
 		Pool:            "default",
 	})
 	pollReq2, _ := http.NewRequest(http.MethodPost, server.URL+"/worker/v1/poll", bytes.NewReader(pollReqBody2))
@@ -586,7 +586,8 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 		t.Fatalf("expected 200 OK for complete, got %d", compResp.StatusCode)
 	}
 
-	// 6. Stale Complete: Calling complete again returns 409 STALE_OWNERSHIP
+	// 6. An identical Complete retry is idempotently acknowledged even though
+	// the lease was released by the first commit.
 	compReq2, _ := http.NewRequest(http.MethodPost, server.URL+"/worker/v1/complete", bytes.NewReader(compReqBody))
 	compReq2.Header.Set("Authorization", "Bearer "+sessionToken)
 	compReq2.Header.Set("Content-Type", "application/json")
@@ -595,8 +596,31 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 		t.Fatalf("stale complete failed: %v", err)
 	}
 	defer compResp2.Body.Close()
-	if compResp2.StatusCode != http.StatusConflict {
-		t.Fatalf("expected 409 Conflict (STALE_OWNERSHIP) on late complete, got %d", compResp2.StatusCode)
+	if compResp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for identical Complete retry, got %d", compResp2.StatusCode)
+	}
+
+	// 7. A different digest for the same terminal attempt is a conflict.
+	conflictingBody, _ := json.Marshal(worker.CompleteRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion,
+		RequestID:       "comp-conflict",
+		WorkerID:        workerID,
+		SessionID:       sessionID,
+		AttemptID:       claimed.AttemptID,
+		OwnershipEpoch:  claimed.OwnershipEpoch,
+		Outcome:         "SUCCEEDED",
+		ResultDigest:    "sha256:different-outcome-digest",
+	})
+	conflictingReq, _ := http.NewRequest(http.MethodPost, server.URL+"/worker/v1/complete", bytes.NewReader(conflictingBody))
+	conflictingReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	conflictingReq.Header.Set("Content-Type", "application/json")
+	conflictingResp, err := http.DefaultClient.Do(conflictingReq)
+	if err != nil {
+		t.Fatalf("conflicting complete failed: %v", err)
+	}
+	defer conflictingResp.Body.Close()
+	if conflictingResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for different Complete digest, got %d", conflictingResp.StatusCode)
 	}
 }
 
