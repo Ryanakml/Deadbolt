@@ -2126,13 +2126,12 @@ func TestIdempotencyOrganizationCreationReplayAndConflict(t *testing.T) {
 	}
 
 	// 4. Assert DB contains only ONE organization for this owner
-	var orgCount int
-	err = tc.pool.QueryRow(ctx, `SELECT COUNT(*) FROM organization_members WHERE user_id = $1`, ownerID).Scan(&orgCount)
+	members, err := storage.DiscoverUserMemberships(ctx, tc.runtimePool, ownerID)
 	if err != nil {
 		t.Fatalf("failed to count orgs: %v", err)
 	}
-	if orgCount != 1 {
-		t.Fatalf("expected exactly 1 organization in DB, got %d", orgCount)
+	if len(members) != 1 {
+		t.Fatalf("expected exactly 1 organization in DB, got %d", len(members))
 	}
 
 	// 5. Concurrent identical organization creation: exactly ONE commits
@@ -2191,7 +2190,8 @@ func TestIdempotencyProjectAndEnvironmentReplayAndConflict(t *testing.T) {
 	ctx := context.Background()
 	ownerID, _ := tenant.NewUUID()
 	org, _ := tc.service.CreateOrganization(ctx, ownerID, "Project Idemp Corp")
-	env, _ := tc.service.CreateEnvironment(ctx, org.ID, org.ID, tenant.EnvProduction, 10)
+	projInit, _ := tc.service.CreateProject(ctx, org.ID, "Init Proj")
+	env, _ := tc.service.CreateEnvironment(ctx, org.ID, projInit.ID, tenant.EnvProduction, 10)
 	key := bootstrapTestKey(t, tc.service, org.ID, env.ID, []string{tenant.CapAdminProject, tenant.CapOrgRead})
 
 	server := httptest.NewServer(tc.handler.Routes())
