@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
+	"github.com/Ryanakml/Deadbolt/internal/deployment"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -27,6 +28,11 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 		tenantService := tenant.NewService(storagePool)
 		tenantHandler := tenant.NewHTTPHandler(tenantService, pool, store, cfg)
 		tenantHandler.RegisterRoutes(mux)
+		deploymentHandler := deployment.NewHTTPHandler(deployment.NewService(storagePool), tenantService)
+		mux.Handle("POST /api/v1/deployments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(deploymentHandler.Register)))
+		mux.Handle("POST /v1/deployments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(deploymentHandler.Register)))
+		mux.Handle("POST /api/v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(deploymentHandler.Activate)))
+		mux.Handle("POST /v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(deploymentHandler.Activate)))
 
 		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
 		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)

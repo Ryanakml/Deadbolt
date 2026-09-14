@@ -398,8 +398,8 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
-      x-required-capability: deployments:write
+      x-implemented: true
+      x-required-capability: deployments:register
       parameters:
         - *a2
         - name: X-CSRF-Token
@@ -491,8 +491,8 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
-      x-required-capability: deployments:write
+      x-implemented: true
+      x-required-capability: deployments:activate:staging
   /reconciliation-cases/{id}/resolve:
     post:
       summary: Authoritative human/application decision for an unknown outcome
