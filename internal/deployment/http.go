@@ -35,10 +35,15 @@ func (h *HTTPHandler) Register(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			errJSON(w, r, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "Manifest exceeds the request limit")
+			return
+		}
 		errJSON(w, r, 400, "INVALID_MANIFEST", "Invalid manifest")
 		return
 	}
-	d, created, err := h.service.Register(r.Context(), caller.OrganizationID, env, body)
+	d, created, err := h.service.Register(r.Context(), caller.OrganizationID, env, body, auditFromCaller(caller, r))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
@@ -54,10 +59,12 @@ func (h *HTTPHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	env := r.URL.Query().Get("environment")
 	var in struct {
 		DeploymentID      string `json:"deploymentId"`
-		ExpectedRevision  int64  `json:"expectedRevision"`
+		ExpectedRevision  *int64 `json:"expectedRevision"`
 		AllowSingleWorker bool   `json:"allowSingleWorker"`
 	}
-	if env == "" || json.NewDecoder(r.Body).Decode(&in) != nil || in.DeploymentID == "" {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if env == "" || dec.Decode(&in) != nil || in.DeploymentID == "" || in.ExpectedRevision == nil || dec.Decode(&struct{}{}) != io.EOF {
 		errJSON(w, r, 400, "INVALID_REQUEST", "deploymentId, expectedRevision, and environment are required")
 		return
 	}
@@ -74,7 +81,7 @@ func (h *HTTPHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, r, 403, "FORBIDDEN", "Deployment activation is not permitted")
 		return
 	}
-	out, err := h.service.Activate(r.Context(), caller.OrganizationID, env, r.PathValue("name"), in.DeploymentID, in.ExpectedRevision, in.AllowSingleWorker)
+	out, err := h.service.Activate(r.Context(), caller.OrganizationID, env, r.PathValue("name"), in.DeploymentID, *in.ExpectedRevision, in.AllowSingleWorker, auditFromCaller(caller, r))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
@@ -94,7 +101,7 @@ func (h *HTTPHandler) allowed(r *http.Request, c *tenant.CallerIdentity, env, ca
 func writeServiceErr(w http.ResponseWriter, r *http.Request, e error) {
 	code, status := "INTERNAL_ERROR", 500
 	if _, ok := e.(*contracts.Error); ok {
-		code, status = "INVALID_MANIFEST", 422
+		code, status = e.(*contracts.Error).Code, 422
 	}
 	if errors.Is(e, ErrImmutable) {
 		code, status = "IMMUTABLE_CONTENT_CONFLICT", 409
@@ -109,6 +116,15 @@ func writeServiceErr(w http.ResponseWriter, r *http.Request, e error) {
 		code, status = "NOT_FOUND", 404
 	}
 	errJSON(w, r, status, code, "Request could not be completed")
+}
+func auditFromCaller(c *tenant.CallerIdentity, r *http.Request) *tenant.AuditContext {
+	var id *string
+	if c.Type == tenant.IdentityTypeMachine {
+		id = &c.KeyID
+	} else {
+		id = &c.UserID
+	}
+	return &tenant.AuditContext{ActorID: id, ActorType: c.Type, Role: c.Role, Capabilities: c.Capabilities, CorrelationID: tenant.RequestIDFromContext(r.Context())}
 }
 func writeJSON(w http.ResponseWriter, s int, v any) {
 	w.Header().Set("Content-Type", "application/json")

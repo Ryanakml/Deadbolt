@@ -2349,6 +2349,9 @@ components:
             - string
             - "null"
         revision: *a3
+        warning:
+          type: string
+          minLength: 1
       required:
         - name
         - activeDeploymentId

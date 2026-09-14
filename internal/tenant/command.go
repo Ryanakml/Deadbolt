@@ -33,6 +33,12 @@ func commandFromContext(ctx context.Context) (Command, bool) {
 	return command, ok && command.Key != "" && command.Scope != "" && command.Fingerprint != "" && command.Operation != ""
 }
 
+// WithCommandTx is the canonical mutation idempotency path. It claims, mutates,
+// records, and replays a scoped command in one tenant transaction.
+func (s *Service) WithCommandTx(ctx context.Context, orgID string, operation string, responseCode int, mutate func(context.Context, storage.Tx) error, outcome func() any, replay func(json.RawMessage) error) (bool, error) {
+	return s.withCommandTx(ctx, orgID, operation, responseCode, mutate, outcome, replay)
+}
+
 func RequestFingerprint(method, path string, body []byte) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(method))

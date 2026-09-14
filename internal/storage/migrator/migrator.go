@@ -17,7 +17,7 @@ import (
 const MigrationAdvisoryLockID int64 = 7142893
 
 // LatestSchemaVersion defines the expected schema version for readiness and health checks.
-const LatestSchemaVersion int64 = 8
+const LatestSchemaVersion int64 = 9
 
 type Runner struct {
 	db            *sql.DB
