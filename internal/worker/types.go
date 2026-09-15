@@ -73,6 +73,15 @@ const (
 // is retried with the same attempt identity; reject is authoritative.
 type StartDecisionFunc func(ctx context.Context, attemptID string, epoch int64) (StartDecision, error)
 
+// StartAuthorization is an immutable, typed handoff of the authenticated
+// control-plane Start decision to the local supervisor. It prevents a second
+// logical Start transition while keeping the supervisor's launch gate intact.
+type StartAuthorization struct {
+	AttemptID string
+	Epoch     int64
+	Decision  StartDecision
+}
+
 type LeaseRenewal struct {
 	ExpiresAt time.Time
 	RTT       time.Duration

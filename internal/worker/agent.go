@@ -450,6 +450,11 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 
 	sup := NewProcessSupervisor(a.cfg.NodePath, a.cfg.RunnerPath)
 	sup.LeaseTracker = leaseTracker
+	sup.StartAuthorization = &StartAuthorization{
+		AttemptID: assignment.AttemptID,
+		Epoch:     assignment.OwnershipEpoch,
+		Decision:  StartAccepted,
+	}
 	sup.TaskEnvAllowlist = assignment.SecretNames
 	sup.OnProcessStart = func(pid int) {
 		a.mu.Lock()
