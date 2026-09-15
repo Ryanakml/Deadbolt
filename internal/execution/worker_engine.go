@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"runtime"
 	"strings"
 	"time"
 
@@ -47,12 +46,15 @@ type workflowManifest struct {
 }
 
 type deploymentManifest struct {
+	TargetOS           string   `json:"targetOS"`
 	TargetArchitecture string   `json:"targetArchitecture"`
 	SecretNames        []string `json:"secretNames"`
 	Tasks              []struct {
-		Name       string `json:"name"`
-		Entrypoint string `json:"entrypoint"`
-		TimeoutMs  int64  `json:"timeoutMs"`
+		Name         string `json:"name"`
+		Entrypoint   string `json:"entrypoint"`
+		TimeoutMs    int64  `json:"timeoutMs"`
+		InputSchema  any    `json:"inputSchema"`
+		OutputSchema any    `json:"outputSchema"`
 	} `json:"tasks"`
 	Workflows []workflowManifest `json:"workflows"`
 }
@@ -82,20 +84,45 @@ func (m deploymentManifest) taskPolicy(workflowName, nodeID string) (string, int
 	return nodeID, defaultAttemptTimeout.Milliseconds()
 }
 
+func (m deploymentManifest) taskSchemas(workflowName, nodeID string) (any, any) {
+	taskName := nodeID
+	for _, wf := range m.Workflows {
+		if wf.Name != workflowName {
+			continue
+		}
+		for _, node := range wf.Nodes {
+			if node.ID == nodeID && node.Task != "" {
+				taskName = node.Task
+				break
+			}
+		}
+	}
+	for _, task := range m.Tasks {
+		if task.Name == taskName {
+			return task.InputSchema, task.OutputSchema
+		}
+	}
+	return nil, nil
+}
+
 func stableOperationID(environmentID, runID, nodeID string) string {
 	digest := sha256.Sum256([]byte("deadbolt-operation:v1:" + environmentID + ":" + runID + ":" + nodeID))
 	return "op_" + hex.EncodeToString(digest[:])
 }
 
-func targetArchitecture(architecture string) string {
+func targetArchitecture(os, architecture string) string {
+	os = strings.ToLower(strings.TrimSpace(os))
 	architecture = strings.ToLower(strings.TrimSpace(architecture))
+	if os == "" {
+		os = "linux"
+	}
 	switch architecture {
 	case "":
 		return ""
 	case "amd64", "x64":
-		return runtime.GOOS + "/amd64"
+		return os + "/amd64"
 	case "arm64":
-		return runtime.GOOS + "/arm64"
+		return os + "/arm64"
 	default:
 		return architecture
 	}
@@ -297,7 +324,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				ClaimStartDeadlineAt: claimDeadline.UTC().Format(time.RFC3339Nano), AttemptTimeoutMs: timeoutMs,
 				RunDeadlineAt:      runDeadline,
 				TraceContext:       worker.TraceContextDTO{Traceparent: "00-00000000000000000000000000000000-0000000000000000-01"},
-				TargetArchitecture: targetArchitecture(manifest.TargetArchitecture), SecretNames: manifest.SecretNames,
+				TargetArchitecture: targetArchitecture(manifest.TargetOS, manifest.TargetArchitecture), SecretNames: manifest.SecretNames,
 			})
 		}
 		return nil
@@ -491,22 +518,32 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 	if !validOutcome(req.Outcome) {
 		return nil, worker.ErrInvalidOutcome
 	}
-	err := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		var runID, stepID, status, ownerSession string
+	computedDigest, err := worker.CanonicalCompletionDigest(req)
+	if err != nil || req.ResultDigest != computedDigest {
+		return nil, worker.ErrResultConflict
+	}
+	err = e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
+		var runID, stepID, nodeID, status, ownerSession, workflowName string
+		var manifestBytes []byte
 		var epoch int64
 		var storedDigest *string
 		var attemptDeadline *time.Time
-		err := tx.QueryRow(ctx, `SELECT r.id::text,rs.id::text,a.status,a.epoch,a.session_id::text,a.outcome_digest,a.deadline_at
+		err := tx.QueryRow(ctx, `SELECT r.id::text,rs.id::text,rs.node_id,a.status,a.epoch,a.session_id::text,a.outcome_digest,a.deadline_at,d.manifest,r.workflow_name
 			FROM runs r JOIN run_steps rs ON rs.run_id=r.id AND rs.organization_id=r.organization_id
 			JOIN task_attempts a ON a.step_id=rs.id AND a.organization_id=rs.organization_id
+			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid
 			FOR UPDATE OF r,rs,a`, req.AttemptID, session.OrganizationID).Scan(
-			&runID, &stepID, &status, &epoch, &ownerSession, &storedDigest, &attemptDeadline)
+			&runID, &stepID, &nodeID, &status, &epoch, &ownerSession, &storedDigest, &attemptDeadline, &manifestBytes, &workflowName)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return worker.ErrAttemptNotFound
 			}
 			return err
+		}
+		// A duplicate ACK is safe only for the same authenticated ownership.
+		if epoch != req.OwnershipEpoch || ownerSession != session.SessionID {
+			return worker.ErrStaleOwnership
 		}
 		if terminalAttempt(status) {
 			if status == req.Outcome && storedDigest != nil && *storedDigest == req.ResultDigest {
@@ -514,7 +551,7 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 			}
 			return worker.ErrResultConflict
 		}
-		if status != "RUNNING" || epoch != req.OwnershipEpoch || ownerSession != session.SessionID || attemptDeadline == nil {
+		if status != "RUNNING" || attemptDeadline == nil {
 			return worker.ErrStaleOwnership
 		}
 
@@ -532,6 +569,21 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		}
 		if leaseEpoch != req.OwnershipEpoch || leaseSession != session.SessionID || !dbNow.Before(leaseExpiry) || !dbNow.Before(*attemptDeadline) {
 			return worker.ErrStaleOwnership
+		}
+		// Validate a successful worker result before it can change durable state.
+		// Contract/schema failures are deterministic terminal failures, never retryable
+		// successes with a bad payload.
+		if req.Outcome == "SUCCEEDED" {
+			var manifest deploymentManifest
+			if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+				return fmt.Errorf("decode manifest: %w", err)
+			}
+			_, outputSchema := manifest.taskSchemas(workflowName, nodeID)
+			if outputSchema != nil && contracts.ValidatePayload(outputSchema, req.Output) != nil {
+				req.Outcome = "FAILED"
+				req.Output = nil
+				req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Task output does not conform to output schema", Retryable: false, EffectStatus: "NOT_APPLIED"}
+			}
 		}
 
 		errorJSON := "null"
@@ -646,7 +698,9 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 					if allDepsMet {
 						// Evaluate input mapping if present
 						if node.Input != nil {
-							if _, err := contracts.MapInput(node.Input, runInput, outputsMap); err != nil {
+							mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
+							inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
+							if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
 								// Non-retryable mapping error per Blueprint §10.4 & §14.2
 								if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED',wait_reason='INPUT_MAPPING_ERROR',updated_at=clock_timestamp()
 									WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, session.OrganizationID); uErr != nil {
@@ -656,9 +710,11 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 									WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, session.OrganizationID); uErr != nil {
 									return uErr
 								}
-								_ = appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{
+								if err := appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{
 									"reason": "INPUT_MAPPING_ERROR", "nodeId": node.ID,
-								})
+								}); err != nil {
+									return err
+								}
 								return nil
 							}
 						}
@@ -706,6 +762,13 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 								})
 							}
 							finalOutput = mappedOut
+						}
+						if targetWorkflow.OutputSchema != nil && contracts.ValidatePayload(targetWorkflow.OutputSchema, finalOutput) != nil {
+							if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='OUTPUT_SCHEMA_VIOLATION',updated_at=clock_timestamp()
+								WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, session.OrganizationID); err != nil {
+								return err
+							}
+							return appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{"reason": "OUTPUT_SCHEMA_VIOLATION"})
 						}
 						finalJSON, _ := json.Marshal(finalOutput)
 						if _, err := tx.Exec(ctx, `UPDATE runs SET status='SUCCEEDED',output=$1::jsonb,reason_code=NULL,updated_at=clock_timestamp()

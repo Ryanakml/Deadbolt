@@ -1,10 +1,13 @@
 package execution
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
+	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 )
 
@@ -37,8 +40,19 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		errJSON(w, r, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "Request body exceeds transport limit")
+		return
+	}
+	parsed, err := contracts.ParseJSON(raw)
+	if err != nil {
+		errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
+		return
+	}
+	canonical, _ := json.Marshal(parsed)
 	var req CreateRunRequestDTO
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(bytes.NewReader(canonical))
 	if err := dec.Decode(&req); err != nil {
 		errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
 		return
@@ -78,6 +92,10 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, ErrSchemaViolation) {
 			errJSON(w, r, http.StatusUnprocessableEntity, "SCHEMA_VIOLATION", "Input does not conform to workflow input schema")
+			return
+		}
+		if errors.Is(err, ErrPayloadTooLarge) {
+			errJSON(w, r, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "Inline JSON payload exceeds 256 KiB")
 			return
 		}
 		if errors.Is(err, ErrNoActiveDeployment) {
@@ -130,8 +148,20 @@ func (h *HTTPHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, r, http.StatusNotFound, "RUN_NOT_FOUND", "Run not found")
 		return
 	}
+	if !h.hasPayloadRead(r, caller, snapshot.EnvironmentID) {
+		snapshot.Output = nil
+		snapshot.Error = nil
+	}
 
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (h *HTTPHandler) hasPayloadRead(r *http.Request, c *tenant.CallerIdentity, environmentID string) bool {
+	if c.Type == tenant.IdentityTypeMachine {
+		return c.EnvironmentID == environmentID && tenant.CanAPIKeyPerform(c.Capabilities, tenant.CapPayloadRead)
+	}
+	m, err := h.tenants.GetMember(r.Context(), c.OrganizationID, c.UserID)
+	return err == nil && m.Status == tenant.StatusActive && tenant.CanRolePerform(m.Role, tenant.CapPayloadRead)
 }
 
 func (h *HTTPHandler) allowed(r *http.Request, c *tenant.CallerIdentity, envParam, cap string) bool {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -307,6 +308,50 @@ func TestCreateRunIdempotencyAnd202(t *testing.T) {
 	_ = json.NewDecoder(respConflict.Body).Decode(&errEnv)
 	if errEnv["code"] != "IDEMPOTENCY_CONFLICT" {
 		t.Fatalf("expected IDEMPOTENCY_CONFLICT error code, got %v", errEnv["code"])
+	}
+
+	// Step 3b: a previously unseen key is serialized too. Both requests must
+	// observe the same committed logical run instead of leaking a unique error.
+	concurrentBody, _ := json.Marshal(map[string]any{"environment": "staging", "input": map[string]any{"val": "CONCURRENT"}})
+	type concurrentResult struct {
+		status int
+		runID  string
+		err    error
+	}
+	results := make(chan concurrentResult, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/workflows/simple-flow/runs", bytes.NewReader(concurrentBody))
+			req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+			req.Header.Set("X-Organization-ID", orgID)
+			req.Header.Set("Idempotency-Key", "run-concurrent-key")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				results <- concurrentResult{err: err}
+				return
+			}
+			defer resp.Body.Close()
+			var out execution.RunDTO
+			_ = json.NewDecoder(resp.Body).Decode(&out)
+			results <- concurrentResult{status: resp.StatusCode, runID: out.ID}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var concurrentRunID string
+	for result := range results {
+		if result.err != nil || result.status != http.StatusAccepted {
+			t.Fatalf("concurrent create: status=%d err=%v", result.status, result.err)
+		}
+		if concurrentRunID == "" {
+			concurrentRunID = result.runID
+		} else if result.runID != concurrentRunID {
+			t.Fatalf("concurrent replay created distinct runs: %s != %s", concurrentRunID, result.runID)
+		}
 	}
 
 	// Step 4: Missing Idempotency-Key returns 400 MISSING_IDEMPOTENCY_KEY
@@ -621,11 +666,13 @@ func startNode(t *testing.T, server *httptest.Server, session *testWorkerSession
 func completeNode(t *testing.T, server *httptest.Server, session *testWorkerSession, attemptID string, epoch int64, outcome string, output any, digest string) {
 	t.Helper()
 	var resp worker.CompleteResponseDTO
-	status := postWorkerJSON(t, server, "/worker/v1/complete", session.SessionToken, worker.CompleteRequestDTO{
+	req := worker.CompleteRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion, RequestID: "complete-" + attemptID,
 		WorkerID: session.WorkerID, SessionID: session.SessionID, AttemptID: attemptID, OwnershipEpoch: epoch,
 		Outcome: outcome, Output: output, ResultDigest: digest,
-	}, &resp)
+	}
+	req.ResultDigest, _ = worker.CanonicalCompletionDigest(&req)
+	status := postWorkerJSON(t, server, "/worker/v1/complete", session.SessionToken, req, &resp)
 	if status != http.StatusOK || !resp.Accepted {
 		t.Fatalf("complete failed: status=%d resp=%+v", status, resp)
 	}

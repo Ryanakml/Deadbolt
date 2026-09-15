@@ -22,7 +22,10 @@ var (
 	ErrRunNotFound           = errors.New("RUN_NOT_FOUND: Run not found")
 	ErrSchemaViolation       = errors.New("SCHEMA_VIOLATION: Input does not conform to workflow schema")
 	ErrEnvironmentNotFound   = errors.New("ENVIRONMENT_NOT_FOUND: Environment not found")
+	ErrPayloadTooLarge       = errors.New("PAYLOAD_TOO_LARGE: Inline JSON payload exceeds 256 KiB")
 )
+
+const maxInlinePayloadBytes = 256 << 10
 
 type Service struct {
 	pool    *storage.Pool
@@ -115,16 +118,24 @@ func (s *Service) CreateRun(
 	if err != nil {
 		return nil, false, fmt.Errorf("canonicalize input: %w", err)
 	}
+	if len(canonicalInput) > maxInlinePayloadBytes {
+		return nil, false, ErrPayloadTooLarge
+	}
 
 	var resultRun *RunDTO
 	var isReplay bool
 
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		// 1. Check idempotency record under lock
+		// PostgreSQL advisory transaction locks serialize a previously unseen key
+		// too; SELECT FOR UPDATE alone cannot lock a missing row.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, envID+":CREATE_RUN:"+keyHash); err != nil {
+			return fmt.Errorf("lock idempotency identity: %w", err)
+		}
 		var storedReqHash, storedRunID string
 		err := tx.QueryRow(ctx, `SELECT request_hash, response_identity::text
 			FROM idempotency_records
-			WHERE environment_id = $1::uuid AND key_hash = $2
+			WHERE environment_id = $1::uuid AND operation_type='CREATE_RUN' AND key_hash = $2
 			FOR UPDATE`, envID, keyHash).Scan(&storedReqHash, &storedRunID)
 		if err == nil {
 			if storedReqHash != requestHash {
@@ -232,11 +243,11 @@ func (s *Service) CreateRun(
 
 		// 6. Record idempotency
 		idempotencyInsert := `INSERT INTO idempotency_records (
-			organization_id, environment_id, key_hash, request_hash,
+			organization_id, environment_id, operation_type, key_hash, request_hash,
 			response_identity, expires_at, created_at
 		) VALUES (
-			$1::uuid, $2::uuid, $3, $4,
-			$5::uuid, clock_timestamp() + INTERVAL '30 days', clock_timestamp()
+			$1::uuid, $2::uuid, 'CREATE_RUN', $3, $4,
+			$5::uuid, 'infinity', clock_timestamp()
 		)`
 		if _, err := tx.Exec(ctx, idempotencyInsert, orgID, envID, keyHash, requestHash, runID); err != nil {
 			return fmt.Errorf("insert idempotency: %w", err)

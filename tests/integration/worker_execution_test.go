@@ -565,7 +565,7 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 	}
 
 	// 5. Complete attempt with valid session
-	compReqBody, _ := json.Marshal(worker.CompleteRequestDTO{
+	completion := worker.CompleteRequestDTO{
 		ProtocolVersion: worker.ProtocolVersion,
 		RequestID:       "comp-1",
 		WorkerID:        workerID,
@@ -573,8 +573,9 @@ func TestWorkerExecutionStartDeadlineAndIdempotency(t *testing.T) {
 		AttemptID:       claimed.AttemptID,
 		OwnershipEpoch:  claimed.OwnershipEpoch,
 		Outcome:         "SUCCEEDED",
-		ResultDigest:    "sha256:mock-outcome-digest",
-	})
+	}
+	completion.ResultDigest, _ = worker.CanonicalCompletionDigest(&completion)
+	compReqBody, _ := json.Marshal(completion)
 	compReq, _ := http.NewRequest(http.MethodPost, server.URL+"/worker/v1/complete", bytes.NewReader(compReqBody))
 	compReq.Header.Set("Authorization", "Bearer "+sessionToken)
 	compReq.Header.Set("Content-Type", "application/json")

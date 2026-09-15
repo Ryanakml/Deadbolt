@@ -474,16 +474,6 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		outcome = "FAILED"
 	}
 
-	var resDigest string
-	if completion != nil && completion.Output != nil {
-		outBytes, _ := json.Marshal(completion.Output)
-		h := sha256.Sum256(outBytes)
-		resDigest = hex.EncodeToString(h[:])
-	} else {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%v", execErr)))
-		resDigest = hex.EncodeToString(h[:])
-	}
-
 	compReq := &CompleteRequestDTO{
 		ProtocolVersion: ProtocolVersion,
 		RequestID:       fmt.Sprintf("req_comp_%d", time.Now().UnixNano()),
@@ -492,7 +482,6 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		AttemptID:       assignment.AttemptID,
 		OwnershipEpoch:  assignment.OwnershipEpoch,
 		Outcome:         outcome,
-		ResultDigest:    resDigest,
 	}
 	if outcome == "SUCCEEDED" && completion != nil {
 		compReq.Output = completion.Output
@@ -512,6 +501,11 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 			EffectStatus: "NOT_APPLIED",
 		}
 	}
+	resDigest, digestErr := CanonicalCompletionDigest(compReq)
+	if digestErr != nil {
+		return
+	}
+	compReq.ResultDigest = resDigest
 
 	if _, err := a.complete(attCtx, compReq); errors.Is(err, ErrWorkerRevoked) {
 		a.handleWorkerRevoked()
