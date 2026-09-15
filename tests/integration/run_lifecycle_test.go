@@ -51,6 +51,7 @@ func setupRunLifecycleTest(t *testing.T) (*tenantTestContext, *httptest.Server, 
 		tenant.CapWorkersDrain,
 		tenant.CapRunsCreate,
 		tenant.CapRunsRead,
+		tenant.CapPayloadRead,
 		tenant.CapAdminKey,
 	})
 
