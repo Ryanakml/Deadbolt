@@ -874,13 +874,6 @@ func (a *Agent) completeWithRetry(ctx context.Context, req *CompleteRequestDTO) 
 			return res, err
 		}
 		lastErr = err
-		if tries == 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
 	}
 	return nil, lastErr
 }

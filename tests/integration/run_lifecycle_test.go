@@ -35,6 +35,23 @@ func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) 
 	return fn(req)
 }
 
+type synchronizedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
 func writeAgentBundle(t *testing.T, dir string) string {
 	t.Helper()
 	var archive bytes.Buffer
@@ -782,7 +799,7 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	var agentLogs bytes.Buffer
+	var agentLogs synchronizedBuffer
 	var childLaunches atomic.Int32
 	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: server.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(&agentLogs, "", 0), HTTPClient: faultClient, OnTaskProcessStart: func() { childLaunches.Add(1) }})
 	if err != nil {
