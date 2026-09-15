@@ -10,6 +10,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/deployment"
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
+	"github.com/Ryanakml/Deadbolt/internal/outbox"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
@@ -19,12 +20,22 @@ import (
 // This canonical constructor is shared between production (cmd/control-plane)
 // and integration tests to guarantee identical route mountings and middleware.
 func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, logger *log.Logger) *http.ServeMux {
+	return BuildMuxWithMetrics(cfg, pool, healthChecker, nil, logger)
+}
+
+// BuildMuxWithMetrics wires all production routes and attaches an optional outbox.Metrics collector.
+func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, outboxMetrics *outbox.Metrics, logger *log.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 	if healthChecker != nil {
 		healthChecker.Routes(mux)
 	}
 
 	if pool != nil {
+		if outboxMetrics == nil {
+			outboxMetrics = outbox.NewMetrics(pool)
+		}
+		mux.Handle("GET /metrics", outboxMetrics)
+
 		store := auth.NewSessionStore(pool)
 		storagePool := storage.NewPool(pool)
 		tenantService := tenant.NewService(storagePool)
