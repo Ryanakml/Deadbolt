@@ -177,11 +177,15 @@ type CompleteResponseDTO struct {
 // It deliberately includes outcome and the structured error envelope, not just
 // an arbitrary worker-provided output string.
 func CanonicalCompletionDigest(req *CompleteRequestDTO) (string, error) {
+	var errorEnvelope any
+	if req.Error != nil {
+		errorEnvelope = *req.Error
+	}
 	canonical, err := contracts.CanonicalizeGeneric(map[string]any{
 		"outcome":    req.Outcome,
 		"output":     req.Output,
 		"artifactId": req.ArtifactID,
-		"error":      req.Error,
+		"error":      errorEnvelope,
 	})
 	if err != nil {
 		return "", err
