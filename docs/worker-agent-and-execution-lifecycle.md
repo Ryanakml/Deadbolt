@@ -45,7 +45,7 @@ sequenceDiagram
     W->>W: Sign nonce with stored private key
     W->>CP: POST /worker/v1/session (workerId, nonce, signature)
     CP->>DB: Verify signature & active worker status
-    CP->>DB: Revoke old sessions & cancel old leases
+    CP->>DB: Revoke old sessions
     CP-->>W: SessionResponse (sessionId, sessionToken, expiresAt)
 ```
 
@@ -76,9 +76,9 @@ sequenceDiagram
 - Authenticated requests pass the session token via `Authorization: Bearer <sessionToken>`.
 - The agent proactively refreshes its session before expiration.
 - **Revocation**:
-  - Admin/Owner revocation (`POST /api/v1/workers/{workerId}/revoke`) marks the worker `REVOKED`, revokes all active sessions (`revoked_at = clock_timestamp()`), and drops active leases.
+  - Admin/Owner revocation (`POST /api/v1/workers/{workerId}/revoke`) marks the worker `REVOKED` and revokes all active sessions (`revoked_at = clock_timestamp()`).
   - Revoked workers receive HTTP 403 `WORKER_REVOKED` and halt execution immediately.
-  - Reconnecting creates a fresh session; old sessions are revoked and active leases from prior sessions are removed.
+  - Reconnecting creates a fresh session and revokes old sessions. The engine applies resulting attempt loss/recovery under Issue #12.
 
 ---
 
@@ -120,7 +120,8 @@ sequenceDiagram
 - **One Process per Attempt**: Each attempt spawns exactly one isolated Node.js child process group.
 - **Dedicated Result Channel**: The runner writes the authoritative result JSON to a dedicated temporary file specified via `DEADBOLT_RESULT_FILE`.
 - **Log Streaming**: Runner `stdout` and `stderr` are captured separately as unstructured log streams. Arbitrary text printed to stdout is **never parsed as completion**.
-- **Log Batching**: Captured logs are redacted and shipped asynchronously to `POST /worker/v1/logs`.
+- **Bounded stdin**: The serialized runner input is limited to 1 MiB and rejected before a child process is spawned.
+- **Log Batching**: Captured logs retain their existing 1 MiB-per-stream cap. Before transport, every non-empty resolved task-secret value is replaced with `[REDACTED]`; logs remain best-effort and never become results.
 
 ### 3.2 Task Secrets & Environment Allowlisting
 
@@ -141,6 +142,8 @@ sequenceDiagram
 ---
 
 ## 4. Lease Management & Monotonic Fencing
+
+The worker protocol carries the ownership epoch and fails closed when its execution-engine adapter is unavailable. Production claim, Start/heartbeat/Complete transition authority, result commitment, and recovery are owned by Issue #12; Issue #11 does not implement them in the gateway.
 
 1. **Lease TTL and Heartbeat**:
    - Default lease TTL is **30 seconds**.

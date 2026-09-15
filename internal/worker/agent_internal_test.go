@@ -2,9 +2,20 @@ package worker
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveTaskSecretsFailsClosedWhenRequiredSecretIsMissing(t *testing.T) {
@@ -34,4 +45,103 @@ func TestCapturedProcessOutputIsStrictlyBounded(t *testing.T) {
 	if written, err := output.Write([]byte("ignored")); err != nil || written != len("ignored") || output.Len() != maxCapturedOutput {
 		t.Fatalf("writes after cap changed buffer: written=%d len=%d err=%v", written, output.Len(), err)
 	}
+}
+
+func TestOversizedRunnerInputNeverSpawnsChild(t *testing.T) {
+	bundle, err := os.CreateTemp(t.TempDir(), "task-*.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bundle.WriteString("export default async () => ({ ok: true });\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bundle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(bundle.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	supervisor := NewProcessSupervisor("definitely-not-node", "ignored")
+	supervisor.LeaseTracker = NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+	supervisor.StartAckFn = func(context.Context, string, int64) error { return nil }
+	supervisor.MaxRunnerInputBytes = 256
+	started := false
+	supervisor.OnProcessStart = func(int) { started = true }
+
+	_, _, err = supervisor.ExecuteAttempt(context.Background(), &TaskInput{
+		AttemptID: "too-large", Entrypoint: bundle.Name(),
+		Bundle: &BundleSpec{Path: bundle.Name(), SHA256: hex.EncodeToString(digest[:]), TargetArch: CurrentHostArchitecture()},
+		Input:  strings.Repeat("x", 4096),
+	}, 1)
+	if !errors.Is(err, ErrRunnerInputTooLarge) {
+		t.Fatalf("expected oversized runner input to fail before spawn, got %v", err)
+	}
+	if started {
+		t.Fatal("runner child was spawned for oversized serialized input")
+	}
+}
+
+func TestCustomerSecretInChildLogsIsRedactedBeforeControlPlaneTransport(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node binary not found in PATH")
+	}
+	const secret = "sentinel-secret-must-never-reach-control-plane"
+	var received []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		received, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read log transport: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(AckResponseDTO{ProtocolVersion: ProtocolVersion, Accepted: true})
+	}))
+	defer server.Close()
+
+	agent, err := NewAgent(AgentConfig{ControlPlaneURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.workerID, agent.sessionID, agent.sessionTok = "worker", "session", "token"
+	fixture, err := filepath.Abs("../../runner/node/tests/fixtures/print-secret-task.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	supervisor := NewProcessSupervisor("node", mustWorkerRunnerPath(t))
+	supervisor.LeaseTracker = NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+	supervisor.StartAckFn = func(context.Context, string, int64) error { return nil }
+	supervisor.TaskEnvAllowlist = []string{"DEMO_TASK_SECRET"}
+	_, logs, err := supervisor.ExecuteAttempt(context.Background(), &TaskInput{
+		AttemptID: "secret-log", StepID: "step", TaskName: "printSecretTask", Entrypoint: fixture,
+		Bundle: &BundleSpec{Path: fixture, SHA256: hex.EncodeToString(digest[:]), TargetArch: CurrentHostArchitecture()},
+		Env:    map[string]string{"DEMO_TASK_SECRET": secret},
+	}, 1)
+	if err != nil {
+		t.Fatalf("run child that prints secret: %v", err)
+	}
+	if logs == nil || !strings.Contains(logs.Stdout+logs.Stderr, secret) {
+		t.Fatal("test fixture did not emit the task secret into captured logs")
+	}
+	agent.sendLogBatch(context.Background(), "secret-log", logs, map[string]string{"DEMO_TASK_SECRET": secret})
+	if strings.Contains(string(received), secret) {
+		t.Fatalf("control plane log transport received raw task secret: %s", received)
+	}
+	if !strings.Contains(string(received), "[REDACTED]") {
+		t.Fatalf("expected transport to contain a redaction marker, got %s", received)
+	}
+}
+
+func mustWorkerRunnerPath(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.Abs("../../runner/node/dist/index.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

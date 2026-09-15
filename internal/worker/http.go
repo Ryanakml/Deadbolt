@@ -177,6 +177,10 @@ func (h *HTTPHandler) HandlePoll(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.PollAssignments(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrExecutionEngineUnavailable) {
+			h.writeError(w, r, http.StatusServiceUnavailable, "EXECUTION_ENGINE_UNAVAILABLE", "Execution authority is not installed", true)
+			return
+		}
 		if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrSessionRevoked) || errors.Is(err, ErrSessionExpired) {
 			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
 			return
@@ -204,6 +208,10 @@ func (h *HTTPHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.StartAttempt(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrExecutionEngineUnavailable) {
+			h.writeError(w, r, http.StatusServiceUnavailable, "EXECUTION_ENGINE_UNAVAILABLE", "Execution authority is not installed", true)
+			return
+		}
 		if errors.Is(err, ErrUnauthorized) {
 			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
 			return
@@ -239,6 +247,10 @@ func (h *HTTPHandler) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.Heartbeat(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrExecutionEngineUnavailable) {
+			h.writeError(w, r, http.StatusServiceUnavailable, "EXECUTION_ENGINE_UNAVAILABLE", "Execution authority is not installed", true)
+			return
+		}
 		if errors.Is(err, ErrUnauthorized) {
 			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
 			return
@@ -262,6 +274,10 @@ func (h *HTTPHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.CompleteAttempt(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrExecutionEngineUnavailable) {
+			h.writeError(w, r, http.StatusServiceUnavailable, "EXECUTION_ENGINE_UNAVAILABLE", "Execution authority is not installed", true)
+			return
+		}
 		if errors.Is(err, ErrUnauthorized) {
 			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
 			return
@@ -301,6 +317,10 @@ func (h *HTTPHandler) HandleStopAck(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.StopAck(r.Context(), sessionCtx, &req)
 	if err != nil {
+		if errors.Is(err, ErrExecutionEngineUnavailable) {
+			h.writeError(w, r, http.StatusServiceUnavailable, "EXECUTION_ENGINE_UNAVAILABLE", "Execution authority is not installed", true)
+			return
+		}
 		if errors.Is(err, ErrUnauthorized) {
 			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
 			return

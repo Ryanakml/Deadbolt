@@ -248,10 +248,6 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 	var sessionExpiresAt time.Time
 
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		if err := s.engine.FenceWorkerSessions(ctx, tx, orgID, req.WorkerID, "WORKER_RECONNECTED"); err != nil {
-			return fmt.Errorf("fence old worker sessions: %w", err)
-		}
-
 		// Revoke old sessions
 		_, err := tx.Exec(ctx, `UPDATE worker_sessions SET revoked_at = clock_timestamp()
 		                        WHERE worker_id = $1::uuid AND organization_id = $2::uuid AND revoked_at IS NULL`, req.WorkerID, orgID)
@@ -361,6 +357,9 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 	if req.AvailableSlots <= 0 {
 		return &PollResponseDTO{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, Assignments: []AssignmentDTO{}}, nil
 	}
+	if s.engine == nil {
+		return nil, ErrExecutionEngineUnavailable
+	}
 	deadline := time.NewTimer(DefaultPollTimeout)
 	defer deadline.Stop()
 	for {
@@ -408,21 +407,33 @@ func (s *Service) workerAssignmentStatus(ctx context.Context, sessionCtx *Worker
 
 // StartAttempt delegates the authoritative transition to the execution engine.
 func (s *Service) StartAttempt(ctx context.Context, sessionCtx *WorkerSessionContext, req *StartRequestDTO) (*StartResponseDTO, error) {
+	if s.engine == nil {
+		return nil, ErrExecutionEngineUnavailable
+	}
 	return s.engine.Start(ctx, sessionCtx, req)
 }
 
 // Heartbeat delegates lease fencing and renewal to the execution engine.
 func (s *Service) Heartbeat(ctx context.Context, sessionCtx *WorkerSessionContext, req *HeartbeatRequestDTO) (*HeartbeatResponseDTO, error) {
+	if s.engine == nil {
+		return nil, ErrExecutionEngineUnavailable
+	}
 	return s.engine.Heartbeat(ctx, sessionCtx, req)
 }
 
 // CompleteAttempt delegates result commitment to the execution engine.
 func (s *Service) CompleteAttempt(ctx context.Context, sessionCtx *WorkerSessionContext, req *CompleteRequestDTO) (*CompleteResponseDTO, error) {
+	if s.engine == nil {
+		return nil, ErrExecutionEngineUnavailable
+	}
 	return s.engine.Complete(ctx, sessionCtx, req)
 }
 
 // StopAck records process termination confirmation for a stop command.
 func (s *Service) StopAck(ctx context.Context, sessionCtx *WorkerSessionContext, req *StopAckRequestDTO) (*AckResponseDTO, error) {
+	if s.engine == nil {
+		return nil, ErrExecutionEngineUnavailable
+	}
 	return s.engine.StopAck(ctx, sessionCtx, req)
 }
 
@@ -443,9 +454,6 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 // RevokeWorker marks a worker REVOKED and revokes all its active sessions and leases.
 func (s *Service) RevokeWorker(ctx context.Context, orgID, workerID string) error {
 	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		if err := s.engine.FenceWorkerSessions(ctx, tx, orgID, workerID, "WORKER_REVOKED"); err != nil {
-			return err
-		}
 		_, err := tx.Exec(ctx, `UPDATE workers SET status = 'REVOKED' WHERE id = $1::uuid AND organization_id = $2::uuid`, workerID, orgID)
 		if err != nil {
 			return err

@@ -36,10 +36,7 @@ CREATE TABLE worker_challenges (
 
 CREATE INDEX idx_worker_challenges_expires ON worker_challenges (expires_at);
 
--- 3. Task Attempts Start Deadline
-ALTER TABLE task_attempts ADD COLUMN IF NOT EXISTS claim_start_deadline_at TIMESTAMPTZ;
-
--- 4. Worker Security Definer Discovery Functions
+-- 3. Worker Security Definer Discovery Functions
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION app.consume_enrollment_token(p_token_hash TEXT)
 RETURNS TABLE (
@@ -147,6 +144,5 @@ END $$;
 DROP FUNCTION IF EXISTS app.lookup_worker_for_session(TEXT) CASCADE;
 DROP FUNCTION IF EXISTS app.authenticate_worker_session(TEXT) CASCADE;
 DROP FUNCTION IF EXISTS app.consume_enrollment_token(TEXT) CASCADE;
-ALTER TABLE task_attempts DROP COLUMN IF EXISTS claim_start_deadline_at;
 DROP TABLE IF EXISTS worker_challenges;
 DROP TABLE IF EXISTS worker_enrollments CASCADE;

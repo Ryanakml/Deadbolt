@@ -8,7 +8,6 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/deployment"
-	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -40,7 +39,9 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 		mux.Handle("POST /api/v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 		mux.Handle("POST /v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 
-		workerSvc := worker.NewService(storagePool, deploymentSvc, execution.NewWorkerEngine(storagePool))
+		// The worker gateway owns authenticated transport. The execution engine is
+		// injected by Issue #12; until then these assignment endpoints fail closed.
+		workerSvc := worker.NewService(storagePool, deploymentSvc, nil)
 		workerHandler := worker.NewHTTPHandler(workerSvc, tenantService)
 		workerHandler.RegisterRoutes(mux)
 

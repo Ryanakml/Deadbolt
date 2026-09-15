@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -24,9 +25,15 @@ var (
 	ErrStartAuthorityMissing  = errors.New("START_AUTHORITY_REQUIRED: customer code cannot run without a Start verifier")
 	ErrLeaseAuthorityMissing  = errors.New("LEASE_AUTHORITY_REQUIRED: customer code cannot run without a lease tracker")
 	ErrBundleEntrypoint       = errors.New("BUNDLE_ENTRYPOINT_MISMATCH: verified artifact is not the requested entrypoint")
+	ErrRunnerInputTooLarge    = errors.New("RUNNER_INPUT_TOO_LARGE: serialized runner input exceeds the configured limit")
 )
 
 type ExecutionLogs struct{ Stdout, Stderr string }
+
+// MaxSerializedRunnerInputBytes bounds the JSON payload sent over a runner's
+// stdin. It applies before the child process exists, so an oversized payload
+// cannot consume a runner slot or block on a pipe.
+const MaxSerializedRunnerInputBytes = 1 << 20
 
 // ProcessSupervisor is deliberately a bounded lifecycle harness, not a worker
 // service. Gateway callbacks stand in for the future authenticated transport.
@@ -40,6 +47,7 @@ type ProcessSupervisor struct {
 	OnProcessStart                  func(pid int) // test-only observation hook
 	ResultDir                       string        // optional test-owned directory for result cleanup assertions
 	AllowlistKeys, TaskEnvAllowlist []string
+	MaxRunnerInputBytes             int
 }
 
 func NewProcessSupervisor(nodePath, runnerPath string) *ProcessSupervisor {
@@ -49,6 +57,7 @@ func NewProcessSupervisor(nodePath, runnerPath string) *ProcessSupervisor {
 	return &ProcessSupervisor{
 		NodePath: nodePath, RunnerPath: runnerPath, GracePeriod: 10 * time.Second,
 		LeaseCheckInterval: 100 * time.Millisecond, AllowlistKeys: []string{"NODE_ENV", "DEADBOLT_ENV"},
+		MaxRunnerInputBytes: MaxSerializedRunnerInputBytes,
 	}
 }
 
@@ -259,6 +268,19 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 	if err := ValidateTaskEnvironment(input.Env, s.TaskEnvAllowlist); err != nil {
 		return nil, nil, err
 	}
+	runnerInput := *input
+	runnerInput.Entrypoint = verifiedEntrypoint
+	inputBytes, err := json.Marshal(&runnerInput)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode input: %w", err)
+	}
+	maxInputBytes := s.MaxRunnerInputBytes
+	if maxInputBytes <= 0 {
+		maxInputBytes = MaxSerializedRunnerInputBytes
+	}
+	if len(inputBytes) > maxInputBytes {
+		return nil, nil, fmt.Errorf("%w: got %d bytes, limit %d", ErrRunnerInputTooLarge, len(inputBytes), maxInputBytes)
+	}
 
 	if input.TimeoutMs > 0 {
 		var cancel context.CancelFunc
@@ -292,13 +314,6 @@ func (s *ProcessSupervisor) ExecuteAttempt(ctx context.Context, input *TaskInput
 	pid := cmd.Process.Pid
 	if s.OnProcessStart != nil {
 		s.OnProcessStart(pid)
-	}
-	runnerInput := *input
-	runnerInput.Entrypoint = verifiedEntrypoint
-	inputBytes, err := json.Marshal(&runnerInput)
-	if err != nil {
-		_ = cmd.Process.Kill()
-		return nil, nil, fmt.Errorf("encode input: %w", err)
 	}
 	if _, err := stdin.Write(inputBytes); err != nil {
 		_ = cmd.Process.Kill()
@@ -384,6 +399,37 @@ done:
 }
 
 const maxCapturedOutput = 1 << 20
+
+// RedactExecutionLogs removes resolved task-secret values before logs leave a
+// customer worker. Empty values are intentionally ignored: replacing an empty
+// string would corrupt every log line without protecting a secret.
+func RedactExecutionLogs(logs *ExecutionLogs, secrets map[string]string) *ExecutionLogs {
+	if logs == nil || len(secrets) == 0 {
+		return logs
+	}
+	values := make([]string, 0, len(secrets))
+	seen := make(map[string]struct{}, len(secrets))
+	for _, value := range secrets {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	// Redact longer values first so a shorter secret cannot leave a suffix of a
+	// longer one exposed.
+	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	redact := func(value string) string {
+		for _, secret := range values {
+			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		}
+		return value
+	}
+	return &ExecutionLogs{Stdout: redact(logs.Stdout), Stderr: redact(logs.Stderr)}
+}
 
 type cappedBuffer struct {
 	bytes.Buffer

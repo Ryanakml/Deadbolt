@@ -442,7 +442,7 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 
 	// 5. Send logs to control plane
 	if logs != nil && (logs.Stdout != "" || logs.Stderr != "") {
-		a.sendLogBatch(attCtx, assignment.AttemptID, logs)
+		a.sendLogBatch(attCtx, assignment.AttemptID, logs, secretEnv)
 	}
 
 	// 6. Complete request
@@ -593,7 +593,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context, attemptID string, epoch int64
 	}
 }
 
-func (a *Agent) sendLogBatch(ctx context.Context, attemptID string, logs *ExecutionLogs) {
+func (a *Agent) sendLogBatch(ctx context.Context, attemptID string, logs *ExecutionLogs, resolvedSecrets map[string]string) {
+	logs = RedactExecutionLogs(logs, resolvedSecrets)
 	records := make([]LogRecordDTO, 0)
 	now := time.Now().UTC().Format(time.RFC3339)
 	var seq int64 = 1
