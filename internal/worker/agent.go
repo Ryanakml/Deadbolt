@@ -676,7 +676,9 @@ func (a *Agent) handleWorkerRevoked() {
 	a.mu.Unlock()
 	a.cfg.Logger.Printf("Worker revoked by control plane. Stopping immediately.")
 	a.stopOnce.Do(func() { close(a.stopPoll) })
-	a.stopAllRunners()
+	// Process-group shutdown can wait through its grace period. Start it now but
+	// never hold the terminal revocation signal behind that wait.
+	go a.stopAllRunners()
 }
 
 func (a *Agent) listAvailableDigests() []string {
