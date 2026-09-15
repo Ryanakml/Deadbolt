@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -728,12 +727,14 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: server.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(io.Discard, "", 0)})
+	var agentLogs bytes.Buffer
+	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: server.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(&agentLogs, "", 0)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { _ = agent.Start(ctx) }()
+	agentDone := make(chan struct{})
+	go func() { defer close(agentDone); _ = agent.Start(ctx) }()
+	defer func() { cancel(); <-agentDone }()
 
 	createBody, _ := json.Marshal(map[string]any{"environment": "staging", "input": map[string]any{"value": "agent"}})
 	createReq, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/workflows/agent-linear/runs", bytes.NewReader(createBody))
@@ -764,7 +765,8 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("actual agent/node child did not complete run before deadline")
+	snapshot, _ := execution.NewService(tc.pool, tc.service).GetRun(context.Background(), orgID, run.ID)
+	t.Fatalf("actual agent/node child did not complete run before deadline: snapshot=%+v agentLogs=%s", snapshot, agentLogs.String())
 }
 
 func startNode(t *testing.T, server *httptest.Server, session *testWorkerSession, attemptID string, epoch int64) {
