@@ -159,6 +159,7 @@ func TestHeartbeatRevocationTerminatesActiveRunnerAndAgentFailsClosed(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	agent.supervisor.GracePeriod = 100 * time.Millisecond
 	agent.workerID, agent.sessionID, agent.sessionTok = "worker", "session", "token"
 	agent.expiresAt = time.Now().Add(time.Hour)
 	cmd := exec.Command("sh", "-c", "sleep 30")
