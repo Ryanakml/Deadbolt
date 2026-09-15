@@ -242,6 +242,57 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				return fmt.Errorf("decode deployment manifest: %w", err)
 			}
 			entrypoint, timeoutMs := manifest.taskPolicy(match.workflowName, match.nodeID)
+			assignmentInput := match.input
+			var targetNode *workflowNode
+			for _, wf := range manifest.Workflows {
+				if wf.Name != match.workflowName {
+					continue
+				}
+				for i := range wf.Nodes {
+					if wf.Nodes[i].ID == match.nodeID {
+						targetNode = &wf.Nodes[i]
+						break
+					}
+				}
+				break
+			}
+			if targetNode != nil && targetNode.Input != nil {
+				outRows, err := tx.Query(ctx, `SELECT node_id, output FROM run_steps
+					WHERE run_id=$1::uuid AND organization_id=$2::uuid AND output IS NOT NULL`,
+					match.runID, session.OrganizationID)
+				if err != nil {
+					return fmt.Errorf("load mapped step outputs: %w", err)
+				}
+				outputsMap := make(map[string]any)
+				for outRows.Next() {
+					var nodeID string
+					var rawOutput []byte
+					if err := outRows.Scan(&nodeID, &rawOutput); err != nil {
+						outRows.Close()
+						return err
+					}
+					var output any
+					if err := json.Unmarshal(rawOutput, &output); err != nil {
+						outRows.Close()
+						return fmt.Errorf("decode mapped step output: %w", err)
+					}
+					outputsMap[nodeID] = output
+				}
+				if err := outRows.Err(); err != nil {
+					outRows.Close()
+					return err
+				}
+				outRows.Close()
+				mapped, err := contracts.MapInput(targetNode.Input, match.input, outputsMap)
+				if err != nil {
+					return fmt.Errorf("map task input: %w", err)
+				}
+				inputSchema, _ := manifest.taskSchemas(match.workflowName, match.nodeID)
+				if inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil {
+					return fmt.Errorf("map task input: %w", ErrSchemaViolation)
+				}
+				assignmentInput = mapped
+			}
 
 			var epoch int64
 			var attemptNumber int
@@ -278,42 +329,6 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			runDeadline := ""
 			if match.runDeadline != nil {
 				runDeadline = match.runDeadline.UTC().Format(time.RFC3339Nano)
-			}
-
-			assignmentInput := match.input
-			var targetNode *workflowNode
-			for _, wf := range manifest.Workflows {
-				if wf.Name == match.workflowName {
-					for i := range wf.Nodes {
-						if wf.Nodes[i].ID == match.nodeID {
-							targetNode = &wf.Nodes[i]
-							break
-						}
-					}
-					break
-				}
-			}
-			if targetNode != nil && targetNode.Input != nil {
-				outRows, oErr := tx.Query(ctx, `SELECT node_id, output FROM run_steps
-					WHERE run_id=$1::uuid AND organization_id=$2::uuid AND output IS NOT NULL`,
-					match.runID, session.OrganizationID)
-				if oErr == nil {
-					outputsMap := make(map[string]any)
-					for outRows.Next() {
-						var nID string
-						var rawOut []byte
-						if scanErr := outRows.Scan(&nID, &rawOut); scanErr == nil && len(rawOut) > 0 {
-							var stepOut any
-							if json.Unmarshal(rawOut, &stepOut) == nil {
-								outputsMap[nID] = stepOut
-							}
-						}
-					}
-					outRows.Close()
-					if mapped, mapErr := contracts.MapInput(targetNode.Input, match.input, outputsMap); mapErr == nil {
-						assignmentInput = mapped
-					}
-				}
 			}
 
 			assignments = append(assignments, worker.AssignmentDTO{
@@ -518,6 +533,12 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 	if !validOutcome(req.Outcome) {
 		return nil, worker.ErrInvalidOutcome
 	}
+	if req.Output != nil {
+		canonicalOutput, err := contracts.CanonicalizeGeneric(req.Output)
+		if err != nil || len(canonicalOutput) > worker.MaxInlinePayloadBytes {
+			return nil, worker.ErrPayloadTooLarge
+		}
+	}
 	computedDigest, err := worker.CanonicalCompletionDigest(req)
 	if err != nil || req.ResultDigest != computedDigest {
 		return nil, worker.ErrResultConflict
@@ -546,7 +567,10 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 			return worker.ErrStaleOwnership
 		}
 		if terminalAttempt(status) {
-			if status == req.Outcome && storedDigest != nil && *storedDigest == req.ResultDigest {
+			// Stored digest names the submitted result, while status names the
+			// engine decision after schema validation. A deterministic validation
+			// failure must still ACK an identical authorized delivery.
+			if storedDigest != nil && *storedDigest == req.ResultDigest {
 				return nil
 			}
 			return worker.ErrResultConflict
@@ -770,7 +794,10 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 							}
 							return appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{"reason": "OUTPUT_SCHEMA_VIOLATION"})
 						}
-						finalJSON, _ := json.Marshal(finalOutput)
+						finalJSON, err := contracts.CanonicalizeGeneric(finalOutput)
+						if err != nil || len(finalJSON) > worker.MaxInlinePayloadBytes {
+							return worker.ErrPayloadTooLarge
+						}
 						if _, err := tx.Exec(ctx, `UPDATE runs SET status='SUCCEEDED',output=$1::jsonb,reason_code=NULL,updated_at=clock_timestamp()
 							WHERE id=$2::uuid AND organization_id=$3::uuid`, string(finalJSON), runID, session.OrganizationID); err != nil {
 							return err

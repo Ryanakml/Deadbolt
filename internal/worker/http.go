@@ -290,6 +290,10 @@ func (h *HTTPHandler) HandleComplete(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, r, http.StatusBadRequest, "INVALID_OUTCOME", err.Error(), false)
 			return
 		}
+		if errors.Is(err, ErrPayloadTooLarge) {
+			h.writeError(w, r, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "Inline result exceeds 256 KiB", false)
+			return
+		}
 		if errors.Is(err, ErrResultConflict) {
 			h.writeError(w, r, http.StatusConflict, "RESULT_CONFLICT", err.Error(), false)
 			return

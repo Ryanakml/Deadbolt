@@ -10,6 +10,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
+	"github.com/Ryanakml/Deadbolt/internal/worker"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -25,7 +26,7 @@ var (
 	ErrPayloadTooLarge       = errors.New("PAYLOAD_TOO_LARGE: Inline JSON payload exceeds 256 KiB")
 )
 
-const maxInlinePayloadBytes = 256 << 10
+const maxInlinePayloadBytes = worker.MaxInlinePayloadBytes
 
 type Service struct {
 	pool    *storage.Pool

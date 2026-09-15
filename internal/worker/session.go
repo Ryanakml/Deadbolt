@@ -25,7 +25,10 @@ var (
 	ErrLeaseExpiredServer    = errors.New("LEASE_EXPIRED: Lease has expired on the control plane")
 	ErrResultConflict        = errors.New("RESULT_CONFLICT: Attempt already has a different terminal result")
 	ErrInvalidOutcome        = errors.New("INVALID_OUTCOME: Attempt outcome is not supported")
+	ErrPayloadTooLarge       = errors.New("PAYLOAD_TOO_LARGE: Inline result exceeds 256 KiB")
 )
+
+const MaxInlinePayloadBytes = 256 << 10
 
 const (
 	SessionTTL         = 15 * time.Minute
