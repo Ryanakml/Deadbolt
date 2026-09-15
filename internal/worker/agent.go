@@ -42,6 +42,10 @@ type AgentConfig struct {
 	TaskEnvAllowlist  []string
 	DrainGracePeriod  time.Duration
 	Logger            *log.Logger
+	// HTTPClient is optional. A nil client preserves the production default.
+	HTTPClient *http.Client
+	// OnTaskProcessStart is an optional observation hook for integration tests.
+	OnTaskProcessStart func()
 }
 
 type activeAttempt struct {
@@ -117,9 +121,14 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 	supervisor := NewProcessSupervisor(cfg.NodePath, cfg.RunnerPath)
 	supervisor.TaskEnvAllowlist = cfg.TaskEnvAllowlist
 
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
 	return &Agent{
 		cfg:             cfg,
-		client:          &http.Client{Timeout: 30 * time.Second},
+		client:          client,
 		baseURL:         parsedURL,
 		poolName:        cfg.Pool,
 		supervisor:      supervisor,
@@ -460,6 +469,9 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		a.mu.Lock()
 		active.pid = pid
 		a.mu.Unlock()
+		if a.cfg.OnTaskProcessStart != nil {
+			a.cfg.OnTaskProcessStart()
+		}
 	}
 
 	completion, logs, execErr := sup.ExecuteAttempt(attCtx, taskInput, assignment.OwnershipEpoch)

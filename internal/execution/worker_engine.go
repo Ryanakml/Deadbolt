@@ -24,6 +24,7 @@ const defaultAttemptTimeout = 5 * time.Minute
 type WorkerEngine struct {
 	pool                 *storage.Pool
 	beforeCompleteCommit func() error
+	afterCompleteCommit  func() error
 }
 
 func NewWorkerEngine(pool *storage.Pool) *WorkerEngine {
@@ -35,6 +36,12 @@ func NewWorkerEngine(pool *storage.Pool) *WorkerEngine {
 // commit. Production constructors leave it nil.
 func (e *WorkerEngine) SetBeforeCompleteCommitHookForTest(hook func() error) {
 	e.beforeCompleteCommit = hook
+}
+
+// SetAfterCompleteCommitHookForTest injects a caller-visible failure only after
+// Complete has committed. Production constructors leave it nil.
+func (e *WorkerEngine) SetAfterCompleteCommitHookForTest(hook func() error) {
+	e.afterCompleteCommit = hook
 }
 
 type workflowNode struct {
@@ -856,6 +863,11 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 	})
 	if err != nil {
 		return nil, err
+	}
+	if e.afterCompleteCommit != nil {
+		if err := e.afterCompleteCommit(); err != nil {
+			return nil, err
+		}
 	}
 	return &worker.CompleteResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID,
 		AttemptID: req.AttemptID, OwnershipEpoch: req.OwnershipEpoch, Accepted: true, ResultDigest: req.ResultDigest}, nil

@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,12 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
 
 func writeAgentBundle(t *testing.T, dir string) string {
 	t.Helper()
@@ -706,48 +713,50 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "agent-linear", manifest)
 	var completeMu sync.Mutex
 	completeRequests := make([]worker.CompleteRequestDTO, 0, 2)
-	dropFirstCompleteResponse := true
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
+	dropFirstCompleteAck := true
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	defer transport.CloseIdleConnections()
+	faultClient := &http.Client{Timeout: 30 * time.Second, Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/worker/v1/complete" {
+			return transport.RoundTrip(req)
+		}
+		body, err := io.ReadAll(req.Body)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+			return nil, err
 		}
-		backendRequest, err := http.NewRequestWithContext(r.Context(), r.Method, server.URL+r.URL.RequestURI(), bytes.NewReader(body))
+		if err := req.Body.Close(); err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+
+		response, err := transport.RoundTrip(req)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, err
 		}
-		backendRequest.Header = r.Header.Clone()
-		backendResponse, err := http.DefaultClient.Do(backendRequest)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
+		var completion worker.CompleteRequestDTO
+		if err := json.Unmarshal(body, &completion); err != nil {
+			response.Body.Close()
+			return nil, err
 		}
-		defer backendResponse.Body.Close()
-		if r.URL.Path == "/worker/v1/complete" {
-			var completion worker.CompleteRequestDTO
-			if json.Unmarshal(body, &completion) == nil {
-				completeMu.Lock()
-				completeRequests = append(completeRequests, completion)
-				drop := dropFirstCompleteResponse
-				dropFirstCompleteResponse = false
-				completeMu.Unlock()
-				if drop {
-					_, _ = io.Copy(io.Discard, backendResponse.Body)
-					return
-				}
-			}
+		completeMu.Lock()
+		completeRequests = append(completeRequests, completion)
+		drop := dropFirstCompleteAck
+		if drop && response.StatusCode < http.StatusBadRequest {
+			dropFirstCompleteAck = false
+		} else {
+			drop = false
 		}
-		for key, values := range backendResponse.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
+		completeMu.Unlock()
+		if !drop {
+			return response, nil
 		}
-		w.WriteHeader(backendResponse.StatusCode)
-		_, _ = io.Copy(w, backendResponse.Body)
-	}))
-	defer proxy.Close()
+
+		// The handler has returned a successful response, so the control-plane
+		// transaction is committed. Only the caller's ACK is now lost.
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return nil, errors.New("injected COMPLETE ACK loss after backend commit")
+	})}
 
 	// Issue a real enrollment token; Agent owns challenge/enroll/session itself.
 	enrollBody, _ := json.Marshal(map[string]any{"poolName": "default"})
@@ -774,7 +783,8 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var agentLogs bytes.Buffer
-	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: proxy.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(&agentLogs, "", 0)})
+	var childLaunches atomic.Int32
+	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: server.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(&agentLogs, "", 0), HTTPClient: faultClient, OnTaskProcessStart: func() { childLaunches.Add(1) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,20 +818,42 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 				t.Fatalf("unexpected agent child output: %+v", snapshot.Output)
 			}
 			completeMu.Lock()
-			defer completeMu.Unlock()
-			if len(completeRequests) < 2 {
-				t.Fatalf("expected Agent retry after lost ACK, got %d Complete requests", len(completeRequests))
+			requests := append([]worker.CompleteRequestDTO(nil), completeRequests...)
+			completeMu.Unlock()
+			if len(requests) != 2 {
+				t.Fatalf("expected exactly two Complete requests after lost ACK, got %d; childLaunches=%d agentLogs=%s", len(requests), childLaunches.Load(), agentLogs.String())
 			}
-			first, second := completeRequests[0], completeRequests[1]
+			first, second := requests[0], requests[1]
 			if first.AttemptID != second.AttemptID || first.OwnershipEpoch != second.OwnershipEpoch || first.Outcome != second.Outcome || first.ResultDigest != second.ResultDigest || !reflect.DeepEqual(first.Output, second.Output) || !reflect.DeepEqual(first.Error, second.Error) {
 				t.Fatalf("Agent ACK-loss retry changed result identity: first=%+v second=%+v", first, second)
+			}
+			if childLaunches.Load() != 1 {
+				t.Fatalf("expected exactly one Node child execution, got %d; completes=%d agentLogs=%s", childLaunches.Load(), len(requests), agentLogs.String())
+			}
+			var terminalAttempts, releasedLeases, taskCompleted, runCompleted, taskOutbox, runOutbox int
+			if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+				return tx.QueryRow(ctx, `SELECT
+					(SELECT count(*) FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id WHERE rs.run_id=$1::uuid AND a.status IN ('SUCCEEDED','FAILED','CANCELLED')),
+					(SELECT count(*) FROM task_leases l JOIN task_attempts a ON a.id=l.attempt_id JOIN run_steps rs ON rs.id=a.step_id WHERE rs.run_id=$1::uuid),
+					(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_COMPLETED'),
+					(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='RUN_COMPLETED'),
+					(SELECT count(*) FROM outbox_events WHERE payload->>'runId'=$1::text AND payload->>'eventType'='TASK_COMPLETED'),
+					(SELECT count(*) FROM outbox_events WHERE payload->>'runId'=$1::text AND payload->>'eventType'='RUN_COMPLETED')`, run.ID).Scan(&terminalAttempts, &releasedLeases, &taskCompleted, &runCompleted, &taskOutbox, &runOutbox)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if terminalAttempts != 1 || releasedLeases != 0 || taskCompleted != 1 || runCompleted != 1 || taskOutbox != 1 || runOutbox != 1 {
+				t.Fatalf("ACK-loss retry duplicated durable effects: terminalAttempts=%d leases=%d taskCompleted=%d runCompleted=%d taskOutbox=%d runOutbox=%d", terminalAttempts, releasedLeases, taskCompleted, runCompleted, taskOutbox, runOutbox)
 			}
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	snapshot, _ := execution.NewService(tc.pool, tc.service).GetRun(context.Background(), orgID, run.ID)
-	t.Fatalf("actual agent/node child did not complete run before deadline: snapshot=%+v agentLogs=%s", snapshot, agentLogs.String())
+	completeMu.Lock()
+	completeCount := len(completeRequests)
+	completeMu.Unlock()
+	t.Fatalf("actual agent/node child did not complete run before deadline: run=%s snapshot=%+v completes=%d childLaunches=%d agentLogs=%s", run.ID, snapshot, completeCount, childLaunches.Load(), agentLogs.String())
 }
 
 func startNode(t *testing.T, server *httptest.Server, session *testWorkerSession, attemptID string, epoch int64) {

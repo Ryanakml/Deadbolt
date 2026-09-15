@@ -132,6 +132,56 @@ func TestCompletionPreCommitFailureRollsBack(t *testing.T) {
 	}
 }
 
+// TestCompletionPostCommitFailureReplaysWithoutDuplicateEffects proves the
+// caller can lose an ACK after the database commits and safely resend the exact
+// completion without creating another terminal transition or outbox emission.
+func TestCompletionPostCommitFailureReplaysWithoutDuplicateEffects(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "completion-postcommit")
+	const digest = "bundle-postcommit"
+	deploymentID := seedExecutionDeployment(t, tc, orgID, envID, digest)
+	runID, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	assignment := claimExecution(t, server, session, digest, "postcommit-claim")
+	startNode(t, server, session, assignment.AttemptID, assignment.OwnershipEpoch)
+	completion := worker.CompleteRequestDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: "postcommit-complete", WorkerID: session.WorkerID, SessionID: session.SessionID, AttemptID: assignment.AttemptID, OwnershipEpoch: assignment.OwnershipEpoch, Outcome: "SUCCEEDED", Output: map[string]any{"ok": true}}
+	completion.ResultDigest, _ = worker.CanonicalCompletionDigest(&completion)
+	engine := execution.NewWorkerEngine(tc.pool)
+	engine.SetAfterCompleteCommitHookForTest(func() error { return errors.New("injected postcommit ACK loss") })
+	workerContext := &worker.WorkerSessionContext{SessionID: session.SessionID, WorkerID: session.WorkerID, OrganizationID: orgID, EnvironmentID: envID, PoolName: "default"}
+	if _, err := engine.Complete(context.Background(), workerContext, &completion); err == nil {
+		t.Fatal("expected injected postcommit failure")
+	}
+
+	assertPostCommitEffects := func() {
+		t.Helper()
+		var terminalAttempts, releasedLeases, taskCompleted, runCompleted, taskOutbox, runOutbox int
+		if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT
+				(SELECT count(*) FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id WHERE rs.run_id=$1::uuid AND a.status IN ('SUCCEEDED','FAILED','CANCELLED')),
+				(SELECT count(*) FROM task_leases l JOIN task_attempts a ON a.id=l.attempt_id JOIN run_steps rs ON rs.id=a.step_id WHERE rs.run_id=$1::uuid),
+				(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_COMPLETED'),
+				(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='RUN_COMPLETED'),
+				(SELECT count(*) FROM outbox_events WHERE payload->>'runId'=$1::text AND payload->>'eventType'='TASK_COMPLETED'),
+				(SELECT count(*) FROM outbox_events WHERE payload->>'runId'=$1::text AND payload->>'eventType'='RUN_COMPLETED')`, runID).Scan(&terminalAttempts, &releasedLeases, &taskCompleted, &runCompleted, &taskOutbox, &runOutbox)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if terminalAttempts != 1 || releasedLeases != 0 || taskCompleted != 1 || runCompleted != 1 || taskOutbox != 1 || runOutbox != 1 {
+			t.Fatalf("postcommit replay duplicated durable effects: terminalAttempts=%d leases=%d taskCompleted=%d runCompleted=%d taskOutbox=%d runOutbox=%d", terminalAttempts, releasedLeases, taskCompleted, runCompleted, taskOutbox, runOutbox)
+		}
+	}
+	assertPostCommitEffects()
+
+	engine.SetAfterCompleteCommitHookForTest(nil)
+	accepted, err := engine.Complete(context.Background(), workerContext, &completion)
+	if err != nil || !accepted.Accepted {
+		t.Fatalf("replay after postcommit failure rejected: response=%+v err=%v", accepted, err)
+	}
+	assertPostCommitEffects()
+}
+
 func enrollExecutionWorker(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID, suffix string) (*testWorkerSession, *tenant.GeneratedKey) {
 	t.Helper()
 	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapDeploymentsWrite, tenant.CapWorkersDrain, tenant.CapAdminKey})
