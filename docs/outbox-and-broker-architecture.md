@@ -60,25 +60,25 @@ CREATE INDEX idx_outbox_events_pending ON outbox_events (next_at) WHERE publishe
 
 ### 3.1 Stream Topology
 
-| Parameter | Value | Rationale |
-| :--- | :--- | :--- |
-| **Stream Name** | `RUNTIME_WAKEUP` | Internal control plane stream. |
-| **Subjects** | `runtime.v1.wakeup.>` | Versioned subject hierarchy (Blueprint §19.1). |
-| **Default Subject** | `runtime.v1.wakeup.default` | Default shard subject. |
-| **Storage Type** | File storage (`FileStorage`) | Durable on-disk spooling across broker restarts. |
-| **Retention Policy** | `WorkQueue` | Messages are removed from the stream once consumed. |
-| **Duplicates Window** | 2 minutes (`120s`) | Deduplicates retried publishes with the same `Nats-Msg-Id`. |
-| **Discard Policy** | `DiscardOld` | Drops oldest messages if bounded stream limits are reached. |
-| **Max Message Age** | 24 hours | Stale hints expire; PostgreSQL reconciler remains authoritative. |
+| Parameter             | Value                        | Rationale                                                        |
+| :-------------------- | :--------------------------- | :--------------------------------------------------------------- |
+| **Stream Name**       | `RUNTIME_WAKEUP`             | Internal control plane stream.                                   |
+| **Subjects**          | `runtime.v1.wakeup.>`        | Versioned subject hierarchy (Blueprint §19.1).                   |
+| **Default Subject**   | `runtime.v1.wakeup.default`  | Default shard subject.                                           |
+| **Storage Type**      | File storage (`FileStorage`) | Durable on-disk spooling across broker restarts.                 |
+| **Retention Policy**  | `WorkQueue`                  | Messages are removed from the stream once consumed.              |
+| **Duplicates Window** | 2 minutes (`120s`)           | Deduplicates retried publishes with the same `Nats-Msg-Id`.      |
+| **Discard Policy**    | `DiscardOld`                 | Drops oldest messages if bounded stream limits are reached.      |
+| **Max Message Age**   | 24 hours                     | Stale hints expire; PostgreSQL reconciler remains authoritative. |
 
 ### 3.2 Consumer Configuration
 
-| Parameter | Value | Rationale |
-| :--- | :--- | :--- |
-| **Consumer Name** | `runtime-controlplane-wakeup` | Durable push/queue consumer on `runtime.v1.wakeup.>`. |
-| **Ack Policy** | `AckExplicit` | Consumer explicitly calls `msg.Ack()` only after DB scan finishes. |
-| **Ack Wait** | 10 seconds | Unacknowledged messages are redelivered after 10s. |
-| **Max Deliver** | 5 | Prevents poisonous retry loops; dead work is re-discovered by DB reconciler. |
+| Parameter         | Value                         | Rationale                                                                    |
+| :---------------- | :---------------------------- | :--------------------------------------------------------------------------- |
+| **Consumer Name** | `runtime-controlplane-wakeup` | Durable push/queue consumer on `runtime.v1.wakeup.>`.                        |
+| **Ack Policy**    | `AckExplicit`                 | Consumer explicitly calls `msg.Ack()` only after DB scan finishes.           |
+| **Ack Wait**      | 10 seconds                    | Unacknowledged messages are redelivered after 10s.                           |
+| **Max Deliver**   | 5                             | Prevents poisonous retry loops; dead work is re-discovered by DB reconciler. |
 
 ### 3.3 Message Payload Contract (`WakeupHintDTO`)
 
@@ -122,11 +122,13 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
 ### 5.1 Symptom: High Outbox Age (`outbox_age_seconds > 60s`)
 
 **Causes:**
+
 1. NATS JetStream broker is unreachable or restarted.
 2. Control-plane dispatcher loop crashed or hung.
 3. Database lock contention on `outbox_events`.
 
 **Verification:**
+
 1. Check `/readyz` endpoint:
    ```bash
    curl -s http://127.0.0.1:8080/readyz | jq .
@@ -148,6 +150,7 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
    ```
 
 **Remediation:**
+
 1. If NATS is degraded, check broker logs and restart NATS service:
    ```bash
    docker compose logs nats
@@ -164,20 +167,24 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
 ### 5.2 Symptom: JetStream Broker Redelivery Spikes
 
 **Causes:**
+
 1. Consumer DB scan takes longer than `AckWait` (10s), causing JetStream to redeliver the message.
 2. Network timeout between consumer and broker.
 
 **Verification:**
+
 1. Check slow queries on `run_steps` and `runs`.
 2. Verify database connection pool saturation.
 
 **Remediation:**
+
 1. Check query plans for candidate scans (`idx_runs_env_status_created`, `idx_outbox_events_pending`).
 2. Singular claim invariants guarantee that redeliveries do NOT cause duplicate worker execution (`INV-03`).
 
 ### 5.3 Broker Total Loss Recovery (`INV-11`)
 
 If NATS JetStream storage volume is completely corrupted or destroyed:
+
 1. Re-create the stream:
    The control plane automatically recreates `RUNTIME_WAKEUP` on boot via `outbox.EnsureStream()`.
 2. Outstanding un-published outbox entries in PostgreSQL are preserved and will be published.
