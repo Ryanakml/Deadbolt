@@ -67,7 +67,9 @@ type Agent struct {
 	mu              sync.RWMutex
 	runningAttempts map[string]*activeAttempt
 	draining        bool
+	revoked         bool
 	stopPoll        chan struct{}
+	stopOnce        sync.Once
 	slotsChan       chan struct{}
 }
 
@@ -276,6 +278,9 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-a.stopPoll:
+			if a.isRevoked() {
+				return ErrWorkerRevoked
+			}
 			return nil
 		default:
 		}
@@ -296,7 +301,16 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 
 		availableSlots := a.cfg.Slots - len(a.slotsChan)
 		if availableSlots <= 0 {
-			time.Sleep(200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-a.stopPoll:
+				if a.isRevoked() {
+					return ErrWorkerRevoked
+				}
+				return nil
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
 		}
 
@@ -315,8 +329,7 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 		cancelPoll()
 		if err != nil {
 			if errors.Is(err, ErrWorkerRevoked) {
-				a.cfg.Logger.Printf("Worker revoked by control plane. Stopping immediately.")
-				a.stopAllRunners()
+				a.handleWorkerRevoked()
 				return ErrWorkerRevoked
 			}
 			time.Sleep(2 * time.Second)
@@ -370,6 +383,10 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 
 	startRes, err := a.startWithRetry(attCtx, startReq)
 	if err != nil {
+		if errors.Is(err, ErrWorkerRevoked) {
+			a.handleWorkerRevoked()
+			return
+		}
 		a.cfg.Logger.Printf("Start rejected for attempt %s: %v", assignment.AttemptID, err)
 		return
 	}
@@ -439,10 +456,16 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	}
 
 	completion, logs, execErr := sup.ExecuteAttempt(attCtx, taskInput, assignment.OwnershipEpoch)
+	if a.isRevoked() {
+		return
+	}
 
 	// 5. Send logs to control plane
 	if logs != nil && (logs.Stdout != "" || logs.Stderr != "") {
-		a.sendLogBatch(attCtx, assignment.AttemptID, logs, secretEnv)
+		if err := a.sendLogBatch(attCtx, assignment.AttemptID, logs, secretEnv); errors.Is(err, ErrWorkerRevoked) {
+			a.handleWorkerRevoked()
+			return
+		}
 	}
 
 	// 6. Complete request
@@ -490,7 +513,9 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		}
 	}
 
-	_, _ = a.complete(attCtx, compReq)
+	if _, err := a.complete(attCtx, compReq); errors.Is(err, ErrWorkerRevoked) {
+		a.handleWorkerRevoked()
+	}
 }
 
 func resolveTaskSecrets(names []string) (map[string]string, error) {
@@ -511,6 +536,9 @@ func (a *Agent) startWithRetry(ctx context.Context, req *StartRequestDTO) (*Star
 		res, err := a.start(ctx, req)
 		if err == nil {
 			return res, nil
+		}
+		if errors.Is(err, ErrWorkerRevoked) {
+			return nil, err
 		}
 		lastErr = err
 		time.Sleep(100 * time.Millisecond)
@@ -555,6 +583,10 @@ func (a *Agent) heartbeatLoop(ctx context.Context, attemptID string, epoch int64
 			hbRes, err := a.heartbeat(ctx, hbReq)
 			rtt := time.Since(startT)
 			if err != nil {
+				if errors.Is(err, ErrWorkerRevoked) {
+					a.handleWorkerRevoked()
+					return
+				}
 				continue
 			}
 
@@ -584,7 +616,9 @@ func (a *Agent) heartbeatLoop(ctx context.Context, attemptID string, epoch int64
 							OwnershipEpoch:  epoch,
 							ProcessStopped:  true,
 						}
-						_, _ = a.stopAck(ctx, stopAck)
+						if _, err := a.stopAck(ctx, stopAck); errors.Is(err, ErrWorkerRevoked) {
+							a.handleWorkerRevoked()
+						}
 					}
 					return
 				}
@@ -593,7 +627,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context, attemptID string, epoch int64
 	}
 }
 
-func (a *Agent) sendLogBatch(ctx context.Context, attemptID string, logs *ExecutionLogs, resolvedSecrets map[string]string) {
+func (a *Agent) sendLogBatch(ctx context.Context, attemptID string, logs *ExecutionLogs, resolvedSecrets map[string]string) error {
 	logs = RedactExecutionLogs(logs, resolvedSecrets)
 	records := make([]LogRecordDTO, 0)
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -621,8 +655,28 @@ func (a *Agent) sendLogBatch(ctx context.Context, attemptID string, logs *Execut
 			AttemptID:       attemptID,
 			Records:         records,
 		}
-		_, _ = a.sendLogs(ctx, req)
+		_, err := a.sendLogs(ctx, req)
+		return err
 	}
+	return nil
+}
+
+func (a *Agent) isRevoked() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.revoked
+}
+
+// handleWorkerRevoked is terminal: a revoked session has no remaining
+// execution authority, so every local child is cancelled before the agent exits.
+func (a *Agent) handleWorkerRevoked() {
+	a.mu.Lock()
+	a.revoked = true
+	a.draining = true
+	a.mu.Unlock()
+	a.cfg.Logger.Printf("Worker revoked by control plane. Stopping immediately.")
+	a.stopOnce.Do(func() { close(a.stopPoll) })
+	a.stopAllRunners()
 }
 
 func (a *Agent) listAvailableDigests() []string {
@@ -677,7 +731,7 @@ func (a *Agent) Drain(ctx context.Context) {
 	a.draining = true
 	a.mu.Unlock()
 
-	close(a.stopPoll)
+	a.stopOnce.Do(func() { close(a.stopPoll) })
 
 	graceTimer := time.NewTimer(a.cfg.DrainGracePeriod)
 	defer graceTimer.Stop()

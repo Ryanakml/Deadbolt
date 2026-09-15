@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -144,4 +145,100 @@ func mustWorkerRunnerPath(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestHeartbeatRevocationTerminatesActiveRunnerAndAgentFailsClosed(t *testing.T) {
+	var heartbeats atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		heartbeats.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(ErrorEnvelopeDTO{Code: "WORKER_REVOKED", Message: "revoked"})
+	}))
+	defer server.Close()
+	agent, err := NewAgent(AgentConfig{ControlPlaneURL: server.URL, HeartbeatInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.workerID, agent.sessionID, agent.sessionTok = "worker", "session", "token"
+	agent.expiresAt = time.Now().Add(time.Hour)
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	configureProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := make(chan struct{})
+	agent.runningAttempts["attempt"] = &activeAttempt{attemptID: "attempt", pid: cmd.Process.Pid, cancel: func() { close(cancelled) }}
+	// Keep polling blocked on slots; revocation must wake it without waiting for the lease.
+	for i := 0; i < agent.cfg.Slots; i++ {
+		agent.slotsChan <- struct{}{}
+	}
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- agent.pollLoop(context.Background()) }()
+	hbDone := make(chan struct{})
+	go func() {
+		agent.heartbeatLoop(context.Background(), "attempt", 1, NewLeaseTracker(time.Now().Add(time.Minute), 0, 0), hbDone)
+		close(hbDone)
+	}()
+	select {
+	case <-hbDone:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat did not stop on WORKER_REVOKED")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("active attempt was not cancelled on revocation")
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active child process was not terminated immediately")
+	}
+	select {
+	case err := <-pollDone:
+		if !errors.Is(err, ErrWorkerRevoked) {
+			t.Fatalf("poll loop returned %v, want ErrWorkerRevoked", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("agent waited instead of exiting after revocation")
+	}
+	if got := heartbeats.Load(); got != 1 {
+		t.Fatalf("heartbeats continued after revocation: %d", got)
+	}
+}
+
+func TestHeartbeatTransientErrorsRemainLeaseSafetyErrors(t *testing.T) {
+	var heartbeats atomic.Int32
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if heartbeats.Add(1) == 2 {
+			close(done)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(ErrorEnvelopeDTO{Code: "INTERNAL_ERROR", Message: "temporary"})
+	}))
+	defer server.Close()
+	agent, err := NewAgent(AgentConfig{ControlPlaneURL: server.URL, HeartbeatInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.workerID, agent.sessionID, agent.sessionTok = "worker", "session", "token"
+	loopDone := make(chan struct{})
+	go func() {
+		agent.heartbeatLoop(context.Background(), "attempt", 1, NewLeaseTracker(time.Now().Add(time.Minute), 0, 0), done)
+		close(loopDone)
+	}()
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat loop did not observe test completion")
+	}
+	if agent.isRevoked() {
+		t.Fatal("transient heartbeat failure incorrectly revoked worker")
+	}
+	if got := heartbeats.Load(); got < 2 {
+		t.Fatalf("expected transient retry behavior, got %d calls", got)
+	}
 }
