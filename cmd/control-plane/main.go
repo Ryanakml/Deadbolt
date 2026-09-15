@@ -22,8 +22,10 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
+	"github.com/Ryanakml/Deadbolt/internal/outbox"
 	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
+	"github.com/nats-io/nats.go"
 )
 
 var (
@@ -232,8 +234,9 @@ func run() error {
 		reconcilerPool = pool
 	}
 
+	var reconciler *scheduling.Reconciler
 	if reconcilerPool != nil {
-		reconciler := scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
+		reconciler = scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
 		healthChecker.SetSchedulerTicker(reconciler.Ticker(), gateway.DefaultSchedulerTimeout)
 		go func() {
 			if err := reconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -242,7 +245,57 @@ func run() error {
 		}()
 	}
 
-	mux := BuildMux(cfg, pool, healthChecker, logger)
+	// Wire Outbox Dispatcher and NATS JetStream wake-up handling (Blueprint §11 & §19.1)
+	outboxMetrics := outbox.NewMetrics(pool)
+	// Outbox sweeps cross tenant boundaries and therefore use the dedicated
+	// system connection. The runtime role is intentionally tenant-scoped and
+	// must not be able to invoke a cross-tenant dispatcher function.
+	dispatchPool := systemPool
+	if dispatchPool == nil {
+		logger.Printf("[OUTBOX] System database pool unavailable; dispatcher disabled, PostgreSQL reconciliation remains active")
+	}
+	if dispatchPool != nil {
+		var jsClient outbox.JetStreamClient
+		nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second), nats.MaxReconnects(5))
+		if err != nil {
+			logger.Printf("[OUTBOX] Warning: NATS connection not established (%v); DB fallback active", err)
+		} else {
+			defer nc.Close()
+			js, err := nc.JetStream()
+			if err != nil {
+				logger.Printf("[OUTBOX] Warning: JetStream context error: %v", err)
+			} else {
+				jsClient = js
+				if _, err := outbox.EnsureStream(js, outbox.StreamName, []string{outbox.SubjectPrefix + ">"}, 2*time.Minute); err != nil {
+					logger.Printf("[OUTBOX] Warning: Failed to ensure JetStream stream: %v", err)
+				} else {
+					// Start WakeupConsumer: triggers DB scans only without granting execution ownership
+					wakeupConsumer := outbox.NewWakeupConsumer(js, outbox.DefaultConsumerConfig(), outbox.WakeupHandlerFunc(func(ctx context.Context, hint outbox.WakeupHintDTO) error {
+						logger.Printf("[WAKEUP] Triggered DB scan for run %s (event %s)", hint.RunID, hint.EventID)
+						if reconciler != nil {
+							reconciler.Wake()
+						}
+						return nil
+					}), logger)
+					if err := wakeupConsumer.Start(ctx); err != nil {
+						logger.Printf("[OUTBOX] Warning: Failed to start wakeup consumer: %v", err)
+					} else {
+						defer func() { _ = wakeupConsumer.Stop() }()
+					}
+				}
+			}
+		}
+
+		dispatcher := outbox.NewDispatcher(dispatchPool, jsClient, outbox.DefaultConfig(), outboxMetrics, logger)
+		go func() {
+			if err := dispatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Printf("[OUTBOX] Dispatcher loop terminated: %v", err)
+			}
+		}()
+		defer dispatcher.Stop()
+	}
+
+	mux := BuildMuxWithMetrics(cfg, pool, healthChecker, outboxMetrics, logger)
 
 	server := &http.Server{
 		Addr:         listenAddr,
@@ -284,6 +337,11 @@ func run() error {
 // BuildMux wires all production routes onto a new http.ServeMux using the canonical constructor.
 func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, logger *log.Logger) *http.ServeMux {
 	return controlplane.BuildMux(cfg, pool, healthChecker, logger)
+}
+
+// BuildMuxWithMetrics wires all production routes and attaches an optional outbox metrics collector.
+func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, metrics *outbox.Metrics, logger *log.Logger) *http.ServeMux {
+	return controlplane.BuildMuxWithMetrics(cfg, pool, healthChecker, metrics, logger)
 }
 
 // runMigrations executes database schema migrations using DDL-capable migrator credentials

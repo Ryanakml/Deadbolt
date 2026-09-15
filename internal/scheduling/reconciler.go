@@ -17,6 +17,7 @@ type Reconciler struct {
 	pool          *pgxpool.Pool
 	sweepInterval time.Duration
 	ticker        *atomic.Int64
+	wakeup        chan struct{}
 	logger        *log.Logger
 }
 
@@ -29,7 +30,21 @@ func NewReconciler(pool *pgxpool.Pool, sweepInterval time.Duration, logger *log.
 		pool:          pool,
 		sweepInterval: sweepInterval,
 		ticker:        &atomic.Int64{},
+		wakeup:        make(chan struct{}, 1),
 		logger:        logger,
+	}
+}
+
+// Wake requests an early authoritative sweep. Wake-ups are deliberately
+// coalesced and lossy: PostgreSQL remains authoritative and the periodic sweep
+// is still the safety net if a hint or wake signal is missed.
+func (r *Reconciler) Wake() {
+	if r == nil {
+		return
+	}
+	select {
+	case r.wakeup <- struct{}{}:
+	default:
 	}
 }
 
@@ -78,6 +93,10 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-r.wakeup:
+			if err := r.Sweep(ctx); err != nil {
+				r.logger.Printf("[SCHEDULER] Wake-up sweep failed: %v", err)
+			}
 		case <-ticker.C:
 			if err := r.Sweep(ctx); err != nil {
 				r.logger.Printf("[SCHEDULER] Error: Sweep iteration failed: %v", err)
