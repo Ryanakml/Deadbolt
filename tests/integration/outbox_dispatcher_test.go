@@ -77,6 +77,7 @@ func startRealNATSServer(t *testing.T) (*natsServer.Server, *nats.Conn, nats.Jet
 type outboxTestContext struct {
 	db          *sql.DB
 	pool        *pgxpool.Pool
+	systemPool  *pgxpool.Pool
 	storagePool *storage.Pool
 	tenantSvc   *tenant.Service
 	workerEng   *execution.WorkerEngine
@@ -94,7 +95,7 @@ func setupOutboxTestContext(t *testing.T) *outboxTestContext {
 		t.Fatalf("resolve bootstrap path: %v", err)
 	}
 
-	migratorURL, runtimeURL, _, err := testdb.SetupIsolatedDatabase("deadbolt_outbox_test", bootstrapPath)
+	migratorURL, runtimeURL, systemURL, err := testdb.SetupIsolatedDatabase("deadbolt_outbox_test", bootstrapPath)
 	if err != nil {
 		t.Skipf("PostgreSQL isolated database setup skipped: %v", err)
 	}
@@ -116,6 +117,11 @@ func setupOutboxTestContext(t *testing.T) *outboxTestContext {
 	if err != nil {
 		t.Fatalf("runtime pool failed: %v", err)
 	}
+	systemPool, err := pgxpool.New(context.Background(), systemURL)
+	if err != nil {
+		runtimePool.Close()
+		t.Fatalf("system pool failed: %v", err)
+	}
 
 	storagePool := storage.NewPool(runtimePool)
 	tenantSvc := tenant.NewService(storagePool)
@@ -124,11 +130,13 @@ func setupOutboxTestContext(t *testing.T) *outboxTestContext {
 	return &outboxTestContext{
 		db:          db,
 		pool:        runtimePool,
+		systemPool:  systemPool,
 		storagePool: storagePool,
 		tenantSvc:   tenantSvc,
 		workerEng:   workerEng,
 		cleanup: func() {
 			runtimePool.Close()
+			systemPool.Close()
 			db.Close()
 		},
 	}
@@ -212,7 +220,7 @@ func TestOutboxAtomicIntentAndPublishAckPrecedesMark(t *testing.T) {
 
 	// 4. Run dispatcher batch
 	metrics := outbox.NewMetrics(tc.pool)
-	dispatcher := outbox.NewDispatcher(tc.pool, js, outbox.DefaultConfig(), metrics, nil)
+	dispatcher := outbox.NewDispatcher(tc.systemPool, js, outbox.DefaultConfig(), metrics, nil)
 	count, err := dispatcher.DispatchBatch(ctx, 10)
 	if err != nil {
 		t.Fatalf("dispatch batch failed: %v", err)
@@ -324,7 +332,7 @@ func TestOutboxPublishCrashAndRedeliverySafety(t *testing.T) {
 
 	// 2. Dispatcher runs next pass: claims the un-marked row and republishes with same event_id
 	metrics := outbox.NewMetrics(tc.pool)
-	dispatcher := outbox.NewDispatcher(tc.pool, js, outbox.DefaultConfig(), metrics, nil)
+	dispatcher := outbox.NewDispatcher(tc.systemPool, js, outbox.DefaultConfig(), metrics, nil)
 	count, err := dispatcher.DispatchBatch(ctx, 10)
 	if err != nil {
 		t.Fatalf("recovery dispatch batch failed: %v", err)
@@ -420,7 +428,7 @@ func TestMessagesContainRoutingHintsWithoutSecrets(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	metrics := outbox.NewMetrics(tc.pool)
-	dispatcher := outbox.NewDispatcher(tc.pool, js, outbox.DefaultConfig(), metrics, nil)
+	dispatcher := outbox.NewDispatcher(tc.systemPool, js, outbox.DefaultConfig(), metrics, nil)
 	count, err := dispatcher.DispatchBatch(ctx, 10)
 	if err != nil || count != 1 {
 		t.Fatalf("dispatch batch: err=%v count=%d", err, count)

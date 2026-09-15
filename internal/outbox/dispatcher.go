@@ -96,6 +96,9 @@ func (d *Dispatcher) CalculateBackoff(attempts int) time.Duration {
 	}
 	// Add 10% jitter
 	jitter := time.Duration(rand.Float64() * 0.1 * float64(delay))
+	if delay > d.cfg.MaxRetryDelay-jitter {
+		return d.cfg.MaxRetryDelay
+	}
 	return delay + jitter
 }
 
@@ -170,6 +173,14 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 	if len(records) == 0 {
 		return 0, tx.Commit(ctx)
 	}
+	// claim_outbox_batch advances next_at and attempts in this transaction. Commit
+	// before contacting NATS: the blueprint explicitly forbids holding a database
+	// transaction open while waiting on an external provider. The due-time claim
+	// is the bounded, crash-safe reservation; an abandoned claim becomes eligible
+	// again after the claim lease.
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit outbox claims: %w", err)
+	}
 
 	publishedCount := 0
 	targetSubject := fmt.Sprintf("%s%s", SubjectPrefix, d.cfg.Shard)
@@ -205,24 +216,33 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 		}
 
 		if err != nil {
-			// Publish failed: calculate backoff, schedule next_at retry, increment attempts
-			d.metrics.IncFailures()
-			backoff := d.CalculateBackoff(rec.Attempts + 1)
+			// Publish failed: calculate backoff and release the claim. Attempts was
+			// incremented by claim_outbox_batch exactly once.
+			if d.metrics != nil {
+				d.metrics.IncFailures()
+			}
+			backoff := d.CalculateBackoff(rec.Attempts)
 			updateRetry := `SELECT app.retry_outbox_event($1::uuid, $2::interval)`
 			intervalStr := fmt.Sprintf("%d milliseconds", backoff.Milliseconds())
-			if _, execErr := tx.Exec(ctx, updateRetry, rec.ID, intervalStr); execErr != nil {
+			if _, execErr := d.pool.Exec(ctx, updateRetry, rec.ID, intervalStr); execErr != nil {
 				d.logger.Printf("[OUTBOX] Failed to update retry next_at for event %s: %v", rec.EventID, execErr)
+			}
+			if _, execErr := d.pool.Exec(ctx, `SELECT app.record_outbox_failure($1::uuid, $2)`, rec.ID, err.Error()); execErr != nil {
+				d.logger.Printf("[OUTBOX] Failed to record publish error for event %s: %v", rec.EventID, execErr)
 			}
 			d.logger.Printf("[OUTBOX] Publish failed for event %s (attempt %d): %v (retrying in %v)", rec.EventID, rec.Attempts+1, err, backoff)
 		} else {
 			// Publish ACK received: Mark published_at atomically in PostgreSQL
 			updateSuccess := `SELECT app.mark_outbox_published($1::uuid)`
-			if _, execErr := tx.Exec(ctx, updateSuccess, rec.ID); execErr != nil {
+			if _, execErr := d.pool.Exec(ctx, updateSuccess, rec.ID); execErr != nil {
 				d.logger.Printf("[OUTBOX] Failed to mark published_at for event %s: %v", rec.EventID, execErr)
-				// If DB mark fails, tx will rollback, leaving event to be retried safely
+				// If DB mark fails, the committed claim expires and the event is
+				// retried safely on a later sweep.
 				return publishedCount, fmt.Errorf("mark published_at for event %s: %w", rec.EventID, execErr)
 			}
-			d.metrics.IncPublished()
+			if d.metrics != nil {
+				d.metrics.IncPublished()
+			}
 			publishedCount++
 			if pubAck != nil && pubAck.Duplicate {
 				d.logger.Printf("[OUTBOX] Event %s recognized as duplicate by broker stream %s (seq %d)", rec.EventID, pubAck.Stream, pubAck.Sequence)
@@ -230,11 +250,9 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit outbox batch tx: %w", err)
+	if d.metrics != nil {
+		d.metrics.RecordSweep()
 	}
-
-	d.metrics.RecordSweep()
 	return publishedCount, nil
 }
 
@@ -271,7 +289,9 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			d.logger.Printf("[OUTBOX] Dispatcher stopping: stop signaled")
 			return nil
 		case <-metricsTicker.C:
-			_ = d.metrics.UpdateDatabaseGauges(ctx)
+			if d.metrics != nil {
+				_ = d.metrics.UpdateDatabaseGauges(ctx)
+			}
 		case <-ticker.C:
 			// Process available batch
 			batchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
