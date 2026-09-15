@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"testing"
@@ -702,6 +704,50 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 	manifestMap["targetOS"], manifestMap["targetArchitecture"] = targetOS, targetArch
 	manifest, _ = json.Marshal(manifestMap)
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "agent-linear", manifest)
+	var completeMu sync.Mutex
+	completeRequests := make([]worker.CompleteRequestDTO, 0, 2)
+	dropFirstCompleteResponse := true
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		backendRequest, err := http.NewRequestWithContext(r.Context(), r.Method, server.URL+r.URL.RequestURI(), bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		backendRequest.Header = r.Header.Clone()
+		backendResponse, err := http.DefaultClient.Do(backendRequest)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer backendResponse.Body.Close()
+		if r.URL.Path == "/worker/v1/complete" {
+			var completion worker.CompleteRequestDTO
+			if json.Unmarshal(body, &completion) == nil {
+				completeMu.Lock()
+				completeRequests = append(completeRequests, completion)
+				drop := dropFirstCompleteResponse
+				dropFirstCompleteResponse = false
+				completeMu.Unlock()
+				if drop {
+					_, _ = io.Copy(io.Discard, backendResponse.Body)
+					return
+				}
+			}
+		}
+		for key, values := range backendResponse.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(backendResponse.StatusCode)
+		_, _ = io.Copy(w, backendResponse.Body)
+	}))
+	defer proxy.Close()
 
 	// Issue a real enrollment token; Agent owns challenge/enroll/session itself.
 	enrollBody, _ := json.Marshal(map[string]any{"poolName": "default"})
@@ -728,7 +774,7 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var agentLogs bytes.Buffer
-	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: server.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(&agentLogs, "", 0)})
+	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: proxy.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(&agentLogs, "", 0)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,6 +806,15 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 			output, _ := snapshot.Output.(map[string]any)
 			if output["value"] != "agent-done" {
 				t.Fatalf("unexpected agent child output: %+v", snapshot.Output)
+			}
+			completeMu.Lock()
+			defer completeMu.Unlock()
+			if len(completeRequests) < 2 {
+				t.Fatalf("expected Agent retry after lost ACK, got %d Complete requests", len(completeRequests))
+			}
+			first, second := completeRequests[0], completeRequests[1]
+			if first.AttemptID != second.AttemptID || first.OwnershipEpoch != second.OwnershipEpoch || first.Outcome != second.Outcome || first.ResultDigest != second.ResultDigest || !reflect.DeepEqual(first.Output, second.Output) || !reflect.DeepEqual(first.Error, second.Error) {
+				t.Fatalf("Agent ACK-loss retry changed result identity: first=%+v second=%+v", first, second)
 			}
 			return
 		}

@@ -22,11 +22,19 @@ const defaultAttemptTimeout = 5 * time.Minute
 // adapter. State transitions, leases, history, and wake-up hints are committed
 // together here instead of in the transport layer.
 type WorkerEngine struct {
-	pool *storage.Pool
+	pool                 *storage.Pool
+	beforeCompleteCommit func() error
 }
 
 func NewWorkerEngine(pool *storage.Pool) *WorkerEngine {
 	return &WorkerEngine{pool: pool}
+}
+
+// SetBeforeCompleteCommitHookForTest injects a deterministic failure after all
+// completion writes have been staged but before the transaction is allowed to
+// commit. Production constructors leave it nil.
+func (e *WorkerEngine) SetBeforeCompleteCommitHookForTest(hook func() error) {
+	e.beforeCompleteCommit = hook
 }
 
 type workflowNode struct {
@@ -840,6 +848,9 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 			}); err != nil {
 				return err
 			}
+		}
+		if e.beforeCompleteCommit != nil {
+			return e.beforeCompleteCommit()
 		}
 		return nil
 	})

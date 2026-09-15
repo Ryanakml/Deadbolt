@@ -6,12 +6,15 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
@@ -20,6 +23,113 @@ import (
 type testWorkerSession struct {
 	worker.SessionResponseDTO
 	privateKey ed25519.PrivateKey
+}
+
+// TestConcurrentAuthenticatedClaimsHaveOneAuthority races two real persisted
+// worker sessions against a single READY step through the PostgreSQL engine.
+func TestConcurrentAuthenticatedClaimsHaveOneAuthority(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	first, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "concurrent-claim-a")
+	second, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "concurrent-claim-b")
+	const digest = "bundle-concurrent-claim"
+	deploymentID := seedExecutionDeployment(t, tc, orgID, envID, digest)
+	_, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		for _, session := range []*testWorkerSession{first, second} {
+			if _, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1::uuid,$2::uuid,$3)`, session.SessionID, orgID, digest); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := execution.NewWorkerEngine(tc.pool)
+	type result struct {
+		assignments int
+		err         error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for index, session := range []*testWorkerSession{first, second} {
+		wg.Add(1)
+		go func(index int, session *testWorkerSession) {
+			defer wg.Done()
+			<-start
+			response, err := engine.Claim(context.Background(), &worker.WorkerSessionContext{SessionID: session.SessionID, WorkerID: session.WorkerID, OrganizationID: orgID, EnvironmentID: envID, PoolName: "default"}, &worker.PollRequestDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: fmt.Sprintf("concurrent-%d", index), WorkerID: session.WorkerID, SessionID: session.SessionID, AvailableSlots: 1, DeploymentDigests: []string{digest}, Pool: "default"})
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{assignments: len(response.Assignments)}
+		}(index, session)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	claimed := 0
+	for outcome := range results {
+		if outcome.err != nil {
+			t.Fatalf("concurrent claim failed: %v", outcome.err)
+		}
+		claimed += outcome.assignments
+	}
+	if claimed != 1 {
+		t.Fatalf("expected exactly one concurrent claim, got %d", claimed)
+	}
+	var attempts, leases, active int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM task_attempts WHERE step_id=$1::uuid),
+			(SELECT count(*) FROM task_leases WHERE step_id=$1::uuid),
+			(SELECT count(*) FROM task_attempts WHERE step_id=$1::uuid AND status IN ('CLAIMED','RUNNING'))`, stepID).Scan(&attempts, &leases, &active)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || leases != 1 || active != 1 {
+		t.Fatalf("duplicate claim authority: attempts=%d leases=%d active=%d", attempts, leases, active)
+	}
+}
+
+// TestCompletionPreCommitFailureRollsBack proves a database failure after the
+// authoritative transition starts cannot leak a partial completion; the exact
+// result is safe to retry once the dependency recovers.
+func TestCompletionPreCommitFailureRollsBack(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "completion-precommit")
+	const digest = "bundle-precommit"
+	deploymentID := seedExecutionDeployment(t, tc, orgID, envID, digest)
+	_, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	assignment := claimExecution(t, server, session, digest, "precommit-claim")
+	startNode(t, server, session, assignment.AttemptID, assignment.OwnershipEpoch)
+	completion := worker.CompleteRequestDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: "precommit-complete", WorkerID: session.WorkerID, SessionID: session.SessionID, AttemptID: assignment.AttemptID, OwnershipEpoch: assignment.OwnershipEpoch, Outcome: "SUCCEEDED", Output: map[string]any{"ok": true}}
+	completion.ResultDigest, _ = worker.CanonicalCompletionDigest(&completion)
+	engine := execution.NewWorkerEngine(tc.pool)
+	engine.SetBeforeCompleteCommitHookForTest(func() error { return errors.New("injected precommit failure") })
+	workerContext := &worker.WorkerSessionContext{SessionID: session.SessionID, WorkerID: session.WorkerID, OrganizationID: orgID, EnvironmentID: envID, PoolName: "default"}
+	if _, err := engine.Complete(context.Background(), workerContext, &completion); err == nil {
+		t.Fatal("expected injected precommit failure")
+	}
+	var attemptStatus, stepState string
+	var leases, completions int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT a.status,rs.state,(SELECT count(*) FROM task_leases WHERE attempt_id=a.id),(SELECT count(*) FROM run_events WHERE run_id=rs.run_id AND event_type='TASK_COMPLETED') FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id WHERE a.id=$1::uuid AND rs.id=$2::uuid`, assignment.AttemptID, stepID).Scan(&attemptStatus, &stepState, &leases, &completions)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attemptStatus != "RUNNING" || stepState != "RUNNING" || leases != 1 || completions != 0 {
+		t.Fatalf("precommit failure leaked state: attempt=%s step=%s leases=%d completions=%d", attemptStatus, stepState, leases, completions)
+	}
+	engine.SetBeforeCompleteCommitHookForTest(nil)
+	accepted, err := engine.Complete(context.Background(), workerContext, &completion)
+	if err != nil || !accepted.Accepted {
+		t.Fatalf("retry after precommit failure rejected: response=%+v err=%v", accepted, err)
+	}
 }
 
 func enrollExecutionWorker(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID, suffix string) (*testWorkerSession, *tenant.GeneratedKey) {
