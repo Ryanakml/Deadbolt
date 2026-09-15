@@ -248,6 +248,12 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 	var sessionExpiresAt time.Time
 
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		if fencer, ok := s.engine.(SessionFencer); ok && fencer != nil {
+			if err := fencer.FenceWorkerSessions(ctx, tx, orgID, req.WorkerID, "RECONNECT"); err != nil {
+				return fmt.Errorf("fence reconnecting worker: %w", err)
+			}
+		}
+
 		// Revoke old sessions
 		_, err := tx.Exec(ctx, `UPDATE worker_sessions SET revoked_at = clock_timestamp()
 		                        WHERE worker_id = $1::uuid AND organization_id = $2::uuid AND revoked_at IS NULL`, req.WorkerID, orgID)
@@ -454,6 +460,12 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 // RevokeWorker marks a worker REVOKED and revokes all its active sessions and leases.
 func (s *Service) RevokeWorker(ctx context.Context, orgID, workerID string) error {
 	return s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		if fencer, ok := s.engine.(SessionFencer); ok && fencer != nil {
+			if err := fencer.FenceWorkerSessions(ctx, tx, orgID, workerID, "REVOKED"); err != nil {
+				return fmt.Errorf("fence revoked worker: %w", err)
+			}
+		}
+
 		_, err := tx.Exec(ctx, `UPDATE workers SET status = 'REVOKED' WHERE id = $1::uuid AND organization_id = $2::uuid`, workerID, orgID)
 		if err != nil {
 			return err

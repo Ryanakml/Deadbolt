@@ -68,7 +68,7 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
+      x-implemented: true
       x-required-capability: runs:create
   /runs/{id}:
     get:
@@ -105,7 +105,7 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
+      x-implemented: true
       x-required-capability: runs:read
   /runs/{id}/events:
     get:

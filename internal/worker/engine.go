@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"errors"
+
+	"github.com/Ryanakml/Deadbolt/internal/storage"
 )
 
 // ErrExecutionEngineUnavailable means the gateway has no authoritative engine
@@ -17,4 +19,10 @@ type ExecutionEngine interface {
 	Heartbeat(context.Context, *WorkerSessionContext, *HeartbeatRequestDTO) (*HeartbeatResponseDTO, error)
 	Complete(context.Context, *WorkerSessionContext, *CompleteRequestDTO) (*CompleteResponseDTO, error)
 	StopAck(context.Context, *WorkerSessionContext, *StopAckRequestDTO) (*AckResponseDTO, error)
+}
+
+// SessionFencer allows fencing worker sessions and releasing claimed/running
+// tasks on reconnect or revocation within a tenant transaction.
+type SessionFencer interface {
+	FenceWorkerSessions(ctx context.Context, tx storage.Tx, organizationID, workerID, reason string) error
 }
