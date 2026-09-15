@@ -1,5 +1,7 @@
 package worker
 
+import "github.com/Ryanakml/Deadbolt/internal/contracts"
+
 // ProtocolVersion is the canonical protocol version for /worker/v1/...
 const ProtocolVersion = 1
 
@@ -169,6 +171,26 @@ type CompleteResponseDTO struct {
 	OwnershipEpoch  int64  `json:"ownershipEpoch"`
 	Accepted        bool   `json:"accepted"`
 	ResultDigest    string `json:"resultDigest"`
+}
+
+// CanonicalCompletionDigest is the server-verifiable identity of a completion.
+// It deliberately includes outcome and the structured error envelope, not just
+// an arbitrary worker-provided output string.
+func CanonicalCompletionDigest(req *CompleteRequestDTO) (string, error) {
+	var errorEnvelope any
+	if req.Error != nil {
+		errorEnvelope = *req.Error
+	}
+	canonical, err := contracts.CanonicalizeGeneric(map[string]any{
+		"outcome":    req.Outcome,
+		"output":     req.Output,
+		"artifactId": req.ArtifactID,
+		"error":      errorEnvelope,
+	})
+	if err != nil {
+		return "", err
+	}
+	return contracts.SHA256Hex(canonical), nil
 }
 
 type StopAckRequestDTO struct {

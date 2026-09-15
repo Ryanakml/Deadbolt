@@ -42,6 +42,10 @@ type AgentConfig struct {
 	TaskEnvAllowlist  []string
 	DrainGracePeriod  time.Duration
 	Logger            *log.Logger
+	// HTTPClient is optional. A nil client preserves the production default.
+	HTTPClient *http.Client
+	// OnTaskProcessStart is an optional observation hook for integration tests.
+	OnTaskProcessStart func()
 }
 
 type activeAttempt struct {
@@ -117,9 +121,14 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 	supervisor := NewProcessSupervisor(cfg.NodePath, cfg.RunnerPath)
 	supervisor.TaskEnvAllowlist = cfg.TaskEnvAllowlist
 
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
 	return &Agent{
 		cfg:             cfg,
-		client:          &http.Client{Timeout: 30 * time.Second},
+		client:          client,
 		baseURL:         parsedURL,
 		poolName:        cfg.Pool,
 		supervisor:      supervisor,
@@ -416,7 +425,7 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	if secretErr != nil {
 		a.cfg.Logger.Printf("Refusing attempt %s: %v", assignment.AttemptID, secretErr)
 		digest := sha256.Sum256([]byte(secretErr.Error()))
-		_, _ = a.complete(attCtx, &CompleteRequestDTO{
+		preflight := &CompleteRequestDTO{
 			ProtocolVersion: ProtocolVersion,
 			RequestID:       fmt.Sprintf("req_comp_preflight_%d", time.Now().UnixNano()),
 			WorkerID:        a.workerID,
@@ -431,7 +440,9 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 				Retryable:    false,
 				EffectStatus: "NOT_APPLIED",
 			},
-		})
+		}
+		preflight.ResultDigest, _ = CanonicalCompletionDigest(preflight)
+		_, _ = a.completeWithRetry(attCtx, preflight)
 		return
 	}
 	taskInput := &TaskInput{
@@ -448,11 +459,19 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 
 	sup := NewProcessSupervisor(a.cfg.NodePath, a.cfg.RunnerPath)
 	sup.LeaseTracker = leaseTracker
+	sup.StartAuthorization = &StartAuthorization{
+		AttemptID: assignment.AttemptID,
+		Epoch:     assignment.OwnershipEpoch,
+		Decision:  StartAccepted,
+	}
 	sup.TaskEnvAllowlist = assignment.SecretNames
 	sup.OnProcessStart = func(pid int) {
 		a.mu.Lock()
 		active.pid = pid
 		a.mu.Unlock()
+		if a.cfg.OnTaskProcessStart != nil {
+			a.cfg.OnTaskProcessStart()
+		}
 	}
 
 	completion, logs, execErr := sup.ExecuteAttempt(attCtx, taskInput, assignment.OwnershipEpoch)
@@ -474,16 +493,6 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		outcome = "FAILED"
 	}
 
-	var resDigest string
-	if completion != nil && completion.Output != nil {
-		outBytes, _ := json.Marshal(completion.Output)
-		h := sha256.Sum256(outBytes)
-		resDigest = hex.EncodeToString(h[:])
-	} else {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%v", execErr)))
-		resDigest = hex.EncodeToString(h[:])
-	}
-
 	compReq := &CompleteRequestDTO{
 		ProtocolVersion: ProtocolVersion,
 		RequestID:       fmt.Sprintf("req_comp_%d", time.Now().UnixNano()),
@@ -492,7 +501,6 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		AttemptID:       assignment.AttemptID,
 		OwnershipEpoch:  assignment.OwnershipEpoch,
 		Outcome:         outcome,
-		ResultDigest:    resDigest,
 	}
 	if outcome == "SUCCEEDED" && completion != nil {
 		compReq.Output = completion.Output
@@ -512,8 +520,13 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 			EffectStatus: "NOT_APPLIED",
 		}
 	}
+	resDigest, digestErr := CanonicalCompletionDigest(compReq)
+	if digestErr != nil {
+		return
+	}
+	compReq.ResultDigest = resDigest
 
-	if _, err := a.complete(attCtx, compReq); errors.Is(err, ErrWorkerRevoked) {
+	if _, err := a.completeWithRetry(attCtx, compReq); errors.Is(err, ErrWorkerRevoked) {
 		a.handleWorkerRevoked()
 	}
 }
@@ -848,6 +861,21 @@ func (a *Agent) complete(ctx context.Context, req *CompleteRequestDTO) (*Complet
 	var res CompleteResponseDTO
 	err := a.postJSON(ctx, "/worker/v1/complete", req, &res, true)
 	return &res, err
+}
+
+// completeWithRetry replays the exact canonical result identity after an
+// ambiguous response. The control plane fences the owner and ACKs an identical
+// committed digest, so this never starts a second task execution.
+func (a *Agent) completeWithRetry(ctx context.Context, req *CompleteRequestDTO) (*CompleteResponseDTO, error) {
+	var lastErr error
+	for tries := 0; tries < 2; tries++ {
+		res, err := a.complete(ctx, req)
+		if err == nil || errors.Is(err, ErrWorkerRevoked) {
+			return res, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func (a *Agent) stopAck(ctx context.Context, req *StopAckRequestDTO) (*AckResponseDTO, error) {

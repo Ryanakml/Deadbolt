@@ -43,6 +43,7 @@ type ProcessSupervisor struct {
 	LeaseTracker                    *LeaseTracker
 	StartAckFn                      StartAckFunc // compatibility adapter: any error is authoritative rejection
 	StartFn                         StartDecisionFunc
+	StartAuthorization              *StartAuthorization
 	RenewLeaseFn                    RenewLeaseFunc
 	OnProcessStart                  func(pid int) // test-only observation hook
 	ResultDir                       string        // optional test-owned directory for result cleanup assertions
@@ -100,6 +101,12 @@ func (s *ProcessSupervisor) TerminateProcessGroup(pid int) *StopResult {
 }
 
 func (s *ProcessSupervisor) verifyStart(ctx context.Context, attemptID string, epoch int64) error {
+	if authorization := s.StartAuthorization; authorization != nil {
+		if authorization.AttemptID != attemptID || authorization.Epoch != epoch || authorization.Decision != StartAccepted {
+			return ErrStartAckRejected
+		}
+		return nil
+	}
 	if s.StartFn == nil {
 		if s.StartAckFn == nil {
 			return ErrStartAuthorityMissing
