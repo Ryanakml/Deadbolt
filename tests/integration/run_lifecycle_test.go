@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -229,20 +230,21 @@ func TestCreateRunIdempotencyAnd202(t *testing.T) {
 	}
 
 	// Verify database rows committed atomically
-	var stepsCount, eventCount, outboxCount, idempCount int
+	var stepsCount, eventCount, outboxCount, idempCount, auditCount int
 	err = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM run_steps WHERE run_id = $1::uuid),
 			(SELECT count(*) FROM run_events WHERE run_id = $1::uuid),
 			(SELECT count(*) FROM outbox_events WHERE organization_id = $2::uuid),
-			(SELECT count(*) FROM idempotency_records WHERE response_identity = $1::uuid)`, run.ID, orgID).
-			Scan(&stepsCount, &eventCount, &outboxCount, &idempCount)
+			(SELECT count(*) FROM idempotency_records WHERE response_identity = $1::uuid),
+			(SELECT count(*) FROM audit_events WHERE organization_id = $2::uuid AND target_id = $1::uuid AND action = 'run.create')`, run.ID, orgID).
+			Scan(&stepsCount, &eventCount, &outboxCount, &idempCount, &auditCount)
 	})
 	if err != nil {
 		t.Fatalf("query verification: %v", err)
 	}
-	if stepsCount != 1 || eventCount != 1 || outboxCount == 0 || idempCount != 1 {
-		t.Fatalf("incomplete atomic commit: steps=%d events=%d outbox=%d idemp=%d", stepsCount, eventCount, outboxCount, idempCount)
+	if stepsCount != 1 || eventCount != 1 || outboxCount == 0 || idempCount != 1 || auditCount != 1 {
+		t.Fatalf("incomplete atomic commit: steps=%d events=%d outbox=%d idemp=%d audit=%d", stepsCount, eventCount, outboxCount, idempCount, auditCount)
 	}
 
 	// Step 2: Replay with identical key & payload returns original run (HTTP 202)
@@ -267,6 +269,18 @@ func TestCreateRunIdempotencyAnd202(t *testing.T) {
 	}
 	if replayRun.ID != run.ID {
 		t.Fatalf("replay returned different run ID: expected %s, got %s", run.ID, replayRun.ID)
+	}
+
+	// Verify replay did not create another audit event
+	err = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE organization_id = $1::uuid AND target_id = $2::uuid AND action = 'run.create'`, orgID, run.ID).
+			Scan(&auditCount)
+	})
+	if err != nil {
+		t.Fatalf("query replay audit count: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("expected exactly 1 audit event after replay, got %d", auditCount)
 	}
 
 	// Step 3: Replay with SAME key but CHANGED payload returns 409 IDEMPOTENCY_CONFLICT
@@ -307,6 +321,13 @@ func TestCreateRunIdempotencyAnd202(t *testing.T) {
 	defer respMissing.Body.Close()
 	if respMissing.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 Bad Request for missing Idempotency-Key, got %d", respMissing.StatusCode)
+	}
+
+	// Step 5: Verify fail-closed behavior when audit context is nil
+	execSvc := execution.NewService(tc.pool, tc.service)
+	_, _, err = execSvc.CreateRun(context.Background(), orgID, "staging", "simple-flow", "idemp-nil-audit", nil, map[string]any{"val": "foo"}, nil)
+	if !errors.Is(err, tenant.ErrAuditRequired) {
+		t.Fatalf("expected ErrAuditRequired when audit is nil, got %v", err)
 	}
 
 	_ = envID

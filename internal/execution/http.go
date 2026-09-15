@@ -64,6 +64,10 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		auditFromCaller(caller, r),
 	)
 	if err != nil {
+		if errors.Is(err, tenant.ErrAuditRequired) {
+			errJSON(w, r, http.StatusUnauthorized, "AUDIT_REQUIRED", "Audit context is required")
+			return
+		}
 		if errors.Is(err, ErrMissingIdempotencyKey) {
 			errJSON(w, r, http.StatusBadRequest, "MISSING_IDEMPOTENCY_KEY", err.Error())
 			return
@@ -146,11 +150,18 @@ func (h *HTTPHandler) allowed(r *http.Request, c *tenant.CallerIdentity, envPara
 }
 
 func auditFromCaller(c *tenant.CallerIdentity, r *http.Request) *tenant.AuditContext {
+	if c == nil {
+		return nil
+	}
 	var id *string
 	if c.Type == tenant.IdentityTypeMachine {
-		id = &c.KeyID
+		if c.KeyID != "" {
+			id = &c.KeyID
+		}
 	} else {
-		id = &c.UserID
+		if c.UserID != "" {
+			id = &c.UserID
+		}
 	}
 	return &tenant.AuditContext{
 		ActorID:       id,

@@ -84,6 +84,9 @@ func (s *Service) CreateRun(
 	input any,
 	audit *tenant.AuditContext,
 ) (*RunDTO, bool, error) {
+	if audit == nil {
+		return nil, false, tenant.ErrAuditRequired
+	}
 	if idempotencyKey == "" {
 		return nil, false, ErrMissingIdempotencyKey
 	}
@@ -259,6 +262,31 @@ func (s *Service) CreateRun(
 		)`
 		if _, err := tx.Exec(ctx, outboxInsert, orgID, runID); err != nil {
 			return fmt.Errorf("insert outbox: %w", err)
+		}
+
+		// 9. Audit event
+		var actorID *string
+		if audit.ActorID != nil && *audit.ActorID != "" {
+			actorID = audit.ActorID
+		}
+		auditMeta, err := json.Marshal(map[string]any{
+			"actor_type":     audit.ActorType,
+			"role":           audit.Role,
+			"capabilities":   audit.Capabilities,
+			"environment_id": envID,
+			"workflow_name":  workflowName,
+			"deployment_id":  deploymentID,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal audit metadata: %w", err)
+		}
+		auditInsert := `INSERT INTO audit_events (
+			organization_id, actor_id, action, target_type, target_id, correlation_id, reason, metadata
+		) VALUES (
+			$1::uuid, $2, 'run.create', 'run', $3::uuid, $4, $5, $6::jsonb
+		)`
+		if _, err := tx.Exec(ctx, auditInsert, orgID, actorID, runID, audit.CorrelationID, audit.Reason, auditMeta); err != nil {
+			return fmt.Errorf("insert audit: %w", err)
 		}
 
 		var deadlineStr *string
