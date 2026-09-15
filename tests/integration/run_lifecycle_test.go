@@ -1,13 +1,20 @@
 package integration_test
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +26,27 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
+
+func writeAgentBundle(t *testing.T, dir string) string {
+	t.Helper()
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	code := []byte("export default async function task(input) { return { value: input.value + '-done' }; }\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "tasks/agent.mjs", Mode: 0o600, Size: int64(len(code))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(code); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive.Bytes()))
+	if err := os.WriteFile(filepath.Join(dir, digest+".tar"), archive.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
 
 func setupRunLifecycleTest(t *testing.T) (*tenantTestContext, *httptest.Server, string, string, *tenant.GeneratedKey) {
 	t.Helper()
@@ -650,6 +678,93 @@ func TestLinearRunProgressionThroughWorkerAgent(t *testing.T) {
 	}
 
 	_ = depID
+}
+
+// TestLinearRunThroughActualAgentAndNodeChild proves the production worker path:
+// authenticated Agent poll -> Start -> verified tar bundle -> real Node child ->
+// Complete -> durable run output. It intentionally does not call protocol helpers.
+func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Agent bundle fixture requires the Linux worker runtime used by CI")
+	}
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	bundleDir := t.TempDir()
+	bundle := writeAgentBundle(t, bundleDir)
+	targetOS, targetArch := "linux", runtime.GOARCH
+	tasks := []map[string]any{{"name": "agent-task", "entrypoint": "tasks/agent.mjs", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000,
+		"inputSchema":  map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}},
+		"outputSchema": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}}}
+	workflows := []map[string]any{{"manifestVersion": 1, "name": "agent-linear", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}, "outputSchema": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}, "nodes": []map[string]any{{"id": "agent-node", "type": "task", "task": "agent-task"}}, "output": map[string]any{"value": map[string]any{"$ref": "step.output", "stepId": "agent-node", "pointer": "/value"}}}}
+	manifest := createLifecycleManifest(bundle, tasks, workflows)
+	var manifestMap map[string]any
+	_ = json.Unmarshal(manifest, &manifestMap)
+	manifestMap["targetOS"], manifestMap["targetArchitecture"] = targetOS, targetArch
+	manifest, _ = json.Marshal(manifestMap)
+	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "agent-linear", manifest)
+
+	// Issue a real enrollment token; Agent owns challenge/enroll/session itself.
+	enrollBody, _ := json.Marshal(map[string]any{"poolName": "default"})
+	enrollReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/environments/%s/worker-enrollments", server.URL, envID), bytes.NewReader(enrollBody))
+	enrollReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	enrollReq.Header.Set("X-Organization-ID", orgID)
+	enrollReq.Header.Set("Idempotency-Key", "agent-e2e-enrollment")
+	enrollReq.Header.Set("Content-Type", "application/json")
+	enrollResp, err := http.DefaultClient.Do(enrollReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enrollResp.Body.Close()
+	if enrollResp.StatusCode != http.StatusCreated {
+		t.Fatalf("agent enrollment status=%d", enrollResp.StatusCode)
+	}
+	var enrollment worker.EnrollmentTokenInfo
+	if err := json.NewDecoder(enrollResp.Body).Decode(&enrollment); err != nil {
+		t.Fatal(err)
+	}
+	runnerPath, err := filepath.Abs("../../runner/node/dist/index.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agent, err := worker.NewAgent(worker.AgentConfig{ControlPlaneURL: server.URL, KeyPath: filepath.Join(t.TempDir(), "worker.key"), EnrollmentToken: enrollment.Token, BundleDir: bundleDir, RunnerPath: runnerPath, PollTimeout: 100 * time.Millisecond, HeartbeatInterval: 20 * time.Millisecond, Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = agent.Start(ctx) }()
+
+	createBody, _ := json.Marshal(map[string]any{"environment": "staging", "input": map[string]any{"value": "agent"}})
+	createReq, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/workflows/agent-linear/runs", bytes.NewReader(createBody))
+	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq.Header.Set("X-Organization-ID", orgID)
+	createReq.Header.Set("Idempotency-Key", "agent-e2e-run")
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("agent create status=%d", createResp.StatusCode)
+	}
+	var run execution.RunDTO
+	_ = json.NewDecoder(createResp.Body).Decode(&run)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := execution.NewService(tc.pool, tc.service).GetRun(context.Background(), orgID, run.ID)
+		if err == nil && snapshot.Status == contracts.RunStatusSUCCEEDED {
+			output, _ := snapshot.Output.(map[string]any)
+			if output["value"] != "agent-done" {
+				t.Fatalf("unexpected agent child output: %+v", snapshot.Output)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("actual agent/node child did not complete run before deadline")
 }
 
 func startNode(t *testing.T, server *httptest.Server, session *testWorkerSession, attemptID string, epoch int64) {

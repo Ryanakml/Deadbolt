@@ -416,7 +416,7 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	if secretErr != nil {
 		a.cfg.Logger.Printf("Refusing attempt %s: %v", assignment.AttemptID, secretErr)
 		digest := sha256.Sum256([]byte(secretErr.Error()))
-		_, _ = a.complete(attCtx, &CompleteRequestDTO{
+		preflight := &CompleteRequestDTO{
 			ProtocolVersion: ProtocolVersion,
 			RequestID:       fmt.Sprintf("req_comp_preflight_%d", time.Now().UnixNano()),
 			WorkerID:        a.workerID,
@@ -431,7 +431,9 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 				Retryable:    false,
 				EffectStatus: "NOT_APPLIED",
 			},
-		})
+		}
+		preflight.ResultDigest, _ = CanonicalCompletionDigest(preflight)
+		_, _ = a.completeWithRetry(attCtx, preflight)
 		return
 	}
 	taskInput := &TaskInput{
@@ -507,7 +509,7 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	}
 	compReq.ResultDigest = resDigest
 
-	if _, err := a.complete(attCtx, compReq); errors.Is(err, ErrWorkerRevoked) {
+	if _, err := a.completeWithRetry(attCtx, compReq); errors.Is(err, ErrWorkerRevoked) {
 		a.handleWorkerRevoked()
 	}
 }
@@ -842,6 +844,28 @@ func (a *Agent) complete(ctx context.Context, req *CompleteRequestDTO) (*Complet
 	var res CompleteResponseDTO
 	err := a.postJSON(ctx, "/worker/v1/complete", req, &res, true)
 	return &res, err
+}
+
+// completeWithRetry replays the exact canonical result identity after an
+// ambiguous response. The control plane fences the owner and ACKs an identical
+// committed digest, so this never starts a second task execution.
+func (a *Agent) completeWithRetry(ctx context.Context, req *CompleteRequestDTO) (*CompleteResponseDTO, error) {
+	var lastErr error
+	for tries := 0; tries < 2; tries++ {
+		res, err := a.complete(ctx, req)
+		if err == nil || errors.Is(err, ErrWorkerRevoked) {
+			return res, err
+		}
+		lastErr = err
+		if tries == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	return nil, lastErr
 }
 
 func (a *Agent) stopAck(ctx context.Context, req *StopAckRequestDTO) (*AckResponseDTO, error) {
