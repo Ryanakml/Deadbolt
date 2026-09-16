@@ -62,7 +62,7 @@ jobs:
       - run: pnpm audit
       - run: node scripts/install-tools.mjs sqlc goose gitleaks govulncheck
       - run: bin/sqlc version
-      - run: bin/goose -version
+      - run: bin/goose --version
       - run: bin/govulncheck ./...
       - name: Verify control plane Dockerfile builds
         run: |

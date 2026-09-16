@@ -22,6 +22,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
+	"github.com/Ryanakml/Deadbolt/internal/outbox"
 	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
 )
@@ -232,8 +233,9 @@ func run() error {
 		reconcilerPool = pool
 	}
 
+	var reconciler *scheduling.Reconciler
 	if reconcilerPool != nil {
-		reconciler := scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
+		reconciler = scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
 		healthChecker.SetSchedulerTicker(reconciler.Ticker(), gateway.DefaultSchedulerTimeout)
 		go func() {
 			if err := reconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -242,7 +244,43 @@ func run() error {
 		}()
 	}
 
-	mux := BuildMux(cfg, pool, healthChecker, logger)
+	// Wire Outbox Dispatcher and NATS JetStream wake-up handling (Blueprint §11 & §19.1)
+	outboxMetrics := outbox.NewMetrics(pool)
+	if reconciler != nil {
+		outboxMetrics.SetSchedulerHeartbeat(reconciler.Ticker())
+	}
+	// Outbox sweeps cross tenant boundaries and therefore use the dedicated
+	// system connection. The runtime role is intentionally tenant-scoped and
+	// must not be able to invoke a cross-tenant dispatcher function.
+	dispatchPool := systemPool
+	if dispatchPool == nil {
+		logger.Printf("[OUTBOX] System database pool unavailable; dispatcher disabled, PostgreSQL reconciliation remains active")
+	}
+	if dispatchPool != nil {
+		publisher := outbox.NewJetStreamPublisherSlot()
+		dispatcher := outbox.NewDispatcher(dispatchPool, publisher, outbox.DefaultConfig(), outboxMetrics, logger)
+		go func() {
+			if err := dispatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Printf("[OUTBOX] Dispatcher loop terminated: %v", err)
+			}
+		}()
+		defer dispatcher.Stop()
+
+		manager := outbox.NewBrokerManager(natsURL, publisher, outbox.WakeupHandlerFunc(func(ctx context.Context, hint outbox.WakeupHintDTO) error {
+			logger.Printf("[WAKEUP] Triggered DB scan for run %s (event %s)", hint.RunID, hint.EventID)
+			if reconciler != nil {
+				reconciler.Wake()
+			}
+			return nil
+		}), logger, 2*time.Second)
+		go func() {
+			if err := manager.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Printf("[OUTBOX] Broker manager terminated: %v", err)
+			}
+		}()
+	}
+
+	mux := BuildMuxWithMetrics(cfg, pool, healthChecker, outboxMetrics, logger)
 
 	server := &http.Server{
 		Addr:         listenAddr,
@@ -284,6 +322,11 @@ func run() error {
 // BuildMux wires all production routes onto a new http.ServeMux using the canonical constructor.
 func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, logger *log.Logger) *http.ServeMux {
 	return controlplane.BuildMux(cfg, pool, healthChecker, logger)
+}
+
+// BuildMuxWithMetrics wires all production routes and attaches an optional outbox metrics collector.
+func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, metrics *outbox.Metrics, logger *log.Logger) *http.ServeMux {
+	return controlplane.BuildMuxWithMetrics(cfg, pool, healthChecker, metrics, logger)
 }
 
 // runMigrations executes database schema migrations using DDL-capable migrator credentials
