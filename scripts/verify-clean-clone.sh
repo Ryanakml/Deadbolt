@@ -101,6 +101,11 @@ for i in $(seq 1 30); do
     sleep 2
 done
 curl -fs http://127.0.0.1:8080/livez >/dev/null || compose_logs_and_fail
+# Prove the final image serves the bundled Inspector assets. This intentionally
+# runs after Compose starts, rather than reading files from the checkout.
+curl -fs http://127.0.0.1:8080/dashboard/ >/dev/null || compose_logs_and_fail
+curl -fs http://127.0.0.1:8080/dashboard/index.js >/dev/null || compose_logs_and_fail
+curl -fs http://127.0.0.1:8080/dashboard/styles.css >/dev/null || compose_logs_and_fail
 compose exec -T control-plane /usr/local/bin/control-plane --migrate
 READYZ_OK=false
 for i in $(seq 1 15); do

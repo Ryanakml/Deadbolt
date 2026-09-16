@@ -471,6 +471,7 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 
 	var droppedCount int
 	var budgetExhausted bool
+	var newlyDropped int
 
 	err := s.pool.WithTenantTx(ctx, sessionCtx.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
 		var stepID, runID, envID string
@@ -486,6 +487,16 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 			}
 			return fmt.Errorf("verify attempt ownership: %w", err)
 		}
+		// Serialize accounting for one attempt. This prevents concurrent batches
+		// from both observing spare budget and collectively exceeding 1 MiB.
+		var lockedAttemptID string
+		if err := tx.QueryRow(ctx, `
+			SELECT id FROM task_attempts
+			WHERE id = $1::uuid AND organization_id = $2::uuid
+			FOR UPDATE
+		`, req.AttemptID, sessionCtx.OrganizationID).Scan(&lockedAttemptID); err != nil {
+			return fmt.Errorf("lock attempt log budget: %w", err)
+		}
 
 		var currentBytes int64
 		if err := tx.QueryRow(ctx, `
@@ -498,15 +509,56 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 
 		var insertedAny bool
 		for _, rec := range req.Records {
-			msgBytes := int64(len([]byte(rec.Message)))
-			if msgBytes > MaxLogLineSizeBytes {
-				droppedCount++
+			// A retry of an accepted record is a no-op even after the attempt has
+			// reached its byte budget.
+			var alreadyStored bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS(
+					SELECT 1 FROM task_logs
+					WHERE attempt_id = $1::uuid AND sequence = $2 AND organization_id = $3::uuid
+				)
+			`, req.AttemptID, rec.Sequence, sessionCtx.OrganizationID).Scan(&alreadyStored); err != nil {
+				return fmt.Errorf("check existing task log: %w", err)
+			}
+			if alreadyStored {
 				continue
 			}
 
-			if currentBytes+msgBytes > MaxAttemptLogSizeBytes {
-				budgetExhausted = true
+			var priorDropReason string
+			priorDropErr := tx.QueryRow(ctx, `
+				SELECT reason FROM task_log_drop_receipts
+				WHERE attempt_id = $1::uuid AND sequence = $2 AND organization_id = $3::uuid
+			`, req.AttemptID, rec.Sequence, sessionCtx.OrganizationID).Scan(&priorDropReason)
+			if priorDropErr != nil && !errors.Is(priorDropErr, pgx.ErrNoRows) {
+				return fmt.Errorf("check existing dropped task log: %w", priorDropErr)
+			}
+			if priorDropErr == nil {
 				droppedCount++
+				budgetExhausted = budgetExhausted || priorDropReason == "BUDGET_EXHAUSTED"
+				continue
+			}
+
+			msgBytes := int64(len([]byte(rec.Message)))
+			dropReason := ""
+			if msgBytes > MaxLogLineSizeBytes {
+				dropReason = "LINE_TOO_LARGE"
+			} else if currentBytes+msgBytes > MaxAttemptLogSizeBytes {
+				dropReason = "BUDGET_EXHAUSTED"
+			}
+			if dropReason != "" {
+				droppedCount++
+				budgetExhausted = budgetExhausted || dropReason == "BUDGET_EXHAUSTED"
+				tag, err := tx.Exec(ctx, `
+					INSERT INTO task_log_drop_receipts (organization_id, attempt_id, sequence, reason)
+					VALUES ($1::uuid, $2::uuid, $3, $4)
+					ON CONFLICT (attempt_id, sequence) DO NOTHING
+				`, sessionCtx.OrganizationID, req.AttemptID, rec.Sequence, dropReason)
+				if err != nil {
+					return fmt.Errorf("record dropped task log: %w", err)
+				}
+				if tag.RowsAffected() > 0 {
+					newlyDropped++
+				}
 				continue
 			}
 
@@ -548,6 +600,17 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 				return fmt.Errorf("mark logs recorded: %w", err)
 			}
 		}
+		if newlyDropped > 0 {
+			_, err = tx.Exec(ctx, `
+				UPDATE task_attempts
+				SET dropped_log_count = dropped_log_count + $1,
+					log_budget_exhausted = log_budget_exhausted OR $2
+				WHERE id = $3::uuid AND organization_id = $4::uuid
+			`, newlyDropped, budgetExhausted, req.AttemptID, sessionCtx.OrganizationID)
+			if err != nil {
+				return fmt.Errorf("record task log drop state: %w", err)
+			}
+		}
 
 		return nil
 	})
@@ -558,8 +621,8 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 		return nil, fmt.Errorf("record logs: %w", err)
 	}
 
-	if droppedCount > 0 {
-		s.droppedLogsTotal.Add(int64(droppedCount))
+	if newlyDropped > 0 {
+		s.droppedLogsTotal.Add(int64(newlyDropped))
 	}
 
 	return &AckResponseDTO{

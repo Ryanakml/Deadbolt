@@ -134,6 +134,7 @@ describe("RunInspector", () => {
       type: "attempt.completed",
       payload: {
         attemptId: "att-2",
+        outcome: "SUCCEEDED",
       },
       committedAt: new Date().toISOString(),
     });
@@ -248,6 +249,43 @@ describe("RunInspector", () => {
 
     assert.equal(snapshot.steps[0].attempts[0].status, "CANCELLED");
     assert.equal(snapshot.steps[0].status, "FAILED");
+  });
+
+  test("does not fabricate success when a malformed completion event lacks its committed outcome", () => {
+    const inspector = new RunInspector("run-unknown-outcome");
+    const snapshot = {
+      id: "run-unknown-outcome",
+      workflowName: "flow",
+      deploymentId: "dep-001",
+      status: "RUNNING",
+      revision: 1,
+      lastEventSequence: 1,
+      createdAt: "2026-09-16T12:00:00.000Z",
+      steps: [
+        {
+          id: "step-1",
+          nodeId: "task",
+          status: "RUNNING",
+          currentEpoch: 1,
+          attempts: [{ id: "att-1", attemptNumber: 1, status: "RUNNING" }],
+        },
+      ],
+    };
+    inspector["snapshot"] = snapshot;
+
+    inspector.applyEvent({
+      id: "evt-2",
+      runId: "run-unknown-outcome",
+      sequence: 2,
+      schemaVersion: 1,
+      type: "attempt.completed",
+      payload: { attemptId: "att-1" },
+      committedAt: "2026-09-16T12:00:01.000Z",
+    });
+
+    assert.equal(snapshot.steps[0].attempts[0].status, "RUNNING");
+    assert.equal(snapshot.steps[0].status, "RUNNING");
+    assert.equal(snapshot.steps[0].attempts[0].completedAt, undefined);
   });
 
   test("deduplicates and sorts events in timeline", () => {

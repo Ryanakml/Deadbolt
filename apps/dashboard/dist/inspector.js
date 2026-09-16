@@ -238,11 +238,17 @@ export class RunInspector {
                     for (const s of this.snapshot.steps) {
                         const att = s.attempts.find((a) => a.id === payload.attemptId);
                         if (att) {
-                            const outcome = typeof payload.outcome === "string"
-                                ? payload.outcome
-                                : "SUCCEEDED";
+                            // TASK_COMPLETED is emitted for every terminal outcome.  Never
+                            // infer success from the event name: the committed outcome is
+                            // the authority for the inspector's transient state.
+                            if (typeof payload.outcome !== "string") {
+                                break;
+                            }
+                            const outcome = payload.outcome;
                             att.status = outcome;
-                            att.completedAt = event.committedAt || new Date().toISOString();
+                            if (event.committedAt) {
+                                att.completedAt = event.committedAt;
+                            }
                             if (payload.error !== undefined) {
                                 att.error = payload.error;
                             }

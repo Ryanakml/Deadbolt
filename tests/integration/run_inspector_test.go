@@ -1276,7 +1276,9 @@ func TestRunInspectorLogBoundsAndDroppedMetric(t *testing.T) {
 	lReq1.Header.Set("Content-Type", "application/json")
 	lRes1, err := http.DefaultClient.Do(lReq1)
 	if err != nil || lRes1.StatusCode != http.StatusOK {
-		t.Fatalf("log 16k failed: %v", err)
+		body, _ := io.ReadAll(lRes1.Body)
+		lRes1.Body.Close()
+		t.Fatalf("log 16k failed: %v status=%d body=%s", err, lRes1.StatusCode, body)
 	}
 	var ack1 worker.AckResponseDTO
 	_ = json.NewDecoder(lRes1.Body).Decode(&ack1)
@@ -1372,7 +1374,10 @@ func TestRunInspectorLogBoundsAndDroppedMetric(t *testing.T) {
 	}
 
 	// 4. Retry overflow batch (idempotency check)
-	oResRetry, _ := http.DefaultClient.Do(oReq)
+	oReqRetry, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(obBytes))
+	oReqRetry.Header.Set("Authorization", "Bearer "+sessionToken)
+	oReqRetry.Header.Set("Content-Type", "application/json")
+	oResRetry, _ := http.DefaultClient.Do(oReqRetry)
 	var ackRetry worker.AckResponseDTO
 	_ = json.NewDecoder(oResRetry.Body).Decode(&ackRetry)
 	oResRetry.Body.Close()
@@ -1381,9 +1386,28 @@ func TestRunInspectorLogBoundsAndDroppedMetric(t *testing.T) {
 		t.Fatalf("expected idempotent response on retry, got %+v", ackRetry)
 	}
 
+	// The inspector's persisted state must make partial diagnostics observable;
+	// the worker ACK alone is not enough once an operator opens the run later.
+	logsReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+runResp.ID+"/logs?attemptId="+as.AttemptID, nil)
+	logsReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	logsRes, err := http.DefaultClient.Do(logsReq)
+	if err != nil {
+		t.Fatalf("get persisted log drop state failed: %v", err)
+	}
+	if logsRes.StatusCode != http.StatusOK {
+		logsRes.Body.Close()
+		t.Fatalf("get persisted log drop state returned %d", logsRes.StatusCode)
+	}
+	var logsSnapshot execution.RunLogsResponseDTO
+	_ = json.NewDecoder(logsRes.Body).Decode(&logsSnapshot)
+	logsRes.Body.Close()
+	if logsSnapshot.DroppedCount != 2 || !logsSnapshot.BudgetExhausted {
+		t.Fatalf("expected persisted two-drop incomplete state, got %+v", logsSnapshot)
+	}
+
 	// 5. Verify worker.Service DroppedLogsCount metric
 	ws := worker.NewService(tc.pool, deployment.NewService(tc.pool, tc.service), execution.NewWorkerEngine(tc.pool, execution.NewEventHub()))
-	_, _ = ws.RecordLogs(context.Background(), sessionCtx, &worker.LogBatchRequestDTO{
+	directOversized := &worker.LogBatchRequestDTO{
 		ProtocolVersion: 1,
 		RequestID:       "direct-svc-oversized",
 		WorkerID:        sessionCtx.WorkerID,
@@ -1392,9 +1416,17 @@ func TestRunInspectorLogBoundsAndDroppedMetric(t *testing.T) {
 		Records: []worker.LogRecordDTO{
 			{Sequence: 999, Level: "error", Message: strings.Repeat("Z", 20000), Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
 		},
-	})
-	if ws.DroppedLogsCount() < 1 {
-		t.Fatalf("expected ws.DroppedLogsCount() >= 1, got %d", ws.DroppedLogsCount())
+	}
+	directAck1, err := ws.RecordLogs(context.Background(), sessionCtx, directOversized)
+	if err != nil || directAck1.DroppedCount != 1 {
+		t.Fatalf("first direct oversized log was not dropped: ack=%+v err=%v", directAck1, err)
+	}
+	directAck2, err := ws.RecordLogs(context.Background(), sessionCtx, directOversized)
+	if err != nil || directAck2.DroppedCount != 1 {
+		t.Fatalf("retried direct oversized log did not return prior drop: ack=%+v err=%v", directAck2, err)
+	}
+	if ws.DroppedLogsCount() != 1 {
+		t.Fatalf("expected retry-safe dropped metric count of 1, got %d", ws.DroppedLogsCount())
 	}
 }
 

@@ -923,6 +923,20 @@ func (s *Service) GetRunLogs(ctx context.Context, orgID, runID string, stepID, a
 
 		var isExpired bool
 		var message *string
+		var droppedCount int
+		var budgetExhausted bool
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(ta.dropped_log_count), 0)::integer,
+			       COALESCE(BOOL_OR(ta.log_budget_exhausted), FALSE)
+			FROM task_attempts ta
+			JOIN run_steps rs ON rs.id = ta.step_id AND rs.organization_id = ta.organization_id
+			WHERE rs.run_id = $1::uuid
+			  AND ta.organization_id = $2::uuid
+			  AND ($3::uuid IS NULL OR rs.id = $3::uuid)
+			  AND ($4::uuid IS NULL OR ta.id = $4::uuid)
+		`, runID, orgID, stepUUID, attemptUUID).Scan(&droppedCount, &budgetExhausted); err != nil {
+			return fmt.Errorf("get task log drop state: %w", err)
+		}
 
 		// Only evaluate expiration if 0 items returned on initial query (no cursor)
 		if len(items) == 0 && (cursor == nil || *cursor == "") {
@@ -951,10 +965,12 @@ func (s *Service) GetRunLogs(ctx context.Context, orgID, runID string, stepID, a
 		}
 
 		resp = &RunLogsResponseDTO{
-			Items:      items,
-			NextCursor: nextCursor,
-			Expired:    isExpired,
-			Message:    message,
+			Items:           items,
+			NextCursor:      nextCursor,
+			Expired:         isExpired,
+			Message:         message,
+			DroppedCount:    droppedCount,
+			BudgetExhausted: budgetExhausted,
 		}
 		return nil
 	})

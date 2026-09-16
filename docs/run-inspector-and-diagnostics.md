@@ -55,7 +55,7 @@ The inspection endpoints enforce granular permission filtering:
 ### Streaming Endpoints & Ordering
 
 - **REST Events:** `GET /v1/runs/{id}/events?cursor=N&limit=M`
-- **Server-Sent Events (SSE):** `GET /v1/runs/{id}/events/stream`
+- **Server-Sent Events (SSE):** `GET /v1/runs/{id}/stream`
 
 Events are committed to the `run_events` table and assigned a monotonically increasing, gapless `sequence` (1, 2, 3, ...). The stream orders all events strictly by `sequence ASC`.
 
@@ -111,6 +111,7 @@ To protect control plane performance and prevent storage exhaustion:
    - `droppedCount: N` (count of lines dropped due to per-line or cumulative limit)
    - `budgetExhausted: true/false` (indicates whether the attempt budget was hit)
 4. **Dropped Metric Counter:** Dropped logs increment an internal atomic counter (`DroppedLogsCount()`) exposed in control plane telemetry.
+5. **Persistent incomplete-diagnostics signal:** `task_attempts` retains the dropped count and budget-exhausted flag, so a later `GET /v1/runs/{id}/logs` response remains honest after the worker ACK is gone. Rejected `(attempt_id, sequence)` records have durable receipts; an idempotent worker retry returns the original drop result but does not add another metric increment or another dropped record.
 
 ### Stable Keyset Pagination
 
@@ -164,6 +165,8 @@ Pruning is performed via `PruneExpiredTaskLogs(ctx, orgID, limit)`:
     )
   ```
 
+Operationally, invoke this bounded tenant-scoped operation from the existing maintenance runner. It is safe to repeat: once a batch has deleted an expired row, subsequent passes simply find fewer rows. Retention deletion is irreversible; restore requires the normal PostgreSQL backup/restore procedure, not an application rollback. Migration `00016_task_log_drop_receipts.sql` adds only diagnostic accounting columns/table and can be rolled back only after the application version no longer reads them.
+
 ---
 
 ## 5. Dashboard UI & Accessibility (WCAG 2.2 AA)
@@ -173,7 +176,7 @@ The operator dashboard (`apps/dashboard/`) is a standalone single-page applicati
 - **Accessibility & Contrast:** Conforms to WCAG 2.2 AA standards with high-contrast status colors, visible focus rings, and full screen-reader announcements via `aria-live="polite"`.
 - **Reduced Motion:** Respects user motion preferences via `@media (prefers-reduced-motion: reduce)`, suppressing pulsing animations and smooth scroll effects.
 - **Event Timeline Deduplication:** Deduplicates streamed events using event `sequence` and `id`, ensuring the timeline remains pristine during rapid reconnects.
-- **Decoupled Freshness:** A dedicated SSE heartbeat badge (`Live Stream Active`) indicates WebSocket/SSE transport health independently from the initial snapshot fetch timestamp.
+- **Decoupled Freshness:** A dedicated SSE badge indicates stream transport health independently from the initial snapshot fetch timestamp.
 - **Diagnostics Display:** Directly surfaces run timeouts (`deadlineAt`), waiting diagnostics (`Waiting Reason: NO_COMPATIBLE_WORKERS`), and log expiration notices.
 
 ---
