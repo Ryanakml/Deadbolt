@@ -1,6 +1,7 @@
 package outbox
 
 import (
+	"context"
 	"regexp"
 	"strconv"
 	"sync/atomic"
@@ -37,9 +38,13 @@ func TestMetricsDispatcherAndSchedulerHeartbeatsAreIndependent(t *testing.T) {
 		t.Fatalf("scheduler heartbeat should be independently stale: scheduler=%d dispatcher=%d", schedulerBefore, dispatchBefore)
 	}
 
-	// DispatchBatch records this same sweep after an empty successful claim, so
-	// an idle outbox does not create false dispatcher lag.
-	m.RecordSweep()
+	// Exercise DispatchBatch's empty successful-claim path directly. The hook
+	// stands in for the database claim function while preserving public behavior.
+	d := NewDispatcher(nil, nil, DefaultConfig(), m, nil)
+	d.claimRecords = func(context.Context, int) ([]OutboxEventRecord, error) { return nil, nil }
+	if published, err := d.DispatchBatch(context.Background(), 1); err != nil || published != 0 {
+		t.Fatalf("empty dispatch sweep returned published=%d err=%v", published, err)
+	}
 	after := m.FormatPrometheus()
 	dispatchAfter := metricValue(t, after, "deadbolt_outbox_dispatcher_loop_lag_seconds")
 	schedulerAfter := metricValue(t, after, "deadbolt_scheduler_loop_lag_seconds")

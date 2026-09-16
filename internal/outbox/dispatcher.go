@@ -76,14 +76,15 @@ func DefaultConfig() DispatcherConfig {
 
 // Dispatcher coordinates reading outbox intents from PostgreSQL and publishing wake-up hints to NATS JetStream.
 type Dispatcher struct {
-	pool       *pgxpool.Pool
-	js         JetStreamClient
-	cfg        DispatcherConfig
-	metrics    *Metrics
-	logger     *log.Logger
-	mu         sync.Mutex
-	running    bool
-	stopSignal chan struct{}
+	pool         *pgxpool.Pool
+	js           JetStreamClient
+	cfg          DispatcherConfig
+	metrics      *Metrics
+	logger       *log.Logger
+	mu           sync.Mutex
+	running      bool
+	stopSignal   chan struct{}
+	claimRecords func(context.Context, int) ([]OutboxEventRecord, error)
 }
 
 // NewDispatcher creates an outbox Dispatcher.
@@ -190,7 +191,7 @@ func BuildSanitizedHint(record OutboxEventRecord) (WakeupHintDTO, error) {
 // DispatchBatch processes up to batchSize pending outbox events.
 // Requirement: "Publish ACK precedes published_at; Stable event IDs make duplicate delivery harmless."
 func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, error) {
-	if d.pool == nil {
+	if d.pool == nil && d.claimRecords == nil {
 		return 0, fmt.Errorf("outbox dispatcher pool is nil")
 	}
 	if batchSize <= 0 {
@@ -198,6 +199,20 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 	}
 
 	// 1. Begin transaction to select batch with FOR UPDATE SKIP LOCKED (Blueprint §11.2)
+	if d.claimRecords != nil {
+		records, err := d.claimRecords(ctx, batchSize)
+		if err != nil {
+			return 0, err
+		}
+		if len(records) == 0 {
+			if d.metrics != nil {
+				d.metrics.RecordSweep()
+			}
+			return 0, nil
+		}
+		return 0, fmt.Errorf("claimRecords hook returned records")
+	}
+
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin outbox claim tx: %w", err)
