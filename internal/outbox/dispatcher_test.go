@@ -81,9 +81,9 @@ func TestBuildSanitizedHint_NoSecretsOrOutputs(t *testing.T) {
 func TestBuildSanitizedHint_RejectsPoisonPayloads(t *testing.T) {
 	base := outbox.OutboxEventRecord{OrganizationID: "org", EventID: "event", Subject: "execution.state_changed", PayloadVersion: 1, CreatedAt: time.Now()}
 	for name, payload := range map[string][]byte{
-		"malformed JSON": []byte(`{"runId":`),
+		"malformed JSON":      []byte(`{"runId":`),
 		"missing routing IDs": []byte(`{"eventType":"TASK_STARTED"}`),
-		"wrong field types": []byte(`{"runId":42,"eventType":"TASK_STARTED"}`),
+		"wrong field types":   []byte(`{"runId":42,"eventType":"TASK_STARTED"}`),
 		"fractional sequence": []byte(`{"runId":"run","eventType":"TASK_STARTED","sequence":1.5}`),
 	} {
 		t.Run(name, func(t *testing.T) {

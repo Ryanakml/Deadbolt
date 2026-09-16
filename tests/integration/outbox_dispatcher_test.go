@@ -186,11 +186,17 @@ func TestOutboxAtomicIntentAndPublishAckPrecedesMark(t *testing.T) {
 	runID, _ := tenant.NewUUID()
 	err = tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO deployments (id, organization_id, environment_id, manifest_hash, bundle_digest, manifest, runtime_version)
-			VALUES ($1,$2,$3,'atomic-manifest',$4,'{}'::jsonb,'1.0')`, deploymentID, orgID, envID, "sha256:atomic"); err != nil { return err }
+			VALUES ($1,$2,$3,'atomic-manifest',$4,'{}'::jsonb,'1.0')`, deploymentID, orgID, envID, "sha256:atomic"); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO runs (id, organization_id, environment_id, deployment_id, workflow_name, status)
-			VALUES ($1,$2,$3,$4,'atomic-workflow','RUNNING')`, runID, orgID, envID, deploymentID); err != nil { return err }
+			VALUES ($1,$2,$3,$4,'atomic-workflow','RUNNING')`, runID, orgID, envID, deploymentID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO run_events (organization_id, run_id, sequence, event_type, payload)
-			VALUES ($1,$2,1,'RUN_CREATED','{}'::jsonb)`, orgID, runID); err != nil { return err }
+			VALUES ($1,$2,1,'RUN_CREATED','{}'::jsonb)`, orgID, runID); err != nil {
+			return err
+		}
 		row := tx.QueryRow(ctx, `
 			INSERT INTO outbox_events (
 				organization_id, subject, payload
@@ -229,17 +235,27 @@ func TestOutboxAtomicIntentAndPublishAckPrecedesMark(t *testing.T) {
 	rollbackRunID, _ := tenant.NewUUID()
 	rollbackErr := tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO runs (id, organization_id, environment_id, deployment_id, workflow_name, status)
-			VALUES ($1,$2,$3,$4,'rolled-back','RUNNING')`, rollbackRunID, orgID, envID, deploymentID); err != nil { return err }
-		if _, err := tx.Exec(ctx, `INSERT INTO run_events (organization_id, run_id, sequence, event_type) VALUES ($1,$2,1,'RUN_CREATED')`, orgID, rollbackRunID); err != nil { return err }
-		if _, err := tx.Exec(ctx, `INSERT INTO outbox_events (organization_id, subject, payload) VALUES ($1,'execution.state_changed',jsonb_build_object('runId',$2::text,'eventType','RUN_CREATED'))`, orgID, rollbackRunID); err != nil { return err }
+			VALUES ($1,$2,$3,$4,'rolled-back','RUNNING')`, rollbackRunID, orgID, envID, deploymentID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO run_events (organization_id, run_id, sequence, event_type) VALUES ($1,$2,1,'RUN_CREATED')`, orgID, rollbackRunID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO outbox_events (organization_id, subject, payload) VALUES ($1,'execution.state_changed',jsonb_build_object('runId',$2::text,'eventType','RUN_CREATED'))`, orgID, rollbackRunID); err != nil {
+			return err
+		}
 		return fmt.Errorf("intentional rollback for atomicity evidence")
 	})
-	if rollbackErr == nil { t.Fatal("expected rollback transaction to fail") }
+	if rollbackErr == nil {
+		t.Fatal("expected rollback transaction to fail")
+	}
 	var rollbackCount int
 	err = tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE id=$1::uuid`, rollbackRunID).Scan(&rollbackCount)
 	})
-	if err != nil || rollbackCount != 0 { t.Fatalf("rollback leaked authoritative state: err=%v count=%d", err, rollbackCount) }
+	if err != nil || rollbackCount != 0 {
+		t.Fatalf("rollback leaked authoritative state: err=%v count=%d", err, rollbackCount)
+	}
 
 	// 3. Setup subscriber to capture published NATS JetStream message
 	msgCh := make(chan *nats.Msg, 1)
@@ -784,7 +800,9 @@ func TestDuplicateWakeupConsumer_SingularClaimEvidence(t *testing.T) {
 		consumerMu.Lock()
 		calls := consumerCalls
 		consumerMu.Unlock()
-		if calls >= 2 { break }
+		if calls >= 2 {
+			break
+		}
 		select {
 		case <-deadline:
 			t.Fatal("timed out waiting for JetStream redelivery")
@@ -792,7 +810,9 @@ func TestDuplicateWakeupConsumer_SingularClaimEvidence(t *testing.T) {
 		}
 	}
 	consumerMu.Lock()
-	if claimedCount != 1 { t.Fatalf("expected one claim across consumer redelivery, got %d", claimedCount) }
+	if claimedCount != 1 {
+		t.Fatalf("expected one claim across consumer redelivery, got %d", claimedCount)
+	}
 	consumerMu.Unlock()
 
 	// 6. Direct database evidence of singular ownership (INV-03)

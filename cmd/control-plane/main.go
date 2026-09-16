@@ -276,14 +276,26 @@ func run() error {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			defer func() {
-				if consumer != nil { _ = consumer.Stop() }
-				if nc != nil { nc.Close() }
+				if consumer != nil {
+					_ = consumer.Stop()
+				}
+				if nc != nil {
+					nc.Close()
+				}
 				publisher.Set(nil)
 			}()
 			connect := func() {
-				if nc != nil && nc.IsConnected() { return }
-				if consumer != nil { _ = consumer.Stop(); consumer = nil }
-				if nc != nil { nc.Close(); nc = nil }
+				if nc != nil && nc.IsConnected() {
+					return
+				}
+				if consumer != nil {
+					_ = consumer.Stop()
+					consumer = nil
+				}
+				if nc != nil {
+					nc.Close()
+					nc = nil
+				}
 				conn, err := nats.Connect(natsURL, nats.Timeout(2*time.Second), nats.MaxReconnects(0))
 				if err != nil {
 					publisher.Set(nil)
@@ -292,22 +304,27 @@ func run() error {
 				}
 				js, err := conn.JetStream()
 				if err != nil {
-					conn.Close(); publisher.Set(nil)
+					conn.Close()
+					publisher.Set(nil)
 					logger.Printf("[OUTBOX] JetStream unavailable; retrying connection: %v", err)
 					return
 				}
 				if _, err := outbox.EnsureStream(js, outbox.StreamName, []string{outbox.SubjectPrefix + ">"}, 2*time.Minute); err != nil {
-					conn.Close(); publisher.Set(nil)
+					conn.Close()
+					publisher.Set(nil)
 					logger.Printf("[OUTBOX] NATS stream contract unavailable; retrying: %v", err)
 					return
 				}
 				candidate := outbox.NewWakeupConsumer(js, outbox.DefaultConsumerConfig(), outbox.WakeupHandlerFunc(func(ctx context.Context, hint outbox.WakeupHintDTO) error {
 					logger.Printf("[WAKEUP] Triggered DB scan for run %s (event %s)", hint.RunID, hint.EventID)
-					if reconciler != nil { reconciler.Wake() }
+					if reconciler != nil {
+						reconciler.Wake()
+					}
 					return nil
 				}), logger)
 				if err := candidate.Start(ctx); err != nil {
-					conn.Close(); publisher.Set(nil)
+					conn.Close()
+					publisher.Set(nil)
 					logger.Printf("[OUTBOX] Wake-up consumer unavailable; retrying: %v", err)
 					return
 				}
@@ -318,8 +335,10 @@ func run() error {
 			connect()
 			for {
 				select {
-				case <-ctx.Done(): return
-				case <-ticker.C: connect()
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					connect()
 				}
 			}
 		}()
