@@ -238,11 +238,18 @@ func run() error {
 	var reconciler *scheduling.Reconciler
 	if reconcilerPool != nil {
 		reconciler = scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
-		retentionService := execution.NewService(storage.NewPool(reconcilerPool), nil)
-		reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
-			_, err := retentionService.PruneExpiredTaskLogs(ctx, orgID, 1000)
-			return err
-		})
+		// The system role may enumerate tenants, but deliberately has no direct
+		// table DML privileges. Retention must execute through the runtime pool so
+		// each delete remains constrained by WithTenantTx(orgID) and RLS.
+		if pool != nil {
+			retentionService := execution.NewService(storage.NewPool(pool), nil)
+			reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
+				_, err := retentionService.PruneExpiredTaskLogs(ctx, orgID, 1000)
+				return err
+			})
+		} else {
+			logger.Printf("[SCHEDULER] Task-log retention disabled: runtime database pool unavailable")
+		}
 		healthChecker.SetSchedulerTicker(reconciler.Ticker(), gateway.DefaultSchedulerTimeout)
 		go func() {
 			if err := reconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
