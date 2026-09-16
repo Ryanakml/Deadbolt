@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Deadbolt Workflow Dashboard</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header" role="banner">
+      <div class="header-left">
+        <h1 class="logo">Deadbolt <span>Runtime</span></h1>
+        <nav class="main-nav" aria-label="Main Navigation">
+          <button id="nav-runs" class="nav-btn active" type="button">
+            Runs
+          </button>
+          <button id="nav-workers" class="nav-btn" type="button">
+            Workers
+          </button>
+        </nav>
+      </div>
+      <div class="header-right">
+        <div class="env-selector">
+          <label for="env-select">Environment:</label>
+          <select id="env-select" aria-label="Select Environment">
+            <option value="staging">staging</option>
+            <option value="production">production</option>
+          </select>
+        </div>
+        <button
+          id="theme-toggle"
+          class="icon-btn"
+          type="button"
+          aria-label="Toggle theme"
+          aria-pressed="false"
+        >
+          🌓 Theme
+        </button>
+      </div>
+    </header>
+
+    <div
+      id="global-error-banner"
+      class="error-banner hidden"
+      role="alert"
+      aria-live="assertive"
+    ></div>
+
+    <main class="app-content" role="main">
+      <!-- Runs List View -->
+      <section id="runs-view" class="view-panel" aria-labelledby="runs-heading">
+        <div class="panel-header">
+          <h2 id="runs-heading">Workflow Runs</h2>
+        </div>
+        <div class="table-container">
+          <table class="data-table" aria-label="Workflow Runs Table">
+            <thead>
+              <tr>
+                <th scope="col">Run ID</th>
+                <th scope="col">Workflow</th>
+                <th scope="col">Status</th>
+                <th scope="col">Reason</th>
+                <th scope="col">Created At</th>
+              </tr>
+            </thead>
+            <tbody id="runs-table-body">
+              <tr>
+                <td colspan="5" class="loading">Loading workflow runs...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Workers List View -->
+      <section
+        id="workers-view"
+        class="view-panel hidden"
+        aria-labelledby="workers-heading"
+      >
+        <div class="panel-header">
+          <h2 id="workers-heading">Registered Workers</h2>
+        </div>
+        <div class="table-container">
+          <table class="data-table" aria-label="Workers Table">
+            <thead>
+              <tr>
+                <th scope="col">Worker ID</th>
+                <th scope="col">Pool</th>
+                <th scope="col">Status</th>
+                <th scope="col">Deployment Digests</th>
+              </tr>
+            </thead>
+            <tbody id="workers-table-body">
+              <tr>
+                <td colspan="4" class="loading">Loading workers...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Run Inspector View -->
+      <section
+        id="inspector-view"
+        class="view-panel hidden"
+        aria-labelledby="inspector-heading"
+        aria-live="polite"
+      >
+        <div class="panel-header">
+          <button
+            id="inspector-back-btn"
+            class="back-btn"
+            type="button"
+            onclick="document.getElementById('nav-runs').click()"
+          >
+            &larr; Back to Runs
+          </button>
+          <h2 id="inspector-heading" class="sr-only">Run Inspector</h2>
+        </div>
+        <div id="inspector-content" class="inspector-body">
+          <!-- Dynamically rendered via inspector.ts -->
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="index.js"></script>
+  </body>
+</html>

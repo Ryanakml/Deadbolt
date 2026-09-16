@@ -449,7 +449,85 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 		return nil, ErrUnauthorized
 	}
 
-	// Logs are best-effort delivery per Blueprint §12.2.
+	records := req.Records
+	if len(records) > 100 {
+		records = records[:100]
+	}
+	if len(records) == 0 {
+		return &AckResponseDTO{
+			ProtocolVersion: ProtocolVersion,
+			RequestID:       req.RequestID,
+			Accepted:        true,
+		}, nil
+	}
+
+	err := s.pool.WithTenantTx(ctx, sessionCtx.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
+		var stepID, runID, envID string
+		err := tx.QueryRow(ctx, `
+			SELECT a.step_id::text, rs.run_id::text, rs.environment_id::text
+			FROM task_attempts a
+			JOIN run_steps rs ON rs.id = a.step_id AND rs.organization_id = a.organization_id
+			WHERE a.id = $1::uuid AND a.session_id = $2::uuid AND a.organization_id = $3::uuid
+		`, req.AttemptID, sessionCtx.SessionID, sessionCtx.OrganizationID).Scan(&stepID, &runID, &envID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrUnauthorized
+			}
+			return fmt.Errorf("verify attempt ownership: %w", err)
+		}
+
+		var existingCount int64
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM task_logs WHERE attempt_id = $1::uuid AND organization_id = $2::uuid`, req.AttemptID, sessionCtx.OrganizationID).Scan(&existingCount); err != nil {
+			return fmt.Errorf("count existing logs: %w", err)
+		}
+		if existingCount >= 1000 {
+			// Per-attempt quota reached; acknowledge to avoid worker retry loops
+			return nil
+		}
+
+		remaining := 1000 - existingCount
+		if int64(len(records)) > remaining {
+			records = records[:remaining]
+		}
+
+		for _, rec := range records {
+			msg := rec.Message
+			if len(msg) > 16384 {
+				msg = msg[:16381] + "..."
+			}
+			ts, parseErr := time.Parse(time.RFC3339Nano, rec.Timestamp)
+			if parseErr != nil {
+				ts = time.Now()
+			}
+			lvl := "info"
+			switch rec.Level {
+			case "debug", "info", "warn", "error":
+				lvl = rec.Level
+			}
+
+			_, insErr := tx.Exec(ctx, `
+				INSERT INTO task_logs (
+					organization_id, environment_id, run_id, step_id, attempt_id,
+					sequence, timestamp, level, message
+				) VALUES (
+					$1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+					$6, $7, $8, $9
+				) ON CONFLICT (attempt_id, sequence) DO NOTHING
+			`, sessionCtx.OrganizationID, envID, runID, stepID, req.AttemptID, rec.Sequence, ts, lvl, msg)
+			if insErr != nil {
+				return fmt.Errorf("insert task log: %w", insErr)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return nil, ErrUnauthorized
+		}
+		return nil, fmt.Errorf("record logs: %w", err)
+	}
+
 	return &AckResponseDTO{
 		ProtocolVersion: ProtocolVersion,
 		RequestID:       req.RequestID,

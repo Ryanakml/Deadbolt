@@ -21,6 +21,15 @@ importers:
         specifier: 2.9.0
         version: 2.9.0
 
+  apps/dashboard:
+    devDependencies:
+      '@types/node':
+        specifier: 24.10.1
+        version: 24.10.1
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   runner/node:
     devDependencies:
       '@types/node':
