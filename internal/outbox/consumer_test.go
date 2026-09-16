@@ -8,7 +8,7 @@ import (
 )
 
 func TestSameStreamContractRequiresExactDurableContract(t *testing.T) {
-	wantSubjects := []string{"deadbolt.wakeup.>"}
+	wantSubjects := []string{SubjectPrefix + ">"}
 	base := nats.StreamConfig{
 		Name:       StreamName,
 		Subjects:   append([]string(nil), wantSubjects...),
