@@ -254,7 +254,7 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 	for _, rec := range records {
 		hint, err := BuildSanitizedHint(rec)
 		if err != nil {
-			d.handleFailure(ctx, rec, err)
+			d.handleValidationFailure(ctx, rec, err)
 			continue
 		}
 		data, err := json.Marshal(hint)
@@ -283,7 +283,7 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 		if err != nil {
 			// Publish failed: calculate backoff and release the claim. Attempts was
 			// incremented by claim_outbox_batch exactly once.
-			d.handleFailure(ctx, rec, err)
+			d.handlePublishFailure(ctx, rec, err)
 			d.logger.Printf("[OUTBOX] Publish failed for event %s (attempt %d): %v", rec.EventID, rec.Attempts, err)
 		} else {
 			// Publish ACK received: Mark published_at atomically in PostgreSQL
@@ -310,17 +310,22 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 	return publishedCount, nil
 }
 
-func (d *Dispatcher) handleFailure(ctx context.Context, rec OutboxEventRecord, cause error) {
+func (d *Dispatcher) handleValidationFailure(ctx context.Context, rec OutboxEventRecord, cause error) {
 	if d.metrics != nil {
 		d.metrics.IncFailures()
 	}
-	if rec.Attempts >= d.cfg.MaxAttempts {
-		if _, err := d.pool.Exec(ctx, `SELECT app.dead_letter_outbox_event($1::uuid, $2)`, rec.ID, cause.Error()); err != nil {
-			d.logger.Printf("[OUTBOX] Failed to dead-letter event %s: %v", rec.EventID, err)
-		}
-		d.logger.Printf("[OUTBOX] Dead-lettered event %s after %d attempts: %v", rec.EventID, rec.Attempts, cause)
-		return
+	if _, err := d.pool.Exec(ctx, `SELECT app.dead_letter_outbox_event($1::uuid, $2)`, rec.ID, cause.Error()); err != nil {
+		d.logger.Printf("[OUTBOX] Failed to dead-letter invalid event %s: %v", rec.EventID, err)
 	}
+	d.logger.Printf("[OUTBOX] Dead-lettered invalid event %s: %v", rec.EventID, cause)
+}
+
+func (d *Dispatcher) handlePublishFailure(ctx context.Context, rec OutboxEventRecord, cause error) {
+	if d.metrics != nil {
+		d.metrics.IncFailures()
+	}
+	// Broker/network failures are transient. Do not apply MaxAttempts here:
+	// doing so would permanently lose events during a prolonged NATS outage.
 	backoff := d.CalculateBackoff(rec.Attempts)
 	if _, err := d.pool.Exec(ctx, `SELECT app.retry_outbox_event($1::uuid, $2::interval)`, rec.ID, fmt.Sprintf("%d milliseconds", backoff.Milliseconds())); err != nil {
 		d.logger.Printf("[OUTBOX] Failed to schedule retry for event %s: %v", rec.EventID, err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -76,18 +77,18 @@ func EnsureStream(js nats.JetStreamContext, streamName string, subjects []string
 }
 
 func sameStreamContract(cfg nats.StreamConfig, name string, subjects []string, dupWindow time.Duration) bool {
-	if cfg.Name != name || cfg.Storage != nats.FileStorage || cfg.Retention != nats.WorkQueuePolicy || cfg.MaxAge != 24*time.Hour || cfg.Duplicates != dupWindow {
+	if cfg.Name != name || cfg.Storage != nats.FileStorage || cfg.Retention != nats.WorkQueuePolicy || cfg.Discard != nats.DiscardOld || cfg.MaxAge != 24*time.Hour || cfg.Duplicates != dupWindow {
 		return false
 	}
-	for _, want := range subjects {
-		found := false
-		for _, got := range cfg.Subjects {
-			if got == want {
-				found = true
-				break
-			}
-		}
-		if !found {
+	want := append([]string(nil), subjects...)
+	got := append([]string(nil), cfg.Subjects...)
+	sort.Strings(want)
+	sort.Strings(got)
+	if len(want) != len(got) {
+		return false
+	}
+	for i := range want {
+		if want[i] != got[i] {
 			return false
 		}
 	}

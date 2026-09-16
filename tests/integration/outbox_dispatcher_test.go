@@ -249,12 +249,15 @@ func TestOutboxAtomicIntentAndPublishAckPrecedesMark(t *testing.T) {
 	if rollbackErr == nil {
 		t.Fatal("expected rollback transaction to fail")
 	}
-	var rollbackCount int
+	var rollbackRuns, rollbackEvents, rollbackOutbox int
 	err = tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE id=$1::uuid`, rollbackRunID).Scan(&rollbackCount)
+		return tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM runs WHERE id=$1::uuid),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid),
+			(SELECT count(*) FROM outbox_events WHERE payload->>'runId'=$1::text)`, rollbackRunID).Scan(&rollbackRuns, &rollbackEvents, &rollbackOutbox)
 	})
-	if err != nil || rollbackCount != 0 {
-		t.Fatalf("rollback leaked authoritative state: err=%v count=%d", err, rollbackCount)
+	if err != nil || rollbackRuns != 0 || rollbackEvents != 0 || rollbackOutbox != 0 {
+		t.Fatalf("rollback leaked authoritative state: err=%v runs=%d events=%d outbox=%d", err, rollbackRuns, rollbackEvents, rollbackOutbox)
 	}
 
 	// 3. Setup subscriber to capture published NATS JetStream message
@@ -740,17 +743,6 @@ func TestDuplicateWakeupConsumer_SingularClaimEvidence(t *testing.T) {
 		Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	hintData, _ := json.Marshal(hint)
-	// Publish hint twice to simulate duplicate delivery
-	for i := 0; i < 2; i++ {
-		_, err = js.PublishMsg(&nats.Msg{
-			Subject: outbox.SubjectPrefix + outbox.DefaultShard,
-			Header:  nats.Header{"Nats-Msg-Id": []string{fmt.Sprintf("%s-%d", eventID, i)}},
-			Data:    hintData,
-		})
-		if err != nil {
-			t.Fatalf("publish hint %d failed: %v", i, err)
-		}
-	}
 
 	// 4. Route both deliveries through the real consumer -> authoritative scan
 	// path. The first handler claims the step and then deliberately returns an
@@ -795,6 +787,16 @@ func TestDuplicateWakeupConsumer_SingularClaimEvidence(t *testing.T) {
 		t.Fatalf("start wakeup consumer: %v", err)
 	}
 	defer wakeupConsumer.Stop()
+	// Publish exactly one message. The first handler invocation NAKs it, so a
+	// second invocation can only be JetStream redelivery of that same message.
+	_, err = js.PublishMsg(&nats.Msg{
+		Subject: outbox.SubjectPrefix + outbox.DefaultShard,
+		Header:  nats.Header{"Nats-Msg-Id": []string{eventID}},
+		Data:    hintData,
+	})
+	if err != nil {
+		t.Fatalf("publish hint failed: %v", err)
+	}
 	deadline := time.After(5 * time.Second)
 	for {
 		consumerMu.Lock()

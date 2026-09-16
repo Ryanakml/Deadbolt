@@ -27,11 +27,14 @@ CREATE TABLE outbox_events (
     attempts INT NOT NULL DEFAULT 0,
     next_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     published_at TIMESTAMPTZ,
+    last_error TEXT,
+    dead_lettered_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (event_id)
 );
 
-CREATE INDEX idx_outbox_events_pending ON outbox_events (next_at) WHERE published_at IS NULL;
+CREATE INDEX idx_outbox_events_pending ON outbox_events (next_at)
+    WHERE published_at IS NULL AND dead_lettered_at IS NULL;
 ```
 
 ### 2.2 Security & Multi-Tenancy
@@ -52,7 +55,8 @@ CREATE INDEX idx_outbox_events_pending ON outbox_events (next_at) WHERE publishe
 3. **Sanitize Payload:** Payload is stripped of all customer secrets, environment variables, task inputs, and task outputs.
 4. **Publish to JetStream:** Message is published with `Nats-Msg-Id: <event_id>` header for broker-side deduplication.
 5. **Wait for Broker ACK:** Dispatcher synchronously waits for JetStream publish ACK.
-6. **Mark Published:** Upon ACK, `published_at` is set to `clock_timestamp()`. If publish fails, `attempts` is incremented and `next_at` is set using bounded exponential backoff (`500ms * 2^attempts`, capped at 60s).
+6. **Mark Published:** Upon ACK, `published_at` is set to `clock_timestamp()`.
+7. **Classify failures:** malformed/unsupported payloads are permanent and are recorded in `last_error` before being marked with `dead_lettered_at`. NATS/network failures are transient: they remain eligible for retry with bounded exponential backoff (`500ms * 2^attempts`, capped at 60s) and are never dead-lettered solely because an outage lasted longer than the retry count.
 
 ---
 
@@ -107,7 +111,8 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
 - `deadbolt_outbox_publish_failures_total` (counter): Total count of failed JetStream publish attempts.
 - `deadbolt_outbox_age_seconds` (gauge): Current age in seconds of the oldest unpublished outbox event.
 - `deadbolt_outbox_pending_count` (gauge): Number of outbox events currently awaiting dispatch.
-- `deadbolt_scheduler_loop_lag_seconds` (gauge): Time in seconds since the last dispatcher loop iteration.
+- `deadbolt_outbox_dispatcher_loop_lag_seconds` (gauge): Time in seconds since the last outbox dispatcher sweep.
+- `deadbolt_scheduler_loop_lag_seconds` (gauge): Time in seconds since the last authoritative scheduler/reconciler sweep.
 
 ### Alerting Thresholds
 
@@ -138,13 +143,13 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
    ```sql
    SELECT count(*), min(created_at), max(attempts)
    FROM outbox_events
-   WHERE published_at IS NULL;
+   WHERE published_at IS NULL AND dead_lettered_at IS NULL;
    ```
 3. Inspect top failing outbox events:
    ```sql
-   SELECT id, event_id, subject, attempts, next_at, created_at
+   SELECT id, event_id, subject, attempts, next_at, last_error, dead_lettered_at, created_at
    FROM outbox_events
-   WHERE published_at IS NULL
+   WHERE published_at IS NULL OR dead_lettered_at IS NOT NULL
    ORDER BY attempts DESC
    LIMIT 10;
    ```
@@ -161,7 +166,9 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
    ```sql
    UPDATE outbox_events
    SET next_at = clock_timestamp()
-   WHERE published_at IS NULL;
+   WHERE published_at IS NULL AND dead_lettered_at IS NULL;
+
+4. If an invalid payload is dead-lettered, fix the producer/serializer first. Replaying it without correction will dead-letter it again; use the recorded `last_error` as the diagnosis.
    ```
 
 ### 5.2 Symptom: JetStream Broker Redelivery Spikes
@@ -181,11 +188,16 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
 1. Check query plans for candidate scans (`idx_runs_env_status_created`, `idx_outbox_events_pending`).
 2. Singular claim invariants guarantee that redeliveries do NOT cause duplicate worker execution (`INV-03`).
 
-### 5.3 Broker Total Loss Recovery (`INV-11`)
+### 5.3 Dispatcher and Scheduler Lag
+
+`deadbolt_outbox_dispatcher_loop_lag_seconds` diagnoses the outbox publisher loop. `deadbolt_scheduler_loop_lag_seconds` diagnoses the authoritative database reconciler; these are separate signals. A healthy scheduler can continue progressing work while NATS is degraded, and a healthy dispatcher does not prove the scheduler is running.
+
+### 5.4 Broker Total Loss Recovery (`INV-11`)
 
 If NATS JetStream storage volume is completely corrupted or destroyed:
 
 1. Re-create the stream:
    The control plane automatically recreates `RUNTIME_WAKEUP` on boot via `outbox.EnsureStream()`.
 2. Outstanding un-published outbox entries in PostgreSQL are preserved and will be published.
+   Transiently failed events resume automatically after the NATS connection and JetStream stream are restored.
 3. Ready steps in PostgreSQL will be discovered by the periodic scheduler sweep (every 5 seconds) and by worker long-polling regardless of broker message loss.
