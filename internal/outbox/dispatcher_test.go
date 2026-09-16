@@ -32,6 +32,7 @@ func TestBuildSanitizedHint_NoSecretsOrOutputs(t *testing.T) {
 		OrganizationID: "11111111-2222-3333-4444-555566667777",
 		EventID:        "22222222-3333-4444-5555-666677778888",
 		Subject:        "execution.state_changed",
+		PayloadVersion: 1,
 		Payload:        encoded,
 		CreatedAt:      time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC),
 	}
