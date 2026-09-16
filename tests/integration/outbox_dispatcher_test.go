@@ -176,6 +176,15 @@ func TestOutboxAtomicIntentAndPublishAckPrecedesMark(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	var pendingIndexDef string
+	if err := tc.storagePool.WithTenantTx(ctx, "00000000-0000-0000-0000-000000000000", func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE indexname='idx_outbox_events_pending'`).Scan(&pendingIndexDef)
+	}); err != nil {
+		t.Fatalf("inspect outbox pending index: %v", err)
+	}
+	if !strings.Contains(pendingIndexDef, "dead_lettered_at IS NULL") {
+		t.Fatalf("outbox pending index does not exclude dead-lettered rows: %s", pendingIndexDef)
+	}
 	orgID, envID, _ := createOutboxTestTenant(t, tc.tenantSvc, "test-outbox-atomic")
 
 	// 1. Insert the authoritative state, event, and outbox intent in one

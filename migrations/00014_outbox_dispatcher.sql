@@ -7,6 +7,10 @@ ALTER TABLE outbox_events
 ALTER TABLE outbox_events
     ADD COLUMN IF NOT EXISTS dead_lettered_at TIMESTAMPTZ;
 
+DROP INDEX IF EXISTS idx_outbox_events_pending;
+CREATE INDEX idx_outbox_events_pending ON outbox_events (next_at)
+    WHERE published_at IS NULL AND dead_lettered_at IS NULL;
+
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION app.claim_outbox_batch(p_batch_size INT)
 RETURNS TABLE (
@@ -166,5 +170,8 @@ DROP FUNCTION IF EXISTS app.record_outbox_failure(UUID, TEXT);
 DROP FUNCTION IF EXISTS app.dead_letter_outbox_event(UUID, TEXT);
 DROP FUNCTION IF EXISTS app.mark_outbox_published(UUID);
 DROP FUNCTION IF EXISTS app.claim_outbox_batch(INT);
+DROP INDEX IF EXISTS idx_outbox_events_pending;
+CREATE INDEX idx_outbox_events_pending ON outbox_events (next_at)
+    WHERE published_at IS NULL;
 ALTER TABLE outbox_events DROP COLUMN IF EXISTS last_error;
 ALTER TABLE outbox_events DROP COLUMN IF EXISTS dead_lettered_at;
