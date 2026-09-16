@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -74,6 +76,240 @@ func startRealNATSServer(t *testing.T) (*natsServer.Server, *nats.Conn, nats.Jet
 	return ns, nc, js
 }
 
+// TestBrokerManagerDBBackedRecoveryLifecycle proves the real production path
+// survives an unavailable broker at startup and a later outage without
+// recreating either the BrokerManager or Dispatcher:
+// PostgreSQL outbox -> Dispatcher -> publisher slot -> BrokerManager/NATS ->
+// durable WakeupConsumer -> published_at.
+func TestBrokerManagerDBBackedRecoveryLifecycle(t *testing.T) {
+	tc := setupOutboxTestContextNamed(t, fmt.Sprintf("deadbolt_outbox_recovery_%d", time.Now().UnixNano()))
+	defer tc.cleanup()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve NATS address: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release reserved NATS address: %v", err)
+	}
+	url := fmt.Sprintf("nats://127.0.0.1:%d", port)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	publisher := outbox.NewJetStreamPublisherSlot()
+	var receivedMu sync.Mutex
+	received := map[string]int{}
+	manager := outbox.NewBrokerManager(url, publisher, outbox.WakeupHandlerFunc(func(_ context.Context, hint outbox.WakeupHintDTO) error {
+		receivedMu.Lock()
+		received[hint.EventID]++
+		receivedMu.Unlock()
+		return nil
+	}), log.Default(), 25*time.Millisecond)
+	dispatcher := outbox.NewDispatcher(tc.systemPool, publisher, outbox.DispatcherConfig{
+		BatchSize:     10,
+		PollInterval:  25 * time.Millisecond,
+		Shard:         outbox.DefaultShard,
+		BaseBackoff:   250 * time.Millisecond,
+		MaxRetryDelay: time.Second,
+		MaxAttempts:   3,
+	}, outbox.NewMetrics(tc.pool), log.Default())
+	managerDone := make(chan error, 1)
+	dispatcherDone := make(chan error, 1)
+	go func() { managerDone <- manager.Run(ctx) }()
+	go func() { dispatcherDone <- dispatcher.Run(ctx) }()
+
+	type outboxState struct {
+		attempts     int
+		nextAt       time.Time
+		publishedAt  *time.Time
+		deadLettered *time.Time
+		lastError    string
+	}
+	readState := func(orgID, id string) (outboxState, error) {
+		var state outboxState
+		err := tc.storagePool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `
+				SELECT attempts, next_at, published_at, dead_lettered_at, COALESCE(last_error, '')
+				FROM outbox_events WHERE id = $1::uuid
+			`, id).Scan(&state.attempts, &state.nextAt, &state.publishedAt, &state.deadLettered, &state.lastError)
+		})
+		return state, err
+	}
+	waitState := func(description string, check func(outboxState) bool, orgID, id string) outboxState {
+		t.Helper()
+		deadline := time.NewTimer(8 * time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			state, err := readState(orgID, id)
+			if err != nil {
+				t.Fatalf("read outbox state (%s): %v", description, err)
+			}
+			if check(state) {
+				return state
+			}
+			select {
+			case <-deadline.C:
+				t.Fatalf("timed out waiting for outbox state: %s; last=%+v", description, state)
+			case <-ticker.C:
+			}
+		}
+	}
+	insertPending := func(orgID string) (string, string) {
+		t.Helper()
+		runID, err := tenant.NewUUID()
+		if err != nil {
+			t.Fatalf("new run id: %v", err)
+		}
+		var id, eventID string
+		err = tc.storagePool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `
+				INSERT INTO outbox_events (organization_id, subject, payload)
+				VALUES ($1::uuid, 'execution.state_changed', jsonb_build_object('runId', $2::text, 'eventType', 'RUN_CREATED'))
+				RETURNING id::text, event_id::text
+			`, orgID, runID).Scan(&id, &eventID)
+		})
+		if err != nil {
+			t.Fatalf("insert pending outbox event: %v", err)
+		}
+		return id, eventID
+	}
+	waitReceivedOnce := func(eventID string) {
+		t.Helper()
+		deadline := time.NewTimer(8 * time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			receivedMu.Lock()
+			count := received[eventID]
+			receivedMu.Unlock()
+			if count == 1 {
+				return
+			}
+			if count > 1 {
+				t.Fatalf("durable consumer processed event %s %d times", eventID, count)
+			}
+			select {
+			case <-deadline.C:
+				t.Fatalf("timed out waiting for durable consumer event %s", eventID)
+			case <-ticker.C:
+			}
+		}
+	}
+
+	orgID, _, _ := createOutboxTestTenant(t, tc.tenantSvc, "test-broker-manager-db-recovery")
+	firstID, firstEventID := insertPending(orgID)
+	// No broker is running: the real dispatcher must keep the row pending and
+	// persist the transient failure/backoff rather than dead-lettering it.
+	waitState("startup outage retry", func(state outboxState) bool {
+		return state.attempts > 0 && state.nextAt.After(time.Now()) && state.lastError != "" && state.publishedAt == nil && state.deadLettered == nil
+	}, orgID, firstID)
+
+	storeDir := t.TempDir()
+	server := startRealNATSServerAt(t, port, storeDir)
+	waitState("startup recovery publish acknowledgement", func(state outboxState) bool {
+		return state.publishedAt != nil && state.deadLettered == nil
+	}, orgID, firstID)
+	waitReceivedOnce(firstEventID)
+
+	// Start from the same healthy manager/dispatcher, lose the broker, and add a
+	// second DB intent. It must remain retryable until the same file-backed
+	// JetStream server returns on the same address.
+	server.Shutdown()
+	secondID, secondEventID := insertPending(orgID)
+	waitState("post-connect outage retry", func(state outboxState) bool {
+		return state.attempts > 0 && state.nextAt.After(time.Now()) && state.lastError != "" && state.publishedAt == nil && state.deadLettered == nil
+	}, orgID, secondID)
+
+	server = startRealNATSServerAt(t, port, storeDir)
+	defer server.Shutdown()
+	waitState("post-connect recovery publish acknowledgement", func(state outboxState) bool {
+		return state.publishedAt != nil && state.deadLettered == nil
+	}, orgID, secondID)
+	waitReceivedOnce(secondEventID)
+
+	// Cancellation must stop both long-running components, clear the slot, and
+	// leave the durable consumer without an active subscriber.
+	cancel()
+	for name, done := range map[string]<-chan error{"broker manager": managerDone, "dispatcher": dispatcherDone} {
+		select {
+		case err := <-done:
+			if err != context.Canceled {
+				t.Fatalf("%s returned %v, want context.Canceled", name, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not stop after context cancellation", name)
+		}
+	}
+	if _, err := publisher.PublishMsg(&nats.Msg{Subject: outbox.SubjectPrefix + outbox.DefaultShard}); err == nil {
+		t.Fatal("publisher slot remained usable after broker manager shutdown")
+	}
+
+	nc, err := nats.Connect(url, nats.Timeout(5*time.Second))
+	if err != nil {
+		t.Fatalf("connect to restarted NATS: %v", err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("JetStream context after shutdown: %v", err)
+	}
+	shutdownEventID, err := tenant.NewUUID()
+	if err != nil {
+		t.Fatalf("new shutdown event id: %v", err)
+	}
+	data, err := json.Marshal(outbox.WakeupHintDTO{EventID: shutdownEventID, OrganizationID: orgID, Subject: "execution.state_changed", RunID: "shutdown-run", EventType: "RUN_CREATED", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatalf("marshal shutdown hint: %v", err)
+	}
+	if _, err := js.PublishMsg(&nats.Msg{Subject: outbox.SubjectPrefix + outbox.DefaultShard, Header: nats.Header{"Nats-Msg-Id": []string{shutdownEventID}}, Data: data}); err != nil {
+		t.Fatalf("publish shutdown probe: %v", err)
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		info, err := js.ConsumerInfo(outbox.StreamName, outbox.DefaultConsumerConfig().ConsumerName)
+		if err != nil {
+			t.Fatalf("inspect durable consumer after shutdown: %v", err)
+		}
+		if info.NumPending >= 1 {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("consumer remained active after broker manager shutdown")
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+// startRealNATSServerAt starts a file-backed JetStream server on a previously
+// reserved address. Keeping the same address and store across restarts makes
+// recovery exercise the same boundary as the control-plane process.
+func startRealNATSServerAt(t *testing.T, port int, storeDir string) *natsServer.Server {
+	t.Helper()
+	ns, err := natsServer.NewServer(&natsServer.Options{
+		Host:      "127.0.0.1",
+		Port:      port,
+		JetStream: true,
+		StoreDir:  storeDir,
+		NoLog:     true,
+		NoSigs:    true,
+	})
+	if err != nil {
+		t.Fatalf("initialize NATS server: %v", err)
+	}
+	ns.Start()
+	if !ns.ReadyForConnections(5 * time.Second) {
+		ns.Shutdown()
+		t.Fatal("NATS server failed to become ready")
+	}
+	return ns
+}
+
 type outboxTestContext struct {
 	db          *sql.DB
 	pool        *pgxpool.Pool
@@ -85,6 +321,10 @@ type outboxTestContext struct {
 }
 
 func setupOutboxTestContext(t *testing.T) *outboxTestContext {
+	return setupOutboxTestContextNamed(t, "deadbolt_outbox_test")
+}
+
+func setupOutboxTestContextNamed(t *testing.T, databaseName string) *outboxTestContext {
 	t.Helper()
 	migrationsDir, err := filepath.Abs("../../migrations")
 	if err != nil {
@@ -95,7 +335,7 @@ func setupOutboxTestContext(t *testing.T) *outboxTestContext {
 		t.Fatalf("resolve bootstrap path: %v", err)
 	}
 
-	migratorURL, runtimeURL, systemURL, err := testdb.SetupIsolatedDatabase("deadbolt_outbox_test", bootstrapPath)
+	migratorURL, runtimeURL, systemURL, err := testdb.SetupIsolatedDatabase(databaseName, bootstrapPath)
 	if err != nil {
 		t.Skipf("PostgreSQL isolated database setup skipped: %v", err)
 	}
