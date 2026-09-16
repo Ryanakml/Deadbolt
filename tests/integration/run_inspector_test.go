@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
+	"github.com/Ryanakml/Deadbolt/internal/deployment"
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -382,6 +383,146 @@ func TestRunInspectorPayloadReadBoundaryAndRedaction(t *testing.T) {
 
 	if res3.StatusCode != http.StatusForbidden {
 		t.Fatalf("security violation: expected 403 FORBIDDEN for logs query without payload:read, got %d", res3.StatusCode)
+	}
+
+	// 4. Failed run attempt: verify nested attempt error and top-level error redaction
+	createFailReq, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"fail-input-secret"}}`))
+	createFailReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createFailReq.Header.Set("Idempotency-Key", "payload-boundary-fail-run")
+	createFailReq.Header.Set("Content-Type", "application/json")
+	createFailRes, err := http.DefaultClient.Do(createFailReq)
+	if err != nil || createFailRes.StatusCode != http.StatusAccepted {
+		t.Fatalf("create fail run failed: %v", err)
+	}
+	var failRunResp execution.RunDTO
+	_ = json.NewDecoder(createFailRes.Body).Decode(&failRunResp)
+	createFailRes.Body.Close()
+
+	pollFailBody, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "p-fail-poll",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pollFailReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollFailBody))
+	pollFailReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	pollFailReq.Header.Set("Content-Type", "application/json")
+	pollFailRes, err := http.DefaultClient.Do(pollFailReq)
+	if err != nil || pollFailRes.StatusCode != http.StatusOK {
+		t.Fatalf("poll for failed run failed: %v", err)
+	}
+	var pollFailResp worker.PollResponseDTO
+	_ = json.NewDecoder(pollFailRes.Body).Decode(&pollFailResp)
+	pollFailRes.Body.Close()
+	if len(pollFailResp.Assignments) == 0 {
+		t.Fatalf("expected assignment for failed run")
+	}
+	asFail := pollFailResp.Assignments[0]
+
+	startFailReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/start", strings.NewReader(
+		fmt.Sprintf(`{"protocolVersion":1,"requestId":"s-fail-1","workerId":"%s","sessionId":"%s","attemptId":"%s","ownershipEpoch":%d}`, sessionCtx.WorkerID, sessionCtx.SessionID, asFail.AttemptID, asFail.OwnershipEpoch),
+	))
+	startFailReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	startFailReq.Header.Set("Content-Type", "application/json")
+	startFailRes, err := http.DefaultClient.Do(startFailReq)
+	if err != nil || startFailRes.StatusCode != http.StatusOK {
+		t.Fatalf("start for failed run failed: %v", err)
+	}
+	startFailRes.Body.Close()
+
+	secretErrMsg := "secret_db_pass_9988: failed to connect to internal db"
+	compFailPayload := worker.CompleteRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "c-fail-1",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       asFail.AttemptID,
+		OwnershipEpoch:  asFail.OwnershipEpoch,
+		Outcome:         "FAILED",
+		Error: &worker.TaskErrorDTO{
+			Code:    "ERR_INTERNAL_SECRET",
+			Message: secretErrMsg,
+		},
+	}
+	failDigest, _ := worker.CanonicalCompletionDigest(&compFailPayload)
+	compFailPayload.ResultDigest = failDigest
+	cfb, _ := json.Marshal(compFailPayload)
+	compFailReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/complete", bytes.NewReader(cfb))
+	compFailReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	compFailReq.Header.Set("Content-Type", "application/json")
+	compFailRes, err := http.DefaultClient.Do(compFailReq)
+	if err != nil || compFailRes.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(compFailRes.Body)
+		t.Fatalf("complete for failed run failed: %v (status %d): %s", err, compFailRes.StatusCode, string(b))
+	}
+	compFailRes.Body.Close()
+
+	// 4a. Restricted viewer inspects failed run snapshot
+	reqFailRestricted, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+failRunResp.ID, nil)
+	reqFailRestricted.Header.Set("Authorization", "Bearer "+restrictedKey.PlaintextKey)
+	resFailRestricted, err := http.DefaultClient.Do(reqFailRestricted)
+	if err != nil || resFailRestricted.StatusCode != http.StatusOK {
+		t.Fatalf("restricted snapshot failed: %v", err)
+	}
+	var failSnapRestricted execution.RunSnapshotDTO
+	_ = json.NewDecoder(resFailRestricted.Body).Decode(&failSnapRestricted)
+	resFailRestricted.Body.Close()
+
+	if failSnapRestricted.Error != nil {
+		t.Fatalf("security violation: expected nil top-level error for restricted viewer, got %v", failSnapRestricted.Error)
+	}
+	if len(failSnapRestricted.Steps) == 0 || len(failSnapRestricted.Steps[0].Attempts) == 0 {
+		t.Fatalf("expected steps and attempts in snapshot")
+	}
+	for _, step := range failSnapRestricted.Steps {
+		for _, attempt := range step.Attempts {
+			if attempt.Error != nil {
+				t.Fatalf("security violation: expected nil nested attempt.Error for restricted viewer, got %v", attempt.Error)
+			}
+		}
+	}
+
+	// 4b. Restricted viewer queries events of failed run: no error leak
+	reqEventsRestricted, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+failRunResp.ID+"/events", nil)
+	reqEventsRestricted.Header.Set("Authorization", "Bearer "+restrictedKey.PlaintextKey)
+	resEventsRestricted, err := http.DefaultClient.Do(reqEventsRestricted)
+	if err != nil || resEventsRestricted.StatusCode != http.StatusOK {
+		t.Fatalf("restricted events failed: %v", err)
+	}
+	var failEventsRestricted execution.RunEventsResponseDTO
+	_ = json.NewDecoder(resEventsRestricted.Body).Decode(&failEventsRestricted)
+	resEventsRestricted.Body.Close()
+
+	for _, ev := range failEventsRestricted.Events {
+		if ev.Payload != nil {
+			if m, ok := ev.Payload.(map[string]any); ok {
+				if _, hasErr := m["error"]; hasErr {
+					t.Fatalf("security violation: event %s contains unredacted error payload for restricted viewer", ev.ID)
+				}
+			}
+		}
+	}
+
+	// 4c. Privileged caller with payload:read inspects failed run snapshot: error is present
+	reqFailAdmin, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+failRunResp.ID, nil)
+	reqFailAdmin.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	resFailAdmin, err := http.DefaultClient.Do(reqFailAdmin)
+	if err != nil || resFailAdmin.StatusCode != http.StatusOK {
+		t.Fatalf("admin snapshot failed: %v", err)
+	}
+	var failSnapAdmin execution.RunSnapshotDTO
+	_ = json.NewDecoder(resFailAdmin.Body).Decode(&failSnapAdmin)
+	resFailAdmin.Body.Close()
+
+	if failSnapAdmin.Steps[0].Attempts[0].Error == nil {
+		t.Fatal("expected non-nil attempt error for privileged caller with payload:read")
+	}
+	errStr, _ := json.Marshal(failSnapAdmin.Steps[0].Attempts[0].Error)
+	if !strings.Contains(string(errStr), secretErrMsg) {
+		t.Fatalf("expected admin attempt error to contain secret message, got: %s", string(errStr))
 	}
 }
 
@@ -753,7 +894,8 @@ func TestRunInspectorBoundedTaskLogs(t *testing.T) {
 	lReq.Header.Set("Content-Type", "application/json")
 	lRes, err := http.DefaultClient.Do(lReq)
 	if err != nil || lRes.StatusCode != http.StatusOK {
-		t.Fatalf("log ingestion failed: %v (status %d)", err, lRes.StatusCode)
+		b, _ := io.ReadAll(lRes.Body)
+		t.Fatalf("log ingestion failed: %v (status %d): %s", err, lRes.StatusCode, string(b))
 	}
 	lRes.Body.Close()
 
@@ -808,5 +950,967 @@ func TestRunInspectorBoundedTaskLogs(t *testing.T) {
 	uRes.Body.Close()
 	if uRes.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 UNAUTHORIZED for mismatched worker session, got %d", uRes.StatusCode)
+	}
+}
+
+func setupTwoStepWorkflow(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID string, adminKey *tenant.GeneratedKey) (string, string) {
+	t.Helper()
+	tempDir := t.TempDir()
+	bundleDigest := writeAgentBundle(t, tempDir)
+
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"val": map[string]any{"type": "string"}},
+		"required":             []any{"val"},
+		"additionalProperties": false,
+	}
+	tasks := []map[string]any{
+		{
+			"name":                "task-step1",
+			"entrypoint":          "tasks/agent.mjs",
+			"timeoutMs":           30000,
+			"recovery":            "idempotent",
+			"idempotencyWindowMs": 305000,
+			"inputSchema":         schema,
+			"outputSchema":        schema,
+		},
+		{
+			"name":                "task-step2",
+			"entrypoint":          "tasks/agent.mjs",
+			"timeoutMs":           30000,
+			"recovery":            "idempotent",
+			"idempotencyWindowMs": 305000,
+			"inputSchema":         schema,
+			"outputSchema":        schema,
+		},
+	}
+	workflows := []map[string]any{
+		{
+			"manifestVersion": 1,
+			"name":            "two-step-workflow",
+			"inputSchema":     schema,
+			"outputSchema":    schema,
+			"nodes": []map[string]any{
+				{
+					"id":    "step-1",
+					"type":  "task",
+					"task":  "task-step1",
+					"after": []any{},
+					"input": map[string]any{
+						"val": map[string]any{"$ref": "run.input", "pointer": "/val"},
+					},
+				},
+				{
+					"id":    "step-2",
+					"type":  "task",
+					"task":  "task-step2",
+					"after": []any{"step-1"},
+					"input": map[string]any{
+						"val": map[string]any{"$ref": "step.output", "stepId": "step-1", "pointer": "/val"},
+					},
+				},
+			},
+			"output": map[string]any{
+				"val": map[string]any{"$ref": "step.output", "stepId": "step-2", "pointer": "/val"},
+			},
+		},
+	}
+
+	manifestBytes := createLifecycleManifest(bundleDigest, tasks, workflows)
+	depID := registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "two-step-workflow", manifestBytes)
+	return depID, bundleDigest
+}
+
+func TestRunInspectorStableLogKeysetPagination(t *testing.T) {
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	_, bundleDigest := setupTwoStepWorkflow(t, tc, server, orgID, envID, adminKey)
+	sessionCtx, sessionToken := enrollTestWorker(t, tc, server, orgID, envID, bundleDigest)
+
+	// Create run
+	createReq, _ := http.NewRequest("POST", server.URL+"/v1/workflows/two-step-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"pagination-test"}}`))
+	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq.Header.Set("Idempotency-Key", "keyset-pagination-run")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes, err := http.DefaultClient.Do(createReq)
+	if err != nil || createRes.StatusCode != http.StatusAccepted {
+		t.Fatalf("create run failed: %v", err)
+	}
+	var runResp execution.RunDTO
+	_ = json.NewDecoder(createRes.Body).Decode(&runResp)
+	createRes.Body.Close()
+
+	// 1. Worker polls and claims step-1
+	pollBody, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "poll-step1",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollBody))
+	pReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	pReq.Header.Set("Content-Type", "application/json")
+	pRes, _ := http.DefaultClient.Do(pReq)
+	var pollResp worker.PollResponseDTO
+	_ = json.NewDecoder(pRes.Body).Decode(&pollResp)
+	pRes.Body.Close()
+	if len(pollResp.Assignments) != 1 {
+		t.Fatalf("expected assignment for step-1")
+	}
+	as1 := pollResp.Assignments[0]
+
+	// Send 3 logs for step-1 (sequences 1, 2, 3)
+	batch1 := worker.LogBatchRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "log-batch-step1",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as1.AttemptID,
+		Records: []worker.LogRecordDTO{
+			{Sequence: 1, Level: "info", Message: "step1 log A", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+			{Sequence: 2, Level: "info", Message: "step1 log B", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+			{Sequence: 3, Level: "warn", Message: "step1 log C", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+	}
+	b1Bytes, _ := json.Marshal(batch1)
+	lReq1, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(b1Bytes))
+	lReq1.Header.Set("Authorization", "Bearer "+sessionToken)
+	lReq1.Header.Set("Content-Type", "application/json")
+	lRes1, err := http.DefaultClient.Do(lReq1)
+	if err != nil || lRes1.StatusCode != http.StatusOK {
+		t.Fatalf("ingest step1 logs failed: %v", err)
+	}
+	lRes1.Body.Close()
+
+	// Complete step-1
+	startReq1, _ := http.NewRequest("POST", server.URL+"/worker/v1/start", strings.NewReader(
+		fmt.Sprintf(`{"protocolVersion":1,"requestId":"s-p1","workerId":"%s","sessionId":"%s","attemptId":"%s","ownershipEpoch":%d}`, sessionCtx.WorkerID, sessionCtx.SessionID, as1.AttemptID, as1.OwnershipEpoch),
+	))
+	startReq1.Header.Set("Authorization", "Bearer "+sessionToken)
+	startReq1.Header.Set("Content-Type", "application/json")
+	sRes1, _ := http.DefaultClient.Do(startReq1)
+	sRes1.Body.Close()
+
+	compPayload1 := worker.CompleteRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "c-step1",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as1.AttemptID,
+		OwnershipEpoch:  as1.OwnershipEpoch,
+		Outcome:         "SUCCEEDED",
+		Output:          map[string]any{"val": "data-from-step1"},
+	}
+	d1, _ := worker.CanonicalCompletionDigest(&compPayload1)
+	compPayload1.ResultDigest = d1
+	c1Bytes, _ := json.Marshal(compPayload1)
+	cReq1, _ := http.NewRequest("POST", server.URL+"/worker/v1/complete", bytes.NewReader(c1Bytes))
+	cReq1.Header.Set("Authorization", "Bearer "+sessionToken)
+	cReq1.Header.Set("Content-Type", "application/json")
+	cRes1, _ := http.DefaultClient.Do(cReq1)
+	cRes1.Body.Close()
+
+	// 2. Worker polls and claims step-2
+	pollBody2, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "poll-step2",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pReq2, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollBody2))
+	pReq2.Header.Set("Authorization", "Bearer "+sessionToken)
+	pReq2.Header.Set("Content-Type", "application/json")
+	pRes2, _ := http.DefaultClient.Do(pReq2)
+	var pollResp2 worker.PollResponseDTO
+	_ = json.NewDecoder(pRes2.Body).Decode(&pollResp2)
+	pRes2.Body.Close()
+	if len(pollResp2.Assignments) != 1 {
+		t.Fatalf("expected assignment for step-2")
+	}
+	as2 := pollResp2.Assignments[0]
+
+	// Send 3 logs for step-2 (sequences 1, 2, 3 - deliberate overlap with step-1!)
+	batch2 := worker.LogBatchRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "log-batch-step2",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as2.AttemptID,
+		Records: []worker.LogRecordDTO{
+			{Sequence: 1, Level: "info", Message: "step2 log A", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+			{Sequence: 2, Level: "info", Message: "step2 log B", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+			{Sequence: 3, Level: "error", Message: "step2 log C", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+	}
+	b2Bytes, _ := json.Marshal(batch2)
+	lReq2, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(b2Bytes))
+	lReq2.Header.Set("Authorization", "Bearer "+sessionToken)
+	lReq2.Header.Set("Content-Type", "application/json")
+	lRes2, err := http.DefaultClient.Do(lReq2)
+	if err != nil || lRes2.StatusCode != http.StatusOK {
+		t.Fatalf("ingest step2 logs failed: %v", err)
+	}
+	lRes2.Body.Close()
+
+	// 3. Paginate logs with limit=2 using keyset cursor
+	var allItems []execution.TaskLogRecordDTO
+	var cursor *string
+	pageCount := 0
+
+	for {
+		pageCount++
+		if pageCount > 10 {
+			t.Fatal("infinite loop detected in log pagination")
+		}
+
+		urlStr := fmt.Sprintf("%s/v1/runs/%s/logs?limit=2", server.URL, runResp.ID)
+		if cursor != nil && *cursor != "" {
+			urlStr += "&cursor=" + *cursor
+		}
+
+		qReq, _ := http.NewRequest("GET", urlStr, nil)
+		qReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+		qRes, err := http.DefaultClient.Do(qReq)
+		if err != nil || qRes.StatusCode != http.StatusOK {
+			t.Fatalf("query page %d failed: %v", pageCount, err)
+		}
+		var pageResp execution.RunLogsResponseDTO
+		_ = json.NewDecoder(qRes.Body).Decode(&pageResp)
+		qRes.Body.Close()
+
+		if len(pageResp.Items) == 0 {
+			break
+		}
+		allItems = append(allItems, pageResp.Items...)
+		if pageResp.NextCursor == nil || *pageResp.NextCursor == "" {
+			break
+		}
+		cursor = pageResp.NextCursor
+	}
+
+	if len(allItems) != 6 {
+		t.Fatalf("expected 6 total log items across overlapping sequences, got %d", len(allItems))
+	}
+
+	// Verify all IDs are unique
+	seenIDs := make(map[string]bool)
+	for _, it := range allItems {
+		if seenIDs[it.ID] {
+			t.Fatalf("duplicate log item returned across pagination: %s", it.ID)
+		}
+		seenIDs[it.ID] = true
+	}
+
+	// Verify messages order
+	expectedMessages := []string{
+		"step1 log A",
+		"step1 log B",
+		"step1 log C",
+		"step2 log A",
+		"step2 log B",
+		"step2 log C",
+	}
+	for i, it := range allItems {
+		if it.Message != expectedMessages[i] {
+			t.Errorf("item %d: expected message %q, got %q", i, expectedMessages[i], it.Message)
+		}
+	}
+}
+
+func TestRunInspectorLogBoundsAndDroppedMetric(t *testing.T) {
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	_, bundleDigest := setupInspectorWorkflow(t, tc, server, orgID, envID, adminKey)
+	sessionCtx, sessionToken := enrollTestWorker(t, tc, server, orgID, envID, bundleDigest)
+
+	createReq, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"bounds-test"}}`))
+	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq.Header.Set("Idempotency-Key", "log-bounds-run")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes, _ := http.DefaultClient.Do(createReq)
+	var runResp execution.RunDTO
+	_ = json.NewDecoder(createRes.Body).Decode(&runResp)
+	createRes.Body.Close()
+
+	pollBody, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "p-bounds",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollBody))
+	pReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	pReq.Header.Set("Content-Type", "application/json")
+	pRes, _ := http.DefaultClient.Do(pReq)
+	var pollResp worker.PollResponseDTO
+	_ = json.NewDecoder(pRes.Body).Decode(&pollResp)
+	pRes.Body.Close()
+	as := pollResp.Assignments[0]
+
+	// 1. Exact 16 KiB message (16384 bytes) -> Accepted
+	msg16k := strings.Repeat("A", 16*1024)
+	batch1 := worker.LogBatchRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "log-req-16k",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as.AttemptID,
+		Records: []worker.LogRecordDTO{
+			{Sequence: 1, Level: "info", Message: msg16k, Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+	}
+	b1Bytes, _ := json.Marshal(batch1)
+	lReq1, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(b1Bytes))
+	lReq1.Header.Set("Authorization", "Bearer "+sessionToken)
+	lReq1.Header.Set("Content-Type", "application/json")
+	lRes1, err := http.DefaultClient.Do(lReq1)
+	if err != nil || lRes1.StatusCode != http.StatusOK {
+		t.Fatalf("log 16k failed: %v", err)
+	}
+	var ack1 worker.AckResponseDTO
+	_ = json.NewDecoder(lRes1.Body).Decode(&ack1)
+	lRes1.Body.Close()
+
+	if !ack1.Accepted || ack1.DroppedCount != 0 || ack1.BudgetExhausted {
+		t.Fatalf("expected accepted with 0 dropped, got %+v", ack1)
+	}
+
+	// 2. 16 KiB + 1 byte message (16385 bytes) -> Dropped
+	msg16kPlus1 := strings.Repeat("B", 16*1024+1)
+	batch2 := worker.LogBatchRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "log-req-16k-plus-1",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as.AttemptID,
+		Records: []worker.LogRecordDTO{
+			{Sequence: 2, Level: "info", Message: msg16kPlus1, Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+	}
+	b2Bytes, _ := json.Marshal(batch2)
+	lReq2, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(b2Bytes))
+	lReq2.Header.Set("Authorization", "Bearer "+sessionToken)
+	lReq2.Header.Set("Content-Type", "application/json")
+	lRes2, err := http.DefaultClient.Do(lReq2)
+	if err != nil || lRes2.StatusCode != http.StatusOK {
+		t.Fatalf("log 16k+1 request failed: %v", err)
+	}
+	var ack2 worker.AckResponseDTO
+	_ = json.NewDecoder(lRes2.Body).Decode(&ack2)
+	lRes2.Body.Close()
+
+	if !ack2.Accepted || ack2.DroppedCount != 1 || ack2.BudgetExhausted {
+		t.Fatalf("expected droppedCount=1 for oversized line, got %+v", ack2)
+	}
+
+	// 3. Fill up to 1 MiB cumulative attempt budget
+	// Currently at 16 KiB (sequence 1). Need 63 more 16 KiB records to hit exactly 1 MiB (64 * 16384 = 1048576)
+	var recordsToFill []worker.LogRecordDTO
+	for seq := 3; seq <= 65; seq++ {
+		recordsToFill = append(recordsToFill, worker.LogRecordDTO{
+			Sequence:  int64(seq),
+			Level:     "info",
+			Message:   msg16k,
+			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+	}
+	// Send in batches of 9 records
+	for i := 0; i < len(recordsToFill); i += 9 {
+		end := i + 9
+		if end > len(recordsToFill) {
+			end = len(recordsToFill)
+		}
+		fillBatch := worker.LogBatchRequestDTO{
+			ProtocolVersion: 1,
+			RequestID:       fmt.Sprintf("log-req-fill-%d", i),
+			WorkerID:        sessionCtx.WorkerID,
+			SessionID:       sessionCtx.SessionID,
+			AttemptID:       as.AttemptID,
+			Records:         recordsToFill[i:end],
+		}
+		fbBytes, _ := json.Marshal(fillBatch)
+		fReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(fbBytes))
+		fReq.Header.Set("Authorization", "Bearer "+sessionToken)
+		fReq.Header.Set("Content-Type", "application/json")
+		fRes, _ := http.DefaultClient.Do(fReq)
+		fRes.Body.Close()
+	}
+
+	// Now cumulative size is at 1 MiB. Sending sequence 66 must hit budgetExhausted.
+	overflowBatch := worker.LogBatchRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "log-req-overflow",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as.AttemptID,
+		Records: []worker.LogRecordDTO{
+			{Sequence: 66, Level: "info", Message: "one byte over budget", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+	}
+	obBytes, _ := json.Marshal(overflowBatch)
+	oReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(obBytes))
+	oReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	oReq.Header.Set("Content-Type", "application/json")
+	oRes, _ := http.DefaultClient.Do(oReq)
+	var ackOverflow worker.AckResponseDTO
+	_ = json.NewDecoder(oRes.Body).Decode(&ackOverflow)
+	oRes.Body.Close()
+
+	if !ackOverflow.BudgetExhausted || ackOverflow.DroppedCount != 1 {
+		t.Fatalf("expected budgetExhausted=true and droppedCount=1, got %+v", ackOverflow)
+	}
+
+	// 4. Retry overflow batch (idempotency check)
+	oResRetry, _ := http.DefaultClient.Do(oReq)
+	var ackRetry worker.AckResponseDTO
+	_ = json.NewDecoder(oResRetry.Body).Decode(&ackRetry)
+	oResRetry.Body.Close()
+
+	if !ackRetry.Accepted || !ackRetry.BudgetExhausted || ackRetry.DroppedCount != 1 {
+		t.Fatalf("expected idempotent response on retry, got %+v", ackRetry)
+	}
+
+	// 5. Verify worker.Service DroppedLogsCount metric
+	ws := worker.NewService(tc.pool, deployment.NewService(tc.pool, tc.service), execution.NewWorkerEngine(tc.pool, execution.NewEventHub()))
+	_, _ = ws.RecordLogs(context.Background(), sessionCtx, &worker.LogBatchRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "direct-svc-oversized",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as.AttemptID,
+		Records: []worker.LogRecordDTO{
+			{Sequence: 999, Level: "error", Message: strings.Repeat("Z", 20000), Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+	})
+	if ws.DroppedLogsCount() < 1 {
+		t.Fatalf("expected ws.DroppedLogsCount() >= 1, got %d", ws.DroppedLogsCount())
+	}
+}
+
+func TestRunInspectorRealRetentionCleanupAndStatusDistinction(t *testing.T) {
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	_, bundleDigest := setupInspectorWorkflow(t, tc, server, orgID, envID, adminKey)
+	sessionCtx, sessionToken := enrollTestWorker(t, tc, server, orgID, envID, bundleDigest)
+
+	// Run 1: Created, claimed, and completed with SUCCEEDED, but NO logs ever recorded (logs_recorded = false)
+	createReq1, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"no-logs"}}`))
+	createReq1.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq1.Header.Set("Idempotency-Key", "retention-no-logs-run")
+	createReq1.Header.Set("Content-Type", "application/json")
+	createRes1, _ := http.DefaultClient.Do(createReq1)
+	var run1 execution.RunDTO
+	_ = json.NewDecoder(createRes1.Body).Decode(&run1)
+	createRes1.Body.Close()
+
+	// Worker claims, starts, and completes Run 1
+	pollBody1, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "p-retention-1",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pReq1, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollBody1))
+	pReq1.Header.Set("Authorization", "Bearer "+sessionToken)
+	pReq1.Header.Set("Content-Type", "application/json")
+	pRes1, err := http.DefaultClient.Do(pReq1)
+	if err != nil || pRes1.StatusCode != http.StatusOK {
+		t.Fatalf("poll 1 failed: %v", err)
+	}
+	var pollResp1 worker.PollResponseDTO
+	_ = json.NewDecoder(pRes1.Body).Decode(&pollResp1)
+	pRes1.Body.Close()
+	if len(pollResp1.Assignments) == 0 {
+		t.Fatalf("expected assignment for run 1")
+	}
+	as1 := pollResp1.Assignments[0]
+
+	startReq1, _ := http.NewRequest("POST", server.URL+"/worker/v1/start", strings.NewReader(
+		fmt.Sprintf(`{"protocolVersion":1,"requestId":"s-ret-1","workerId":"%s","sessionId":"%s","attemptId":"%s","ownershipEpoch":%d}`, sessionCtx.WorkerID, sessionCtx.SessionID, as1.AttemptID, as1.OwnershipEpoch),
+	))
+	startReq1.Header.Set("Authorization", "Bearer "+sessionToken)
+	startReq1.Header.Set("Content-Type", "application/json")
+	sRes1, err := http.DefaultClient.Do(startReq1)
+	if err != nil || sRes1.StatusCode != http.StatusOK {
+		t.Fatalf("start 1 failed: %v", err)
+	}
+	sRes1.Body.Close()
+
+	compPayload1 := worker.CompleteRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "c-ret-1",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as1.AttemptID,
+		OwnershipEpoch:  as1.OwnershipEpoch,
+		Outcome:         "SUCCEEDED",
+		Output:          map[string]any{"val": "done-no-logs"},
+	}
+	digest1, _ := worker.CanonicalCompletionDigest(&compPayload1)
+	compPayload1.ResultDigest = digest1
+	cb1, _ := json.Marshal(compPayload1)
+	compReq1, _ := http.NewRequest("POST", server.URL+"/worker/v1/complete", bytes.NewReader(cb1))
+	compReq1.Header.Set("Authorization", "Bearer "+sessionToken)
+	compReq1.Header.Set("Content-Type", "application/json")
+	cRes1, err := http.DefaultClient.Do(compReq1)
+	if err != nil || cRes1.StatusCode != http.StatusOK {
+		t.Fatalf("complete 1 failed: %v", err)
+	}
+	cRes1.Body.Close()
+
+	// Initial check for Run 1: expired should be FALSE, message nil
+	qReq1, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+run1.ID+"/logs", nil)
+	qReq1.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	qRes1, err := http.DefaultClient.Do(qReq1)
+	if err != nil || qRes1.StatusCode != http.StatusOK {
+		t.Fatalf("get logs for run1 failed: %v", err)
+	}
+	var logsResp1 execution.RunLogsResponseDTO
+	_ = json.NewDecoder(qRes1.Body).Decode(&logsResp1)
+	qRes1.Body.Close()
+
+	if logsResp1.Expired {
+		t.Fatal("expected expired=false for run with no logs recorded")
+	}
+	if logsResp1.Message != nil {
+		t.Fatalf("expected nil message for run with no logs recorded, got: %s", *logsResp1.Message)
+	}
+	if len(logsResp1.Items) != 0 {
+		t.Fatalf("expected 0 items, got %d", len(logsResp1.Items))
+	}
+
+	// Run 2: Created, logs recorded, and then aged & pruned
+	createReq2, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"has-logs"}}`))
+	createReq2.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq2.Header.Set("Idempotency-Key", "retention-with-logs-run")
+	createReq2.Header.Set("Content-Type", "application/json")
+	createRes2, _ := http.DefaultClient.Do(createReq2)
+	var run2 execution.RunDTO
+	_ = json.NewDecoder(createRes2.Body).Decode(&run2)
+	createRes2.Body.Close()
+
+	pollBody2, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "p-retention-2",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pReq2, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollBody2))
+	pReq2.Header.Set("Authorization", "Bearer "+sessionToken)
+	pReq2.Header.Set("Content-Type", "application/json")
+	pRes2, err := http.DefaultClient.Do(pReq2)
+	if err != nil || pRes2.StatusCode != http.StatusOK {
+		t.Fatalf("poll 2 failed: %v", err)
+	}
+	var pollResp2 worker.PollResponseDTO
+	_ = json.NewDecoder(pRes2.Body).Decode(&pollResp2)
+	pRes2.Body.Close()
+	if len(pollResp2.Assignments) == 0 {
+		t.Fatalf("expected assignment for run 2")
+	}
+	as2 := pollResp2.Assignments[0]
+
+	// Ingest 2 log lines for Run 2
+	batch2 := worker.LogBatchRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "log-retention-batch-2",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as2.AttemptID,
+		Records: []worker.LogRecordDTO{
+			{Sequence: 1, Level: "info", Message: "Old log message 1", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+			{Sequence: 2, Level: "info", Message: "Old log message 2", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+		},
+	}
+	bBytes2, _ := json.Marshal(batch2)
+	lReq2, _ := http.NewRequest("POST", server.URL+"/worker/v1/logs", bytes.NewReader(bBytes2))
+	lReq2.Header.Set("Authorization", "Bearer "+sessionToken)
+	lReq2.Header.Set("Content-Type", "application/json")
+	lRes2, err := http.DefaultClient.Do(lReq2)
+	if err != nil || lRes2.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(lRes2.Body)
+		t.Fatalf("log ingestion failed: %v (status %d): %s", err, lRes2.StatusCode, string(b))
+	}
+	lRes2.Body.Close()
+
+	// Verify Run 2 has 2 log records before pruning
+	qReq2Pre, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+run2.ID+"/logs", nil)
+	qReq2Pre.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	qRes2Pre, err := http.DefaultClient.Do(qReq2Pre)
+	if err != nil || qRes2Pre.StatusCode != http.StatusOK {
+		t.Fatalf("pre-prune logs query failed: %v", err)
+	}
+	var logsPre execution.RunLogsResponseDTO
+	_ = json.NewDecoder(qRes2Pre.Body).Decode(&logsPre)
+	qRes2Pre.Body.Close()
+	if len(logsPre.Items) != 2 || logsPre.Expired {
+		t.Fatalf("expected 2 unexpired items pre-prune, got %d (expired=%v)", len(logsPre.Items), logsPre.Expired)
+	}
+
+	// Age logs by 8 days directly in PostgreSQL
+	ctx := context.Background()
+	err = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE task_logs SET created_at = clock_timestamp() - INTERVAL '8 days' WHERE run_id = $1::uuid`, run2.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to age task logs: %v", err)
+	}
+
+	// Run pruning
+	execSvc := execution.NewService(tc.pool, tc.service, execution.NewEventHub())
+	pruned, err := execSvc.PruneExpiredTaskLogs(ctx, orgID, 100)
+	if err != nil {
+		t.Fatalf("prune expired logs failed: %v", err)
+	}
+	if pruned < 2 {
+		t.Fatalf("expected at least 2 pruned logs, got %d", pruned)
+	}
+
+	// Verify task_attempts.logs_recorded is still true in DB for Run 2
+	var recorded2 bool
+	err = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT logs_recorded FROM task_attempts WHERE id = $1::uuid`, as2.AttemptID).Scan(&recorded2)
+	})
+	if err != nil || !recorded2 {
+		t.Fatalf("expected logs_recorded to remain true for run 2, got %v (err: %v)", recorded2, err)
+	}
+
+	// Query logs for Run 2: expired MUST be true, message must cite 7-day retention
+	qReq2Post, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+run2.ID+"/logs", nil)
+	qReq2Post.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	qRes2Post, err := http.DefaultClient.Do(qReq2Post)
+	if err != nil || qRes2Post.StatusCode != http.StatusOK {
+		t.Fatalf("post-prune logs query failed: %v", err)
+	}
+	var logsResp2 execution.RunLogsResponseDTO
+	_ = json.NewDecoder(qRes2Post.Body).Decode(&logsResp2)
+	qRes2Post.Body.Close()
+
+	if !logsResp2.Expired {
+		t.Fatal("expected expired=true for run with pruned logs")
+	}
+	if len(logsResp2.Items) != 0 {
+		t.Fatalf("expected 0 items after pruning, got %d", len(logsResp2.Items))
+	}
+	if logsResp2.Message == nil {
+		t.Fatal("expected message mentioning 7-day retention, got nil")
+	} else if !strings.Contains(*logsResp2.Message, "7-day") {
+		t.Fatalf("expected message mentioning 7-day retention, got: %q", *logsResp2.Message)
+	}
+
+	// Query logs for Run 1 after pruning: expired must STILL be false!
+	qReq1Post, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+run1.ID+"/logs", nil)
+	qReq1Post.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	qRes1Post, err := http.DefaultClient.Do(qReq1Post)
+	if err != nil || qRes1Post.StatusCode != http.StatusOK {
+		t.Fatalf("post-prune logs query for run 1 failed: %v", err)
+	}
+	var logsResp1Post execution.RunLogsResponseDTO
+	_ = json.NewDecoder(qRes1Post.Body).Decode(&logsResp1Post)
+	qRes1Post.Body.Close()
+
+	if logsResp1Post.Expired {
+		t.Fatal("expected expired=false for run 1 even after pruning")
+	}
+	if logsResp1Post.Message != nil {
+		t.Fatalf("expected nil message for run 1, got: %v", *logsResp1Post.Message)
+	}
+	if len(logsResp1Post.Items) != 0 {
+		t.Fatalf("expected 0 items for run 1, got %d", len(logsResp1Post.Items))
+	}
+}
+
+func TestRunInspectorDeterministicSnapshotToSubscribeRace(t *testing.T) {
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	_, bundleDigest := setupInspectorWorkflow(t, tc, server, orgID, envID, adminKey)
+	sessionCtx, sessionToken := enrollTestWorker(t, tc, server, orgID, envID, bundleDigest)
+
+	// 1. Create run
+	createReq, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"race-test"}}`))
+	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq.Header.Set("Idempotency-Key", "race-test-run")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes, _ := http.DefaultClient.Do(createReq)
+	var runResp execution.RunDTO
+	_ = json.NewDecoder(createRes.Body).Decode(&runResp)
+	createRes.Body.Close()
+
+	// 2. Snapshot: lastEventSequence is 1 (run.created)
+	snapReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+runResp.ID, nil)
+	snapReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	snapRes, _ := http.DefaultClient.Do(snapReq)
+	var snap execution.RunSnapshotDTO
+	_ = json.NewDecoder(snapRes.Body).Decode(&snap)
+	snapRes.Body.Close()
+
+	if snap.LastEventSequence != 1 {
+		t.Fatalf("expected lastEventSequence=1, got %d", snap.LastEventSequence)
+	}
+
+	// 3. Before client subscribes to SSE, worker claims task (commits event sequence 2)
+	pollBody, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "p-race",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pollReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollBody))
+	pollReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	pollReq.Header.Set("Content-Type", "application/json")
+	pollRes, _ := http.DefaultClient.Do(pollReq)
+	var pollResp worker.PollResponseDTO
+	_ = json.NewDecoder(pollRes.Body).Decode(&pollResp)
+	pollRes.Body.Close()
+	as := pollResp.Assignments[0]
+
+	// 4. Client connects SSE with Last-Event-ID = 1 (simulates snapshot at seq 1, then connecting)
+	sseReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+runResp.ID+"/stream", nil)
+	sseReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	sseReq.Header.Set("Last-Event-ID", "1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sseReq = sseReq.WithContext(ctx)
+
+	sseRes, err := http.DefaultClient.Do(sseReq)
+	if err != nil || sseRes.StatusCode != http.StatusOK {
+		t.Fatalf("SSE connect failed: %v (status %d)", err, sseRes.StatusCode)
+	}
+	defer sseRes.Body.Close()
+
+	reader := bufio.NewReader(sseRes.Body)
+	readChan := make(chan string, 10)
+	go func() {
+		for {
+			line, rErr := reader.ReadString('\n')
+			if rErr != nil {
+				return
+			}
+			if strings.HasPrefix(line, "event:") {
+				readChan <- strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			}
+		}
+	}()
+
+	// 5. Expect sequence 2 (attempt.claimed) from replay catchup
+	select {
+	case ev := <-readChan:
+		if ev != "attempt.claimed" {
+			t.Fatalf("expected attempt.claimed catch-up event, got %s", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for catch-up event sequence 2")
+	}
+
+	// 6. Worker starts task (live broadcast: sequence 3)
+	startReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/start", strings.NewReader(
+		fmt.Sprintf(`{"protocolVersion":1,"requestId":"s-race","workerId":"%s","sessionId":"%s","attemptId":"%s","ownershipEpoch":%d}`, sessionCtx.WorkerID, sessionCtx.SessionID, as.AttemptID, as.OwnershipEpoch),
+	))
+	startReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	startReq.Header.Set("Content-Type", "application/json")
+	startRes, _ := http.DefaultClient.Do(startReq)
+	startRes.Body.Close()
+
+	// 7. Expect sequence 3 (attempt.started) delivered live without reconnecting
+	select {
+	case ev := <-readChan:
+		if ev != "attempt.started" {
+			t.Fatalf("expected attempt.started live event, got %s", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for live broadcast event sequence 3")
+	}
+}
+
+func TestRunInspectorCrossTenantStreamRejection(t *testing.T) {
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	setupInspectorWorkflow(t, tc, server, orgID, envID, adminKey)
+
+	// Create run in Org A
+	createReq, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"tenant-a"}}`))
+	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq.Header.Set("Idempotency-Key", "stream-isolation-run")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes, _ := http.DefaultClient.Do(createReq)
+	var runResp execution.RunDTO
+	_ = json.NewDecoder(createRes.Body).Decode(&runResp)
+	createRes.Body.Close()
+
+	// Create Org B and Key B
+	ctx := context.Background()
+	ownerB, _ := tenant.NewUUID()
+	orgB, _ := tc.service.CreateOrganization(ctx, ownerB, "Tenant B Org")
+	projB, _ := tc.service.CreateProject(ctx, orgB.ID, "Tenant B Proj")
+	envB, _ := tc.service.CreateEnvironment(ctx, orgB.ID, projB.ID, tenant.EnvStaging, 5)
+	keyB := bootstrapTestKey(t, tc.service, orgB.ID, envB.ID, []string{
+		tenant.CapRunsRead,
+	})
+
+	// Tenant B attempts to open SSE stream for Run A
+	req, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+runResp.ID+"/stream", nil)
+	req.Header.Set("Authorization", "Bearer "+keyB.PlaintextKey)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-tenant violation: expected 404 Not Found for stream, got %d", res.StatusCode)
+	}
+	if ct := res.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("cross-tenant violation: stream headers flushed on unauthorized request")
+	}
+}
+
+func TestRunInspectorHonestNoWorkerState(t *testing.T) {
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	_, bundleDigest := setupInspectorWorkflow(t, tc, server, orgID, envID, adminKey)
+
+	// Expire the preflight-seeded worker session so that active compatible worker count starts at 0
+	_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE worker_sessions SET expires_at = clock_timestamp() - interval '1 minute' WHERE organization_id = $1::uuid`, orgID)
+		return err
+	})
+
+	// Create run with NO worker connected
+	createReq, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-workflow/runs", strings.NewReader(`{"environment":"staging","input":{"val":"no-worker-test"}}`))
+	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq.Header.Set("Idempotency-Key", "honest-no-worker-run")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes, _ := http.DefaultClient.Do(createReq)
+	var runResp execution.RunDTO
+	_ = json.NewDecoder(createRes.Body).Decode(&runResp)
+	createRes.Body.Close()
+
+	// Snapshot before worker enrolls
+	snapReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+runResp.ID, nil)
+	snapReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	snapRes, _ := http.DefaultClient.Do(snapReq)
+	var snap execution.RunSnapshotDTO
+	_ = json.NewDecoder(snapRes.Body).Decode(&snap)
+	snapRes.Body.Close()
+
+	if snap.Status != contracts.RunStatusQUEUED {
+		t.Fatalf("expected QUEUED, got %s", snap.Status)
+	}
+	if snap.ActiveCompatibleWorkers != 0 {
+		t.Fatalf("expected 0 active compatible workers, got %d", snap.ActiveCompatibleWorkers)
+	}
+	if snap.WaitingReason == nil || *snap.WaitingReason != "NO_COMPATIBLE_WORKERS" {
+		t.Fatalf("expected waitingReason=NO_COMPATIBLE_WORKERS, got %v", snap.WaitingReason)
+	}
+
+	// Now enroll worker and send poll advertising bundle digest
+	enrollTestWorker(t, tc, server, orgID, envID, bundleDigest)
+
+	// Snapshot after worker enrolls: waitingReason must clear
+	snapRes2, _ := http.DefaultClient.Do(snapReq)
+	var snap2 execution.RunSnapshotDTO
+	_ = json.NewDecoder(snapRes2.Body).Decode(&snap2)
+	snapRes2.Body.Close()
+
+	if snap2.ActiveCompatibleWorkers < 1 {
+		t.Fatalf("expected >= 1 active compatible workers, got %d", snap2.ActiveCompatibleWorkers)
+	}
+	if snap2.WaitingReason != nil {
+		t.Fatalf("expected waitingReason to be nil once worker is active, got %v", *snap2.WaitingReason)
+	}
+}
+
+func TestDashboardStaticFileServingSmoke(t *testing.T) {
+	_, server, _, _, _ := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	// 1. GET /dashboard/ -> HTML index
+	resIndex, err := http.Get(server.URL + "/dashboard/")
+	if err != nil {
+		t.Fatalf("GET /dashboard/ failed: %v", err)
+	}
+	bodyIndex, _ := io.ReadAll(resIndex.Body)
+	resIndex.Body.Close()
+
+	if resIndex.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /dashboard/, got %d", resIndex.StatusCode)
+	}
+	if !strings.Contains(string(bodyIndex), "Deadbolt") {
+		t.Fatalf("expected index.html to mention Deadbolt, got:\n%s", string(bodyIndex))
+	}
+
+	// 2. GET /dashboard (without trailing slash) -> 301 redirect to /dashboard/
+	clientNoFollow := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resRedir, err := clientNoFollow.Get(server.URL + "/dashboard")
+	if err != nil {
+		t.Fatalf("GET /dashboard failed: %v", err)
+	}
+	resRedir.Body.Close()
+
+	if resRedir.StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("expected 301 Moved Permanently for /dashboard, got %d", resRedir.StatusCode)
+	}
+	if loc := resRedir.Header.Get("Location"); loc != "/dashboard/" {
+		t.Fatalf("expected Location: /dashboard/, got %s", loc)
+	}
+
+	// 3. GET /dashboard/styles.css
+	resCSS, err := http.Get(server.URL + "/dashboard/styles.css")
+	if err != nil {
+		t.Fatalf("GET /dashboard/styles.css failed: %v", err)
+	}
+	bodyCSS, _ := io.ReadAll(resCSS.Body)
+	resCSS.Body.Close()
+
+	if resCSS.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for styles.css, got %d", resCSS.StatusCode)
+	}
+	if len(bodyCSS) == 0 {
+		t.Fatal("expected non-empty styles.css")
+	}
+
+	// 4. GET /dashboard/index.js
+	resJS, err := http.Get(server.URL + "/dashboard/index.js")
+	if err != nil {
+		t.Fatalf("GET /dashboard/index.js failed: %v", err)
+	}
+	bodyJS, _ := io.ReadAll(resJS.Body)
+	resJS.Body.Close()
+
+	if resJS.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for index.js, got %d", resJS.StatusCode)
+	}
+	if len(bodyJS) == 0 {
+		t.Fatal("expected non-empty index.js")
 	}
 }

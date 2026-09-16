@@ -41,6 +41,7 @@ USER 10001:10001
 
 COPY --from=builder /bin/control-plane /usr/local/bin/control-plane
 COPY --from=builder /src/migrations /migrations
+COPY --chown=10001:10001 apps/dashboard/dist /app/dashboard
 
 EXPOSE 8080
 

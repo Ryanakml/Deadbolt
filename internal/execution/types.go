@@ -45,10 +45,12 @@ type AttemptSummaryDTO struct {
 
 type RunSnapshotDTO struct {
 	RunDTO
-	LastEventSequence int64        `json:"lastEventSequence"`
-	Steps             []RunStepDTO `json:"steps"`
-	Output            any          `json:"output,omitempty"`
-	Error             any          `json:"error,omitempty"`
+	LastEventSequence       int64        `json:"lastEventSequence"`
+	Steps                   []RunStepDTO `json:"steps"`
+	Output                  any          `json:"output,omitempty"`
+	Error                   any          `json:"error,omitempty"`
+	WaitingReason           *string      `json:"waitingReason,omitempty"`
+	ActiveCompatibleWorkers int          `json:"activeCompatibleWorkers"`
 }
 
 type RunListResponseDTO struct {
@@ -98,8 +100,10 @@ type TaskLogRecordDTO struct {
 }
 
 type RunLogsResponseDTO struct {
-	Items      []TaskLogRecordDTO `json:"items"`
-	NextCursor *string            `json:"nextCursor,omitempty"`
-	Expired    bool               `json:"expired"`
-	Message    *string            `json:"message,omitempty"`
+	Items           []TaskLogRecordDTO `json:"items"`
+	NextCursor      *string            `json:"nextCursor,omitempty"`
+	Expired         bool               `json:"expired"`
+	Message         *string            `json:"message,omitempty"`
+	DroppedCount    int                `json:"droppedCount,omitempty"`
+	BudgetExhausted bool               `json:"budgetExhausted,omitempty"`
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -449,6 +448,49 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			}
 		}
 
+		var activeWorkers int
+		if run.DeploymentID != "" {
+			err := tx.QueryRow(ctx, `
+				SELECT COUNT(DISTINCT ws.id)
+				FROM worker_sessions ws
+				JOIN workers w ON w.id = ws.worker_id AND w.organization_id = ws.organization_id
+				JOIN worker_deployments wd ON wd.session_id = ws.id AND wd.organization_id = ws.organization_id
+				JOIN deployments d ON d.bundle_digest = wd.bundle_digest AND d.organization_id = ws.organization_id
+				WHERE ws.organization_id = $1::uuid
+				  AND d.id = $2::uuid
+				  AND w.status = 'ACTIVE'
+				  AND ws.revoked_at IS NULL
+				  AND ws.expires_at > clock_timestamp()
+			`, orgID, run.DeploymentID).Scan(&activeWorkers)
+			if err != nil {
+				return fmt.Errorf("query active compatible workers: %w", err)
+			}
+		}
+
+		var waitingReason *string
+		isTerminal := run.Status == contracts.RunStatusSUCCEEDED ||
+			run.Status == contracts.RunStatusFAILED ||
+			run.Status == contracts.RunStatusCANCELLED
+
+		if !isTerminal && activeWorkers == 0 {
+			hasRunningAttempt := false
+			for _, st := range steps {
+				for _, att := range st.Attempts {
+					if att.Status == "RUNNING" {
+						hasRunningAttempt = true
+						break
+					}
+				}
+				if hasRunningAttempt {
+					break
+				}
+			}
+			if !hasRunningAttempt {
+				reason := "NO_COMPATIBLE_WORKERS"
+				waitingReason = &reason
+			}
+		}
+
 		if run.Status == contracts.RunStatusFAILED && runError == nil {
 			if run.ReasonCode != nil {
 				runError = map[string]any{
@@ -471,11 +513,13 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 		}
 
 		snapshot = &RunSnapshotDTO{
-			RunDTO:            *run,
-			LastEventSequence: lastEventSeq,
-			Steps:             steps,
-			Output:            output,
-			Error:             runError,
+			RunDTO:                  *run,
+			LastEventSequence:       lastEventSeq,
+			Steps:                   steps,
+			Output:                  output,
+			Error:                   runError,
+			WaitingReason:           waitingReason,
+			ActiveCompatibleWorkers: activeWorkers,
 		}
 		return nil
 	})
@@ -801,33 +845,35 @@ func (s *Service) GetRunLogs(ctx context.Context, orgID, runID string, stepID, a
 	var resp *RunLogsResponseDTO
 
 	err := s.pool.WithTenantReadOnlyRepeatableReadTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		var createdAt time.Time
-		err := tx.QueryRow(ctx, `SELECT created_at FROM runs WHERE id = $1::uuid AND organization_id = $2::uuid`, runID, orgID).Scan(&createdAt)
+		var runExists bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM runs WHERE id = $1::uuid AND organization_id = $2::uuid)`, runID, orgID).Scan(&runExists)
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrRunNotFound
-			}
 			return err
 		}
+		if !runExists {
+			return ErrRunNotFound
+		}
 
-		isExpired := time.Since(createdAt) > 7*24*time.Hour
-
-		var cursorSeq int64 = 0
+		var cursorTime *time.Time
+		var cursorID *string
 		if cursor != nil && *cursor != "" {
-			if parsed, err := strconv.ParseInt(*cursor, 10, 64); err == nil {
-				cursorSeq = parsed
+			t, id, err := decodeCursor(*cursor)
+			if err != nil {
+				return fmt.Errorf("invalid cursor: %w", err)
 			}
+			cursorTime = &t
+			cursorID = &id
 		}
 
 		query := `
-			SELECT id::text, run_id::text, step_id::text, attempt_id::text, sequence, timestamp, level, message
+			SELECT id::text, run_id::text, step_id::text, attempt_id::text, sequence, timestamp, level, message, created_at
 			FROM task_logs
 			WHERE organization_id = $1::uuid AND run_id = $2::uuid
 				AND ($3::uuid IS NULL OR step_id = $3::uuid)
 				AND ($4::uuid IS NULL OR attempt_id = $4::uuid)
-				AND sequence > $5
-			ORDER BY sequence ASC
-			LIMIT $6
+				AND ($5::timestamptz IS NULL OR (created_at, id) > ($5::timestamptz, $6::uuid))
+			ORDER BY created_at ASC, id ASC
+			LIMIT $7
 		`
 		var stepUUID, attemptUUID any = nil, nil
 		if stepID != nil && *stepID != "" {
@@ -837,43 +883,77 @@ func (s *Service) GetRunLogs(ctx context.Context, orgID, runID string, stepID, a
 			attemptUUID = *attemptID
 		}
 
-		rows, err := tx.Query(ctx, query, orgID, runID, stepUUID, attemptUUID, cursorSeq, limit+1)
+		rows, err := tx.Query(ctx, query, orgID, runID, stepUUID, attemptUUID, cursorTime, cursorID, limit+1)
 		if err != nil {
 			return fmt.Errorf("query task logs: %w", err)
 		}
 		defer rows.Close()
 
-		items := make([]TaskLogRecordDTO, 0)
+		type logItemWithCreatedAt struct {
+			rec       TaskLogRecordDTO
+			createdAt time.Time
+		}
+
+		itemsWithMeta := make([]logItemWithCreatedAt, 0)
 		for rows.Next() {
 			var rec TaskLogRecordDTO
-			var ts time.Time
-			if err := rows.Scan(&rec.ID, &rec.RunID, &rec.StepID, &rec.AttemptID, &rec.Sequence, &ts, &rec.Level, &rec.Message); err != nil {
+			var ts, createdAt time.Time
+			if err := rows.Scan(&rec.ID, &rec.RunID, &rec.StepID, &rec.AttemptID, &rec.Sequence, &ts, &rec.Level, &rec.Message, &createdAt); err != nil {
 				return err
 			}
 			rec.Timestamp = ts.UTC().Format(time.RFC3339Nano)
-			items = append(items, rec)
+			itemsWithMeta = append(itemsWithMeta, logItemWithCreatedAt{rec: rec, createdAt: createdAt})
 		}
 		if err := rows.Err(); err != nil {
 			return err
 		}
 
 		var nextCursor *string
-		if len(items) > limit {
-			items = items[:limit]
-			lastSeq := strconv.FormatInt(items[limit-1].Sequence, 10)
-			nextCursor = &lastSeq
+		if len(itemsWithMeta) > limit {
+			last := itemsWithMeta[limit-1]
+			nc := encodeCursor(last.createdAt, last.rec.ID)
+			nextCursor = &nc
+			itemsWithMeta = itemsWithMeta[:limit]
 		}
 
+		items := make([]TaskLogRecordDTO, len(itemsWithMeta))
+		for i, it := range itemsWithMeta {
+			items[i] = it.rec
+		}
+
+		var isExpired bool
 		var message *string
-		if len(items) == 0 && isExpired {
-			msg := "Logs have expired due to the 7-day retention policy"
-			message = &msg
+
+		// Only evaluate expiration if 0 items returned on initial query (no cursor)
+		if len(items) == 0 && (cursor == nil || *cursor == "") {
+			var hadLogsRecorded bool
+			err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM task_attempts ta
+					JOIN run_steps rs ON rs.id = ta.step_id AND rs.organization_id = ta.organization_id
+					WHERE rs.run_id = $1::uuid
+					  AND ta.organization_id = $2::uuid
+					  AND ($3::uuid IS NULL OR rs.id = $3::uuid)
+					  AND ($4::uuid IS NULL OR ta.id = $4::uuid)
+					  AND ta.logs_recorded = TRUE
+				)
+			`, runID, orgID, stepUUID, attemptUUID).Scan(&hadLogsRecorded)
+			if err != nil {
+				return fmt.Errorf("check recorded logs: %w", err)
+			}
+
+			if hadLogsRecorded {
+				isExpired = true
+				msg := "Logs have expired due to the 7-day retention policy"
+				message = &msg
+			}
 		}
 
 		resp = &RunLogsResponseDTO{
 			Items:      items,
 			NextCursor: nextCursor,
-			Expired:    isExpired && len(items) == 0,
+			Expired:    isExpired,
 			Message:    message,
 		}
 		return nil
@@ -882,6 +962,42 @@ func (s *Service) GetRunLogs(ctx context.Context, orgID, runID string, stepID, a
 		return nil, err
 	}
 	return resp, nil
+}
+
+// PruneExpiredTaskLogs deletes task logs older than 7 days based on database time clock_timestamp()
+// within the specified organization under its tenant isolation context.
+// It deletes in bounded batches to avoid long table locks.
+// Returns total rows pruned.
+func (s *Service) PruneExpiredTaskLogs(ctx context.Context, orgID string, batchSize int) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	var totalPruned int64
+	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		for {
+			tag, err := tx.Exec(ctx, `
+				DELETE FROM task_logs
+				WHERE id IN (
+					SELECT id FROM task_logs
+					WHERE organization_id = $1::uuid AND created_at < clock_timestamp() - INTERVAL '7 days'
+					LIMIT $2
+				)
+			`, orgID, batchSize)
+			if err != nil {
+				return fmt.Errorf("prune expired task logs: %w", err)
+			}
+			n := tag.RowsAffected()
+			totalPruned += n
+			if n < int64(batchSize) {
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return totalPruned, nil
 }
 
 func CanonicalEventType(dbType string) string {

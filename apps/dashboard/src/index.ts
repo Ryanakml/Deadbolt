@@ -5,7 +5,12 @@ export * from "./api.js";
 
 import { DashboardApiClient } from "./api.js";
 import { RunInspector } from "./inspector.js";
-import { RunSnapshot, StreamFreshness, TaskLogsResponse } from "./types.js";
+import {
+  RunSnapshot,
+  RunEvent,
+  StreamFreshness,
+  TaskLogsResponse,
+} from "./types.js";
 
 // DOM Bootstrap for browser runtime
 if (typeof document !== "undefined") {
@@ -180,116 +185,153 @@ function initDashboard(): void {
       activeInspector.destroy();
     }
 
+    let currentStreamFreshness: StreamFreshness = "DISCONNECTED";
+
     activeInspector = new RunInspector(runId);
     activeInspector.subscribe({
       onSnapshotUpdated: (snapshot) => renderSnapshot(snapshot),
-      onFreshnessChanged: (freshness) => renderFreshness(freshness),
+      onFreshnessChanged: (freshness) => {
+        currentStreamFreshness = freshness;
+        renderFreshness(freshness);
+      },
+      onEventsUpdated: (events, hasMore, nextCursor) =>
+        renderEvents(events, hasMore, nextCursor),
       onLogsUpdated: (logs, err) => renderLogs(logs, err),
       onError: (err) => renderError(err),
     });
 
     activeInspector.load();
-  }
 
-  function renderSnapshot(snap: RunSnapshot): void {
-    const container = document.getElementById("inspector-content");
-    if (!container) return;
+    function renderSnapshot(snap: RunSnapshot): void {
+      const container = document.getElementById("inspector-content");
+      if (!container) return;
 
-    const stepsHtml = snap.steps
-      .map((st) => {
-        const attemptsHtml = st.attempts
-          .map((att) => {
-            const started = att.startedAt
-              ? new Date(att.startedAt).toLocaleTimeString()
-              : "-";
-            return `
-          <div class="attempt-card status-${att.status.toLowerCase()}">
-            <div class="attempt-header">
-              <span class="attempt-title">Attempt #${att.attemptNumber}</span>
-              <span class="badge status-${att.status.toLowerCase()}">${att.status}</span>
+      const stepsHtml = snap.steps
+        .map((st) => {
+          const attemptsHtml = st.attempts
+            .map((att) => {
+              const started = att.startedAt
+                ? new Date(att.startedAt).toLocaleTimeString()
+                : "-";
+              return `
+            <div class="attempt-card status-${att.status.toLowerCase()}">
+              <div class="attempt-header">
+                <span class="attempt-title">Attempt #${att.attemptNumber}</span>
+                <span class="badge status-${att.status.toLowerCase()}">${att.status}</span>
+              </div>
+              <div class="attempt-details">
+                <span>Session: <code>${att.workerSessionId ? att.workerSessionId.slice(0, 8) + "..." : "-"}</code></span>
+                <span>Started: ${started}</span>
+                <span>Epoch: ${att.ownershipEpoch ?? "-"}</span>
+              </div>
             </div>
-            <div class="attempt-details">
-              <span>Session: <code>${att.workerSessionId ? att.workerSessionId.slice(0, 8) + "..." : "-"}</code></span>
-              <span>Started: ${started}</span>
-              <span>Epoch: ${att.ownershipEpoch ?? "-"}</span>
+          `;
+            })
+            .join("");
+
+          let noAttemptsHtml =
+            '<div class="no-attempts text-muted">No attempts claimed yet</div>';
+          if (
+            snap.waitingReason === "NO_COMPATIBLE_WORKERS" ||
+            snap.activeCompatibleWorkers === 0
+          ) {
+            noAttemptsHtml = `
+              <div class="no-attempts waiting-warning">
+                <strong>No compatible workers available.</strong>
+                <div class="recovery-hint">
+                  Waiting for active worker advertising deployment <code>${escapeHtml(snap.deploymentId.slice(0, 8))}...</code>. Ensure an enrolled worker is running.
+                </div>
+              </div>
+            `;
+          }
+
+          return `
+          <div class="step-card" data-step-id="${st.id}">
+            <div class="step-header">
+              <h4>${escapeHtml(st.nodeId)}</h4>
+              <span class="badge status-${st.status.toLowerCase()}">${st.status}</span>
+            </div>
+            <div class="attempts-container">
+              ${attemptsHtml || noAttemptsHtml}
             </div>
           </div>
         `;
-          })
-          .join("");
+        })
+        .join("");
 
-        return `
-        <div class="step-card" data-step-id="${st.id}">
-          <div class="step-header">
-            <h4>${escapeHtml(st.nodeId)}</h4>
-            <span class="badge status-${st.status.toLowerCase()}">${st.status}</span>
+      container.innerHTML = `
+        <div class="inspector-header">
+          <div class="run-title-group">
+            <h2>${escapeHtml(snap.workflowName)}</h2>
+            <span class="run-id-label">ID: <code>${snap.id}</code></span>
           </div>
-          <div class="attempts-container">
-            ${attemptsHtml || '<div class="no-attempts text-muted">No attempts claimed yet</div>'}
+          <div class="run-badges">
+            <span class="badge status-${snap.status.toLowerCase()}">${snap.status}</span>
+            <span id="stream-freshness-badge" class="badge freshness-badge freshness-${currentStreamFreshness.toLowerCase()}">${currentStreamFreshness}</span>
           </div>
         </div>
+
+        <div class="meta-grid">
+          <div class="meta-item"><label>Revision</label><div>${snap.revision}</div></div>
+          <div class="meta-item"><label>Last Event Seq</label><div>${snap.lastEventSequence}</div></div>
+          <div class="meta-item"><label>Deployment ID</label><div><code>${snap.deploymentId.slice(0, 8)}...</code></div></div>
+          <div class="meta-item"><label>Deadline</label><div>${snap.deadlineAt ? new Date(snap.deadlineAt).toLocaleString() : "None"}</div></div>
+          <div class="meta-item"><label>Created At</label><div>${new Date(snap.createdAt).toLocaleString()}</div></div>
+          ${snap.reasonCode ? `<div class="meta-item"><label>Reason</label><div>${escapeHtml(snap.reasonCode)}</div></div>` : ""}
+        </div>
+
+        <section class="steps-section">
+          <h3>Execution Graph & Attempts</h3>
+          <div class="steps-grid">${stepsHtml}</div>
+        </section>
+
+        <section class="events-section">
+          <h3>Execution Event History</h3>
+          <div id="events-container" class="events-timeline">
+            <div class="loading">Loading event history...</div>
+          </div>
+        </section>
+
+        <section class="logs-section">
+          <h3>Task Diagnostic Logs</h3>
+          <div id="logs-container" class="logs-container">
+            <div class="loading">Loading logs...</div>
+          </div>
+        </section>
+
+        ${
+          snap.output
+            ? `
+          <section class="output-section">
+            <h3>Workflow Output</h3>
+            <pre class="code-block">${escapeHtml(JSON.stringify(snap.output, null, 2))}</pre>
+          </section>
+        `
+            : ""
+        }
+
+        ${
+          snap.error
+            ? `
+          <section class="error-section">
+            <h3>Workflow Error</h3>
+            <pre class="code-block error-text">${escapeHtml(JSON.stringify(snap.error, null, 2))}</pre>
+          </section>
+        `
+            : ""
+        }
       `;
-      })
-      .join("");
 
-    container.innerHTML = `
-      <div class="inspector-header">
-        <div class="run-title-group">
-          <h2>${escapeHtml(snap.workflowName)}</h2>
-          <span class="run-id-label">ID: <code>${snap.id}</code></span>
-        </div>
-        <div class="run-badges">
-          <span class="badge status-${snap.status.toLowerCase()}">${snap.status}</span>
-          <span id="stream-freshness-badge" class="badge freshness-badge freshness-disconnected">DISCONNECTED</span>
-        </div>
-      </div>
+      // Re-apply current transport freshness
+      renderFreshness(currentStreamFreshness);
 
-      <div class="meta-grid">
-        <div class="meta-item"><label>Revision</label><div>${snap.revision}</div></div>
-        <div class="meta-item"><label>Last Event Seq</label><div>${snap.lastEventSequence}</div></div>
-        <div class="meta-item"><label>Deployment ID</label><div><code>${snap.deploymentId.slice(0, 8)}...</code></div></div>
-        <div class="meta-item"><label>Created At</label><div>${new Date(snap.createdAt).toLocaleString()}</div></div>
-        ${snap.reasonCode ? `<div class="meta-item"><label>Reason</label><div>${escapeHtml(snap.reasonCode)}</div></div>` : ""}
-      </div>
-
-      <section class="steps-section">
-        <h3>Execution Graph & Attempts</h3>
-        <div class="steps-grid">${stepsHtml}</div>
-      </section>
-
-      <section class="logs-section">
-        <h3>Task Diagnostic Logs</h3>
-        <div id="logs-container" class="logs-container">
-          <div class="loading">Loading logs...</div>
-        </div>
-      </section>
-
-      ${
-        snap.output
-          ? `
-        <section class="output-section">
-          <h3>Workflow Output</h3>
-          <pre class="code-block">${escapeHtml(JSON.stringify(snap.output, null, 2))}</pre>
-        </section>
-      `
-          : ""
+      // Re-render cached events and logs if activeInspector already has them
+      if (activeInspector) {
+        const evs = activeInspector.getEvents();
+        if (evs.length > 0) {
+          renderEvents(evs, false, null);
+        }
       }
-
-      ${
-        snap.error
-          ? `
-        <section class="error-section">
-          <h3>Workflow Error</h3>
-          <pre class="code-block error-text">${escapeHtml(JSON.stringify(snap.error, null, 2))}</pre>
-        </section>
-      `
-          : ""
-      }
-    `;
-
-    // Re-render freshness if already set
-    if (activeInspector) {
-      renderFreshness(activeInspector.getSnapshot() ? "LIVE" : "DISCONNECTED");
     }
   }
 
@@ -300,6 +342,56 @@ function initDashboard(): void {
     badge.className = `badge freshness-badge freshness-${f.toLowerCase()}`;
     badge.textContent = f;
     badge.setAttribute("aria-label", `Stream status: ${f}`);
+  }
+
+  function renderEvents(
+    events: RunEvent[],
+    hasMore: boolean,
+    nextCursor: number | null,
+  ): void {
+    const container = document.getElementById("events-container");
+    if (!container) return;
+
+    if (events.length === 0) {
+      container.innerHTML =
+        '<div class="text-muted">No events recorded yet.</div>';
+      return;
+    }
+
+    const cardsHtml = events
+      .map((ev) => {
+        const time = new Date(ev.committedAt).toLocaleTimeString();
+        const payloadStr = JSON.stringify(ev.payload, null, 2);
+        return `
+          <div class="event-card" data-sequence="${ev.sequence}">
+            <div class="event-header">
+              <span class="event-type">${escapeHtml(ev.type)}</span>
+              <span class="event-seq">#${ev.sequence}</span>
+            </div>
+            <div class="event-time">${time}</div>
+            <pre class="event-payload">${escapeHtml(payloadStr)}</pre>
+          </div>
+        `;
+      })
+      .join("");
+
+    let loadMoreHtml = "";
+    if (hasMore && nextCursor !== null) {
+      loadMoreHtml = `<button id="load-more-events-btn" class="load-more-btn">Load Earlier Events</button>`;
+    }
+
+    container.innerHTML = cardsHtml + loadMoreHtml;
+
+    if (hasMore && nextCursor !== null) {
+      const btn = document.getElementById("load-more-events-btn");
+      if (btn) {
+        btn.addEventListener("click", () => {
+          btn.textContent = "Loading...";
+          btn.setAttribute("disabled", "true");
+          activeInspector?.fetchEvents(nextCursor, true);
+        });
+      }
+    }
   }
 
   function renderLogs(logs: TaskLogsResponse | null, error?: string): void {
@@ -327,6 +419,13 @@ function initDashboard(): void {
       return;
     }
 
+    let warningNotice = "";
+    if (logs.budgetExhausted) {
+      warningNotice = `<div class="logs-notice logs-restricted">Log budget exhausted (1 MiB per attempt limit reached). ${logs.droppedCount ? logs.droppedCount + " records dropped." : ""}</div>`;
+    } else if (logs.droppedCount) {
+      warningNotice = `<div class="logs-notice logs-restricted">${logs.droppedCount} log record(s) dropped (exceeded 16 KiB per-line limit).</div>`;
+    }
+
     const logLines = logs.items
       .map((item) => {
         const time = new Date(item.timestamp).toLocaleTimeString();
@@ -334,7 +433,28 @@ function initDashboard(): void {
       })
       .join("");
 
-    container.innerHTML = `<div class="log-terminal">${logLines}</div>`;
+    let loadMoreHtml = "";
+    if (logs.nextCursor) {
+      loadMoreHtml = `<button id="load-more-logs-btn" class="load-more-btn">Load More Logs</button>`;
+    }
+
+    container.innerHTML = `${warningNotice}<div class="log-terminal">${logLines}</div>${loadMoreHtml}`;
+
+    if (logs.nextCursor) {
+      const btn = document.getElementById("load-more-logs-btn");
+      if (btn) {
+        btn.addEventListener("click", () => {
+          btn.textContent = "Loading...";
+          btn.setAttribute("disabled", "true");
+          activeInspector?.fetchLogs(
+            undefined,
+            undefined,
+            logs.nextCursor,
+            true,
+          );
+        });
+      }
+    }
   }
 
   function renderError(err: Error): void {

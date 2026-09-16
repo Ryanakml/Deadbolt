@@ -1,17 +1,24 @@
 import {
   RunSnapshot,
   RunEvent,
+  RunEventsResponse,
   TaskAttempt,
+  AttemptStatus,
   TaskLogsResponse,
   StreamFreshness,
 } from "./types.js";
 import { RunEventStreamClient } from "./stream.js";
 
 export interface InspectorListener {
-  onSnapshotUpdated: (snapshot: RunSnapshot) => void;
-  onFreshnessChanged: (freshness: StreamFreshness) => void;
-  onLogsUpdated: (logs: TaskLogsResponse | null, error?: string) => void;
-  onError: (err: Error) => void;
+  onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
+  onFreshnessChanged?: (freshness: StreamFreshness) => void;
+  onLogsUpdated?: (logs: TaskLogsResponse | null, error?: string) => void;
+  onEventsUpdated?: (
+    events: RunEvent[],
+    hasMore: boolean,
+    nextCursor: number | null,
+  ) => void;
+  onError?: (err: Error) => void;
 }
 
 export class RunInspector {
@@ -22,6 +29,9 @@ export class RunInspector {
   private listeners: InspectorListener[] = [];
   private logs: TaskLogsResponse | null = null;
   private logsError: string | null = null;
+  private events: RunEvent[] = [];
+  private eventsHasMore = false;
+  private eventsNextCursor: number | null = null;
 
   constructor(runId: string, baseUrl = "") {
     this.runId = runId;
@@ -30,13 +40,20 @@ export class RunInspector {
 
   public subscribe(listener: InspectorListener): () => void {
     this.listeners.push(listener);
-    if (this.snapshot) {
+    if (this.snapshot && listener.onSnapshotUpdated) {
       listener.onSnapshotUpdated(this.snapshot);
     }
-    if (this.streamClient) {
+    if (this.streamClient && listener.onFreshnessChanged) {
       listener.onFreshnessChanged(this.streamClient.getFreshness());
     }
-    if (this.logs || this.logsError) {
+    if (this.events.length > 0 && listener.onEventsUpdated) {
+      listener.onEventsUpdated(
+        this.events,
+        this.eventsHasMore,
+        this.eventsNextCursor,
+      );
+    }
+    if ((this.logs || this.logsError) && listener.onLogsUpdated) {
       listener.onLogsUpdated(this.logs, this.logsError ?? undefined);
     }
     return () => {
@@ -48,11 +65,15 @@ export class RunInspector {
     return this.snapshot;
   }
 
+  public getEvents(): RunEvent[] {
+    return this.events;
+  }
+
   public async load(): Promise<void> {
     try {
       await this.fetchSnapshot();
       this.startStream();
-      await this.fetchLogs();
+      await Promise.allSettled([this.fetchEvents(), this.fetchLogs()]);
     } catch (err: unknown) {
       this.notifyError(err instanceof Error ? err : new Error(String(err)));
     }
@@ -80,13 +101,56 @@ export class RunInspector {
     return snap;
   }
 
+  public async fetchEvents(
+    cursor?: number,
+    append = false,
+  ): Promise<RunEventsResponse | null> {
+    const params = new URLSearchParams();
+    if (cursor !== undefined && cursor !== null) {
+      params.set("cursor", String(cursor));
+    }
+    const queryStr = params.toString() ? `?${params.toString()}` : "";
+    const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/events${queryStr}`;
+
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(
+          `Failed to fetch events (HTTP ${res.status}): ${res.statusText}`,
+        );
+      }
+      const data = (await res.json()) as RunEventsResponse;
+      this.eventsHasMore = data.hasMore;
+      this.eventsNextCursor = data.nextCursor ?? null;
+
+      if (append) {
+        const existingSeqs = new Set(this.events.map((e) => e.sequence));
+        for (const ev of data.events) {
+          if (!existingSeqs.has(ev.sequence)) {
+            this.events.push(ev);
+          }
+        }
+      } else {
+        this.events = [...data.events];
+      }
+      this.events.sort((a, b) => a.sequence - b.sequence);
+      this.notifyEvents();
+      return data;
+    } catch (err: unknown) {
+      return null;
+    }
+  }
+
   public async fetchLogs(
     stepId?: string,
     attemptId?: string,
+    cursor?: string,
+    append = false,
   ): Promise<TaskLogsResponse | null> {
     const params = new URLSearchParams();
     if (stepId) params.set("stepId", stepId);
     if (attemptId) params.set("attemptId", attemptId);
+    if (cursor) params.set("cursor", cursor);
 
     const queryStr = params.toString() ? `?${params.toString()}` : "";
     const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/logs${queryStr}`;
@@ -106,13 +170,22 @@ export class RunInspector {
         );
       }
       const data = (await res.json()) as TaskLogsResponse;
-      this.logs = data;
+      if (append && this.logs) {
+        this.logs = {
+          ...data,
+          items: [...this.logs.items, ...data.items],
+        };
+      } else {
+        this.logs = data;
+      }
       this.logsError = null;
       this.notifyLogs();
       return data;
     } catch (err: unknown) {
       this.logsError = err instanceof Error ? err.message : String(err);
-      this.logs = null;
+      if (!append) {
+        this.logs = null;
+      }
       this.notifyLogs();
       return null;
     }
@@ -150,6 +223,13 @@ export class RunInspector {
   }
 
   public applyEvent(event: RunEvent): void {
+    // Record into events timeline if not already recorded
+    if (!this.events.some((e) => e.sequence === event.sequence)) {
+      this.events.push(event);
+      this.events.sort((a, b) => a.sequence - b.sequence);
+      this.notifyEvents();
+    }
+
     if (!this.snapshot) return;
 
     if (event.sequence > this.snapshot.lastEventSequence) {
@@ -204,9 +284,8 @@ export class RunInspector {
             if (att) {
               att.status = "RUNNING";
               s.status = "RUNNING";
-              if (typeof payload.deadlineAt === "string") {
-                att.startedAt = att.startedAt ?? new Date().toISOString();
-              }
+              att.startedAt =
+                att.startedAt ?? event.committedAt ?? new Date().toISOString();
               break;
             }
           }
@@ -214,18 +293,39 @@ export class RunInspector {
         break;
 
       case "attempt.completed":
-      case "step.succeeded":
         if (typeof payload.attemptId === "string") {
           for (const s of this.snapshot.steps) {
             const att = s.attempts.find((a) => a.id === payload.attemptId);
             if (att) {
-              att.status = "SUCCEEDED";
-              att.completedAt = new Date().toISOString();
-              s.status = "SUCCEEDED";
+              const outcome =
+                typeof payload.outcome === "string"
+                  ? (payload.outcome as AttemptStatus)
+                  : "SUCCEEDED";
+              att.status = outcome;
+              att.completedAt = event.committedAt || new Date().toISOString();
+              if (payload.error !== undefined) {
+                att.error = payload.error;
+              }
+              if (outcome === "SUCCEEDED") {
+                s.status = "SUCCEEDED";
+              } else if (
+                outcome === "FAILED" ||
+                outcome === "TIMED_OUT" ||
+                outcome === "CANCELLED"
+              ) {
+                s.status = "FAILED";
+              } else if (outcome === "LOST") {
+                att.status = "LOST";
+                s.status = "WAITING";
+              }
               break;
             }
           }
-        } else if (typeof payload.stepId === "string") {
+        }
+        break;
+
+      case "step.succeeded":
+        if (typeof payload.stepId === "string") {
           const s = this.snapshot.steps.find((st) => st.id === payload.stepId);
           if (s) {
             s.status = "SUCCEEDED";
@@ -285,25 +385,45 @@ export class RunInspector {
   private notifySnapshot(): void {
     if (!this.snapshot) return;
     for (const l of this.listeners) {
-      l.onSnapshotUpdated(this.snapshot);
+      if (l.onSnapshotUpdated) {
+        l.onSnapshotUpdated(this.snapshot);
+      }
     }
   }
 
   private notifyFreshness(f: StreamFreshness): void {
     for (const l of this.listeners) {
-      l.onFreshnessChanged(f);
+      if (l.onFreshnessChanged) {
+        l.onFreshnessChanged(f);
+      }
     }
   }
 
   private notifyLogs(): void {
     for (const l of this.listeners) {
-      l.onLogsUpdated(this.logs, this.logsError ?? undefined);
+      if (l.onLogsUpdated) {
+        l.onLogsUpdated(this.logs, this.logsError ?? undefined);
+      }
+    }
+  }
+
+  private notifyEvents(): void {
+    for (const l of this.listeners) {
+      if (l.onEventsUpdated) {
+        l.onEventsUpdated(
+          this.events,
+          this.eventsHasMore,
+          this.eventsNextCursor,
+        );
+      }
     }
   }
 
   private notifyError(err: Error): void {
     for (const l of this.listeners) {
-      l.onError(err);
+      if (l.onError) {
+        l.onError(err);
+      }
     }
   }
 }

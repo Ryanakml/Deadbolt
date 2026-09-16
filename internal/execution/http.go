@@ -154,6 +154,11 @@ func (h *HTTPHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 	if !h.hasPayloadRead(r, caller, snapshot.EnvironmentID) {
 		snapshot.Output = nil
 		snapshot.Error = nil
+		for i := range snapshot.Steps {
+			for j := range snapshot.Steps[i].Attempts {
+				snapshot.Steps[i].Attempts[j].Error = nil
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, snapshot)
@@ -365,8 +370,8 @@ func (h *HTTPHandler) StreamRunEvents(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		resyncData, _ := json.Marshal(map[string]any{
-			"reason":                 "RETENTION_GAP",
-			"code":                   "RESYNC_REQUIRED",
+			"reason":                "RETENTION_GAP",
+			"code":                  "RESYNC_REQUIRED",
 			"lastAvailableSequence": minSeq,
 		})
 		fmt.Fprintf(w, "event: resync\ndata: %s\n\n", string(resyncData))

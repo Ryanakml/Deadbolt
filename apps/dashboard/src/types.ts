@@ -65,6 +65,8 @@ export interface RunSnapshot extends Run {
   steps: RunStep[];
   output?: unknown;
   error?: unknown;
+  waitingReason?: string | null;
+  activeCompatibleWorkers?: number;
 }
 
 export interface Worker {
@@ -86,6 +88,12 @@ export interface RunEvent {
   committedAt: string;
 }
 
+export interface RunEventsResponse {
+  events: RunEvent[];
+  hasMore: boolean;
+  nextCursor?: number | null;
+}
+
 export interface TaskLogRecord {
   id: string;
   runId: string;
@@ -102,6 +110,8 @@ export interface TaskLogsResponse {
   nextCursor?: string;
   expired: boolean;
   message?: string;
+  droppedCount?: number;
+  budgetExhausted?: boolean;
 }
 
 export type StreamFreshness =

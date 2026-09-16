@@ -5,10 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/jackc/pgx/v5"
+)
+
+const (
+	MaxLogLineSizeBytes    = 16 * 1024   // 16 KiB per line bound (Blueprint / F-25)
+	MaxAttemptLogSizeBytes = 1024 * 1024 // 1 MiB per attempt cumulative budget
 )
 
 type DeploymentReconciler interface {
@@ -22,9 +28,10 @@ type EnrollmentTokenInfo struct {
 }
 
 type Service struct {
-	pool        *storage.Pool
-	deployments DeploymentReconciler
-	engine      ExecutionEngine
+	pool             *storage.Pool
+	deployments      DeploymentReconciler
+	engine           ExecutionEngine
+	droppedLogsTotal atomic.Int64
 }
 
 func NewService(pool *storage.Pool, deployments DeploymentReconciler, engine ExecutionEngine) *Service {
@@ -33,6 +40,11 @@ func NewService(pool *storage.Pool, deployments DeploymentReconciler, engine Exe
 		deployments: deployments,
 		engine:      engine,
 	}
+}
+
+// DroppedLogsCount returns the cumulative number of dropped log records due to line or attempt budget limits.
+func (s *Service) DroppedLogsCount() int64 {
+	return s.droppedLogsTotal.Load()
 }
 
 // CreateEnrollmentToken generates a 10-minute single-use hashed enrollment token
@@ -449,17 +461,16 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 		return nil, ErrUnauthorized
 	}
 
-	records := req.Records
-	if len(records) > 100 {
-		records = records[:100]
-	}
-	if len(records) == 0 {
+	if len(req.Records) == 0 {
 		return &AckResponseDTO{
 			ProtocolVersion: ProtocolVersion,
 			RequestID:       req.RequestID,
 			Accepted:        true,
 		}, nil
 	}
+
+	var droppedCount int
+	var budgetExhausted bool
 
 	err := s.pool.WithTenantTx(ctx, sessionCtx.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
 		var stepID, runID, envID string
@@ -476,25 +487,29 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 			return fmt.Errorf("verify attempt ownership: %w", err)
 		}
 
-		var existingCount int64
-		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM task_logs WHERE attempt_id = $1::uuid AND organization_id = $2::uuid`, req.AttemptID, sessionCtx.OrganizationID).Scan(&existingCount); err != nil {
-			return fmt.Errorf("count existing logs: %w", err)
-		}
-		if existingCount >= 1000 {
-			// Per-attempt quota reached; acknowledge to avoid worker retry loops
-			return nil
-		}
-
-		remaining := 1000 - existingCount
-		if int64(len(records)) > remaining {
-			records = records[:remaining]
+		var currentBytes int64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(octet_length(message)), 0)::bigint
+			FROM task_logs
+			WHERE attempt_id = $1::uuid AND organization_id = $2::uuid
+		`, req.AttemptID, sessionCtx.OrganizationID).Scan(&currentBytes); err != nil {
+			return fmt.Errorf("query existing log bytes: %w", err)
 		}
 
-		for _, rec := range records {
-			msg := rec.Message
-			if len(msg) > 16384 {
-				msg = msg[:16381] + "..."
+		var insertedAny bool
+		for _, rec := range req.Records {
+			msgBytes := int64(len([]byte(rec.Message)))
+			if msgBytes > MaxLogLineSizeBytes {
+				droppedCount++
+				continue
 			}
+
+			if currentBytes+msgBytes > MaxAttemptLogSizeBytes {
+				budgetExhausted = true
+				droppedCount++
+				continue
+			}
+
 			ts, parseErr := time.Parse(time.RFC3339Nano, rec.Timestamp)
 			if parseErr != nil {
 				ts = time.Now()
@@ -505,7 +520,7 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 				lvl = rec.Level
 			}
 
-			_, insErr := tx.Exec(ctx, `
+			tag, insErr := tx.Exec(ctx, `
 				INSERT INTO task_logs (
 					organization_id, environment_id, run_id, step_id, attempt_id,
 					sequence, timestamp, level, message
@@ -513,9 +528,24 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 					$1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
 					$6, $7, $8, $9
 				) ON CONFLICT (attempt_id, sequence) DO NOTHING
-			`, sessionCtx.OrganizationID, envID, runID, stepID, req.AttemptID, rec.Sequence, ts, lvl, msg)
+			`, sessionCtx.OrganizationID, envID, runID, stepID, req.AttemptID, rec.Sequence, ts, lvl, rec.Message)
 			if insErr != nil {
 				return fmt.Errorf("insert task log: %w", insErr)
+			}
+			if tag.RowsAffected() > 0 {
+				currentBytes += msgBytes
+				insertedAny = true
+			}
+		}
+
+		if insertedAny {
+			_, err = tx.Exec(ctx, `
+				UPDATE task_attempts
+				SET logs_recorded = TRUE
+				WHERE id = $1::uuid AND organization_id = $2::uuid AND logs_recorded = FALSE
+			`, req.AttemptID, sessionCtx.OrganizationID)
+			if err != nil {
+				return fmt.Errorf("mark logs recorded: %w", err)
 			}
 		}
 
@@ -528,10 +558,16 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 		return nil, fmt.Errorf("record logs: %w", err)
 	}
 
+	if droppedCount > 0 {
+		s.droppedLogsTotal.Add(int64(droppedCount))
+	}
+
 	return &AckResponseDTO{
 		ProtocolVersion: ProtocolVersion,
 		RequestID:       req.RequestID,
 		Accepted:        true,
+		DroppedCount:    droppedCount,
+		BudgetExhausted: budgetExhausted,
 	}, nil
 }
 

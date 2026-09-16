@@ -28,10 +28,13 @@ CREATE POLICY tenant_isolation_task_logs ON task_logs
     USING (organization_id = app.current_organization_id())
     WITH CHECK (organization_id = app.current_organization_id());
 
-CREATE INDEX idx_task_logs_lookup ON task_logs (run_id, created_at, id);
-CREATE INDEX idx_task_logs_step ON task_logs (step_id, created_at);
-CREATE INDEX idx_task_logs_attempt ON task_logs (attempt_id, sequence);
+CREATE INDEX idx_task_logs_lookup ON task_logs (organization_id, run_id, created_at, id);
+CREATE INDEX idx_task_logs_step ON task_logs (organization_id, step_id, created_at, id);
+CREATE INDEX idx_task_logs_attempt ON task_logs (organization_id, attempt_id, created_at, id);
 CREATE INDEX idx_task_logs_retention ON task_logs (created_at);
+
+ALTER TABLE task_attempts ADD COLUMN IF NOT EXISTS logs_recorded BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- +goose Down
 DROP TABLE IF EXISTS task_logs CASCADE;
+ALTER TABLE task_attempts DROP COLUMN IF EXISTS logs_recorded;

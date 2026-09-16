@@ -99,7 +99,11 @@ func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gat
 			}
 		}
 
-		for _, dir := range []string{"apps/dashboard/dist", "apps/dashboard"} {
+		candidates := []string{"/app/dashboard", "apps/dashboard/dist", "apps/dashboard", "../../apps/dashboard/dist"}
+		if customDir := os.Getenv("DEADBOLT_DASHBOARD_DIR"); customDir != "" {
+			candidates = append([]string{customDir}, candidates...)
+		}
+		for _, dir := range candidates {
 			if info, err := os.Stat(dir); err == nil && info.IsDir() {
 				fs := http.FileServer(http.Dir(dir))
 				mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", fs))

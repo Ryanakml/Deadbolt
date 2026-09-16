@@ -372,6 +372,7 @@ func handleLogs(cfg Config, args []string) {
 	fs := flag.NewFlagSet("logs", flag.ExitOnError)
 	stepFlag := fs.String("step", "", "Filter by Step ID")
 	attemptFlag := fs.String("attempt", "", "Filter by Attempt ID")
+	cursorFlag := fs.String("cursor", "", "Keyset cursor for pagination")
 	limitFlag := fs.Int("limit", 50, "Limit log records")
 	jsonFlag := fs.Bool("json", false, "Output as JSON")
 	_ = fs.Parse(args[1:])
@@ -382,6 +383,9 @@ func handleLogs(cfg Config, args []string) {
 	}
 	if *attemptFlag != "" {
 		q.Set("attemptId", *attemptFlag)
+	}
+	if *cursorFlag != "" {
+		q.Set("cursor", *cursorFlag)
 	}
 	if *limitFlag > 0 {
 		q.Set("limit", fmt.Sprintf("%d", *limitFlag))
@@ -419,8 +423,9 @@ func handleLogs(cfg Config, args []string) {
 			Level     string `json:"level"`
 			Message   string `json:"message"`
 		} `json:"items"`
-		Expired bool    `json:"expired"`
-		Message *string `json:"message"`
+		NextCursor *string `json:"nextCursor"`
+		Expired    bool    `json:"expired"`
+		Message    *string `json:"message"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
@@ -444,5 +449,9 @@ func handleLogs(cfg Config, args []string) {
 	for _, item := range result.Items {
 		ts, _ := time.Parse(time.RFC3339Nano, item.Timestamp)
 		fmt.Printf("[%s] [%-5s] #%d %s\n", ts.Format("15:04:05.000"), strings.ToUpper(item.Level), item.Sequence, item.Message)
+	}
+
+	if result.NextCursor != nil && *result.NextCursor != "" {
+		fmt.Printf("\nNext cursor: %s (use --cursor %s to view next page)\n", *result.NextCursor, *result.NextCursor)
 	}
 }
