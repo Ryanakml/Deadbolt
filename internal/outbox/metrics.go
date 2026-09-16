@@ -15,7 +15,8 @@ type Metrics struct {
 	pool             *pgxpool.Pool
 	publishedTotal   atomic.Int64
 	failuresTotal    atomic.Int64
-	lastSweepTime    atomic.Int64
+	lastDispatchTime atomic.Int64
+	schedulerTime    *atomic.Int64
 	oldestPendingAge atomic.Int64 // in seconds
 	pendingCount     atomic.Int64
 }
@@ -23,8 +24,16 @@ type Metrics struct {
 // NewMetrics creates a new Metrics collector instance.
 func NewMetrics(pool *pgxpool.Pool) *Metrics {
 	m := &Metrics{pool: pool}
-	m.lastSweepTime.Store(time.Now().Unix())
+	m.lastDispatchTime.Store(time.Now().Unix())
 	return m
+}
+
+// SetSchedulerHeartbeat connects the metrics exposition to the authoritative
+// reconciler heartbeat. It is intentionally separate from dispatcher sweeps.
+func (m *Metrics) SetSchedulerHeartbeat(heartbeat *atomic.Int64) {
+	if m != nil {
+		m.schedulerTime = heartbeat
+	}
 }
 
 // IncPublished increments the successful outbox publication counter.
@@ -44,7 +53,7 @@ func (m *Metrics) IncFailures() {
 // RecordSweep updates the last dispatcher sweep timestamp.
 func (m *Metrics) RecordSweep() {
 	if m != nil {
-		m.lastSweepTime.Store(time.Now().Unix())
+		m.lastDispatchTime.Store(time.Now().Unix())
 	}
 }
 
@@ -108,10 +117,16 @@ func (m *Metrics) FormatPrometheus() string {
 		return ""
 	}
 	now := time.Now().Unix()
-	lastSweep := m.lastSweepTime.Load()
-	lagSec := now - lastSweep
-	if lagSec < 0 {
-		lagSec = 0
+	dispatchLag := now - m.lastDispatchTime.Load()
+	if dispatchLag < 0 {
+		dispatchLag = 0
+	}
+	schedulerLag := dispatchLag
+	if m.schedulerTime != nil {
+		schedulerLag = now - m.schedulerTime.Load()/1e9
+		if schedulerLag < 0 {
+			schedulerLag = 0
+		}
 	}
 
 	return fmt.Sprintf(`# HELP deadbolt_outbox_published_total Total number of outbox events published to NATS JetStream.
@@ -130,7 +145,11 @@ deadbolt_outbox_age_seconds %d
 # TYPE deadbolt_outbox_pending_count gauge
 deadbolt_outbox_pending_count %d
 
-# HELP deadbolt_scheduler_loop_lag_seconds Seconds elapsed since the last outbox dispatcher sweep.
+# HELP deadbolt_outbox_dispatcher_loop_lag_seconds Seconds elapsed since the last outbox dispatcher sweep.
+# TYPE deadbolt_outbox_dispatcher_loop_lag_seconds gauge
+deadbolt_outbox_dispatcher_loop_lag_seconds %d
+
+# HELP deadbolt_scheduler_loop_lag_seconds Seconds elapsed since the last authoritative scheduler sweep.
 # TYPE deadbolt_scheduler_loop_lag_seconds gauge
 deadbolt_scheduler_loop_lag_seconds %d
 `,
@@ -138,7 +157,8 @@ deadbolt_scheduler_loop_lag_seconds %d
 		m.failuresTotal.Load(),
 		m.oldestPendingAge.Load(),
 		m.pendingCount.Load(),
-		lagSec,
+		dispatchLag,
+		schedulerLag,
 	)
 }
 

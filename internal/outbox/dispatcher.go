@@ -8,12 +8,44 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 )
+
+// JetStreamPublisherSlot lets the dispatcher keep running while NATS is down.
+// The recovery loop swaps in a live JetStream client after reconnecting.
+type JetStreamPublisherSlot struct {
+	mu sync.RWMutex
+	js JetStreamClient
+}
+
+func NewJetStreamPublisherSlot() *JetStreamPublisherSlot { return &JetStreamPublisherSlot{} }
+
+func (s *JetStreamPublisherSlot) Set(js JetStreamClient) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.js = js
+	s.mu.Unlock()
+}
+
+func (s *JetStreamPublisherSlot) PublishMsg(msg *nats.Msg, opts ...nats.PubOpt) (*nats.PubAck, error) {
+	if s == nil {
+		return nil, errors.New("NATS JetStream publisher slot is nil")
+	}
+	s.mu.RLock()
+	js := s.js
+	s.mu.RUnlock()
+	if js == nil {
+		return nil, errors.New("NATS JetStream is unavailable")
+	}
+	return js.PublishMsg(msg, opts...)
+}
 
 // JetStreamClient represents the minimum interface needed to publish wake-up hints to NATS JetStream.
 type JetStreamClient interface {
@@ -27,6 +59,7 @@ type DispatcherConfig struct {
 	Shard         string
 	BaseBackoff   time.Duration
 	MaxRetryDelay time.Duration
+	MaxAttempts   int
 }
 
 // DefaultConfig returns safe, blueprint-compliant defaults for the outbox dispatcher.
@@ -37,6 +70,7 @@ func DefaultConfig() DispatcherConfig {
 		Shard:         DefaultShard,
 		BaseBackoff:   500 * time.Millisecond,
 		MaxRetryDelay: DefaultMaxRetryDelay,
+		MaxAttempts:   DefaultMaxAttempts,
 	}
 }
 
@@ -68,6 +102,9 @@ func NewDispatcher(pool *pgxpool.Pool, js JetStreamClient, cfg DispatcherConfig,
 	}
 	if cfg.MaxRetryDelay <= 0 {
 		cfg.MaxRetryDelay = DefaultMaxRetryDelay
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = DefaultMaxAttempts
 	}
 	if logger == nil {
 		logger = log.Default()
@@ -104,6 +141,12 @@ func (d *Dispatcher) CalculateBackoff(attempts int) time.Duration {
 
 // BuildSanitizedHint constructs a WakeupHintDTO strictly omitting secrets or outputs (Blueprint §19.1).
 func BuildSanitizedHint(record OutboxEventRecord) (WakeupHintDTO, error) {
+	if record.PayloadVersion != 1 {
+		return WakeupHintDTO{}, fmt.Errorf("unsupported outbox payload version %d", record.PayloadVersion)
+	}
+	if record.EventID == "" || record.OrganizationID == "" || record.Subject == "" {
+		return WakeupHintDTO{}, errors.New("outbox routing identifiers are required")
+	}
 	hint := WakeupHintDTO{
 		EventID:        record.EventID,
 		OrganizationID: record.OrganizationID,
@@ -112,17 +155,33 @@ func BuildSanitizedHint(record OutboxEventRecord) (WakeupHintDTO, error) {
 	}
 
 	if len(record.Payload) > 0 {
-		var rawMap map[string]any
-		if err := json.Unmarshal(record.Payload, &rawMap); err == nil {
-			if runID, ok := rawMap["runId"].(string); ok && runID != "" {
-				hint.RunID = runID
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(record.Payload, &rawMap); err != nil {
+			return WakeupHintDTO{}, fmt.Errorf("invalid outbox payload JSON: %w", err)
+		}
+		if raw, ok := rawMap["runId"]; ok {
+			if err := json.Unmarshal(raw, &hint.RunID); err != nil || hint.RunID == "" {
+				return WakeupHintDTO{}, errors.New("outbox runId must be a non-empty string")
 			}
-			if eventType, ok := rawMap["eventType"].(string); ok && eventType != "" {
-				hint.EventType = eventType
+		}
+		if raw, ok := rawMap["eventType"]; ok {
+			if err := json.Unmarshal(raw, &hint.EventType); err != nil || hint.EventType == "" {
+				return WakeupHintDTO{}, errors.New("outbox eventType must be a non-empty string")
 			}
-			if seq, ok := rawMap["sequence"].(float64); ok {
-				hint.Sequence = int64(seq)
+		}
+		if raw, ok := rawMap["sequence"]; ok {
+			var number json.Number
+			if err := json.Unmarshal(raw, &number); err != nil {
+				return WakeupHintDTO{}, errors.New("outbox sequence must be an integer")
 			}
+			seq, err := strconv.ParseInt(string(number), 10, 64)
+			if err != nil || seq < 0 {
+				return WakeupHintDTO{}, errors.New("outbox sequence must be a non-negative integer")
+			}
+			hint.Sequence = seq
+		}
+		if record.Subject == "execution.state_changed" && (hint.RunID == "" || hint.EventType == "") {
+			return WakeupHintDTO{}, errors.New("execution.state_changed requires runId and eventType")
 		}
 	}
 	return hint, nil
@@ -171,7 +230,13 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 	rows.Close()
 
 	if len(records) == 0 {
-		return 0, tx.Commit(ctx)
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		if d.metrics != nil {
+			d.metrics.RecordSweep()
+		}
+		return 0, nil
 	}
 	// claim_outbox_batch advances next_at and attempts in this transaction. Commit
 	// before contacting NATS: the blueprint explicitly forbids holding a database
@@ -189,7 +254,7 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 	for _, rec := range records {
 		hint, err := BuildSanitizedHint(rec)
 		if err != nil {
-			d.logger.Printf("[OUTBOX] Error building sanitized hint for event %s: %v", rec.EventID, err)
+			d.handleFailure(ctx, rec, err)
 			continue
 		}
 		data, err := json.Marshal(hint)
@@ -218,19 +283,8 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 		if err != nil {
 			// Publish failed: calculate backoff and release the claim. Attempts was
 			// incremented by claim_outbox_batch exactly once.
-			if d.metrics != nil {
-				d.metrics.IncFailures()
-			}
-			backoff := d.CalculateBackoff(rec.Attempts)
-			updateRetry := `SELECT app.retry_outbox_event($1::uuid, $2::interval)`
-			intervalStr := fmt.Sprintf("%d milliseconds", backoff.Milliseconds())
-			if _, execErr := d.pool.Exec(ctx, updateRetry, rec.ID, intervalStr); execErr != nil {
-				d.logger.Printf("[OUTBOX] Failed to update retry next_at for event %s: %v", rec.EventID, execErr)
-			}
-			if _, execErr := d.pool.Exec(ctx, `SELECT app.record_outbox_failure($1::uuid, $2)`, rec.ID, err.Error()); execErr != nil {
-				d.logger.Printf("[OUTBOX] Failed to record publish error for event %s: %v", rec.EventID, execErr)
-			}
-			d.logger.Printf("[OUTBOX] Publish failed for event %s (attempt %d): %v (retrying in %v)", rec.EventID, rec.Attempts+1, err, backoff)
+			d.handleFailure(ctx, rec, err)
+			d.logger.Printf("[OUTBOX] Publish failed for event %s (attempt %d): %v", rec.EventID, rec.Attempts, err)
 		} else {
 			// Publish ACK received: Mark published_at atomically in PostgreSQL
 			updateSuccess := `SELECT app.mark_outbox_published($1::uuid)`
@@ -254,6 +308,26 @@ func (d *Dispatcher) DispatchBatch(ctx context.Context, batchSize int) (int, err
 		d.metrics.RecordSweep()
 	}
 	return publishedCount, nil
+}
+
+func (d *Dispatcher) handleFailure(ctx context.Context, rec OutboxEventRecord, cause error) {
+	if d.metrics != nil {
+		d.metrics.IncFailures()
+	}
+	if rec.Attempts >= d.cfg.MaxAttempts {
+		if _, err := d.pool.Exec(ctx, `SELECT app.dead_letter_outbox_event($1::uuid, $2)`, rec.ID, cause.Error()); err != nil {
+			d.logger.Printf("[OUTBOX] Failed to dead-letter event %s: %v", rec.EventID, err)
+		}
+		d.logger.Printf("[OUTBOX] Dead-lettered event %s after %d attempts: %v", rec.EventID, rec.Attempts, cause)
+		return
+	}
+	backoff := d.CalculateBackoff(rec.Attempts)
+	if _, err := d.pool.Exec(ctx, `SELECT app.retry_outbox_event($1::uuid, $2::interval)`, rec.ID, fmt.Sprintf("%d milliseconds", backoff.Milliseconds())); err != nil {
+		d.logger.Printf("[OUTBOX] Failed to schedule retry for event %s: %v", rec.EventID, err)
+	}
+	if _, err := d.pool.Exec(ctx, `SELECT app.record_outbox_failure($1::uuid, $2)`, rec.ID, cause.Error()); err != nil {
+		d.logger.Printf("[OUTBOX] Failed to record error for event %s: %v", rec.EventID, err)
+	}
 }
 
 // Run executes the continuous background dispatch loop until ctx cancellation.

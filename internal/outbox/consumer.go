@@ -48,7 +48,13 @@ func EnsureStream(js nats.JetStreamContext, streamName string, subjects []string
 
 	info, err := js.StreamInfo(streamName)
 	if err == nil {
+		if !sameStreamContract(info.Config, streamName, subjects, dupWindow) {
+			return nil, fmt.Errorf("JetStream stream %s has incompatible durability or subject configuration", streamName)
+		}
 		return info, nil
+	}
+	if err != nats.ErrStreamNotFound {
+		return nil, fmt.Errorf("inspect stream %s: %w", streamName, err)
 	}
 
 	cfg := &nats.StreamConfig{
@@ -64,14 +70,28 @@ func EnsureStream(js nats.JetStreamContext, streamName string, subjects []string
 
 	info, err = js.AddStream(cfg)
 	if err != nil {
-		// In memory fallback for test environments without disk write access
-		cfg.Storage = nats.MemoryStorage
-		info, err = js.AddStream(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("create stream %s: %w", streamName, err)
-		}
+		return nil, fmt.Errorf("create durable stream %s: %w", streamName, err)
 	}
 	return info, nil
+}
+
+func sameStreamContract(cfg nats.StreamConfig, name string, subjects []string, dupWindow time.Duration) bool {
+	if cfg.Name != name || cfg.Storage != nats.FileStorage || cfg.Retention != nats.WorkQueuePolicy || cfg.MaxAge != 24*time.Hour || cfg.Duplicates != dupWindow {
+		return false
+	}
+	for _, want := range subjects {
+		found := false
+		for _, got := range cfg.Subjects {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // WakeupConsumer listens to NATS JetStream wake-up hints and triggers authoritative database scans.

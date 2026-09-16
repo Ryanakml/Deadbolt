@@ -4,6 +4,8 @@
 
 ALTER TABLE outbox_events
     ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE outbox_events
+    ADD COLUMN IF NOT EXISTS dead_lettered_at TIMESTAMPTZ;
 
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION app.claim_outbox_batch(p_batch_size INT)
@@ -28,6 +30,7 @@ BEGIN
         SELECT o.id
         FROM outbox_events o
         WHERE o.published_at IS NULL
+          AND o.dead_lettered_at IS NULL
           AND o.next_at <= clock_timestamp()
         ORDER BY o.next_at ASC, o.created_at ASC, o.id ASC
         LIMIT p_batch_size
@@ -54,7 +57,7 @@ AS $$
 BEGIN
     UPDATE outbox_events
     SET published_at = clock_timestamp(), last_error = NULL
-    WHERE id = p_id AND published_at IS NULL;
+    WHERE id = p_id AND published_at IS NULL AND dead_lettered_at IS NULL;
 END;
 $$;
 -- +goose StatementEnd
@@ -71,7 +74,7 @@ BEGIN
     -- reservation and schedules the next attempt.
     UPDATE outbox_events
     SET next_at = clock_timestamp() + p_retry_delay
-    WHERE id = p_id AND published_at IS NULL;
+    WHERE id = p_id AND published_at IS NULL AND dead_lettered_at IS NULL;
 END;
 $$;
 -- +goose StatementEnd
@@ -86,6 +89,22 @@ AS $$
 BEGIN
     UPDATE outbox_events
     SET last_error = left(COALESCE(p_error, ''), 2048)
+    WHERE id = p_id AND published_at IS NULL;
+END;
+$$;
+-- +goose StatementEnd
+
+-- +goose StatementBegin
+CREATE OR REPLACE FUNCTION app.dead_letter_outbox_event(p_id UUID, p_error TEXT)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path = app, public, pg_temp
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE outbox_events
+    SET dead_lettered_at = clock_timestamp(),
+        last_error = left(COALESCE(p_error, ''), 2048)
     WHERE id = p_id AND published_at IS NULL;
 END;
 $$;
@@ -107,7 +126,7 @@ BEGIN
         count(*)::bigint,
         COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - MIN(created_at))), 0.0)::double precision
     FROM outbox_events
-    WHERE published_at IS NULL;
+    WHERE published_at IS NULL AND dead_lettered_at IS NULL;
 END;
 $$;
 -- +goose StatementEnd
@@ -116,6 +135,7 @@ REVOKE ALL ON FUNCTION app.claim_outbox_batch(INT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.mark_outbox_published(UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.retry_outbox_event(UUID, INTERVAL) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.record_outbox_failure(UUID, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.dead_letter_outbox_event(UUID, TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.get_outbox_metrics() FROM PUBLIC;
 
 -- +goose StatementBegin
@@ -133,6 +153,7 @@ BEGIN
         GRANT EXECUTE ON FUNCTION app.mark_outbox_published(UUID) TO deadbolt_system;
         GRANT EXECUTE ON FUNCTION app.retry_outbox_event(UUID, INTERVAL) TO deadbolt_system;
         GRANT EXECUTE ON FUNCTION app.record_outbox_failure(UUID, TEXT) TO deadbolt_system;
+        GRANT EXECUTE ON FUNCTION app.dead_letter_outbox_event(UUID, TEXT) TO deadbolt_system;
         GRANT EXECUTE ON FUNCTION app.get_outbox_metrics() TO deadbolt_system;
     END IF;
 END $$;
@@ -142,6 +163,8 @@ END $$;
 DROP FUNCTION IF EXISTS app.get_outbox_metrics();
 DROP FUNCTION IF EXISTS app.retry_outbox_event(UUID, INTERVAL);
 DROP FUNCTION IF EXISTS app.record_outbox_failure(UUID, TEXT);
+DROP FUNCTION IF EXISTS app.dead_letter_outbox_event(UUID, TEXT);
 DROP FUNCTION IF EXISTS app.mark_outbox_published(UUID);
 DROP FUNCTION IF EXISTS app.claim_outbox_batch(INT);
 ALTER TABLE outbox_events DROP COLUMN IF EXISTS last_error;
+ALTER TABLE outbox_events DROP COLUMN IF EXISTS dead_lettered_at;

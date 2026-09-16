@@ -247,6 +247,9 @@ func run() error {
 
 	// Wire Outbox Dispatcher and NATS JetStream wake-up handling (Blueprint §11 & §19.1)
 	outboxMetrics := outbox.NewMetrics(pool)
+	if reconciler != nil {
+		outboxMetrics.SetSchedulerHeartbeat(reconciler.Ticker())
+	}
 	// Outbox sweeps cross tenant boundaries and therefore use the dedicated
 	// system connection. The runtime role is intentionally tenant-scoped and
 	// must not be able to invoke a cross-tenant dispatcher function.
@@ -255,44 +258,71 @@ func run() error {
 		logger.Printf("[OUTBOX] System database pool unavailable; dispatcher disabled, PostgreSQL reconciliation remains active")
 	}
 	if dispatchPool != nil {
-		var jsClient outbox.JetStreamClient
-		nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second), nats.MaxReconnects(5))
-		if err != nil {
-			logger.Printf("[OUTBOX] Warning: NATS connection not established (%v); DB fallback active", err)
-		} else {
-			defer nc.Close()
-			js, err := nc.JetStream()
-			if err != nil {
-				logger.Printf("[OUTBOX] Warning: JetStream context error: %v", err)
-			} else {
-				jsClient = js
-				if _, err := outbox.EnsureStream(js, outbox.StreamName, []string{outbox.SubjectPrefix + ">"}, 2*time.Minute); err != nil {
-					logger.Printf("[OUTBOX] Warning: Failed to ensure JetStream stream: %v", err)
-				} else {
-					// Start WakeupConsumer: triggers DB scans only without granting execution ownership
-					wakeupConsumer := outbox.NewWakeupConsumer(js, outbox.DefaultConsumerConfig(), outbox.WakeupHandlerFunc(func(ctx context.Context, hint outbox.WakeupHintDTO) error {
-						logger.Printf("[WAKEUP] Triggered DB scan for run %s (event %s)", hint.RunID, hint.EventID)
-						if reconciler != nil {
-							reconciler.Wake()
-						}
-						return nil
-					}), logger)
-					if err := wakeupConsumer.Start(ctx); err != nil {
-						logger.Printf("[OUTBOX] Warning: Failed to start wakeup consumer: %v", err)
-					} else {
-						defer func() { _ = wakeupConsumer.Stop() }()
-					}
-				}
-			}
-		}
-
-		dispatcher := outbox.NewDispatcher(dispatchPool, jsClient, outbox.DefaultConfig(), outboxMetrics, logger)
+		publisher := outbox.NewJetStreamPublisherSlot()
+		dispatcher := outbox.NewDispatcher(dispatchPool, publisher, outbox.DefaultConfig(), outboxMetrics, logger)
 		go func() {
 			if err := dispatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Printf("[OUTBOX] Dispatcher loop terminated: %v", err)
 			}
 		}()
 		defer dispatcher.Stop()
+
+		// Keep the dispatcher alive across an unavailable-at-start NATS. Each
+		// successful connection gets its own JetStream consumer and stream
+		// contract validation; PostgreSQL remains the safety net between retries.
+		go func() {
+			var nc *nats.Conn
+			var consumer *outbox.WakeupConsumer
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			defer func() {
+				if consumer != nil { _ = consumer.Stop() }
+				if nc != nil { nc.Close() }
+				publisher.Set(nil)
+			}()
+			connect := func() {
+				if nc != nil && nc.IsConnected() { return }
+				if consumer != nil { _ = consumer.Stop(); consumer = nil }
+				if nc != nil { nc.Close(); nc = nil }
+				conn, err := nats.Connect(natsURL, nats.Timeout(2*time.Second), nats.MaxReconnects(0))
+				if err != nil {
+					publisher.Set(nil)
+					logger.Printf("[OUTBOX] NATS unavailable; retrying connection: %v", err)
+					return
+				}
+				js, err := conn.JetStream()
+				if err != nil {
+					conn.Close(); publisher.Set(nil)
+					logger.Printf("[OUTBOX] JetStream unavailable; retrying connection: %v", err)
+					return
+				}
+				if _, err := outbox.EnsureStream(js, outbox.StreamName, []string{outbox.SubjectPrefix + ">"}, 2*time.Minute); err != nil {
+					conn.Close(); publisher.Set(nil)
+					logger.Printf("[OUTBOX] NATS stream contract unavailable; retrying: %v", err)
+					return
+				}
+				candidate := outbox.NewWakeupConsumer(js, outbox.DefaultConsumerConfig(), outbox.WakeupHandlerFunc(func(ctx context.Context, hint outbox.WakeupHintDTO) error {
+					logger.Printf("[WAKEUP] Triggered DB scan for run %s (event %s)", hint.RunID, hint.EventID)
+					if reconciler != nil { reconciler.Wake() }
+					return nil
+				}), logger)
+				if err := candidate.Start(ctx); err != nil {
+					conn.Close(); publisher.Set(nil)
+					logger.Printf("[OUTBOX] Wake-up consumer unavailable; retrying: %v", err)
+					return
+				}
+				nc, consumer = conn, candidate
+				publisher.Set(js)
+				logger.Printf("[OUTBOX] NATS JetStream connected and wake-up consumer ready")
+			}
+			connect()
+			for {
+				select {
+				case <-ctx.Done(): return
+				case <-ticker.C: connect()
+				}
+			}
+		}()
 	}
 
 	mux := BuildMuxWithMetrics(cfg, pool, healthChecker, outboxMetrics, logger)

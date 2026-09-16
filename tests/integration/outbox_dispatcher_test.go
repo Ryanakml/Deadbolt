@@ -176,20 +176,29 @@ func TestOutboxAtomicIntentAndPublishAckPrecedesMark(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	orgID, _, _ := createOutboxTestTenant(t, tc.tenantSvc, "test-outbox-atomic")
+	orgID, envID, _ := createOutboxTestTenant(t, tc.tenantSvc, "test-outbox-atomic")
 
-	// 1. Insert an outbox event atomically in a tenant transaction
+	// 1. Insert the authoritative state, event, and outbox intent in one
+	// transaction. This is the actual INV-06 atomicity boundary.
 	var eventID string
 	var outboxID string
+	deploymentID, _ := tenant.NewUUID()
+	runID, _ := tenant.NewUUID()
 	err = tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO deployments (id, organization_id, environment_id, manifest_hash, bundle_digest, manifest, runtime_version)
+			VALUES ($1,$2,$3,'atomic-manifest',$4,'{}'::jsonb,'1.0')`, deploymentID, orgID, envID, "sha256:atomic"); err != nil { return err }
+		if _, err := tx.Exec(ctx, `INSERT INTO runs (id, organization_id, environment_id, deployment_id, workflow_name, status)
+			VALUES ($1,$2,$3,$4,'atomic-workflow','RUNNING')`, runID, orgID, envID, deploymentID); err != nil { return err }
+		if _, err := tx.Exec(ctx, `INSERT INTO run_events (organization_id, run_id, sequence, event_type, payload)
+			VALUES ($1,$2,1,'RUN_CREATED','{}'::jsonb)`, orgID, runID); err != nil { return err }
 		row := tx.QueryRow(ctx, `
 			INSERT INTO outbox_events (
 				organization_id, subject, payload
 			) VALUES (
 				$1::uuid, 'execution.state_changed',
-				jsonb_build_object('runId', gen_random_uuid(), 'eventType', 'RUN_CREATED')
+				jsonb_build_object('runId', $2::text, 'eventType', 'RUN_CREATED')
 			) RETURNING id::text, event_id::text
-		`, orgID)
+		`, orgID, runID)
 		return row.Scan(&outboxID, &eventID)
 	})
 	if err != nil {
@@ -207,6 +216,30 @@ func TestOutboxAtomicIntentAndPublishAckPrecedesMark(t *testing.T) {
 	if initialPublishedAt != nil {
 		t.Fatalf("expected published_at to be NULL before dispatcher runs, got %v", initialPublishedAt)
 	}
+	var committedState, committedEvent, committedOutbox int
+	err = tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM runs WHERE id=$1::uuid),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid),
+			(SELECT count(*) FROM outbox_events WHERE event_id=$2::uuid)`, runID, eventID).Scan(&committedState, &committedEvent, &committedOutbox)
+	})
+	if err != nil || committedState != 1 || committedEvent != 1 || committedOutbox != 1 {
+		t.Fatalf("atomic commit evidence missing: err=%v state=%d event=%d outbox=%d", err, committedState, committedEvent, committedOutbox)
+	}
+	rollbackRunID, _ := tenant.NewUUID()
+	rollbackErr := tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO runs (id, organization_id, environment_id, deployment_id, workflow_name, status)
+			VALUES ($1,$2,$3,$4,'rolled-back','RUNNING')`, rollbackRunID, orgID, envID, deploymentID); err != nil { return err }
+		if _, err := tx.Exec(ctx, `INSERT INTO run_events (organization_id, run_id, sequence, event_type) VALUES ($1,$2,1,'RUN_CREATED')`, orgID, rollbackRunID); err != nil { return err }
+		if _, err := tx.Exec(ctx, `INSERT INTO outbox_events (organization_id, subject, payload) VALUES ($1,'execution.state_changed',jsonb_build_object('runId',$2::text,'eventType','RUN_CREATED'))`, orgID, rollbackRunID); err != nil { return err }
+		return fmt.Errorf("intentional rollback for atomicity evidence")
+	})
+	if rollbackErr == nil { t.Fatal("expected rollback transaction to fail") }
+	var rollbackCount int
+	err = tc.storagePool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE id=$1::uuid`, rollbackRunID).Scan(&rollbackCount)
+	})
+	if err != nil || rollbackCount != 0 { t.Fatalf("rollback leaked authoritative state: err=%v count=%d", err, rollbackCount) }
 
 	// 3. Setup subscriber to capture published NATS JetStream message
 	msgCh := make(chan *nats.Msg, 1)
@@ -703,7 +736,10 @@ func TestDuplicateWakeupConsumer_SingularClaimEvidence(t *testing.T) {
 		}
 	}
 
-	// 4. Concurrently trigger claim from both workers (simulating two worker agents reacting to the duplicate hints)
+	// 4. Route both deliveries through the real consumer -> authoritative scan
+	// path. The first handler claims the step and then deliberately returns an
+	// error, simulating a crash before ACK; JetStream redelivers the message and
+	// the second handler invocation must not create another lease.
 	session1Ctx := &worker.WorkerSessionContext{
 		SessionID:      session1ID,
 		WorkerID:       worker1ID,
@@ -711,14 +747,6 @@ func TestDuplicateWakeupConsumer_SingularClaimEvidence(t *testing.T) {
 		EnvironmentID:  envID,
 		PoolName:       "default",
 	}
-	session2Ctx := &worker.WorkerSessionContext{
-		SessionID:      session2ID,
-		WorkerID:       worker2ID,
-		OrganizationID: orgID,
-		EnvironmentID:  envID,
-		PoolName:       "default",
-	}
-
 	pollReq := &worker.PollRequestDTO{
 		ProtocolVersion:   worker.ProtocolVersion,
 		RequestID:         "poll-req-1",
@@ -728,45 +756,44 @@ func TestDuplicateWakeupConsumer_SingularClaimEvidence(t *testing.T) {
 		AvailableSlots:    1,
 		DeploymentDigests: []string{bundleDigest},
 	}
-	pollReq2 := &worker.PollRequestDTO{
-		ProtocolVersion:   worker.ProtocolVersion,
-		RequestID:         "poll-req-2",
-		WorkerID:          worker2ID,
-		SessionID:         session2ID,
-		Pool:              "default",
-		AvailableSlots:    1,
-		DeploymentDigests: []string{bundleDigest},
+	var consumerCalls, claimedCount int
+	var consumerMu sync.Mutex
+	wakeupConsumer := outbox.NewWakeupConsumer(js, outbox.DefaultConsumerConfig(), outbox.WakeupHandlerFunc(func(ctx context.Context, hint outbox.WakeupHintDTO) error {
+		consumerMu.Lock()
+		consumerCalls++
+		call := consumerCalls
+		consumerMu.Unlock()
+		resp, err := tc.workerEng.Claim(ctx, session1Ctx, pollReq)
+		if err != nil {
+			return err
+		}
+		consumerMu.Lock()
+		claimedCount += len(resp.Assignments)
+		consumerMu.Unlock()
+		if call == 1 {
+			return fmt.Errorf("simulate crash before ACK")
+		}
+		return nil
+	}), nil)
+	if err := wakeupConsumer.Start(ctx); err != nil {
+		t.Fatalf("start wakeup consumer: %v", err)
 	}
-
-	var wg sync.WaitGroup
-	var resp1, resp2 *worker.PollResponseDTO
-	var err1, err2 error
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		resp1, err1 = tc.workerEng.Claim(ctx, session1Ctx, pollReq)
-	}()
-	go func() {
-		defer wg.Done()
-		resp2, err2 = tc.workerEng.Claim(ctx, session2Ctx, pollReq2)
-	}()
-	wg.Wait()
-
-	if err1 != nil {
-		t.Fatalf("worker 1 claim error: %v", err1)
+	defer wakeupConsumer.Stop()
+	deadline := time.After(5 * time.Second)
+	for {
+		consumerMu.Lock()
+		calls := consumerCalls
+		consumerMu.Unlock()
+		if calls >= 2 { break }
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for JetStream redelivery")
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
-	if err2 != nil {
-		t.Fatalf("worker 2 claim error: %v", err2)
-	}
-
-	// 5. Verify SINGULAR CLAIM EVIDENCE:
-	// Exactly one worker must have obtained the assignment (len = 1); the other must have obtained 0
-	claimedCount := len(resp1.Assignments) + len(resp2.Assignments)
-	if claimedCount != 1 {
-		t.Fatalf("EXPECTED EXACTLY 1 CLAIM ACQUIRED ACROSS BOTH WORKERS, GOT %d (worker1=%d, worker2=%d)",
-			claimedCount, len(resp1.Assignments), len(resp2.Assignments))
-	}
+	consumerMu.Lock()
+	if claimedCount != 1 { t.Fatalf("expected one claim across consumer redelivery, got %d", claimedCount) }
+	consumerMu.Unlock()
 
 	// 6. Direct database evidence of singular ownership (INV-03)
 	var attemptCount int

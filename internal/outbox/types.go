@@ -20,6 +20,7 @@ const DefaultBatchSize = 100
 
 // DefaultMaxRetryDelay is the maximum backoff duration for failed outbox events.
 const DefaultMaxRetryDelay = 60 * time.Second
+const DefaultMaxAttempts = 10
 
 // OutboxEventRecord represents a row from the outbox_events table.
 type OutboxEventRecord struct {
@@ -32,6 +33,7 @@ type OutboxEventRecord struct {
 	Attempts       int             `json:"attempts"`
 	NextAt         time.Time       `json:"nextAt"`
 	PublishedAt    *time.Time      `json:"publishedAt,omitempty"`
+	DeadLetteredAt *time.Time      `json:"deadLetteredAt,omitempty"`
 	CreatedAt      time.Time       `json:"createdAt"`
 }
 

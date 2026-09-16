@@ -78,6 +78,31 @@ func TestBuildSanitizedHint_NoSecretsOrOutputs(t *testing.T) {
 	}
 }
 
+func TestBuildSanitizedHint_RejectsPoisonPayloads(t *testing.T) {
+	base := outbox.OutboxEventRecord{OrganizationID: "org", EventID: "event", Subject: "execution.state_changed", PayloadVersion: 1, CreatedAt: time.Now()}
+	for name, payload := range map[string][]byte{
+		"malformed JSON": []byte(`{"runId":`),
+		"missing routing IDs": []byte(`{"eventType":"TASK_STARTED"}`),
+		"wrong field types": []byte(`{"runId":42,"eventType":"TASK_STARTED"}`),
+		"fractional sequence": []byte(`{"runId":"run","eventType":"TASK_STARTED","sequence":1.5}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			record := base
+			record.Payload = payload
+			if _, err := outbox.BuildSanitizedHint(record); err == nil {
+				t.Fatal("expected payload validation error")
+			}
+		})
+	}
+
+	unsupported := base
+	unsupported.PayloadVersion = 2
+	unsupported.Payload = []byte(`{"runId":"run","eventType":"TASK_STARTED"}`)
+	if _, err := outbox.BuildSanitizedHint(unsupported); err == nil {
+		t.Fatal("expected unsupported payload version error")
+	}
+}
+
 func TestCalculateBackoff_ExponentialAndBounded(t *testing.T) {
 	d := outbox.NewDispatcher(nil, nil, outbox.DispatcherConfig{
 		BaseBackoff:   100 * time.Millisecond,
