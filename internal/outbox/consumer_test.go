@@ -20,9 +20,9 @@ func TestSameStreamContractRequiresExactDurableContract(t *testing.T) {
 	}
 
 	cases := []struct {
-		name  string
+		name   string
 		mutate func(*nats.StreamConfig)
-		valid bool
+		valid  bool
 	}{
 		{name: "matching contract", valid: true},
 		{name: "discard policy", mutate: func(c *nats.StreamConfig) { c.Discard = nats.DiscardNew }},
