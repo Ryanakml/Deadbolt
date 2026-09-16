@@ -5,10 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/jackc/pgx/v5"
+)
+
+const (
+	MaxLogLineSizeBytes    = 16 * 1024   // 16 KiB per line bound (Blueprint / F-25)
+	MaxAttemptLogSizeBytes = 1024 * 1024 // 1 MiB per attempt cumulative budget
 )
 
 type DeploymentReconciler interface {
@@ -22,9 +28,10 @@ type EnrollmentTokenInfo struct {
 }
 
 type Service struct {
-	pool        *storage.Pool
-	deployments DeploymentReconciler
-	engine      ExecutionEngine
+	pool             *storage.Pool
+	deployments      DeploymentReconciler
+	engine           ExecutionEngine
+	droppedLogsTotal atomic.Int64
 }
 
 func NewService(pool *storage.Pool, deployments DeploymentReconciler, engine ExecutionEngine) *Service {
@@ -33,6 +40,11 @@ func NewService(pool *storage.Pool, deployments DeploymentReconciler, engine Exe
 		deployments: deployments,
 		engine:      engine,
 	}
+}
+
+// DroppedLogsCount returns the cumulative number of dropped log records due to line or attempt budget limits.
+func (s *Service) DroppedLogsCount() int64 {
+	return s.droppedLogsTotal.Load()
 }
 
 // CreateEnrollmentToken generates a 10-minute single-use hashed enrollment token
@@ -449,11 +461,176 @@ func (s *Service) RecordLogs(ctx context.Context, sessionCtx *WorkerSessionConte
 		return nil, ErrUnauthorized
 	}
 
-	// Logs are best-effort delivery per Blueprint §12.2.
+	if len(req.Records) == 0 {
+		return &AckResponseDTO{
+			ProtocolVersion: ProtocolVersion,
+			RequestID:       req.RequestID,
+			Accepted:        true,
+		}, nil
+	}
+
+	var droppedCount int
+	var budgetExhausted bool
+	var newlyDropped int
+
+	err := s.pool.WithTenantTx(ctx, sessionCtx.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
+		var stepID, runID, envID string
+		err := tx.QueryRow(ctx, `
+			SELECT a.step_id::text, rs.run_id::text, rs.environment_id::text
+			FROM task_attempts a
+			JOIN run_steps rs ON rs.id = a.step_id AND rs.organization_id = a.organization_id
+			WHERE a.id = $1::uuid AND a.session_id = $2::uuid AND a.organization_id = $3::uuid
+		`, req.AttemptID, sessionCtx.SessionID, sessionCtx.OrganizationID).Scan(&stepID, &runID, &envID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrUnauthorized
+			}
+			return fmt.Errorf("verify attempt ownership: %w", err)
+		}
+		// Serialize accounting for one attempt. This prevents concurrent batches
+		// from both observing spare budget and collectively exceeding 1 MiB.
+		var lockedAttemptID string
+		if err := tx.QueryRow(ctx, `
+			SELECT id FROM task_attempts
+			WHERE id = $1::uuid AND organization_id = $2::uuid
+			FOR UPDATE
+		`, req.AttemptID, sessionCtx.OrganizationID).Scan(&lockedAttemptID); err != nil {
+			return fmt.Errorf("lock attempt log budget: %w", err)
+		}
+
+		var currentBytes int64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(octet_length(message)), 0)::bigint
+			FROM task_logs
+			WHERE attempt_id = $1::uuid AND organization_id = $2::uuid
+		`, req.AttemptID, sessionCtx.OrganizationID).Scan(&currentBytes); err != nil {
+			return fmt.Errorf("query existing log bytes: %w", err)
+		}
+
+		var insertedAny bool
+		for _, rec := range req.Records {
+			// A retry of an accepted record is a no-op even after the attempt has
+			// reached its byte budget.
+			var alreadyStored bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS(
+					SELECT 1 FROM task_logs
+					WHERE attempt_id = $1::uuid AND sequence = $2 AND organization_id = $3::uuid
+				)
+			`, req.AttemptID, rec.Sequence, sessionCtx.OrganizationID).Scan(&alreadyStored); err != nil {
+				return fmt.Errorf("check existing task log: %w", err)
+			}
+			if alreadyStored {
+				continue
+			}
+
+			var priorDropReason string
+			priorDropErr := tx.QueryRow(ctx, `
+				SELECT reason FROM task_log_drop_receipts
+				WHERE attempt_id = $1::uuid AND sequence = $2 AND organization_id = $3::uuid
+			`, req.AttemptID, rec.Sequence, sessionCtx.OrganizationID).Scan(&priorDropReason)
+			if priorDropErr != nil && !errors.Is(priorDropErr, pgx.ErrNoRows) {
+				return fmt.Errorf("check existing dropped task log: %w", priorDropErr)
+			}
+			if priorDropErr == nil {
+				droppedCount++
+				budgetExhausted = budgetExhausted || priorDropReason == "BUDGET_EXHAUSTED"
+				continue
+			}
+
+			msgBytes := int64(len([]byte(rec.Message)))
+			dropReason := ""
+			if msgBytes > MaxLogLineSizeBytes {
+				dropReason = "LINE_TOO_LARGE"
+			} else if currentBytes+msgBytes > MaxAttemptLogSizeBytes {
+				dropReason = "BUDGET_EXHAUSTED"
+			}
+			if dropReason != "" {
+				droppedCount++
+				budgetExhausted = budgetExhausted || dropReason == "BUDGET_EXHAUSTED"
+				tag, err := tx.Exec(ctx, `
+					INSERT INTO task_log_drop_receipts (organization_id, attempt_id, sequence, reason)
+					VALUES ($1::uuid, $2::uuid, $3, $4)
+					ON CONFLICT (attempt_id, sequence) DO NOTHING
+				`, sessionCtx.OrganizationID, req.AttemptID, rec.Sequence, dropReason)
+				if err != nil {
+					return fmt.Errorf("record dropped task log: %w", err)
+				}
+				if tag.RowsAffected() > 0 {
+					newlyDropped++
+				}
+				continue
+			}
+
+			ts, parseErr := time.Parse(time.RFC3339Nano, rec.Timestamp)
+			if parseErr != nil {
+				ts = time.Now()
+			}
+			lvl := "info"
+			switch rec.Level {
+			case "debug", "info", "warn", "error":
+				lvl = rec.Level
+			}
+
+			tag, insErr := tx.Exec(ctx, `
+				INSERT INTO task_logs (
+					organization_id, environment_id, run_id, step_id, attempt_id,
+					sequence, timestamp, level, message
+				) VALUES (
+					$1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+					$6, $7, $8, $9
+				) ON CONFLICT (attempt_id, sequence) DO NOTHING
+			`, sessionCtx.OrganizationID, envID, runID, stepID, req.AttemptID, rec.Sequence, ts, lvl, rec.Message)
+			if insErr != nil {
+				return fmt.Errorf("insert task log: %w", insErr)
+			}
+			if tag.RowsAffected() > 0 {
+				currentBytes += msgBytes
+				insertedAny = true
+			}
+		}
+
+		if insertedAny {
+			_, err = tx.Exec(ctx, `
+				UPDATE task_attempts
+				SET logs_recorded = TRUE
+				WHERE id = $1::uuid AND organization_id = $2::uuid AND logs_recorded = FALSE
+			`, req.AttemptID, sessionCtx.OrganizationID)
+			if err != nil {
+				return fmt.Errorf("mark logs recorded: %w", err)
+			}
+		}
+		if newlyDropped > 0 {
+			_, err = tx.Exec(ctx, `
+				UPDATE task_attempts
+				SET dropped_log_count = dropped_log_count + $1,
+					log_budget_exhausted = log_budget_exhausted OR $2
+				WHERE id = $3::uuid AND organization_id = $4::uuid
+			`, newlyDropped, budgetExhausted, req.AttemptID, sessionCtx.OrganizationID)
+			if err != nil {
+				return fmt.Errorf("record task log drop state: %w", err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return nil, ErrUnauthorized
+		}
+		return nil, fmt.Errorf("record logs: %w", err)
+	}
+
+	if newlyDropped > 0 {
+		s.droppedLogsTotal.Add(int64(newlyDropped))
+	}
+
 	return &AckResponseDTO{
 		ProtocolVersion: ProtocolVersion,
 		RequestID:       req.RequestID,
 		Accepted:        true,
+		DroppedCount:    droppedCount,
+		BudgetExhausted: budgetExhausted,
 	}, nil
 }
 

@@ -49,3 +49,35 @@ func (p *Pool) WithTenantTx(ctx context.Context, orgID string, fn func(ctx conte
 
 	return nil
 }
+
+// WithTenantReadOnlyRepeatableReadTx executes fn within a read-only REPEATABLE READ transaction
+// with transaction-local tenant context.
+// This guarantees snapshot isolation across multiple statements (Blueprint §23.3),
+// ensuring lastEventSequence and committed execution state originate from the exact same point in time.
+func (p *Pool) WithTenantReadOnlyRepeatableReadTx(ctx context.Context, orgID string, fn func(ctx context.Context, tx pgx.Tx) error) error {
+	tx, err := p.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to begin read-only repeatable read transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	_, err = tx.Exec(ctx, "SELECT set_config('app.current_organization_id', $1, true)", orgID)
+	if err != nil {
+		return fmt.Errorf("failed to set tenant context: %w", err)
+	}
+
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}

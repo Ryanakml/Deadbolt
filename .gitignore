@@ -18,6 +18,7 @@ Thumbs.db
 # Node.js & TypeScript
 node_modules/
 dist/
+!apps/dashboard/dist/
 build/
 .pnpm-store/
 npm-debug.log*

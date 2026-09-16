@@ -1,0 +1,16 @@
+{
+  "name": "@runtime/dashboard",
+  "version": "0.1.0",
+  "description": "Deadbolt Workflow Run Inspector & Dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc && cp -r public/* dist/ 2>/dev/null || true",
+    "test": "node ../../scripts/run-node-tests.mjs tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}

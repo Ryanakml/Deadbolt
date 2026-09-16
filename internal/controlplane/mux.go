@@ -3,6 +3,7 @@ package controlplane
 import (
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -51,16 +52,30 @@ func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gat
 		mux.Handle("POST /api/v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 		mux.Handle("POST /v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 
-		workerSvc := worker.NewService(storagePool, deploymentSvc, execution.NewWorkerEngine(storagePool))
+		eventHub := execution.NewEventHub()
+		workerEngine := execution.NewWorkerEngine(storagePool, eventHub)
+		workerSvc := worker.NewService(storagePool, deploymentSvc, workerEngine)
+		outboxMetrics.SetTaskLogDroppedCounter(workerSvc.DroppedLogsCount)
 		workerHandler := worker.NewHTTPHandler(workerSvc, tenantService)
 		workerHandler.RegisterRoutes(mux)
 
-		executionSvc := execution.NewService(storagePool, tenantService)
+		executionSvc := execution.NewService(storagePool, tenantService, eventHub)
 		executionHandler := execution.NewHTTPHandler(executionSvc, tenantService)
 		mux.Handle("POST /api/v1/workflows/{name}/runs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsCreate, executionHandler.CreateRun))))
 		mux.Handle("POST /v1/workflows/{name}/runs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsCreate, executionHandler.CreateRun))))
+		mux.Handle("GET /api/v1/runs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.ListRuns))))
+		mux.Handle("GET /v1/runs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.ListRuns))))
 		mux.Handle("GET /api/v1/runs/{id}", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.GetRun))))
 		mux.Handle("GET /v1/runs/{id}", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.GetRun))))
+		mux.Handle("GET /api/v1/runs/{id}/events", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.GetRunEvents))))
+		mux.Handle("GET /v1/runs/{id}/events", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.GetRunEvents))))
+		mux.Handle("GET /api/v1/runs/{id}/stream", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.StreamRunEvents))))
+		mux.Handle("GET /v1/runs/{id}/stream", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.StreamRunEvents))))
+		mux.Handle("GET /api/v1/runs/{id}/logs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapPayloadRead, executionHandler.GetRunLogs))))
+		mux.Handle("GET /v1/runs/{id}/logs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapPayloadRead, executionHandler.GetRunLogs))))
+
+		mux.Handle("GET /api/v1/workers", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersRead, executionHandler.ListWorkers))))
+		mux.Handle("GET /v1/workers", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersRead, executionHandler.ListWorkers))))
 
 		mux.Handle("POST /api/v1/environments/{envId}/worker-enrollments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsWrite, workerHandler.HandleCreateEnrollmentToken))))
 		mux.Handle("POST /v1/environments/{envId}/worker-enrollments", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapDeploymentsWrite, workerHandler.HandleCreateEnrollmentToken))))
@@ -82,6 +97,19 @@ func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gat
 			mux.HandleFunc("/api/auth/dev-login", devAuth.HandleDevLogin)
 			if logger != nil {
 				logger.Printf("Local developer authentication endpoint enabled at /api/auth/dev-login")
+			}
+		}
+
+		candidates := []string{"/app/dashboard", "apps/dashboard/dist", "apps/dashboard", "../../apps/dashboard/dist"}
+		if customDir := os.Getenv("DEADBOLT_DASHBOARD_DIR"); customDir != "" {
+			candidates = append([]string{customDir}, candidates...)
+		}
+		for _, dir := range candidates {
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
+				fs := http.FileServer(http.Dir(dir))
+				mux.Handle("GET /dashboard/", http.StripPrefix("/dashboard/", fs))
+				mux.Handle("GET /dashboard", http.RedirectHandler("/dashboard/", http.StatusMovedPermanently))
+				break
 			}
 		}
 	}

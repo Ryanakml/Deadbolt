@@ -1,6 +1,10 @@
 package worker
 
-import "github.com/Ryanakml/Deadbolt/internal/contracts"
+import (
+	"encoding/json"
+
+	"github.com/Ryanakml/Deadbolt/internal/contracts"
+)
 
 // ProtocolVersion is the canonical protocol version for /worker/v1/...
 const ProtocolVersion = 1
@@ -179,7 +183,13 @@ type CompleteResponseDTO struct {
 func CanonicalCompletionDigest(req *CompleteRequestDTO) (string, error) {
 	var errorEnvelope any
 	if req.Error != nil {
-		errorEnvelope = *req.Error
+		b, err := json.Marshal(req.Error)
+		if err != nil {
+			return "", err
+		}
+		if err := json.Unmarshal(b, &errorEnvelope); err != nil {
+			return "", err
+		}
 	}
 	canonical, err := contracts.CanonicalizeGeneric(map[string]any{
 		"outcome":    req.Outcome,
@@ -207,6 +217,8 @@ type AckResponseDTO struct {
 	ProtocolVersion int    `json:"protocolVersion"`
 	RequestID       string `json:"requestId"`
 	Accepted        bool   `json:"accepted"`
+	DroppedCount    int    `json:"droppedCount,omitempty"`
+	BudgetExhausted bool   `json:"budgetExhausted,omitempty"`
 }
 
 type LogRecordDTO struct {

@@ -2,9 +2,11 @@ package execution
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
@@ -24,6 +26,7 @@ var (
 	ErrSchemaViolation       = errors.New("SCHEMA_VIOLATION: Input does not conform to workflow schema")
 	ErrEnvironmentNotFound   = errors.New("ENVIRONMENT_NOT_FOUND: Environment not found")
 	ErrPayloadTooLarge       = errors.New("PAYLOAD_TOO_LARGE: Inline JSON payload exceeds 256 KiB")
+	ErrInvalidCursor         = errors.New("INVALID_CURSOR: Cursor is invalid")
 )
 
 const maxInlinePayloadBytes = worker.MaxInlinePayloadBytes
@@ -31,13 +34,25 @@ const maxInlinePayloadBytes = worker.MaxInlinePayloadBytes
 type Service struct {
 	pool    *storage.Pool
 	tenants *tenant.Service
+	hub     *EventHub
 }
 
-func NewService(pool *storage.Pool, tenants *tenant.Service) *Service {
+func NewService(pool *storage.Pool, tenants *tenant.Service, hub ...*EventHub) *Service {
+	var h *EventHub
+	if len(hub) > 0 && hub[0] != nil {
+		h = hub[0]
+	} else {
+		h = NewEventHub()
+	}
 	return &Service{
 		pool:    pool,
 		tenants: tenants,
+		hub:     h,
 	}
+}
+
+func (s *Service) Hub() *EventHub {
+	return s.hub
 }
 
 type payloadHashModel struct {
@@ -325,12 +340,15 @@ func (s *Service) CreateRun(
 	if err != nil {
 		return nil, false, err
 	}
+	if s.hub != nil {
+		s.hub.Publish(resultRun.ID)
+	}
 	return resultRun, isReplay, nil
 }
 
 func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshotDTO, error) {
 	var snapshot *RunSnapshotDTO
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	err := s.pool.WithTenantReadOnlyRepeatableReadTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		run, err := queryRunDTO(ctx, tx, orgID, runID)
 		if err != nil {
 			return err
@@ -371,18 +389,139 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 				return err
 			}
 			st.Status = contracts.StepStatus(stateStr)
+			st.Attempts = []AttemptSummaryDTO{}
 			steps = append(steps, st)
 		}
 		if err := rows.Err(); err != nil {
 			return err
 		}
 
+		if len(steps) > 0 {
+			stepIDs := make([]string, len(steps))
+			for i, st := range steps {
+				stepIDs[i] = st.ID
+			}
+			attemptRows, err := tx.Query(ctx, `
+				SELECT id::text, step_id::text, attempt_number, status, session_id::text,
+					epoch, started_at, completed_at, error
+				FROM task_attempts
+				WHERE organization_id = $1::uuid AND step_id = ANY($2::uuid[])
+				ORDER BY attempt_number ASC
+			`, orgID, stepIDs)
+			if err != nil {
+				return fmt.Errorf("query attempts: %w", err)
+			}
+			defer attemptRows.Close()
+
+			attemptsByStep := make(map[string][]AttemptSummaryDTO)
+			for attemptRows.Next() {
+				var a AttemptSummaryDTO
+				var stepID string
+				var sessID *string
+				var startedAt, completedAt *time.Time
+				var rawErr []byte
+				if err := attemptRows.Scan(&a.ID, &stepID, &a.AttemptNumber, &a.Status, &sessID, &a.OwnershipEpoch, &startedAt, &completedAt, &rawErr); err != nil {
+					return err
+				}
+				a.WorkerSessionID = sessID
+				if startedAt != nil {
+					s := startedAt.UTC().Format(time.RFC3339Nano)
+					a.StartedAt = &s
+				}
+				if completedAt != nil {
+					c := completedAt.UTC().Format(time.RFC3339Nano)
+					a.CompletedAt = &c
+				}
+				if len(rawErr) > 0 && string(rawErr) != "null" {
+					_ = json.Unmarshal(rawErr, &a.Error)
+				}
+				attemptsByStep[stepID] = append(attemptsByStep[stepID], a)
+			}
+			if err := attemptRows.Err(); err != nil {
+				return err
+			}
+
+			for i := range steps {
+				if atts, ok := attemptsByStep[steps[i].ID]; ok {
+					steps[i].Attempts = atts
+				}
+			}
+		}
+
+		var activeWorkers int
+		if run.DeploymentID != "" {
+			err := tx.QueryRow(ctx, `
+				SELECT COUNT(DISTINCT ws.id)
+				FROM worker_sessions ws
+				JOIN workers w ON w.id = ws.worker_id AND w.organization_id = ws.organization_id
+				JOIN worker_deployments wd ON wd.session_id = ws.id AND wd.organization_id = ws.organization_id
+				JOIN deployments d ON d.bundle_digest = wd.bundle_digest AND d.organization_id = ws.organization_id
+				WHERE ws.organization_id = $1::uuid
+				  AND d.id = $2::uuid
+				  AND ws.environment_id = $3::uuid
+				  AND w.environment_id = $3::uuid
+				  AND w.status = 'ACTIVE'
+				  AND ws.revoked_at IS NULL
+				  AND ws.expires_at > clock_timestamp()
+			`, orgID, run.DeploymentID, run.EnvironmentID).Scan(&activeWorkers)
+			if err != nil {
+				return fmt.Errorf("query active compatible workers: %w", err)
+			}
+		}
+
+		var waitingReason *string
+		isTerminal := run.Status == contracts.RunStatusSUCCEEDED ||
+			run.Status == contracts.RunStatusFAILED ||
+			run.Status == contracts.RunStatusCANCELLED
+
+		if !isTerminal && activeWorkers == 0 {
+			hasRunningAttempt := false
+			for _, st := range steps {
+				for _, att := range st.Attempts {
+					if att.Status == "RUNNING" {
+						hasRunningAttempt = true
+						break
+					}
+				}
+				if hasRunningAttempt {
+					break
+				}
+			}
+			if !hasRunningAttempt {
+				reason := "NO_COMPATIBLE_WORKERS"
+				waitingReason = &reason
+			}
+		}
+
+		if run.Status == contracts.RunStatusFAILED && runError == nil {
+			if run.ReasonCode != nil {
+				runError = map[string]any{
+					"code":    *run.ReasonCode,
+					"message": *run.ReasonCode,
+				}
+			} else {
+				for _, st := range steps {
+					for _, att := range st.Attempts {
+						if att.Error != nil {
+							runError = att.Error
+							break
+						}
+					}
+					if runError != nil {
+						break
+					}
+				}
+			}
+		}
+
 		snapshot = &RunSnapshotDTO{
-			RunDTO:            *run,
-			LastEventSequence: lastEventSeq,
-			Steps:             steps,
-			Output:            output,
-			Error:             runError,
+			RunDTO:                  *run,
+			LastEventSequence:       lastEventSeq,
+			Steps:                   steps,
+			Output:                  output,
+			Error:                   runError,
+			WaitingReason:           waitingReason,
+			ActiveCompatibleWorkers: activeWorkers,
 		}
 		return nil
 	})
@@ -391,6 +530,577 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+func (s *Service) ListRuns(ctx context.Context, orgID, envParam string, cursor *string, limit int) (*RunListResponseDTO, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	env, err := s.resolveEnvironment(ctx, orgID, envParam)
+	if err != nil {
+		return nil, ErrEnvironmentNotFound
+	}
+
+	var items []RunDTO
+	var nextCursor *string
+
+	err = s.pool.WithTenantReadOnlyRepeatableReadTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var rows pgx.Rows
+		var qErr error
+		if cursor != nil && *cursor != "" {
+			cursorTime, cursorID, err := decodeCursor(*cursor)
+			if err != nil {
+				return ErrInvalidCursor
+			}
+			query := `
+				SELECT r.id::text, r.organization_id::text, e.project_id::text, r.environment_id::text,
+					r.workflow_name, r.deployment_id::text, r.status, r.reason_code, r.revision,
+					r.created_at, r.deadline_at
+				FROM runs r
+				JOIN environments e ON e.id = r.environment_id AND e.organization_id = r.organization_id
+				WHERE r.organization_id = $1::uuid AND r.environment_id = $2::uuid
+					AND (r.created_at < $3 OR (r.created_at = $3 AND r.id < $4::uuid))
+				ORDER BY r.created_at DESC, r.id DESC
+				LIMIT $5
+			`
+			rows, qErr = tx.Query(ctx, query, orgID, env.ID, cursorTime, cursorID, limit+1)
+		} else {
+			query := `
+				SELECT r.id::text, r.organization_id::text, e.project_id::text, r.environment_id::text,
+					r.workflow_name, r.deployment_id::text, r.status, r.reason_code, r.revision,
+					r.created_at, r.deadline_at
+				FROM runs r
+				JOIN environments e ON e.id = r.environment_id AND e.organization_id = r.organization_id
+				WHERE r.organization_id = $1::uuid AND r.environment_id = $2::uuid
+				ORDER BY r.created_at DESC, r.id DESC
+				LIMIT $3
+			`
+			rows, qErr = tx.Query(ctx, query, orgID, env.ID, limit+1)
+		}
+		if qErr != nil {
+			return fmt.Errorf("query runs: %w", qErr)
+		}
+		defer rows.Close()
+
+		type rawRun struct {
+			dto       RunDTO
+			createdAt time.Time
+		}
+		var rawList []rawRun
+		for rows.Next() {
+			var r RunDTO
+			var statusStr string
+			var createdAt time.Time
+			var deadlineAt *time.Time
+			if err := rows.Scan(
+				&r.ID, &r.OrganizationID, &r.ProjectID, &r.EnvironmentID,
+				&r.WorkflowName, &r.DeploymentID, &statusStr, &r.ReasonCode, &r.Revision,
+				&createdAt, &deadlineAt,
+			); err != nil {
+				return err
+			}
+			r.Status = contracts.RunStatus(statusStr)
+			r.CreatedAt = createdAt.UTC().Format(time.RFC3339Nano)
+			if deadlineAt != nil {
+				d := deadlineAt.UTC().Format(time.RFC3339Nano)
+				r.DeadlineAt = &d
+			}
+			rawList = append(rawList, rawRun{dto: r, createdAt: createdAt})
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		if len(rawList) > limit {
+			last := rawList[limit-1]
+			nc := encodeCursor(last.createdAt, last.dto.ID)
+			nextCursor = &nc
+			rawList = rawList[:limit]
+		}
+
+		items = make([]RunDTO, len(rawList))
+		for i := range rawList {
+			items[i] = rawList[i].dto
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		items = []RunDTO{}
+	}
+
+	return &RunListResponseDTO{
+		Items:      items,
+		NextCursor: nextCursor,
+	}, nil
+}
+
+func (s *Service) ListWorkers(ctx context.Context, orgID, envParam string, cursor *string, limit int) (*WorkerListResponseDTO, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	env, err := s.resolveEnvironment(ctx, orgID, envParam)
+	if err != nil {
+		return nil, ErrEnvironmentNotFound
+	}
+
+	var items []WorkerDTO
+	var nextCursor *string
+
+	err = s.pool.WithTenantReadOnlyRepeatableReadTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var rows pgx.Rows
+		var qErr error
+		if cursor != nil && *cursor != "" {
+			cursorTime, cursorID, err := decodeCursor(*cursor)
+			if err != nil {
+				return ErrInvalidCursor
+			}
+			query := `
+				SELECT w.id::text, w.environment_id::text, w.pool_name, w.status, w.created_at
+				FROM workers w
+				WHERE w.organization_id = $1::uuid AND w.environment_id = $2::uuid
+					AND (w.created_at < $3 OR (w.created_at = $3 AND w.id < $4::uuid))
+				ORDER BY w.created_at DESC, w.id DESC
+				LIMIT $5
+			`
+			rows, qErr = tx.Query(ctx, query, orgID, env.ID, cursorTime, cursorID, limit+1)
+		} else {
+			query := `
+				SELECT w.id::text, w.environment_id::text, w.pool_name, w.status, w.created_at
+				FROM workers w
+				WHERE w.organization_id = $1::uuid AND w.environment_id = $2::uuid
+				ORDER BY w.created_at DESC, w.id DESC
+				LIMIT $3
+			`
+			rows, qErr = tx.Query(ctx, query, orgID, env.ID, limit+1)
+		}
+		if qErr != nil {
+			return fmt.Errorf("query workers: %w", qErr)
+		}
+		defer rows.Close()
+
+		type rawWorker struct {
+			dto       WorkerDTO
+			createdAt time.Time
+		}
+		var rawList []rawWorker
+		for rows.Next() {
+			var w WorkerDTO
+			var createdAt time.Time
+			if err := rows.Scan(&w.ID, &w.EnvironmentID, &w.Pool, &w.Status, &createdAt); err != nil {
+				return err
+			}
+			w.DeploymentDigests = []string{}
+			rawList = append(rawList, rawWorker{dto: w, createdAt: createdAt})
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		if len(rawList) > limit {
+			last := rawList[limit-1]
+			nc := encodeCursor(last.createdAt, last.dto.ID)
+			nextCursor = &nc
+			rawList = rawList[:limit]
+		}
+
+		if len(rawList) > 0 {
+			workerIDs := make([]string, len(rawList))
+			for i, rw := range rawList {
+				workerIDs[i] = rw.dto.ID
+			}
+			dRows, dErr := tx.Query(ctx, `
+				SELECT ws.worker_id::text, wd.bundle_digest
+				FROM worker_deployments wd
+				JOIN worker_sessions ws ON ws.id = wd.session_id AND ws.organization_id = wd.organization_id
+				WHERE ws.organization_id = $1::uuid AND ws.worker_id = ANY($2::uuid[])
+					AND ws.revoked_at IS NULL AND ws.expires_at > clock_timestamp()
+				GROUP BY ws.worker_id, wd.bundle_digest
+				ORDER BY wd.bundle_digest ASC
+			`, orgID, workerIDs)
+			if dErr != nil {
+				return fmt.Errorf("query worker digests: %w", dErr)
+			}
+			defer dRows.Close()
+
+			digestsByWorker := make(map[string][]string)
+			for dRows.Next() {
+				var wid, digest string
+				if err := dRows.Scan(&wid, &digest); err != nil {
+					return err
+				}
+				digestsByWorker[wid] = append(digestsByWorker[wid], digest)
+			}
+			if err := dRows.Err(); err != nil {
+				return err
+			}
+			for i := range rawList {
+				if d, ok := digestsByWorker[rawList[i].dto.ID]; ok {
+					rawList[i].dto.DeploymentDigests = d
+				}
+			}
+		}
+
+		items = make([]WorkerDTO, len(rawList))
+		for i := range rawList {
+			items[i] = rawList[i].dto
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if items == nil {
+		items = []WorkerDTO{}
+	}
+
+	return &WorkerListResponseDTO{
+		Items:      items,
+		NextCursor: nextCursor,
+	}, nil
+}
+
+func (s *Service) GetRunEvents(ctx context.Context, orgID, runID string, cursor int64, limit int, hasPayloadRead bool) (*RunEventsResponseDTO, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var resp *RunEventsResponseDTO
+
+	err := s.pool.WithTenantReadOnlyRepeatableReadTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM runs WHERE id = $1::uuid AND organization_id = $2::uuid)`, runID, orgID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return ErrRunNotFound
+		}
+
+		rows, err := tx.Query(ctx, `
+			SELECT id::text, run_id::text, sequence, version, event_type, payload, committed_at
+			FROM run_events
+			WHERE organization_id = $1::uuid AND run_id = $2::uuid AND sequence > $3
+			ORDER BY sequence ASC
+			LIMIT $4
+		`, orgID, runID, cursor, limit+1)
+		if err != nil {
+			return fmt.Errorf("query run events: %w", err)
+		}
+		defer rows.Close()
+
+		events := make([]RunEventDTO, 0)
+		for rows.Next() {
+			var ev RunEventDTO
+			var rawPayload []byte
+			var committedAt time.Time
+			if err := rows.Scan(&ev.ID, &ev.RunID, &ev.Sequence, &ev.SchemaVersion, &ev.Type, &rawPayload, &committedAt); err != nil {
+				return err
+			}
+			ev.Type = CanonicalEventType(ev.Type)
+			ev.CommittedAt = committedAt.UTC().Format(time.RFC3339Nano)
+			if len(rawPayload) > 0 {
+				var parsedPayload any
+				if err := json.Unmarshal(rawPayload, &parsedPayload); err == nil {
+					if !hasPayloadRead {
+						parsedPayload = SanitizeEventPayload(parsedPayload)
+					}
+					ev.Payload = parsedPayload
+				} else {
+					ev.Payload = map[string]any{}
+				}
+			} else {
+				ev.Payload = map[string]any{}
+			}
+			events = append(events, ev)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		var hasMore bool
+		var nextCursor *int64
+		if len(events) > limit {
+			hasMore = true
+			events = events[:limit]
+			lastSeq := events[limit-1].Sequence
+			nextCursor = &lastSeq
+		}
+
+		resp = &RunEventsResponseDTO{
+			Events:     events,
+			HasMore:    hasMore,
+			NextCursor: nextCursor,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (s *Service) GetRunLogs(ctx context.Context, orgID, runID string, stepID, attemptID *string, cursor *string, limit int) (*RunLogsResponseDTO, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	var resp *RunLogsResponseDTO
+
+	err := s.pool.WithTenantReadOnlyRepeatableReadTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var runExists bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM runs WHERE id = $1::uuid AND organization_id = $2::uuid)`, runID, orgID).Scan(&runExists)
+		if err != nil {
+			return err
+		}
+		if !runExists {
+			return ErrRunNotFound
+		}
+
+		var cursorTime *time.Time
+		var cursorID *string
+		if cursor != nil && *cursor != "" {
+			t, id, err := decodeCursor(*cursor)
+			if err != nil {
+				return fmt.Errorf("invalid cursor: %w", err)
+			}
+			cursorTime = &t
+			cursorID = &id
+		}
+
+		query := `
+			SELECT id::text, run_id::text, step_id::text, attempt_id::text, sequence, timestamp, level, message, created_at
+			FROM task_logs
+			WHERE organization_id = $1::uuid AND run_id = $2::uuid
+				AND ($3::uuid IS NULL OR step_id = $3::uuid)
+				AND ($4::uuid IS NULL OR attempt_id = $4::uuid)
+				AND ($5::timestamptz IS NULL OR (created_at, id) > ($5::timestamptz, $6::uuid))
+			ORDER BY created_at ASC, id ASC
+			LIMIT $7
+		`
+		var stepUUID, attemptUUID any = nil, nil
+		if stepID != nil && *stepID != "" {
+			stepUUID = *stepID
+		}
+		if attemptID != nil && *attemptID != "" {
+			attemptUUID = *attemptID
+		}
+
+		rows, err := tx.Query(ctx, query, orgID, runID, stepUUID, attemptUUID, cursorTime, cursorID, limit+1)
+		if err != nil {
+			return fmt.Errorf("query task logs: %w", err)
+		}
+		defer rows.Close()
+
+		type logItemWithCreatedAt struct {
+			rec       TaskLogRecordDTO
+			createdAt time.Time
+		}
+
+		itemsWithMeta := make([]logItemWithCreatedAt, 0)
+		for rows.Next() {
+			var rec TaskLogRecordDTO
+			var ts, createdAt time.Time
+			if err := rows.Scan(&rec.ID, &rec.RunID, &rec.StepID, &rec.AttemptID, &rec.Sequence, &ts, &rec.Level, &rec.Message, &createdAt); err != nil {
+				return err
+			}
+			rec.Timestamp = ts.UTC().Format(time.RFC3339Nano)
+			itemsWithMeta = append(itemsWithMeta, logItemWithCreatedAt{rec: rec, createdAt: createdAt})
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		var nextCursor *string
+		if len(itemsWithMeta) > limit {
+			last := itemsWithMeta[limit-1]
+			nc := encodeCursor(last.createdAt, last.rec.ID)
+			nextCursor = &nc
+			itemsWithMeta = itemsWithMeta[:limit]
+		}
+
+		items := make([]TaskLogRecordDTO, len(itemsWithMeta))
+		for i, it := range itemsWithMeta {
+			items[i] = it.rec
+		}
+
+		var isExpired bool
+		var message *string
+		var droppedCount int
+		var budgetExhausted bool
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(ta.dropped_log_count), 0)::integer,
+			       COALESCE(BOOL_OR(ta.log_budget_exhausted), FALSE)
+			FROM task_attempts ta
+			JOIN run_steps rs ON rs.id = ta.step_id AND rs.organization_id = ta.organization_id
+			WHERE rs.run_id = $1::uuid
+			  AND ta.organization_id = $2::uuid
+			  AND ($3::uuid IS NULL OR rs.id = $3::uuid)
+			  AND ($4::uuid IS NULL OR ta.id = $4::uuid)
+		`, runID, orgID, stepUUID, attemptUUID).Scan(&droppedCount, &budgetExhausted); err != nil {
+			return fmt.Errorf("get task log drop state: %w", err)
+		}
+
+		// Only evaluate expiration if 0 items returned on initial query (no cursor)
+		if len(items) == 0 && (cursor == nil || *cursor == "") {
+			var hadLogsRecorded bool
+			err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM task_attempts ta
+					JOIN run_steps rs ON rs.id = ta.step_id AND rs.organization_id = ta.organization_id
+					WHERE rs.run_id = $1::uuid
+					  AND ta.organization_id = $2::uuid
+					  AND ($3::uuid IS NULL OR rs.id = $3::uuid)
+					  AND ($4::uuid IS NULL OR ta.id = $4::uuid)
+					  AND ta.logs_recorded = TRUE
+				)
+			`, runID, orgID, stepUUID, attemptUUID).Scan(&hadLogsRecorded)
+			if err != nil {
+				return fmt.Errorf("check recorded logs: %w", err)
+			}
+
+			if hadLogsRecorded {
+				isExpired = true
+				msg := "Logs have expired due to the 7-day retention policy"
+				message = &msg
+			}
+		}
+
+		resp = &RunLogsResponseDTO{
+			Items:           items,
+			NextCursor:      nextCursor,
+			Expired:         isExpired,
+			Message:         message,
+			DroppedCount:    droppedCount,
+			BudgetExhausted: budgetExhausted,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// PruneExpiredTaskLogs deletes one bounded batch of task logs older than 7 days
+// using database time. Each call has its own tenant transaction so scheduler
+// sweeps commit between batches rather than holding a tenant transaction open.
+func (s *Service) PruneExpiredTaskLogs(ctx context.Context, orgID string, batchSize int) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	var pruned int64
+	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM task_logs
+			WHERE id IN (
+				SELECT id FROM task_logs
+				WHERE organization_id = $1::uuid AND created_at < clock_timestamp() - INTERVAL '7 days'
+				ORDER BY created_at ASC, id ASC
+				LIMIT $2
+			)
+		`, orgID, batchSize)
+		if err != nil {
+			return fmt.Errorf("prune expired task logs: %w", err)
+		}
+		pruned = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return pruned, nil
+}
+
+func CanonicalEventType(dbType string) string {
+	switch strings.ToUpper(dbType) {
+	case "RUN_CREATED":
+		return "run.created"
+	case "TASK_CLAIMED":
+		return "attempt.claimed"
+	case "TASK_STARTED":
+		return "attempt.started"
+	case "TASK_COMPLETED":
+		return "attempt.completed"
+	case "TASK_LOST":
+		return "attempt.lost"
+	case "STEP_READY":
+		return "step.ready"
+	case "STEP_SUCCEEDED":
+		return "step.succeeded"
+	case "STEP_FAILED":
+		return "step.failed"
+	case "RUN_COMPLETED":
+		return "run.completed"
+	case "RUN_SUCCEEDED":
+		return "run.succeeded"
+	case "RUN_FAILED":
+		return "run.failed"
+	case "RUN_CANCELLED":
+		return "run.cancelled"
+	case "RUN_PAUSED":
+		return "run.paused"
+	case "RUN_RESUMED":
+		return "run.resumed"
+	default:
+		if strings.Contains(dbType, ".") {
+			return strings.ToLower(dbType)
+		}
+		parts := strings.SplitN(strings.ToLower(dbType), "_", 2)
+		if len(parts) == 2 {
+			return parts[0] + "." + parts[1]
+		}
+		return "run." + strings.ToLower(dbType)
+	}
+}
+
+func SanitizeEventPayload(p any) any {
+	m, ok := p.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	sanitized := make(map[string]any)
+	allowedKeys := map[string]bool{
+		"runId":        true,
+		"workflowName": true,
+		"deploymentId": true,
+		"stepId":       true,
+		"attemptId":    true,
+		"epoch":        true,
+		"reason":       true,
+		"status":       true,
+		"sequence":     true,
+		"recovery":     true,
+		"nodeId":       true,
+		"timeoutMs":    true,
+	}
+	for k, v := range m {
+		if allowedKeys[k] {
+			sanitized[k] = v
+		}
+	}
+	return sanitized
+}
+
+func encodeCursor(t time.Time, id string) string {
+	raw := fmt.Sprintf("%s|%s", t.UTC().Format(time.RFC3339Nano), id)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func decodeCursor(cursor string) (time.Time, string, error) {
+	b, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	parts := strings.SplitN(string(b), "|", 2)
+	if len(parts) != 2 {
+		return time.Time{}, "", errors.New("invalid cursor format")
+	}
+	t, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	return t, parts[1], nil
 }
 
 func queryRunDTO(ctx context.Context, tx storage.Tx, orgID, runID string) (*RunDTO, error) {
@@ -416,10 +1126,32 @@ func queryRunDTO(ctx context.Context, tx storage.Tx, orgID, runID string) (*RunD
 		return nil, fmt.Errorf("query run: %w", err)
 	}
 	run.Status = contracts.RunStatus(statusStr)
-	run.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+	run.CreatedAt = createdAt.UTC().Format(time.RFC3339Nano)
 	if deadlineAt != nil {
-		d := deadlineAt.UTC().Format(time.RFC3339)
+		d := deadlineAt.UTC().Format(time.RFC3339Nano)
 		run.DeadlineAt = &d
 	}
 	return &run, nil
+}
+
+func (s *Service) GetRunEventRetentionBounds(ctx context.Context, orgID, runID string) (minSeq int64, maxSeq int64, err error) {
+	err = s.pool.WithTenantReadOnlyRepeatableReadTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var minS, maxS *int64
+		qErr := tx.QueryRow(ctx, `
+			SELECT MIN(sequence), MAX(sequence)
+			FROM run_events
+			WHERE organization_id = $1::uuid AND run_id = $2::uuid
+		`, orgID, runID).Scan(&minS, &maxS)
+		if qErr != nil {
+			return qErr
+		}
+		if minS != nil {
+			minSeq = *minS
+		}
+		if maxS != nil {
+			maxSeq = *maxS
+		}
+		return nil
+	})
+	return minSeq, maxSeq, err
 }

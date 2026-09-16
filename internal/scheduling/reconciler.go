@@ -19,6 +19,16 @@ type Reconciler struct {
 	ticker        *atomic.Int64
 	wakeup        chan struct{}
 	logger        *log.Logger
+	tenantSweep   func(context.Context, string) error
+}
+
+// SetTenantSweep adds bounded per-tenant maintenance to the existing
+// authoritative reconciliation pass. A hook must complete one small unit of
+// work; it is called once per discovered tenant and may safely be retried.
+func (r *Reconciler) SetTenantSweep(hook func(context.Context, string) error) {
+	if r != nil {
+		r.tenantSweep = hook
+	}
 }
 
 // NewReconciler creates a scheduler reconciler wired to the database pool.
@@ -63,6 +73,13 @@ func (r *Reconciler) Sweep(ctx context.Context) error {
 	tenants, err := storage.EnumerateTenantsForScheduler(ctx, r.pool)
 	if err != nil {
 		return fmt.Errorf("scheduler tenant enumeration failed: %w", err)
+	}
+	if r.tenantSweep != nil {
+		for _, orgID := range tenants {
+			if err := r.tenantSweep(ctx, orgID); err != nil {
+				return fmt.Errorf("scheduler tenant maintenance for %s failed: %w", orgID, err)
+			}
+		}
 	}
 
 	// Update heartbeat only after successful database enumeration

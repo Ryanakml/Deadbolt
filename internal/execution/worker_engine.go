@@ -23,12 +23,21 @@ const defaultAttemptTimeout = 5 * time.Minute
 // together here instead of in the transport layer.
 type WorkerEngine struct {
 	pool                 *storage.Pool
+	hub                  *EventHub
 	beforeCompleteCommit func() error
 	afterCompleteCommit  func() error
 }
 
-func NewWorkerEngine(pool *storage.Pool) *WorkerEngine {
-	return &WorkerEngine{pool: pool}
+func NewWorkerEngine(pool *storage.Pool, hub ...*EventHub) *WorkerEngine {
+	var h *EventHub
+	if len(hub) > 0 && hub[0] != nil {
+		h = hub[0]
+	}
+	return &WorkerEngine{pool: pool, hub: h}
+}
+
+func (e *WorkerEngine) SetHub(hub *EventHub) {
+	e.hub = hub
 }
 
 // SetBeforeCompleteCommitHookForTest injects a deterministic failure after all
@@ -362,6 +371,11 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 	if err != nil {
 		return nil, err
 	}
+	if e.hub != nil {
+		for _, a := range assignments {
+			e.hub.Publish(a.RunID)
+		}
+	}
 	return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
 }
 
@@ -370,8 +384,9 @@ func (e *WorkerEngine) Start(ctx context.Context, session *worker.WorkerSessionC
 		return nil, worker.ErrUnauthorized
 	}
 	var deadline time.Time
+	var runID string
 	err := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		var runID, status, ownerSession string
+		var status, ownerSession string
 		var epoch int64
 		var claimDeadline, storedDeadline, runDeadline *time.Time
 		var timeoutMs int64
@@ -435,6 +450,9 @@ func (e *WorkerEngine) Start(ctx context.Context, session *worker.WorkerSessionC
 	})
 	if err != nil {
 		return nil, err
+	}
+	if e.hub != nil {
+		e.hub.Publish(runID)
 	}
 	return &worker.StartResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID,
 		AttemptID: req.AttemptID, OwnershipEpoch: req.OwnershipEpoch, Accepted: true,
@@ -558,8 +576,9 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 	if err != nil || req.ResultDigest != computedDigest {
 		return nil, worker.ErrResultConflict
 	}
+	var runID string
 	err = e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		var runID, stepID, nodeID, status, ownerSession, workflowName string
+		var stepID, nodeID, status, ownerSession, workflowName string
 		var manifestBytes []byte
 		var epoch int64
 		var storedDigest *string
@@ -863,6 +882,9 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 	})
 	if err != nil {
 		return nil, err
+	}
+	if e.hub != nil {
+		e.hub.Publish(runID)
 	}
 	if e.afterCompleteCommit != nil {
 		if err := e.afterCompleteCommit(); err != nil {

@@ -17,6 +17,7 @@ type Metrics struct {
 	failuresTotal    atomic.Int64
 	lastDispatchTime atomic.Int64
 	schedulerTime    *atomic.Int64
+	taskLogDrops     func() int64
 	oldestPendingAge atomic.Int64 // in seconds
 	pendingCount     atomic.Int64
 }
@@ -33,6 +34,14 @@ func NewMetrics(pool *pgxpool.Pool) *Metrics {
 func (m *Metrics) SetSchedulerHeartbeat(heartbeat *atomic.Int64) {
 	if m != nil {
 		m.schedulerTime = heartbeat
+	}
+}
+
+// SetTaskLogDroppedCounter attaches the worker-owned counter to this existing
+// /metrics exposition. Keeping a callback avoids a second metrics subsystem.
+func (m *Metrics) SetTaskLogDroppedCounter(counter func() int64) {
+	if m != nil {
+		m.taskLogDrops = counter
 	}
 }
 
@@ -129,6 +138,11 @@ func (m *Metrics) FormatPrometheus() string {
 		}
 	}
 
+	var taskLogDrops int64
+	if m.taskLogDrops != nil {
+		taskLogDrops = m.taskLogDrops()
+	}
+
 	return fmt.Sprintf(`# HELP deadbolt_outbox_published_total Total number of outbox events published to NATS JetStream.
 # TYPE deadbolt_outbox_published_total counter
 deadbolt_outbox_published_total %d
@@ -152,6 +166,10 @@ deadbolt_outbox_dispatcher_loop_lag_seconds %d
 # HELP deadbolt_scheduler_loop_lag_seconds Seconds elapsed since the last authoritative scheduler sweep.
 # TYPE deadbolt_scheduler_loop_lag_seconds gauge
 deadbolt_scheduler_loop_lag_seconds %d
+
+# HELP deadbolt_task_logs_dropped_total Total number of newly dropped task diagnostic log records.
+# TYPE deadbolt_task_logs_dropped_total counter
+deadbolt_task_logs_dropped_total %d
 `,
 		m.publishedTotal.Load(),
 		m.failuresTotal.Load(),
@@ -159,6 +177,7 @@ deadbolt_scheduler_loop_lag_seconds %d
 		m.pendingCount.Load(),
 		dispatchLag,
 		schedulerLag,
+		taskLogDrops,
 	)
 }
 
