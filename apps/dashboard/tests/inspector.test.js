@@ -345,4 +345,54 @@ describe("RunInspector", () => {
     assert.equal(receivedEvents[1].sequence, 2);
     assert.equal(receivedEvents[2].sequence, 3);
   });
+
+  test("merges history with an SSE event received before the history request resolves", async () => {
+    const inspector = new RunInspector("run-history-race");
+    const originalFetch = globalThis.fetch;
+    let resolveHistory;
+    const history = new Promise((resolve) => {
+      resolveHistory = resolve;
+    });
+    globalThis.fetch = async () => ({
+      ok: true,
+      statusText: "OK",
+      json: async () => history,
+    });
+
+    try {
+      const historyRequest = inspector.fetchEvents();
+      inspector.applyEvent({
+        id: "live-2",
+        runId: "run-history-race",
+        sequence: 2,
+        schemaVersion: 1,
+        type: "step.ready",
+        payload: { stepId: "step-1" },
+        committedAt: "2026-09-16T12:00:02.000Z",
+      });
+      resolveHistory({
+        events: [
+          {
+            id: "history-1",
+            runId: "run-history-race",
+            sequence: 1,
+            schemaVersion: 1,
+            type: "run.created",
+            payload: {},
+            committedAt: "2026-09-16T12:00:01.000Z",
+          },
+        ],
+        hasMore: false,
+        nextCursor: null,
+      });
+      await historyRequest;
+
+      assert.deepEqual(
+        inspector.getEvents().map((event) => event.sequence),
+        [1, 2],
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

@@ -149,10 +149,10 @@ When `GET /v1/runs/{id}/logs` returns 0 items on an initial query (cursor empty)
 
 ### Tenant-Scoped Batch Retention Pruning
 
-Pruning is performed via `PruneExpiredTaskLogs(ctx, orgID, limit)`:
+Pruning is performed by the control-plane's existing scheduler reconciliation sweep via `PruneExpiredTaskLogs(ctx, orgID, limit)`:
 
 - Executes within the tenant's transaction context via `pool.WithTenantTx(ctx, orgID, ...)` to satisfy PostgreSQL Row-Level Security.
-- Deletes expired rows in bounded batches:
+- Each tenant sweep deletes at most one bounded batch, then commits. The next scheduler pass continues safely if more rows remain:
   ```sql
   DELETE FROM task_logs
   WHERE organization_id = $1::uuid
@@ -165,7 +165,7 @@ Pruning is performed via `PruneExpiredTaskLogs(ctx, orgID, limit)`:
     )
   ```
 
-Operationally, invoke this bounded tenant-scoped operation from the existing maintenance runner. It is safe to repeat: once a batch has deleted an expired row, subsequent passes simply find fewer rows. Retention deletion is irreversible; restore requires the normal PostgreSQL backup/restore procedure, not an application rollback. Migration `00016_task_log_drop_receipts.sql` adds only diagnostic accounting columns/table and can be rolled back only after the application version no longer reads them.
+The sweep is safe to repeat: once a batch has deleted an expired row, subsequent passes simply find fewer rows. Retention deletion is irreversible; restore requires the normal PostgreSQL backup/restore procedure, not an application rollback. Migration `00016_task_log_drop_receipts.sql` adds only diagnostic accounting columns/table and can be rolled back only after the application version no longer reads them.
 
 ---
 

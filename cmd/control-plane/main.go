@@ -21,9 +21,11 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
+	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/outbox"
 	"github.com/Ryanakml/Deadbolt/internal/scheduling"
+	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
 )
 
@@ -236,6 +238,11 @@ func run() error {
 	var reconciler *scheduling.Reconciler
 	if reconcilerPool != nil {
 		reconciler = scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
+		retentionService := execution.NewService(storage.NewPool(reconcilerPool), nil)
+		reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
+			_, err := retentionService.PruneExpiredTaskLogs(ctx, orgID, 1000)
+			return err
+		})
 		healthChecker.SetSchedulerTicker(reconciler.Ticker(), gateway.DefaultSchedulerTimeout)
 		go func() {
 			if err := reconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

@@ -1405,6 +1405,19 @@ func TestRunInspectorLogBoundsAndDroppedMetric(t *testing.T) {
 		t.Fatalf("expected persisted two-drop incomplete state, got %+v", logsSnapshot)
 	}
 
+	metricsRes, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("get production metrics failed: %v", err)
+	}
+	metricsBody, _ := io.ReadAll(metricsRes.Body)
+	metricsRes.Body.Close()
+	if metricsRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected metrics status 200, got %d", metricsRes.StatusCode)
+	}
+	if !strings.Contains(string(metricsBody), "deadbolt_task_logs_dropped_total 2") {
+		t.Fatalf("expected exactly two newly dropped logs in production metrics, got:\n%s", metricsBody)
+	}
+
 	// 5. Verify worker.Service DroppedLogsCount metric
 	ws := worker.NewService(tc.pool, deployment.NewService(tc.pool, tc.service), execution.NewWorkerEngine(tc.pool, execution.NewEventHub()))
 	directOversized := &worker.LogBatchRequestDTO{
@@ -1859,6 +1872,29 @@ func TestRunInspectorHonestNoWorkerState(t *testing.T) {
 	}
 	if snap.WaitingReason == nil || *snap.WaitingReason != "NO_COMPATIBLE_WORKERS" {
 		t.Fatalf("expected waitingReason=NO_COMPATIBLE_WORKERS, got %v", snap.WaitingReason)
+	}
+
+	// A worker in another environment may advertise the identical bundle but
+	// cannot execute this staging run. It must not clear the waiting diagnosis.
+	var projectID string
+	err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT project_id::text FROM environments WHERE id = $1::uuid`, envID).Scan(&projectID)
+	})
+	if err != nil {
+		t.Fatalf("resolve staging project for cross-environment fixture: %v", err)
+	}
+	envB, err := tc.service.CreateEnvironment(context.Background(), orgID, projectID, tenant.EnvProduction, 5)
+	if err != nil {
+		t.Fatalf("create second environment: %v", err)
+	}
+	enrollTestWorker(t, tc, server, orgID, envB.ID, bundleDigest)
+
+	snapResOtherEnv, _ := http.DefaultClient.Do(snapReq)
+	var snapOtherEnv execution.RunSnapshotDTO
+	_ = json.NewDecoder(snapResOtherEnv.Body).Decode(&snapOtherEnv)
+	snapResOtherEnv.Body.Close()
+	if snapOtherEnv.ActiveCompatibleWorkers != 0 || snapOtherEnv.WaitingReason == nil {
+		t.Fatalf("other-environment worker must not satisfy staging run: %+v", snapOtherEnv)
 	}
 
 	// Now enroll worker and send poll advertising bundle digest

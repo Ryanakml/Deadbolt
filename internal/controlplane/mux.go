@@ -55,6 +55,7 @@ func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gat
 		eventHub := execution.NewEventHub()
 		workerEngine := execution.NewWorkerEngine(storagePool, eventHub)
 		workerSvc := worker.NewService(storagePool, deploymentSvc, workerEngine)
+		outboxMetrics.SetTaskLogDroppedCounter(workerSvc.DroppedLogsCount)
 		workerHandler := worker.NewHTTPHandler(workerSvc, tenantService)
 		workerHandler.RegisterRoutes(mux)
 

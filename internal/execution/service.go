@@ -458,10 +458,12 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 				JOIN deployments d ON d.bundle_digest = wd.bundle_digest AND d.organization_id = ws.organization_id
 				WHERE ws.organization_id = $1::uuid
 				  AND d.id = $2::uuid
+				  AND ws.environment_id = $3::uuid
+				  AND w.environment_id = $3::uuid
 				  AND w.status = 'ACTIVE'
 				  AND ws.revoked_at IS NULL
 				  AND ws.expires_at > clock_timestamp()
-			`, orgID, run.DeploymentID).Scan(&activeWorkers)
+			`, orgID, run.DeploymentID, run.EnvironmentID).Scan(&activeWorkers)
 			if err != nil {
 				return fmt.Errorf("query active compatible workers: %w", err)
 			}
@@ -980,40 +982,34 @@ func (s *Service) GetRunLogs(ctx context.Context, orgID, runID string, stepID, a
 	return resp, nil
 }
 
-// PruneExpiredTaskLogs deletes task logs older than 7 days based on database time clock_timestamp()
-// within the specified organization under its tenant isolation context.
-// It deletes in bounded batches to avoid long table locks.
-// Returns total rows pruned.
+// PruneExpiredTaskLogs deletes one bounded batch of task logs older than 7 days
+// using database time. Each call has its own tenant transaction so scheduler
+// sweeps commit between batches rather than holding a tenant transaction open.
 func (s *Service) PruneExpiredTaskLogs(ctx context.Context, orgID string, batchSize int) (int64, error) {
 	if batchSize <= 0 {
 		batchSize = 1000
 	}
-	var totalPruned int64
+	var pruned int64
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		for {
-			tag, err := tx.Exec(ctx, `
-				DELETE FROM task_logs
-				WHERE id IN (
-					SELECT id FROM task_logs
-					WHERE organization_id = $1::uuid AND created_at < clock_timestamp() - INTERVAL '7 days'
-					LIMIT $2
-				)
-			`, orgID, batchSize)
-			if err != nil {
-				return fmt.Errorf("prune expired task logs: %w", err)
-			}
-			n := tag.RowsAffected()
-			totalPruned += n
-			if n < int64(batchSize) {
-				break
-			}
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM task_logs
+			WHERE id IN (
+				SELECT id FROM task_logs
+				WHERE organization_id = $1::uuid AND created_at < clock_timestamp() - INTERVAL '7 days'
+				ORDER BY created_at ASC, id ASC
+				LIMIT $2
+			)
+		`, orgID, batchSize)
+		if err != nil {
+			return fmt.Errorf("prune expired task logs: %w", err)
 		}
+		pruned = tag.RowsAffected()
 		return nil
 	})
 	if err != nil {
 		return 0, err
 	}
-	return totalPruned, nil
+	return pruned, nil
 }
 
 func CanonicalEventType(dbType string) string {

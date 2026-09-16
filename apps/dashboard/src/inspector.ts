@@ -123,16 +123,22 @@ export class RunInspector {
       this.eventsHasMore = data.hasMore;
       this.eventsNextCursor = data.nextCursor ?? null;
 
+      // A live SSE event may arrive while the initial history request is in
+      // flight. Always merge by authoritative sequence; replacing the array
+      // would silently erase that live event from the visible timeline.
+      const eventsBySequence = new Map<number, RunEvent>();
       if (append) {
-        const existingSeqs = new Set(this.events.map((e) => e.sequence));
-        for (const ev of data.events) {
-          if (!existingSeqs.has(ev.sequence)) {
-            this.events.push(ev);
-          }
-        }
+        for (const ev of this.events) eventsBySequence.set(ev.sequence, ev);
       } else {
-        this.events = [...data.events];
+        // Keep events received after this request started as well as history.
+        for (const ev of this.events) eventsBySequence.set(ev.sequence, ev);
       }
+      for (const ev of data.events) {
+        if (!eventsBySequence.has(ev.sequence)) {
+          eventsBySequence.set(ev.sequence, ev);
+        }
+      }
+      this.events = [...eventsBySequence.values()];
       this.events.sort((a, b) => a.sequence - b.sequence);
       this.notifyEvents();
       return data;
