@@ -163,13 +163,14 @@ Prometheus metrics are exposed on the control-plane `/metrics` endpoint:
    ```
 2. Once NATS is restored, the dispatcher will automatically resume claiming batches.
 3. If backoff delays (`next_at`) are high for stalled events, reset `next_at` to trigger immediate dispatch:
+
    ```sql
    UPDATE outbox_events
    SET next_at = clock_timestamp()
    WHERE published_at IS NULL AND dead_lettered_at IS NULL;
+   ```
 
 4. If an invalid payload is dead-lettered, fix the producer/serializer first. Replaying it without correction will dead-letter it again; use the recorded `last_error` as the diagnosis.
-   ```
 
 ### 5.2 Symptom: JetStream Broker Redelivery Spikes
 
