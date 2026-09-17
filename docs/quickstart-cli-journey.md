@@ -156,6 +156,26 @@ Credentials are automatically stored in the secure OS Keychain:
 
 ---
 
+## 5b. Hosted Context Bootstrap (`runtime bootstrap`)
+
+A fresh hosted identity starts with zero organizations. Establish organization, project, and environment context using only supported CLI commands — no database writes, no raw curl, no manual UUID copying:
+
+```bash
+runtime bootstrap --org-name "acme" --project "order-service" --env staging --control-plane-url https://api.deadbolt.cloud
+```
+
+Behavior:
+
+- **Zero organizations:** creates the named organization and selects it.
+- **Exactly one organization:** selects it deterministically.
+- **Several organizations:** fails with the list; rerun with `--org <id>`.
+- **Project/environment:** selected by name when present, created otherwise. Rerunning is safe and creates no duplicates.
+- Project name defaults to `deadbolt.config.json`; environment defaults to stored context, then `staging`.
+
+The selected organization and environment are stored in the OS credential store and become the defaults for `deploy`, `activate`, and `runs` commands.
+
+---
+
 ## 6. Manifest Registration (`runtime deploy`)
 
 Register your immutable deployment manifest on the control plane:
@@ -188,6 +208,9 @@ This generates an Ed25519 keypair, signs the single-use challenge nonce from `/w
 ### Step 7b: Start Worker 1 & Worker 2 Agents
 
 Worker processes automatically discover the Node runner companion asset located at `<install-prefix>/share/deadbolt/runner/index.js`. Alternatively, pass `--runner-path /path/to/runner/index.js` or set `DEADBOLT_RUNNER_PATH`.
+
+> [!IMPORTANT]
+> **Required worker secrets:** tasks declare required secret _names_ (e.g. `NOTIFICATION_API_KEY` in `deadbolt.config.json`). Each worker process must have those variables set in its own environment before starting — secret values are never embedded in manifests and never travel through the control plane. A worker missing a required secret fails its claimed attempt closed with `MISSING_REQUIRED_SECRET`.
 
 ```bash
 # Terminal 1: Worker 1
@@ -242,6 +265,9 @@ runtime runs create \
 ```
 
 The control plane persists the run, initializes DAG step states (`validate: READY`, `provision: BLOCKED`, `notify: BLOCKED`), and returns `HTTP 202 Accepted`.
+
+> [!NOTE]
+> **Operator surface:** `runtime runs create`, `runtime runs inspect`, and `runtime logs` are acceptance/operator surfaces for humans. A production SaaS/backend normally triggers workflow runs automatically through the API/SDK/event integration; humans do not manually invoke the CLI for every customer request.
 
 ---
 
@@ -345,3 +371,20 @@ The script automatically:
 8. Polls until completion and inspects final snapshot with `runtime runs inspect`.
 9. Displays task logs with `runtime logs`.
 10. Traps script exit and cleanly terminates both worker processes.
+
+---
+
+## 14. Browser Dashboard (hosted)
+
+Open the hosted dashboard (served by the control plane):
+
+```text
+https://<staging-host>/dashboard/
+```
+
+The dashboard authenticates through the existing browser session flow — CLI credentials are never shared with the browser:
+
+1. The dashboard checks `GET /api/auth/session`. While unauthenticated it shows a **Sign in** call-to-action and issues no protected API requests.
+2. Sign in navigates to `/api/auth/login` (hosted OIDC). After Auth0 approval the callback sets the HttpOnly session cookie and returns to `/dashboard/`.
+3. If the session has no active organization, the dashboard establishes one deterministically (single membership) or offers an explicit organization selector — it never silently picks between several.
+4. Runs, workers, inspector, logs, and the reconnect-safe event stream then load under the authenticated session. An expired session returns to the sign-in state without leaking data.

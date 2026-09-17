@@ -551,6 +551,47 @@ func (s *Service) ListEnvironments(ctx context.Context, orgID string, projectID 
 	return envs, nil
 }
 
+// ResolveEnvironment resolves an environment by canonical UUID or by
+// unambiguous name within the organization. Human-supplied values never reach
+// a UUID column as UUIDs: UUIDs match by identity, names match by scoped
+// name lookup. A name matching zero environments returns ErrNotFound; a name
+// matching more than one (multiple projects may each own e.g. "staging")
+// returns ErrEnvironmentAmbiguous instead of silently picking one.
+func (s *Service) ResolveEnvironment(ctx context.Context, orgID string, envParam string) (*Environment, error) {
+	var envs []Environment
+	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		query := `
+			SELECT e.id, e.organization_id, e.project_id, e.name, COALESCE(ea.max_concurrency, 10), e.created_at, e.updated_at
+			FROM environments e
+			LEFT JOIN environment_admissions ea ON ea.environment_id = e.id AND ea.organization_id = e.organization_id
+			WHERE e.organization_id = $1 AND (e.id::text = $2 OR e.name = $2)
+		`
+		rows, err := tx.Query(ctx, query, orgID, envParam)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e Environment
+			if err := rows.Scan(&e.ID, &e.OrganizationID, &e.ProjectID, &e.Name, &e.MaxConcurrency, &e.CreatedAt, &e.UpdatedAt); err != nil {
+				return err
+			}
+			envs = append(envs, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(envs) == 0 {
+		return nil, ErrNotFound
+	}
+	if len(envs) > 1 {
+		return nil, ErrEnvironmentAmbiguous
+	}
+	return &envs[0], nil
+}
+
 // GetEnvironment fetches an environment by ID scoped to the organization.
 func (s *Service) GetEnvironment(ctx context.Context, orgID string, envID string) (*Environment, error) {
 	var env Environment

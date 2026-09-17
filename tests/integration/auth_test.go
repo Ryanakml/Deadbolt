@@ -119,6 +119,9 @@ func TestOIDCLoginAndSessionLifecycle(t *testing.T) {
 	if callbackRec.Code != http.StatusFound {
 		t.Fatalf("expected 302 redirect from /api/auth/callback, got %d (body: %s)", callbackRec.Code, callbackRec.Body.String())
 	}
+	if loc := callbackRec.Header().Get("Location"); loc != "/dashboard/" {
+		t.Fatalf("expected callback to land on /dashboard/, got %q", loc)
+	}
 
 	// Verify __Host-runtime_session cookie attributes (HttpOnly, Secure, SameSite=Lax, Path=/)
 	var sessionCookie *http.Cookie

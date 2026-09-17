@@ -8,6 +8,7 @@ import {
   StreamFreshness,
 } from "./types.js";
 import { RunEventStreamClient } from "./stream.js";
+import { apiFetch } from "./api.js";
 
 export interface InspectorListener {
   onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
@@ -89,7 +90,7 @@ export class RunInspector {
 
   public async fetchSnapshot(): Promise<RunSnapshot> {
     const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}`;
-    const res = await fetch(url);
+    const res = await apiFetch(url);
     if (!res.ok) {
       throw new Error(
         `Failed to load run snapshot (HTTP ${res.status}): ${res.statusText}`,
@@ -113,7 +114,7 @@ export class RunInspector {
     const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/events${queryStr}`;
 
     try {
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       if (!res.ok) {
         throw new Error(
           `Failed to fetch events (HTTP ${res.status}): ${res.statusText}`,
@@ -162,7 +163,7 @@ export class RunInspector {
     const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/logs${queryStr}`;
 
     try {
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       if (res.status === 403) {
         this.logsError =
           "Diagnostic task logs require payload:read capability (redacted by tenant policy).";

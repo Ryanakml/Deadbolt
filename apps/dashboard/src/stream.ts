@@ -1,4 +1,5 @@
 import { RunEvent, StreamFreshness, ResyncControlEvent } from "./types.js";
+import { apiFetch } from "./api.js";
 
 export interface StreamClientOptions {
   baseUrl?: string;
@@ -121,7 +122,7 @@ export class RunEventStreamClient {
         headers["Last-Event-ID"] = String(this.lastProcessedSequence);
       }
 
-      const response = await fetch(url, {
+      const response = await apiFetch(url, {
         headers,
         signal: this.abortController.signal,
       });

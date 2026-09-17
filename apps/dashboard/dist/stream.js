@@ -1,3 +1,4 @@
+import { apiFetch } from "./api.js";
 export class RunEventStreamClient {
     runId;
     baseUrl;
@@ -93,7 +94,7 @@ export class RunEventStreamClient {
             if (this.lastProcessedSequence > 0) {
                 headers["Last-Event-ID"] = String(this.lastProcessedSequence);
             }
-            const response = await fetch(url, {
+            const response = await apiFetch(url, {
                 headers,
                 signal: this.abortController.signal,
             });

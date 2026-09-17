@@ -3,7 +3,9 @@ export * from "./stream.js";
 export * from "./inspector.js";
 export * from "./api.js";
 
-import { DashboardApiClient } from "./api.js";
+import { DashboardApiClient, isUnauthorized } from "./api.js";
+import type { AuthMembership, AuthSession } from "./api.js";
+import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
 import {
   RunSnapshot,
@@ -70,10 +72,146 @@ function initDashboard(): void {
   // Check URL params for deep linking to /runs/:id
   const urlParams = new URLSearchParams(window.location.search);
   const runIdParam = urlParams.get("runId");
-  if (runIdParam) {
-    inspectRun(runIdParam);
-  } else {
-    loadRunsList(api, currentEnv);
+
+  // Auth bootstrap gate: Issue #14 data loading starts only after the BFF
+  // session (and a valid organization context) is established. While
+  // unauthenticated, no protected API is called.
+  void bootstrap();
+
+  async function bootstrap(): Promise<void> {
+    let session: AuthSession | null;
+    try {
+      session = await api.getSession();
+    } catch (err: unknown) {
+      renderError(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    await enterWithSession(session);
+  }
+
+  async function enterWithSession(session: AuthSession | null): Promise<void> {
+    if (!session) {
+      showAuthRequired("Sign in to view workflow runs.");
+      return;
+    }
+    const state = resolveOrgState(session);
+    if (state.kind === "ready") {
+      enterApp(session);
+      return;
+    }
+    if (state.kind === "empty") {
+      showAuthRequired(
+        "This identity has no organization yet. Create one with `runtime bootstrap`, then reload.",
+      );
+      return;
+    }
+    if (state.kind === "select") {
+      showOrgSelect(state.orgs);
+      return;
+    }
+    // Exactly one membership: establish it deterministically, then enter.
+    try {
+      await api.switchOrganization(state.orgId);
+      await enterWithSession(await api.getSession());
+    } catch (err: unknown) {
+      renderError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  function enterApp(session: AuthSession): void {
+    hideAuthView();
+    const label = document.getElementById("session-label");
+    if (label) {
+      label.textContent = session.user?.email ?? "";
+      label.classList.remove("hidden");
+    }
+    if (runIdParam) {
+      inspectRun(runIdParam);
+    } else {
+      showView("runs-view");
+      loadRunsList(api, currentEnv);
+    }
+  }
+
+  function showAuthRequired(message: string): void {
+    teardownAppViews();
+    const msg = document.getElementById("auth-message");
+    if (msg) msg.textContent = message;
+    const login = document.getElementById("login-link");
+    if (login) login.classList.remove("hidden");
+    const orgWrap = document.getElementById("org-select-wrap");
+    if (orgWrap) orgWrap.classList.add("hidden");
+    showView("auth-view");
+  }
+
+  function hideAuthView(): void {
+    const login = document.getElementById("login-link");
+    if (login) login.classList.add("hidden");
+    const orgWrap = document.getElementById("org-select-wrap");
+    if (orgWrap) orgWrap.classList.add("hidden");
+  }
+
+  function showOrgSelect(orgs: AuthMembership[]): void {
+    teardownAppViews();
+    const msg = document.getElementById("auth-message");
+    if (msg) msg.textContent = "Select an organization to continue.";
+    const login = document.getElementById("login-link");
+    if (login) login.classList.add("hidden");
+    const orgWrap = document.getElementById("org-select-wrap");
+    const select = document.getElementById(
+      "org-select",
+    ) as HTMLSelectElement | null;
+    const cont = document.getElementById("org-continue-btn");
+    if (orgWrap && select && cont) {
+      select.innerHTML = "";
+      for (const o of orgs) {
+        const opt = document.createElement("option");
+        opt.value = o.OrganizationID;
+        opt.textContent = `${o.OrganizationName} (${o.Role})`;
+        select.appendChild(opt);
+      }
+      cont.onclick = () => {
+        if (!select.value) return;
+        cont.textContent = "Switching...";
+        api
+          .switchOrganization(select.value)
+          .then(() => api.getSession())
+          .then((s) => enterWithSession(s))
+          .catch((err: unknown) =>
+            renderError(err instanceof Error ? err : new Error(String(err))),
+          )
+          .finally(() => {
+            cont.textContent = "Continue";
+          });
+      };
+      orgWrap.classList.remove("hidden");
+    }
+    showView("auth-view");
+  }
+
+  // teardownAppViews stops live streams and clears protected data so an
+  // expired session neither leaks data nor invents workflow failure.
+  function teardownAppViews(): void {
+    if (activeInspector) {
+      activeInspector.destroy();
+      activeInspector = null;
+    }
+    for (const id of ["runs-table-body", "workers-table-body"]) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = "";
+    }
+    const insp = document.getElementById("inspector-content");
+    if (insp) insp.innerHTML = "";
+    const label = document.getElementById("session-label");
+    if (label) {
+      label.textContent = "";
+      label.classList.add("hidden");
+    }
+  }
+
+  function handleUnauthorized(): void {
+    teardownAppViews();
+    showAuthRequired("Session expired. Sign in again to continue.");
   }
 
   function showView(viewId: string): void {
@@ -128,6 +266,10 @@ function initDashboard(): void {
         });
       });
     } catch (err: unknown) {
+      if (isUnauthorized(err)) {
+        handleUnauthorized();
+        return;
+      }
       listContainer.innerHTML = `<tr><td colspan="5" class="error-state">Failed to load runs: ${escapeHtml(err instanceof Error ? err.message : String(err))}</td></tr>`;
     }
   }
@@ -170,6 +312,10 @@ function initDashboard(): void {
         listContainer.appendChild(row);
       }
     } catch (err: unknown) {
+      if (isUnauthorized(err)) {
+        handleUnauthorized();
+        return;
+      }
       listContainer.innerHTML = `<tr><td colspan="4" class="error-state">Failed to load workers: ${escapeHtml(err instanceof Error ? err.message : String(err))}</td></tr>`;
     }
   }
@@ -197,7 +343,13 @@ function initDashboard(): void {
       onEventsUpdated: (events, hasMore, nextCursor) =>
         renderEvents(events, hasMore, nextCursor),
       onLogsUpdated: (logs, err) => renderLogs(logs, err),
-      onError: (err) => renderError(err),
+      onError: (err) => {
+        if (isUnauthorized(err)) {
+          handleUnauthorized();
+          return;
+        }
+        renderError(err);
+      },
     });
 
     activeInspector.load();

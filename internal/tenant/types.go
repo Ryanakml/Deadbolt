@@ -92,6 +92,7 @@ var (
 	ErrUnauthorized         = errors.New("UNAUTHORIZED: Authentication is required")
 	ErrForbidden            = errors.New("FORBIDDEN: Insufficient permissions for requested operation")
 	ErrNotFound             = errors.New("NOT_FOUND: The requested resource was not found")
+	ErrEnvironmentAmbiguous = errors.New("AMBIGUOUS_ENVIRONMENT: Environment name matches multiple environments in scope")
 	ErrAuditRequired        = errors.New("AUDIT_REQUIRED: Audit context is required for lifecycle mutation")
 	ErrIdempotencyConflict  = errors.New("IDEMPOTENCY_CONFLICT: Idempotency-Key was already used with different request content")
 	ErrCommandStorage       = errors.New("COMMAND_STORAGE_FAILURE: tenant command storage failed")

@@ -13,6 +13,7 @@ if (!dashboardBaseURL) {
 const moduleNames = [
   "index.js",
   "api.js",
+  "auth.js",
   "inspector.js",
   "stream.js",
   "types.js",

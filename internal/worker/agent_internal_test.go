@@ -33,6 +33,33 @@ func TestResolveTaskSecretsFailsClosedWhenRequiredSecretIsMissing(t *testing.T) 
 	}
 }
 
+func TestClassifyLogLevelPreservesRunnerLevel(t *testing.T) {
+	runnerEntry := func(level string) string {
+		return `{"timestamp":"2026-09-17T00:00:00.000Z","level":"` + level + `","attemptId":"a","message":"hello"}`
+	}
+	for _, tc := range []struct {
+		line     string
+		fallback string
+		want     string
+	}{
+		{runnerEntry("INFO"), "warn", "info"},
+		{runnerEntry("WARN"), "warn", "warn"},
+		{runnerEntry("ERROR"), "warn", "error"},
+		{runnerEntry("DEBUG"), "info", "debug"},
+		{runnerEntry("info"), "warn", "info"},
+		// Unstructured lines keep the stream default: stderr warn, stdout info.
+		{"FATAL_RUNNER_ERROR: boom", "warn", "warn"},
+		{"plain stdout line", "info", "info"},
+		{"{not json", "warn", "warn"},
+		{`{"level":"VERBOSE","message":"x"}`, "warn", "warn"},
+		{`{"message":"no level"}`, "info", "info"},
+	} {
+		if got := classifyLogLevel(tc.line, tc.fallback); got != tc.want {
+			t.Errorf("classifyLogLevel(%q, %q) = %q, want %q", tc.line, tc.fallback, got, tc.want)
+		}
+	}
+}
+
 func TestCapturedProcessOutputIsStrictlyBounded(t *testing.T) {
 	var output cappedBuffer
 	payload := bytes.Repeat([]byte("x"), maxCapturedOutput+4096)

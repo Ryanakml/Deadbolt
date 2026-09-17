@@ -517,34 +517,14 @@ func runHostedBrowserLogin(cfg Config, customOrg string, customEnv string) error
 		return fmt.Errorf("token exchange failed: %s", FormatAPIError(resp.StatusCode, respBytes))
 	}
 
-	var tokenResp struct {
-		AccessToken    string `json:"access_token"`
-		OrganizationID string `json:"organization_id"`
-		Environment    string `json:"environment"`
-	}
+	var tokenResp hostedTokenResponse
 	if err := json.Unmarshal(respBytes, &tokenResp); err != nil {
 		return fmt.Errorf("failed to parse token exchange response: %w", err)
 	}
 
-	tokenToStore := tokenResp.AccessToken
-	if tokenToStore != "" {
-		_ = StoreCredential("deadbolt", "api_key", tokenToStore)
-	}
-
-	orgID := tokenResp.OrganizationID
-	if customOrg != "" {
-		orgID = customOrg
-	}
-	if orgID != "" {
-		_ = StoreCredential("deadbolt", "org_id", orgID)
-	}
-
-	envName := tokenResp.Environment
-	if customEnv != "" {
-		envName = customEnv
-	}
-	if envName != "" {
-		_ = StoreCredential("deadbolt", "env", envName)
+	orgID, envName, err := commitHostedLoginContext(tokenResp, customOrg, customEnv)
+	if err != nil {
+		return err
 	}
 
 	fmt.Println("✓ Successfully authenticated via browser.")
@@ -557,6 +537,51 @@ func runHostedBrowserLogin(cfg Config, customOrg string, customEnv string) error
 	fmt.Println("  Credentials saved securely in OS credentials store.")
 
 	return nil
+}
+
+// hostedTokenResponse is the control-plane token exchange result for a
+// successful hosted browser login.
+type hostedTokenResponse struct {
+	AccessToken    string `json:"access_token"`
+	OrganizationID string `json:"organization_id"`
+	Environment    string `json:"environment"`
+}
+
+// commitHostedLoginContext deterministically replaces the authenticated CLI
+// context after a successful hosted login. Values present in the new login
+// overwrite previous context; values absent from the new login remove stale
+// context so a prior organization or environment can never leak into the new
+// session. Nothing is written when the exchange yielded no access token.
+func commitHostedLoginContext(tokenResp hostedTokenResponse, customOrg, customEnv string) (orgID, envName string, err error) {
+	if tokenResp.AccessToken == "" {
+		return "", "", fmt.Errorf("hosted login did not return an access token")
+	}
+	orgID = tokenResp.OrganizationID
+	if customOrg != "" {
+		orgID = customOrg
+	}
+	envName = tokenResp.Environment
+	if customEnv != "" {
+		envName = customEnv
+	}
+	if err := StoreCredential("deadbolt", "api_key", tokenResp.AccessToken); err != nil {
+		return "", "", err
+	}
+	if orgID != "" {
+		if err := StoreCredential("deadbolt", "org_id", orgID); err != nil {
+			return "", "", err
+		}
+	} else if err := DeleteCredential("deadbolt", "org_id"); err != nil {
+		return "", "", err
+	}
+	if envName != "" {
+		if err := StoreCredential("deadbolt", "env", envName); err != nil {
+			return "", "", err
+		}
+	} else if err := DeleteCredential("deadbolt", "env"); err != nil {
+		return "", "", err
+	}
+	return orgID, envName, nil
 }
 
 func openBrowser(targetURL string) error {

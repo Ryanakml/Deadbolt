@@ -57,6 +57,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
   DEADBOLT_OIDC_ISSUER="https://mock-issuer.com" \
   DEADBOLT_OIDC_CLIENT_ID="mock_client_id" \
   DEADBOLT_OIDC_CLIENT_SECRET="mock_client_secret" \
+  DEADBOLT_OIDC_CLI_CLIENT_ID="mock_cli_client_id" \
   DEADBOLT_STAGING_DOMAIN="staging.deadbolt.cloud" \
   docker compose -f "$COMPOSE_FILE" --profile slot-blue --profile slot-green config --quiet || { err "Staging Compose validation failed"; exit 1; }
   log "DRY RUN passed: Staging deployment workflow is syntactically sound."
@@ -128,7 +129,7 @@ elif [[ -z "${DEADBOLT_POSTGRES_IMAGE:-}" && -f "$POSTGRES_IMAGE_FILE" ]]; then
 fi
 
 # Validate required variables (zero repository-known defaults allowed in hosted staging)
-for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL MIGRATOR_DATABASE_URL SYSTEM_DATABASE_URL DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_STORAGE_S3_BUCKET; do
+for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL MIGRATOR_DATABASE_URL SYSTEM_DATABASE_URL DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_OIDC_CLI_CLIENT_ID DEADBOLT_STORAGE_S3_BUCKET; do
   if [[ -z "${!var:-}" ]]; then
     err "Required configuration variable $var is missing or empty!"
     err "Configure in $CONFIG_FILE or via environment. Zero default passwords permitted."

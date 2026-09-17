@@ -656,6 +656,7 @@ func TestDeploymentScriptsGuards(t *testing.T) {
 		"DEADBOLT_OIDC_ISSUER=https://i",
 		"DEADBOLT_OIDC_CLIENT_ID=id",
 		"DEADBOLT_OIDC_CLIENT_SECRET=s",
+		"DEADBOLT_OIDC_CLI_CLIENT_ID=mock_cli_client_id",
 		"DEADBOLT_POSTGRES_IMAGE=ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee",
 	}
 	out, err := cmdWithConfig.CombinedOutput()
@@ -1271,11 +1272,65 @@ func TestStagingComposeCandidateImageInterpolation(t *testing.T) {
 		"DEADBOLT_OIDC_ISSUER=https://mock-issuer.example",
 		"DEADBOLT_OIDC_CLIENT_ID=mock-client-id",
 		"DEADBOLT_OIDC_CLIENT_SECRET=mock-client-secret",
+		"DEADBOLT_OIDC_CLI_CLIENT_ID=mock-cli-client-id",
 		"DEADBOLT_STAGING_DOMAIN=staging.example.test",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("expected bootstrap/blue-green Compose interpolation with immutable candidate to succeed: %v\n%s", err, out)
+	}
+}
+
+// TestStagingSlotsReceiveCLIOIDCClientID proves both staging control-plane
+// slots receive DEADBOLT_OIDC_CLI_CLIENT_ID (the public CLI PKCE client,
+// distinct from the browser BFF client) and that Compose fails closed when
+// it is missing, so hosted CLI login can never deploy against slots without it.
+func TestStagingSlotsReceiveCLIOIDCClientID(t *testing.T) {
+	composeBytes, err := os.ReadFile("../../deploy/compose/docker-compose.staging.yml")
+	if err != nil {
+		t.Fatalf("failed to read staging compose: %v", err)
+	}
+	composeStr := string(composeBytes)
+	if got := strings.Count(composeStr, "DEADBOLT_OIDC_CLI_CLIENT_ID: ${DEADBOLT_OIDC_CLI_CLIENT_ID:?"); got != 2 {
+		t.Fatalf("expected both staging slots to require DEADBOLT_OIDC_CLI_CLIENT_ID, found %d wiring(s)", got)
+	}
+
+	baseEnv := []string{
+		"DEADBOLT_IMAGE=ghcr.io/ryanakml/deadbolt/control-plane@sha256:" + strings.Repeat("5", 64),
+		"DEADBOLT_POSTGRES_IMAGE=ghcr.io/ryanakml/deadbolt/postgres@sha256:" + strings.Repeat("6", 64),
+		"DEADBOLT_DB_ADMIN_PASSWORD=mock_admin_password",
+		"DEADBOLT_MIGRATOR_PASSWORD=mock_migrator_password",
+		"DEADBOLT_RUNTIME_PASSWORD=mock_runtime_password",
+		"DEADBOLT_SYSTEM_PASSWORD=mock_system_password",
+		"DATABASE_URL=postgres://deadbolt_runtime:mock_runtime_password@localhost:5432/mock",
+		"SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system_password@localhost:5432/mock",
+		"DEADBOLT_OIDC_ISSUER=https://mock-issuer.example",
+		"DEADBOLT_OIDC_CLIENT_ID=mock-client-id",
+		"DEADBOLT_OIDC_CLIENT_SECRET=mock-client-secret",
+		"DEADBOLT_STAGING_DOMAIN=staging.example.test",
+	}
+
+	composeConfig := func(extraEnv ...string) (string, error) {
+		cmd := exec.Command("docker", "compose", "-f", "../../deploy/compose/docker-compose.staging.yml", "--profile", "slot-blue", "--profile", "slot-green", "config")
+		cmd.Env = append(os.Environ(), append(baseEnv, extraEnv...)...)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// Missing CLI client ID must fail closed before an incomplete deployment starts.
+	if out, err := composeConfig(); err == nil {
+		t.Fatalf("expected staging Compose config to fail without DEADBOLT_OIDC_CLI_CLIENT_ID, succeeded:\n%s", out)
+	} else if !strings.Contains(out, "DEADBOLT_OIDC_CLI_CLIENT_ID") {
+		t.Fatalf("expected missing-variable error to name DEADBOLT_OIDC_CLI_CLIENT_ID, got:\n%s", out)
+	}
+
+	// Provided CLI client ID must reach both rendered slots.
+	rendered, err := composeConfig("DEADBOLT_OIDC_CLI_CLIENT_ID=mock-cli-client-id")
+	if err != nil {
+		t.Fatalf("expected staging Compose config with CLI client ID to succeed: %v\n%s", err, rendered)
+	}
+	if got := strings.Count(rendered, "DEADBOLT_OIDC_CLI_CLIENT_ID: mock-cli-client-id"); got != 2 {
+		t.Fatalf("expected rendered CLI client ID in both slots, found %d occurrence(s)", got)
 	}
 }
 
@@ -1878,6 +1933,7 @@ func TestRollbackStagingImmutableEdgeSafety(t *testing.T) {
 		"DEADBOLT_OIDC_ISSUER=https://mock-issuer.example",
 		"DEADBOLT_OIDC_CLIENT_ID=mock-client-id",
 		"DEADBOLT_OIDC_CLIENT_SECRET=mock-client-secret",
+		"DEADBOLT_OIDC_CLI_CLIENT_ID=mock-cli-client-id",
 		"DEADBOLT_STAGING_DOMAIN=staging.example.test",
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {

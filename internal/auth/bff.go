@@ -378,8 +378,9 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	h.logSecurityEvent("LOGIN_SUCCESS", r, ReasonLoginSuccess)
 
-	// Redirect to application root or dashboard
-	http.Redirect(w, r, "/", http.StatusFound)
+	// Redirect to the dashboard. Callback URLs are provider-registered, so
+	// this fixed same-origin target cannot become an open redirect.
+	http.Redirect(w, r, "/dashboard/", http.StatusFound)
 }
 
 // HandleLogout terminates the user session in the database and clears session & CSRF cookies

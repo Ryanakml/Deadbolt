@@ -1,4 +1,5 @@
 import { RunEventStreamClient } from "./stream.js";
+import { apiFetch } from "./api.js";
 export class RunInspector {
     snapshot = null;
     streamClient = null;
@@ -57,7 +58,7 @@ export class RunInspector {
     }
     async fetchSnapshot() {
         const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}`;
-        const res = await fetch(url);
+        const res = await apiFetch(url);
         if (!res.ok) {
             throw new Error(`Failed to load run snapshot (HTTP ${res.status}): ${res.statusText}`);
         }
@@ -74,7 +75,7 @@ export class RunInspector {
         const queryStr = params.toString() ? `?${params.toString()}` : "";
         const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/events${queryStr}`;
         try {
-            const res = await fetch(url);
+            const res = await apiFetch(url);
             if (!res.ok) {
                 throw new Error(`Failed to fetch events (HTTP ${res.status}): ${res.statusText}`);
             }
@@ -119,7 +120,7 @@ export class RunInspector {
         const queryStr = params.toString() ? `?${params.toString()}` : "";
         const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/logs${queryStr}`;
         try {
-            const res = await fetch(url);
+            const res = await apiFetch(url);
             if (res.status === 403) {
                 this.logsError =
                     "Diagnostic task logs require payload:read capability (redacted by tenant policy).";

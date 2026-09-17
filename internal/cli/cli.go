@@ -27,6 +27,8 @@ func Run(args []string) error {
 		return HandleBuild(cmdArgs)
 	case "login":
 		return RunLogin(cmdArgs)
+	case "bootstrap":
+		return HandleBootstrap(cmdArgs)
 	case "deploy":
 		return HandleDeploy(cmdArgs)
 	case "deployments":
@@ -62,6 +64,7 @@ The Developer Journey Commands:
   doctor        Inspect environment prerequisites, connectivity, digests, and secrets
   build         Package deterministic task bundle and generate immutable manifest
   login         Authenticate with hosted Deadbolt or local dev control plane
+  bootstrap     Establish hosted organization/project/environment context
   deploy        Register immutable manifest with control plane
   worker        Manage worker agents (enroll, start, drain, list)
   deployments   Manage deployment activations (activate, list)
