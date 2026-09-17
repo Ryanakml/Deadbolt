@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -456,5 +457,102 @@ func TestDeployRejectsFreshInitWithoutBuild(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Run `runtime build` first") {
 		t.Errorf("expected error to instruct running runtime build, got %v", err)
+	}
+}
+
+func TestPackagedStandaloneComposePlatformContract(t *testing.T) {
+	// 1. Locate repository root
+	repoRoot, err := filepath.Abs("../../")
+	if err != nil {
+		t.Fatalf("failed to resolve repo root: %v", err)
+	}
+
+	standaloneComposePath := filepath.Join(repoRoot, "deploy", "compose", "standalone-compose.yaml")
+	composeBytes, err := os.ReadFile(standaloneComposePath)
+	if err != nil {
+		t.Fatalf("failed to read standalone-compose.yaml: %v", err)
+	}
+	composeStr := string(composeBytes)
+
+	// Verify static contract declarations:
+	// - control-plane MUST specify platform: linux/amd64
+	// - control-plane image MUST be pinned to release.json immutable controlPlaneImage
+	// - postgres, nats, minio MUST NOT specify platform (preserving native multi-arch host compatibility)
+	if !strings.Contains(composeStr, "platform: linux/amd64") {
+		t.Errorf("standalone-compose.yaml must declare 'platform: linux/amd64' for control-plane")
+	}
+	if !strings.Contains(composeStr, "${DEADBOLT_CONTROL_PLANE_IMAGE:") {
+		t.Errorf("standalone-compose.yaml must interpolate DEADBOLT_CONTROL_PLANE_IMAGE")
+	}
+
+	// 2. Test packaging flow with scripts/package-cli-distribution.sh
+	pkgDir := t.TempDir()
+	dummyBin := filepath.Join(pkgDir, "dummy-runtime")
+	if err := os.WriteFile(dummyBin, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("failed to create dummy binary: %v", err)
+	}
+
+	mockDigest := "ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee"
+	outDir := filepath.Join(pkgDir, "dist")
+	scriptPath := filepath.Join(repoRoot, "scripts", "package-cli-distribution.sh")
+
+	cmd := exec.Command(scriptPath, dummyBin, mockDigest, outDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("package-cli-distribution.sh failed: %v\n%s", err, string(out))
+	}
+
+	// 3. Verify packaged companion asset share/deadbolt/compose.yaml
+	packagedComposePath := filepath.Join(outDir, "share", "deadbolt", "compose.yaml")
+	packagedBytes, err := os.ReadFile(packagedComposePath)
+	if err != nil {
+		t.Fatalf("failed to read packaged compose.yaml: %v", err)
+	}
+	packagedStr := string(packagedBytes)
+
+	if !strings.Contains(packagedStr, "platform: linux/amd64") {
+		t.Errorf("packaged compose.yaml missing 'platform: linux/amd64' for control-plane")
+	}
+
+	// 4. Validate with docker compose config if docker is installed
+	if _, err := exec.LookPath("docker"); err == nil {
+		composeCmd := exec.Command("docker", "compose", "-f", packagedComposePath, "config", "--format", "json")
+		composeCmd.Env = append(os.Environ(), "DEADBOLT_CONTROL_PLANE_IMAGE="+mockDigest)
+		jsonOut, err := composeCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("docker compose config validation on packaged compose.yaml failed: %v\n%s", err, string(jsonOut))
+		}
+
+		var parsed struct {
+			Services map[string]struct {
+				Platform string `json:"platform"`
+				Image    string `json:"image"`
+			} `json:"services"`
+		}
+		if err := json.Unmarshal(jsonOut, &parsed); err != nil {
+			t.Fatalf("failed to parse docker compose config json: %v", err)
+		}
+
+		// Control-plane must be explicitly pinned to linux/amd64
+		cp, ok := parsed.Services["control-plane"]
+		if !ok {
+			t.Fatalf("packaged compose.yaml missing control-plane service")
+		}
+		if cp.Platform != "linux/amd64" {
+			t.Errorf("expected control-plane platform 'linux/amd64', got %q", cp.Platform)
+		}
+		if cp.Image != mockDigest {
+			t.Errorf("expected control-plane image %q, got %q", mockDigest, cp.Image)
+		}
+
+		// Postgres, NATS, and MinIO must NOT specify platform (preserving native host architecture e.g. arm64 on Apple Silicon)
+		for _, svc := range []string{"postgres", "nats", "minio"} {
+			s, ok := parsed.Services[svc]
+			if !ok {
+				t.Fatalf("packaged compose.yaml missing service %q", svc)
+			}
+			if s.Platform != "" {
+				t.Errorf("service %q should not specify platform override (expected native, got %q)", svc, s.Platform)
+			}
+		}
 	}
 }

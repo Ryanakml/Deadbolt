@@ -30,6 +30,7 @@ services:
     volumes: ["deadbolt_minio_data:/data"]
 
   control-plane:
+    platform: linux/amd64
     image: ${DEADBOLT_CONTROL_PLANE_IMAGE:?release.json supplies an immutable control-plane image}
     environment:
       RUNTIME_MODE: local
