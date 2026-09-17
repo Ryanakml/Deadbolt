@@ -1088,7 +1088,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 		LEFT JOIN task_leases l ON l.attempt_id=a.id AND l.organization_id=a.organization_id
 		JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 		WHERE r.organization_id=$1::uuid
-			AND r.status IN ('QUEUED','RUNNING')
+			AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
 			AND a.status IN ('CLAIMED','RUNNING')
 			AND (
 				(a.status='CLAIMED' AND (a.claim_start_deadline_at <= clock_timestamp() OR (l.expires_at IS NOT NULL AND l.expires_at <= clock_timestamp()) OR l.step_id IS NULL))
@@ -1123,7 +1123,57 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 	}
 	rows.Close()
 
-	if len(candidates) == 0 {
+	type handoffCandidate struct {
+		runID             string
+		stepID            string
+		nextAttemptNumber int
+		currentEpoch      int64
+		nodeID            string
+		workflowName      string
+		manifestBytes     []byte
+		runStatus         string
+		runDeadlineAt     *time.Time
+		hasStartedAttempt bool
+	}
+
+	// Also sweep steps in WAITING with wait_reason='RECOVERY_HANDOFF'
+	handoffRows, err := tx.Query(ctx, `SELECT
+			r.id::text, rs.id::text, rs.next_attempt_number, rs.current_epoch, rs.node_id,
+			r.workflow_name, d.manifest, r.status, r.deadline_at,
+			EXISTS (SELECT 1 FROM task_attempts ta JOIN run_steps rst ON rst.id=ta.step_id WHERE rst.run_id=r.id AND ta.started_at IS NOT NULL)
+		FROM runs r
+		JOIN run_steps rs ON rs.run_id=r.id AND rs.organization_id=r.organization_id
+		JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+		WHERE r.organization_id=$1::uuid
+			AND rs.state='WAITING' AND rs.wait_reason='RECOVERY_HANDOFF'
+			AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
+		ORDER BY r.id, rs.id
+		LIMIT 50
+		FOR UPDATE OF r, rs SKIP LOCKED`, organizationID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("query recovery handoff steps: %w", err)
+	}
+
+	handoffs := make([]handoffCandidate, 0)
+	for handoffRows.Next() {
+		var h handoffCandidate
+		if err := handoffRows.Scan(
+			&h.runID, &h.stepID, &h.nextAttemptNumber, &h.currentEpoch, &h.nodeID,
+			&h.workflowName, &h.manifestBytes, &h.runStatus, &h.runDeadlineAt,
+			&h.hasStartedAttempt,
+		); err != nil {
+			handoffRows.Close()
+			return 0, nil, fmt.Errorf("scan recovery handoff candidate: %w", err)
+		}
+		handoffs = append(handoffs, h)
+	}
+	if err := handoffRows.Err(); err != nil {
+		handoffRows.Close()
+		return 0, nil, err
+	}
+	handoffRows.Close()
+
+	if len(candidates) == 0 && len(handoffs) == 0 {
 		return 0, nil, nil
 	}
 
@@ -1160,7 +1210,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 				return 0, nil, err
 			}
 			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='RUN_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
-				WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING')`, c.runID, organizationID); err != nil {
+				WHERE id=$1::uuid AND organization_id=$2::uuid`, c.runID, organizationID); err != nil {
 				return 0, nil, err
 			}
 			if err := appendRunEvent(ctx, tx, organizationID, c.runID, "TASK_LOST", map[string]any{
@@ -1195,7 +1245,15 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			// Unstarted claims never executed any side effects; safe to retry if attempt budget remains
 			if c.nextAttemptNumber <= maxAttempts {
 				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid AND state='RUNNING'`, c.stepID, organizationID); err != nil {
+					WHERE id=$1::uuid AND organization_id=$2::uuid AND state IN ('RUNNING','WAITING')`, c.stepID, organizationID); err != nil {
+					return 0, nil, err
+				}
+				// Normalize parent run if it was WAITING with RECOVERY_HANDOFF
+				if _, err := tx.Exec(ctx, `UPDATE runs SET status=CASE
+					WHEN EXISTS (SELECT 1 FROM task_attempts ta JOIN run_steps rst ON rst.id=ta.step_id WHERE rst.run_id=$1::uuid AND ta.started_at IS NOT NULL) THEN 'RUNNING'
+					ELSE 'QUEUED'
+				END, reason_code=NULL, updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND status='WAITING' AND reason_code='RECOVERY_HANDOFF'`, c.runID, organizationID); err != nil {
 					return 0, nil, err
 				}
 				if err := appendRunEvent(ctx, tx, organizationID, c.runID, "STEP_READY", map[string]any{
@@ -1210,7 +1268,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 					return 0, nil, err
 				}
 				if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='START_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING')`, c.runID, organizationID); err != nil {
+					WHERE id=$1::uuid AND organization_id=$2::uuid`, c.runID, organizationID); err != nil {
 					return 0, nil, err
 				}
 				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
@@ -1270,7 +1328,15 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 		} else {
 			if c.nextAttemptNumber <= maxAttempts {
 				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid AND state='RUNNING'`, c.stepID, organizationID); err != nil {
+					WHERE id=$1::uuid AND organization_id=$2::uuid AND state IN ('RUNNING','WAITING')`, c.stepID, organizationID); err != nil {
+					return 0, nil, err
+				}
+				// Normalize parent run if it was WAITING with RECOVERY_HANDOFF
+				if _, err := tx.Exec(ctx, `UPDATE runs SET status=CASE
+					WHEN EXISTS (SELECT 1 FROM task_attempts ta JOIN run_steps rst ON rst.id=ta.step_id WHERE rst.run_id=$1::uuid AND ta.started_at IS NOT NULL) THEN 'RUNNING'
+					ELSE 'QUEUED'
+				END, reason_code=NULL, updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND status='WAITING' AND reason_code='RECOVERY_HANDOFF'`, c.runID, organizationID); err != nil {
 					return 0, nil, err
 				}
 				if err := appendRunEvent(ctx, tx, organizationID, c.runID, "STEP_READY", map[string]any{
@@ -1284,7 +1350,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 					return 0, nil, err
 				}
 				if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code=$1, updated_at=clock_timestamp()
-					WHERE id=$2::uuid AND organization_id=$3::uuid AND status IN ('QUEUED','RUNNING')`, reasonCode, c.runID, organizationID); err != nil {
+					WHERE id=$2::uuid AND organization_id=$3::uuid`, reasonCode, c.runID, organizationID); err != nil {
 					return 0, nil, err
 				}
 				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
@@ -1296,6 +1362,74 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 				}); err != nil {
 					return 0, nil, err
 				}
+			}
+		}
+	}
+
+	for _, h := range handoffs {
+		reclaimedRunsMap[h.runID] = struct{}{}
+		reclaimedCount++
+
+		var manifest deploymentManifest
+		if len(h.manifestBytes) > 0 {
+			_ = json.Unmarshal(h.manifestBytes, &manifest)
+		}
+		_, maxAttempts := manifest.taskRecoveryPolicy(h.workflowName, h.nodeID)
+
+		if h.runDeadlineAt != nil && !dbNow.Before(*h.runDeadlineAt) {
+			if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING','RUNNING')`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='RUN_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if err := appendRunEvent(ctx, tx, organizationID, h.runID, "RUN_FAILED", map[string]any{
+				"status": "FAILED", "reason": "RUN_DEADLINE_EXCEEDED", "stepId": h.stepID,
+			}); err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
+
+		if h.nextAttemptNumber <= maxAttempts {
+			if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND state='WAITING' AND wait_reason='RECOVERY_HANDOFF'`, h.stepID, organizationID); err != nil {
+				return 0, nil, err
+			}
+
+			targetRunStatus := "QUEUED"
+			if h.hasStartedAttempt {
+				targetRunStatus = "RUNNING"
+			}
+			if _, err := tx.Exec(ctx, `UPDATE runs SET status=$1, reason_code=NULL, updated_at=clock_timestamp()
+				WHERE id=$2::uuid AND organization_id=$3::uuid AND status='WAITING' AND reason_code='RECOVERY_HANDOFF'`, targetRunStatus, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+
+			if err := appendRunEvent(ctx, tx, organizationID, h.runID, "STEP_READY", map[string]any{
+				"stepId": h.stepID, "nodeId": h.nodeID, "reason": "RECOVERY_HANDOFF_RESOLVED",
+			}); err != nil {
+				return 0, nil, err
+			}
+		} else {
+			if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED', wait_reason='MAX_ATTEMPTS_EXCEEDED', updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid`, h.stepID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='MAX_ATTEMPTS_EXCEEDED', updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if err := appendRunEvent(ctx, tx, organizationID, h.runID, "RUN_FAILED", map[string]any{
+				"status": "FAILED", "reason": "MAX_ATTEMPTS_EXCEEDED", "stepId": h.stepID,
+			}); err != nil {
+				return 0, nil, err
 			}
 		}
 	}

@@ -520,6 +520,245 @@ func TestWorkerReconnectCreatesDurableRecoveryHandoff(t *testing.T) {
 	}
 }
 
+// TestWorkerReconnectRecoveryEndToEndSchedulable is the regression test for the
+// REAL persisted state that deadlocked in manual acceptance after commit d206b29.
+// It exercises the FenceWorkerSessions code path (worker reconnect), NOT the
+// reconcileExpiredLeasesTx path (reconciler sweep), because the deadlock was in
+// FenceWorkerSessions setting both step and run to WAITING/RECOVERY_HANDOFF — a
+// state excluded from the Claim candidate query (rs.state='READY' AND r.status
+// IN ('QUEUED','RUNNING')).
+//
+// The test proves that after reconnect:
+//  1. The unstarted claim is durably invalidated (LOST)
+//  2. The step is requeued to READY (not WAITING/RECOVERY_HANDOFF)
+//  3. The run remains schedulable (QUEUED, not WAITING)
+//  4. A second worker can claim replacement Attempt 2 with Epoch 2
+//  5. Stale epoch-1 Start/Heartbeat/Complete from Worker A are rejected
+//  6. The replacement attempt can execute to completion (SUCCEEDED)
+//  7. No RECOVERY_HANDOFF reason_code exists anywhere in the final state
+func TestWorkerReconnectRecoveryEndToEndSchedulable(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	workerA, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "reconnect-e2e-a")
+	workerB, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "reconnect-e2e-b")
+
+	const digest = "bundle-reconnect-e2e"
+	deploymentID := seedExecutionDeployment(t, tc, orgID, envID, digest)
+	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		for _, s := range []*testWorkerSession{workerA, workerB} {
+			if _, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1::uuid,$2::uuid,$3)`, s.SessionID, orgID, digest); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Worker A claims Attempt 1, Epoch 1 — does NOT send Start
+	assignmentA := claimExecution(t, server, workerA, digest, "poll-reconnect-a")
+	if assignmentA.AttemptID == "" || assignmentA.OwnershipEpoch != 1 {
+		t.Fatalf("expected attempt 1 epoch 1, got attempt=%s epoch=%d", assignmentA.AttemptID, assignmentA.OwnershipEpoch)
+	}
+
+	// Verify: CLAIMED, started_at IS NULL
+	var a1Status string
+	var a1StartedAt *time.Time
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT status, started_at FROM task_attempts WHERE id=$1::uuid`, assignmentA.AttemptID).Scan(&a1Status, &a1StartedAt)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if a1Status != "CLAIMED" || a1StartedAt != nil {
+		t.Fatalf("expected CLAIMED/NULL, got status=%s started_at=%v", a1Status, a1StartedAt)
+	}
+
+	// 2. Worker A reconnects (triggers FenceWorkerSessions, the code path that deadlocked)
+	challengeBody, _ := json.Marshal(worker.ChallengeRequestDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: "e2e-challenge", WorkerID: workerA.WorkerID})
+	challengeResp, err := http.Post(server.URL+"/worker/v1/challenge", "application/json", bytes.NewReader(challengeBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var challenge worker.ChallengeResponseDTO
+	_ = json.NewDecoder(challengeResp.Body).Decode(&challenge)
+	challengeResp.Body.Close()
+	sessionBody, _ := json.Marshal(worker.SessionRequestDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: "e2e-session",
+		WorkerID: workerA.WorkerID, Nonce: challenge.Nonce, Signature: worker.SignChallenge(workerA.privateKey, challenge.Nonce)})
+	newSessionResp, err := http.Post(server.URL+"/worker/v1/session", "application/json", bytes.NewReader(sessionBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSessionResp.StatusCode != http.StatusOK {
+		var responseError worker.ErrorEnvelopeDTO
+		_ = json.NewDecoder(newSessionResp.Body).Decode(&responseError)
+		newSessionResp.Body.Close()
+		t.Fatalf("reconnect status=%d error=%+v", newSessionResp.StatusCode, responseError)
+	}
+	var newSession worker.SessionResponseDTO
+	_ = json.NewDecoder(newSessionResp.Body).Decode(&newSession)
+	newSessionResp.Body.Close()
+
+	// 3 & 4. Verify the REAL persisted recovery handoff state:
+	// - attempt 1 is marked LOST
+	// - step is WAITING with wait_reason RECOVERY_HANDOFF
+	// - run is WAITING with reason_code RECOVERY_HANDOFF
+	// - lease is deleted
+	var a1FinalStatus, stepState, runStatus string
+	var stepWaitReason, runReasonCode *string
+	var leasesCount int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT a.status, rs.state, rs.wait_reason, r.status, r.reason_code,
+			(SELECT count(*) FROM task_leases l WHERE l.attempt_id=a.id)
+			FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id JOIN runs r ON r.id=rs.run_id
+			WHERE a.id=$1::uuid AND rs.id=$2::uuid AND r.id=$3::uuid`, assignmentA.AttemptID, stepID, runID).Scan(
+			&a1FinalStatus, &stepState, &stepWaitReason, &runStatus, &runReasonCode, &leasesCount)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if a1FinalStatus != "LOST" {
+		t.Fatalf("attempt 1 not marked LOST: %s", a1FinalStatus)
+	}
+	if stepState != "WAITING" || stepWaitReason == nil || *stepWaitReason != "RECOVERY_HANDOFF" {
+		t.Fatalf("expected step in WAITING/RECOVERY_HANDOFF, got state=%s reason=%v", stepState, stepWaitReason)
+	}
+	if runStatus != "WAITING" || runReasonCode == nil || *runReasonCode != "RECOVERY_HANDOFF" {
+		t.Fatalf("expected run in WAITING/RECOVERY_HANDOFF, got status=%s reason=%v", runStatus, runReasonCode)
+	}
+	if leasesCount != 0 {
+		t.Fatalf("stale lease not deleted: %d", leasesCount)
+	}
+
+	// 5 & 6. Worker B polls: in the poll transaction, the reconciler automatically
+	// resolves RECOVERY_HANDOFF (step -> READY, run -> QUEUED), and Worker B
+	// claims replacement Attempt 2 with Epoch 2.
+	assignmentB := claimExecution(t, server, workerB, digest, "poll-reconnect-b")
+	if assignmentB.AttemptID == "" || assignmentB.AttemptID == assignmentA.AttemptID {
+		t.Fatalf("expected new attempt for worker B, got %s", assignmentB.AttemptID)
+	}
+	if assignmentB.OwnershipEpoch <= assignmentA.OwnershipEpoch {
+		t.Fatalf("expected epoch > %d for worker B, got %d", assignmentA.OwnershipEpoch, assignmentB.OwnershipEpoch)
+	}
+
+	// 7. Verify step became RUNNING, attempt 2 is CLAIMED, run is QUEUED (or RUNNING)
+	var a2Status, step2State, run2Status string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT a.status, rs.state, r.status
+			FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id JOIN runs r ON r.id=rs.run_id
+			WHERE a.id=$1::uuid AND rs.id=$2::uuid AND r.id=$3::uuid`, assignmentB.AttemptID, stepID, runID).Scan(
+			&a2Status, &step2State, &run2Status)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if a2Status != "CLAIMED" || step2State != "RUNNING" {
+		t.Fatalf("unexpected replacement assignment state: attempt=%s step=%s", a2Status, step2State)
+	}
+
+	// 8. Stale epoch-1 requests must ALL be rejected:
+	// a) Stale Start from Worker A's revoked session token -> 401 Unauthorized (SESSION_REVOKED)
+	staleStartOldSession := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-start-old",
+		WorkerID: workerA.WorkerID, SessionID: workerA.SessionID,
+		AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch,
+	}
+	if status := postWorkerJSON(t, server, "/worker/v1/start", workerA.SessionToken, staleStartOldSession, &worker.ErrorEnvelopeDTO{}); status != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for revoked session Start, got %d", status)
+	}
+
+	// b) Stale Start with Worker A's new session token or Worker B's session token -> 409 Conflict
+	staleStartNewSession := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-start-new",
+		WorkerID: workerA.WorkerID, SessionID: newSession.SessionID,
+		AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch,
+	}
+	if status := postWorkerJSON(t, server, "/worker/v1/start", newSession.SessionToken, staleStartNewSession, &worker.ErrorEnvelopeDTO{}); status != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale Start with new session, got %d", status)
+	}
+
+	staleStartWorkerB := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-start-b",
+		WorkerID: workerB.WorkerID, SessionID: workerB.SessionID,
+		AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch,
+	}
+	if status := postWorkerJSON(t, server, "/worker/v1/start", workerB.SessionToken, staleStartWorkerB, &worker.ErrorEnvelopeDTO{}); status != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale Start from worker B, got %d", status)
+	}
+
+	// c) Stale Heartbeat with active session -> stop command with LEASE_NOT_FOUND
+	var hbResp worker.HeartbeatResponseDTO
+	statusHB := postWorkerJSON(t, server, "/worker/v1/heartbeat", newSession.SessionToken, worker.HeartbeatRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-heartbeat-new",
+		WorkerID: workerA.WorkerID, SessionID: newSession.SessionID,
+		Attempts: []worker.HeartbeatAttemptDTO{{AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch}},
+	}, &hbResp)
+	if statusHB != http.StatusOK || len(hbResp.Stops) != 1 || hbResp.Stops[0].Reason != "LEASE_NOT_FOUND" {
+		t.Fatalf("expected LEASE_NOT_FOUND stop for stale Heartbeat, got status=%d stops=%+v", statusHB, hbResp.Stops)
+	}
+
+	// d) Stale Complete with active session -> 409 Conflict
+	staleComp := worker.CompleteRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-complete-new",
+		WorkerID: workerA.WorkerID, SessionID: newSession.SessionID,
+		AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch,
+		Outcome: "SUCCEEDED",
+	}
+	staleComp.ResultDigest, _ = worker.CanonicalCompletionDigest(&staleComp)
+	if status := postWorkerJSON(t, server, "/worker/v1/complete", newSession.SessionToken, staleComp, &worker.ErrorEnvelopeDTO{}); status != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale Complete, got %d", status)
+	}
+
+	// 9. Replacement Worker B starts and completes Attempt 2
+	startB := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "start-reconnect-b",
+		WorkerID: workerB.WorkerID, SessionID: workerB.SessionID,
+		AttemptID: assignmentB.AttemptID, OwnershipEpoch: assignmentB.OwnershipEpoch,
+	}
+	var startBResp worker.StartResponseDTO
+	if status := postWorkerJSON(t, server, "/worker/v1/start", workerB.SessionToken, startB, &startBResp); status != http.StatusOK || !startBResp.Accepted {
+		t.Fatalf("Start for worker B rejected: status=%d resp=%+v", status, startBResp)
+	}
+
+	compB := worker.CompleteRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "complete-reconnect-b",
+		WorkerID: workerB.WorkerID, SessionID: workerB.SessionID,
+		AttemptID: assignmentB.AttemptID, OwnershipEpoch: assignmentB.OwnershipEpoch,
+		Outcome: "SUCCEEDED",
+	}
+	compB.ResultDigest, _ = worker.CanonicalCompletionDigest(&compB)
+	var compBResp worker.CompleteResponseDTO
+	if status := postWorkerJSON(t, server, "/worker/v1/complete", workerB.SessionToken, compB, &compBResp); status != http.StatusOK || !compBResp.Accepted {
+		t.Fatalf("Complete for worker B rejected: status=%d resp=%+v", status, compBResp)
+	}
+
+	// Verify run completed SUCCEEDED
+	var runFinalStatus, stepFinalState string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT r.status, rs.state FROM runs r
+			JOIN run_steps rs ON rs.run_id=r.id WHERE r.id=$1::uuid AND rs.id=$2::uuid`, runID, stepID).Scan(&runFinalStatus, &stepFinalState)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if runFinalStatus != "SUCCEEDED" || stepFinalState != "SUCCEEDED" {
+		t.Fatalf("run failed to complete: run=%s step=%s", runFinalStatus, stepFinalState)
+	}
+
+	// Verify no RECOVERY_HANDOFF exists anywhere in final state
+	var recoveryHandoffCount int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM run_steps WHERE wait_reason='RECOVERY_HANDOFF') +
+			(SELECT count(*) FROM runs WHERE reason_code='RECOVERY_HANDOFF')`).Scan(&recoveryHandoffCount)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryHandoffCount != 0 {
+		t.Fatalf("RECOVERY_HANDOFF still present in DB: count=%d", recoveryHandoffCount)
+	}
+}
+
 func TestWorkerOperationIDStableAcrossRetriesAndUniqueAcrossRuns(t *testing.T) {
 	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
 	defer tc.cleanup()
