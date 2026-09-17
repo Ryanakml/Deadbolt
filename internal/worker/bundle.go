@@ -19,9 +19,11 @@ import (
 const BundlePlatformPath = ".deadbolt/platform.json"
 
 var (
-	ErrBundleDigestMismatch = errors.New("BUNDLE_DIGEST_MISMATCH: Computed bundle SHA-256 does not match manifest")
-	ErrArchitectureMismatch = errors.New("ARCHITECTURE_MISMATCH: Worker runtime architecture incompatible with bundle target")
-	ErrNoBundlePlatform     = errors.New("BUNDLE_PLATFORM_NOT_FOUND: Bundle archive is missing platform metadata")
+	ErrBundleDigestMismatch   = errors.New("BUNDLE_DIGEST_MISMATCH: Computed bundle SHA-256 does not match manifest")
+	ErrArchitectureMismatch   = errors.New("ARCHITECTURE_MISMATCH: Worker runtime architecture incompatible with bundle target")
+	ErrNoBundlePlatform       = errors.New("BUNDLE_PLATFORM_NOT_FOUND: Bundle archive is missing platform metadata")
+	ErrBundlePlatformInvalid  = errors.New("BUNDLE_PLATFORM_INVALID: Bundle archive platform metadata is malformed or incomplete")
+	ErrBundlePlatformMismatch = errors.New("BUNDLE_PLATFORM_MISMATCH: Bundle embedded platform does not match assigned execution target")
 )
 
 // BundlePlatform captures immutable platform metadata embedded inside the bundle.
@@ -76,6 +78,30 @@ func ReadBundlePlatformFromFile(path string) (*BundlePlatform, error) {
 	}
 	defer f.Close()
 	return ReadBundlePlatform(f)
+}
+
+// normalizeBundleArch reduces bare ("arm64"), canonical ("linux/arm64"), and
+// legacy alias ("linux-x64", "x64", ...) target forms to a canonical bare
+// architecture for exact identity comparison. Unknown values pass through so
+// equality still fails closed against well-formed embedded metadata.
+func normalizeBundleArch(v string) string {
+	s := strings.ToLower(strings.TrimSpace(v))
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		s = s[i+1:]
+	}
+	switch s {
+	case "amd64", "x64", "x86_64", "linux-x64", "darwin-x64", "win32-x64", "windows-x64":
+		return "amd64"
+	case "arm64", "linux-arm64", "darwin-arm64":
+		return "arm64"
+	default:
+		return s
+	}
+}
+
+// normalizeBundleOS canonicalizes a target OS for exact identity comparison.
+func normalizeBundleOS(v string) string {
+	return strings.ToLower(strings.TrimSpace(v))
 }
 
 // VerifyBundleDigest computes the SHA-256 digest of the bundle data from reader

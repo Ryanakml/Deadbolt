@@ -408,6 +408,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				RunDeadlineAt:      runDeadline,
 				TraceContext:       worker.TraceContextDTO{Traceparent: "00-00000000000000000000000000000000-0000000000000000-01"},
 				TargetArchitecture: targetArchitecture(manifest.TargetOS, manifest.TargetArchitecture), SecretNames: manifest.SecretNames,
+				TargetOS: manifest.TargetOS,
 			})
 		}
 		return nil

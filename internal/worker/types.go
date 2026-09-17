@@ -24,6 +24,7 @@ type BundleSpec struct {
 	Path       string `json:"path"`
 	SHA256     string `json:"sha256"`
 	TargetArch string `json:"targetArch"`
+	TargetOS   string `json:"targetOS,omitempty"`   // assigned execution target OS; empty when the assignment predates it
 	Entrypoint string `json:"entrypoint,omitempty"` // relative path inside a verified tar bundle
 }
 

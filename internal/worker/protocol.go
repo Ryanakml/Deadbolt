@@ -82,6 +82,7 @@ type AssignmentDTO struct {
 	RunDeadlineAt        string          `json:"runDeadlineAt"`
 	TraceContext         TraceContextDTO `json:"traceContext"`
 	TargetArchitecture   string          `json:"targetArchitecture,omitempty"`
+	TargetOS             string          `json:"targetOS,omitempty"`
 	SecretNames          []string        `json:"secretNames,omitempty"`
 }
 

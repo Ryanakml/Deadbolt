@@ -24,7 +24,7 @@ import (
 func setupInspectorWorkflow(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID string, adminKey *tenant.GeneratedKey) (string, string) {
 	t.Helper()
 	tempDir := t.TempDir()
-	bundleDigest := writeAgentBundle(t, tempDir)
+	bundleDigest := writeAgentBundle(t, tempDir, "linux", "amd64")
 
 	schema := map[string]any{
 		"type":                 "object",
@@ -956,7 +956,7 @@ func TestRunInspectorBoundedTaskLogs(t *testing.T) {
 func setupTwoStepWorkflow(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID string, adminKey *tenant.GeneratedKey) (string, string) {
 	t.Helper()
 	tempDir := t.TempDir()
-	bundleDigest := writeAgentBundle(t, tempDir)
+	bundleDigest := writeAgentBundle(t, tempDir, "linux", "amd64")
 
 	schema := map[string]any{
 		"type":                 "object",

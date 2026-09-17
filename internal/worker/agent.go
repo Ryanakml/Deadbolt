@@ -418,6 +418,7 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		Path:       filepath.Join(a.cfg.BundleDir, assignment.BundleDigest+".tar"),
 		SHA256:     assignment.BundleDigest,
 		TargetArch: assignment.TargetArchitecture,
+		TargetOS:   assignment.TargetOS,
 		Entrypoint: assignment.TaskEntrypoint,
 	}
 	if bundleSpec.TargetArch == "" {

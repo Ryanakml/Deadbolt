@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -280,6 +282,7 @@ func TestArtifactIdentity_FreshLocalBuildDefaultCompatibleWithHost(t *testing.T)
 	var manifest struct {
 		TargetArchitecture string `json:"targetArchitecture"`
 		TargetOS           string `json:"targetOS"`
+		BundleDigest       string `json:"bundleDigest"`
 	}
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 		t.Fatalf("parse manifest: %v", err)
@@ -301,6 +304,29 @@ func TestArtifactIdentity_FreshLocalBuildDefaultCompatibleWithHost(t *testing.T)
 		if manifest.TargetArchitecture != "arm64" {
 			t.Fatalf("Apple Silicon host must default to arm64, got %q", manifest.TargetArchitecture)
 		}
+	}
+
+	// The real build output must pass the real fail-closed worker preflight:
+	// embedded identity equals the manifest target and the host accepts it.
+	bundlePath := filepath.Join(tmpDir, "bundles", manifest.BundleDigest+".tar")
+	supervisor := worker.NewProcessSupervisor("definitely-not-node", "ignored")
+	supervisor.LeaseTracker = worker.NewLeaseTracker(time.Now().Add(time.Minute), 0, 0)
+	supervisor.StartAckFn = func(context.Context, string, int64) error { return nil }
+	started := false
+	supervisor.OnProcessStart = func(int) { started = true }
+	_, _, err = supervisor.ExecuteAttempt(context.Background(), &worker.TaskInput{
+		AttemptID:  "fresh-build-preflight",
+		Entrypoint: "tasks/validate.js",
+		Bundle: &worker.BundleSpec{
+			Path:       bundlePath,
+			SHA256:     manifest.BundleDigest,
+			TargetArch: manifest.TargetArchitecture,
+			TargetOS:   manifest.TargetOS,
+			Entrypoint: "tasks/validate.js",
+		},
+	}, 1)
+	if err == nil || !strings.Contains(err.Error(), "start runner") || started {
+		t.Fatalf("expected fresh build bundle to pass preflight and reach process start, got err=%v started=%v", err, started)
 	}
 }
 
