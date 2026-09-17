@@ -261,9 +261,52 @@ func TestCLIEndToEndDeveloperJourney(t *testing.T) {
 		}
 	}()
 
-	// Wait for workers to poll and advertise bundles
+	// Wait for both workers to poll and advertise bundles, polling for the
+	// explicit condition instead of sleeping a fixed duration.
 	t.Log("Waiting for workers to establish sessions and advertise bundle digests...")
-	time.Sleep(1500 * time.Millisecond)
+	workerDeadline := time.Now().Add(20 * time.Second)
+	seenWorkers := map[string]bool{}
+	for time.Now().Before(workerDeadline) {
+		workersReq, _ := http.NewRequest("GET", server.URL+"/v1/workers?environment=staging", nil)
+		workersReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+		workersReq.Header.Set("X-Organization-ID", org.ID)
+		workersResp, err := http.DefaultClient.Do(workersReq)
+		if err == nil && workersResp.StatusCode == http.StatusOK {
+			var workersResult struct {
+				Items []struct {
+					ID                string   `json:"id"`
+					Status            string   `json:"status"`
+					DeploymentDigests []string `json:"deploymentDigests"`
+				} `json:"items"`
+			}
+			_ = json.NewDecoder(workersResp.Body).Decode(&workersResult)
+			workersResp.Body.Close()
+			for _, w := range workersResult.Items {
+				if w.Status != "ACTIVE" {
+					continue
+				}
+				for _, d := range w.DeploymentDigests {
+					if d == manifest.BundleDigest {
+						seenWorkers[w.ID] = true
+					}
+				}
+			}
+			if len(seenWorkers) >= 2 {
+				break
+			}
+		} else if workersResp != nil {
+			workersResp.Body.Close()
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if len(seenWorkers) < 2 {
+		t.Fatalf("expected 2 independent ACTIVE workers advertising bundle %s, saw %d", manifest.BundleDigest, len(seenWorkers))
+	}
+	workerIDs := make([]string, 0, len(seenWorkers))
+	for id := range seenWorkers {
+		workerIDs = append(workerIDs, id)
+	}
+	t.Logf("two independent workers online: %v", workerIDs)
 
 	// 10. Step: runtime worker list (Inspect registered workers)
 	t.Log("==> Executing: runtime worker list")

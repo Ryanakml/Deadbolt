@@ -250,20 +250,9 @@ func handleWorkerStart(args []string) error {
 		keyPath = filepath.Join(home, ".deadbolt", "worker.key")
 	}
 
-	runnerPath := *runnerPathFlag
-	if runnerPath == "" {
-		runnerPath = os.Getenv("DEADBOLT_RUNNER_PATH")
-	}
-	if runnerPath == "" {
-		if executable, err := os.Executable(); err == nil {
-			candidate := filepath.Join(filepath.Dir(executable), "..", "share", "deadbolt", "runner", "index.js")
-			if fileExists(candidate) {
-				runnerPath = candidate
-			}
-		}
-	}
-	if runnerPath == "" || !fileExists(runnerPath) {
-		return fmt.Errorf("Node runner is not installed. Install the Deadbolt runner companion asset or pass --runner-path /path/to/index.js (DEADBOLT_RUNNER_PATH is also supported)")
+	runnerPath, err := resolveRunnerPath(*runnerPathFlag)
+	if err != nil {
+		return err
 	}
 
 	logger := log.New(os.Stdout, "[WORKER] ", log.LstdFlags|log.Lmsgprefix)
@@ -330,6 +319,30 @@ func handleWorkerDrain(args []string) error {
 
 	fmt.Printf("Drain signal accepted for worker %s.\n", workerID)
 	return nil
+}
+
+// resolveRunnerPath locates the Node runner companion asset in precedence
+// order: explicit flag, DEADBOLT_RUNNER_PATH, then the packaged layout
+// relative to the running executable (<prefix>/share/deadbolt/runner).
+// Repository source paths are never consulted. A missing asset fails fast
+// with an actionable error instead of failing later inside worker startup.
+func resolveRunnerPath(flagVal string) (string, error) {
+	runnerPath := flagVal
+	if runnerPath == "" {
+		runnerPath = os.Getenv("DEADBOLT_RUNNER_PATH")
+	}
+	if runnerPath == "" {
+		if executable, err := os.Executable(); err == nil {
+			candidate := filepath.Join(filepath.Dir(executable), "..", "share", "deadbolt", "runner", "index.js")
+			if fileExists(candidate) {
+				runnerPath = candidate
+			}
+		}
+	}
+	if runnerPath == "" || !fileExists(runnerPath) {
+		return "", fmt.Errorf("Node runner is not installed. Install the Deadbolt runner companion asset or pass --runner-path /path/to/index.js (DEADBOLT_RUNNER_PATH is also supported)")
+	}
+	return runnerPath, nil
 }
 
 // resolveEnvironmentID uses only authenticated public tenant discovery routes.

@@ -3,8 +3,75 @@ package cli
 import (
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// TestControlPlaneURLPersistence proves `runtime login --control-plane-url`
+// persists the non-secret endpoint so later invocations reload it instead of
+// falling back to localhost, while an explicit environment value keeps
+// precedence.
+func TestControlPlaneURLPersistence(t *testing.T) {
+	isolatedCredentials(t)
+
+	if err := StoreControlPlaneURL("https://staging.example:443/"); err != nil {
+		t.Fatalf("store control plane URL: %v", err)
+	}
+	t.Setenv("DEADBOLT_API_URL", "")
+	if got := LoadConfig().APIURL; got != "https://staging.example:443" {
+		t.Fatalf("expected persisted endpoint to load, got %q", got)
+	}
+
+	t.Setenv("DEADBOLT_API_URL", "http://localhost:9999")
+	if got := LoadConfig().APIURL; got != "http://localhost:9999" {
+		t.Fatalf("expected environment override to win, got %q", got)
+	}
+
+	if err := StoreControlPlaneURL("://not-a-url"); err == nil {
+		t.Fatal("expected invalid endpoint to be rejected, got nil")
+	}
+}
+
+// TestMutatingCommandsSendIdempotencyKeys proves deploy and activation carry
+// a per-command Idempotency-Key instead of depending on accidental
+// middleware behavior.
+func TestMutatingCommandsSendIdempotencyKeys(t *testing.T) {
+	isolatedCredentials(t)
+	t.Setenv("DEADBOLT_API_KEY", "test-key")
+	t.Setenv("DEADBOLT_ORG_ID", "org-1")
+	t.Setenv("DEADBOLT_ENV", "staging")
+
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"dep-1","manifestHash":"h","bundleDigest":"b","status":"REGISTERED","createdAt":"2026-09-17T00:00:00Z","name":"wf","activeDeploymentId":"dep-1","revision":1}`))
+	}))
+	defer server.Close()
+
+	if err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "staging", "--control-plane-url", server.URL}); err != nil {
+		t.Fatalf("activate failed: %v", err)
+	}
+	if err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "staging", "--control-plane-url", server.URL}); err != nil {
+		t.Fatalf("second activate failed: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 activate requests, got %d", len(keys))
+	}
+	for i, k := range keys {
+		if k == "" {
+			t.Fatalf("activate request %d missing Idempotency-Key", i)
+		}
+	}
+	if keys[0] == keys[1] {
+		t.Fatal("expected distinct idempotency keys per logical command invocation")
+	}
+	if !strings.HasPrefix(keys[0], "dep-act-") {
+		t.Fatalf("expected conventional dep-act key prefix, got %q", keys[0])
+	}
+}
 
 // TestHostedCallbackListenerUsesPinnedLoopbackPort proves hosted browser
 // login binds the exact loopback callback registered with the identity

@@ -97,6 +97,8 @@ Compile your workflow code into an immutable `.tar` bundle archive and a validat
 runtime build --dir . --arch arm64 --os linux
 ```
 
+When `--arch` is omitted, the build targets the current host architecture (or the project config `targetArch`); hosted/CI callers that need `linux/amd64` should pass it explicitly. The target platform is embedded in the bundle (`.deadbolt/platform.json`) and participates in the bundle digest, so different targets always produce different digests.
+
 Output:
 
 - `dist/manifest.json`: Strictly validated against `contracts/manifest/deployment.schema.json`.

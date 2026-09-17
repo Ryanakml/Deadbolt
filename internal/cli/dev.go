@@ -36,51 +36,12 @@ func RunDev(args []string) error {
 		return fmt.Errorf("docker check failed: %w\n  Remediation:\n    Ensure Docker daemon is installed and running (`docker info`).\n    Local mode requires Docker to orchestrate database and control plane services", err)
 	}
 
-	// 2. Locate docker-compose.yml. A distributed CLI resolves the canonical
-	// companion asset next to the installed binary; repository-relative paths
-	// remain a developer convenience only.
-	composePath := *composeFileFlag
-	if composePath == "" {
-		if configured := os.Getenv("DEADBOLT_COMPOSE_FILE"); configured != "" {
-			composePath = configured
-		}
-	}
-	var releaseImage string
-	if composePath == "" {
-		if executable, err := os.Executable(); err == nil {
-			assetDir := filepath.Join(filepath.Dir(executable), "..", "share", "deadbolt")
-			candidate := filepath.Join(assetDir, "compose.yaml")
-			if _, err := os.Stat(candidate); err == nil {
-				composePath = candidate
-				metadata, err := os.ReadFile(filepath.Join(assetDir, "release.json"))
-				if err != nil {
-					return fmt.Errorf("read installed Deadbolt release metadata: %w", err)
-				}
-				var release struct {
-					ControlPlaneImage string `json:"controlPlaneImage"`
-				}
-				if err := json.Unmarshal(metadata, &release); err != nil || !strings.Contains(release.ControlPlaneImage, "@sha256:") {
-					return fmt.Errorf("installed Deadbolt release metadata has no immutable control-plane image")
-				}
-				releaseImage = release.ControlPlaneImage
-			}
-		}
-	}
-	if composePath == "" && os.Getenv("DEADBOLT_DEV_ASSETS") == "1" {
-		candidates := []string{
-			"deploy/compose/docker-compose.yml",
-			"../deploy/compose/docker-compose.yml",
-			"../../deploy/compose/docker-compose.yml",
-		}
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				composePath = c
-				break
-			}
-		}
-	}
-	if composePath == "" {
-		return fmt.Errorf("local Compose assets are not installed. Install the Deadbolt CLI companion assets, set DEADBOLT_COMPOSE_FILE, or for a repository checkout set DEADBOLT_DEV_ASSETS=1")
+	// 2. Locate docker-compose.yml. Companion assets resolve from the
+	// installed package layout; repository-relative paths remain an explicit
+	// developer opt-in only (DEADBOLT_DEV_ASSETS=1).
+	composePath, releaseImage, err := resolveDevComposePath(*composeFileFlag)
+	if err != nil {
+		return err
 	}
 
 	// 3. Start core services with docker compose
@@ -211,6 +172,58 @@ func RunDev(args []string) error {
 
 	fmt.Println("Shutdown complete.")
 	return nil
+}
+
+// resolveDevComposePath locates the local Compose definition in precedence
+// order: explicit flag, DEADBOLT_COMPOSE_FILE, then the packaged companion
+// asset next to the running executable (<prefix>/share/deadbolt/compose.yaml
+// with release.json). Repository checkout paths are consulted only under the
+// explicit DEADBOLT_DEV_ASSETS=1 opt-in, never silently. A missing asset
+// fails fast with an actionable error.
+func resolveDevComposePath(composeFlag string) (composePath, releaseImage string, err error) {
+	composePath = composeFlag
+	if composePath == "" {
+		if configured := os.Getenv("DEADBOLT_COMPOSE_FILE"); configured != "" {
+			composePath = configured
+		}
+	}
+	if composePath == "" {
+		if executable, execErr := os.Executable(); execErr == nil {
+			assetDir := filepath.Join(filepath.Dir(executable), "..", "share", "deadbolt")
+			candidate := filepath.Join(assetDir, "compose.yaml")
+			if _, statErr := os.Stat(candidate); statErr == nil {
+				composePath = candidate
+				metadata, readErr := os.ReadFile(filepath.Join(assetDir, "release.json"))
+				if readErr != nil {
+					return "", "", fmt.Errorf("read installed Deadbolt release metadata: %w", readErr)
+				}
+				var release struct {
+					ControlPlaneImage string `json:"controlPlaneImage"`
+				}
+				if err := json.Unmarshal(metadata, &release); err != nil || !strings.Contains(release.ControlPlaneImage, "@sha256:") {
+					return "", "", fmt.Errorf("installed Deadbolt release metadata has no immutable control-plane image")
+				}
+				releaseImage = release.ControlPlaneImage
+			}
+		}
+	}
+	if composePath == "" && os.Getenv("DEADBOLT_DEV_ASSETS") == "1" {
+		candidates := []string{
+			"deploy/compose/docker-compose.yml",
+			"../deploy/compose/docker-compose.yml",
+			"../../deploy/compose/docker-compose.yml",
+		}
+		for _, c := range candidates {
+			if _, statErr := os.Stat(c); statErr == nil {
+				composePath = c
+				break
+			}
+		}
+	}
+	if composePath == "" {
+		return "", "", fmt.Errorf("local Compose assets are not installed. Install the Deadbolt CLI companion assets, set DEADBOLT_COMPOSE_FILE, or for a repository checkout set DEADBOLT_DEV_ASSETS=1")
+	}
+	return composePath, releaseImage, nil
 }
 
 func checkDockerRunning() error {

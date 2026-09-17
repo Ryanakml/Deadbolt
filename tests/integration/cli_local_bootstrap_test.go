@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"context"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/cli"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
+	"github.com/Ryanakml/Deadbolt/internal/storage"
 )
 
 // TestLocalBootstrapPublicBoundary proves the complete local/dev-auth bootstrap journey
@@ -103,6 +105,44 @@ func TestLocalBootstrapPublicBoundary(t *testing.T) {
 	// Verify the stored API key has standard Deadbolt prefix db_<env>_
 	if len(storedKey) < 8 || !strings.HasPrefix(storedKey, "db_") {
 		t.Fatalf("stored api key should have standard db_ prefix, got: %s", storedKey)
+	}
+
+	// Verify the bootstrapped key carries exactly the canonical
+	// least-privilege capabilities: no wildcard, no excess grants.
+	expectedCaps := map[string]bool{
+		"org:read": true, "deployments:register": true, "deployments:write": true,
+		"deployments:activate:staging": true, "runs:create": true, "runs:read": true,
+		"payload:read": true, "workers:read": true, "workers:drain": true, "admin:key": true,
+	}
+	err = tc.pool.WithTenantTx(context.Background(), storedOrg, func(ctx context.Context, tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT capabilities FROM api_keys WHERE organization_id = $1`, storedOrg)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		found := false
+		for rows.Next() {
+			var caps []string
+			if err := rows.Scan(&caps); err != nil {
+				return err
+			}
+			found = true
+			if len(caps) != len(expectedCaps) {
+				t.Fatalf("expected %d least-privilege capabilities, got %v", len(expectedCaps), caps)
+			}
+			for _, c := range caps {
+				if c == "*" || !expectedCaps[c] {
+					t.Fatalf("non-least-privilege capability granted: %q (full set %v)", c, caps)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("expected at least one API key row for the bootstrapped org")
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// 5. Step: Use generated credentials for subsequent real public CLI requests
