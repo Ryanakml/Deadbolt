@@ -243,6 +243,16 @@ func (s *ProcessSupervisor) verifyBundle(input *TaskInput) (string, func(), erro
 		cleanup()
 		return "", nil, ErrBundleEntrypoint
 	}
+	platformFile := filepath.Join(dir, BundlePlatformPath)
+	if data, err := os.ReadFile(platformFile); err == nil {
+		var plat BundlePlatform
+		if err := json.Unmarshal(data, &plat); err == nil && plat.TargetArchitecture != "" {
+			if err := VerifyArchitecture(plat.TargetArchitecture, ""); err != nil {
+				cleanup()
+				return "", nil, err
+			}
+		}
+	}
 	return entrypoint, cleanup, nil
 }
 

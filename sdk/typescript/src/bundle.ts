@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { canonicalDigest } from "./canonical.js";
+import { canonicalDigest, canonicalize } from "./canonical.js";
 import { ContractError, fail, type JSONValue } from "./json.js";
 import { type ObjectValue } from "./schema.js";
 import type { TaskDefinition } from "./task.js";
@@ -150,6 +150,14 @@ export function buildDeploymentBundle(
   let bundleDigest = options.bundleDigest;
   if (!bundleDigest) {
     if (options.bundleFiles && Object.keys(options.bundleFiles).length > 0) {
+      // Platform participates in immutable bundle identity: embed canonical
+      // target metadata so same source + different target => different digest.
+      const platformJson = canonicalize({
+        targetArchitecture,
+        targetOS,
+      });
+      files[".deadbolt/platform.json"] = new TextEncoder().encode(platformJson);
+
       // Deterministically sort file keys and hash canonical payload
       const sortedKeys = Object.keys(files).sort();
       const combinedHash = createHash("sha256");

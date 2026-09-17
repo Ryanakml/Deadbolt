@@ -409,6 +409,25 @@ func checkManifestAndBundles(manifestPath, bundleDir string) ([]DoctorCheckResul
 				}
 			}
 
+			// Platform identity check inside bundle archive
+			if plat, err := worker.ReadBundlePlatformFromFile(bundleTarPath); err == nil {
+				if targetArch != "" && plat.TargetArchitecture != "" && plat.TargetArchitecture != targetArch {
+					results = append(results, DoctorCheckResult{
+						Name:        "Bundle Platform Target",
+						Status:      StatusFail,
+						Message:     fmt.Sprintf("Bundle internal target architecture %q does not match manifest targetArchitecture %q.", plat.TargetArchitecture, targetArch),
+						Remediation: "Rerun `runtime build` with matching target architecture.",
+					})
+					passed = false
+				} else {
+					results = append(results, DoctorCheckResult{
+						Name:    "Bundle Platform Target",
+						Status:  StatusOK,
+						Message: fmt.Sprintf("Bundle platform metadata matches manifest (%s/%s).", plat.TargetOS, plat.TargetArchitecture),
+					})
+				}
+			}
+
 			// Architecture compatibility
 			if targetArch != "" {
 				if err := worker.VerifyArchitecture(targetArch, ""); err != nil {

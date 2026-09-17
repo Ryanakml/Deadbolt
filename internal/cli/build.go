@@ -11,11 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
+	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
 
 type BuildOptions struct {
@@ -39,6 +41,13 @@ type BuildResult struct {
 	Workflows            []string `json:"workflows"`
 }
 
+func defaultArchitecture() string {
+	if runtime.GOARCH == "arm64" {
+		return "arm64"
+	}
+	return "amd64"
+}
+
 // HandleBuild compiles local tasks, creates deterministic .tar bundle, and produces validated deployment manifest
 func HandleBuild(args []string) error {
 	fs := flag.NewFlagSet("runtime build", flag.ContinueOnError)
@@ -46,7 +55,7 @@ func HandleBuild(args []string) error {
 	workflowFlag := fs.String("workflow", "", "Path to workflow definition JSON")
 	bundleDirFlag := fs.String("bundle-dir", "", "Directory to store compiled bundle .tar files")
 	outDirFlag := fs.String("out-dir", "", "Directory to write output manifest.json")
-	archFlag := fs.String("arch", "amd64", "Target architecture (amd64 or arm64)")
+	archFlag := fs.String("arch", "", "Target architecture (amd64 or arm64, defaults to host architecture or project config)")
 	osFlag := fs.String("os", "linux", "Target operating system (linux)")
 	jsonFlag := fs.Bool("json", false, "Output build result as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -92,12 +101,6 @@ func BuildDeployment(opts BuildOptions) (*BuildResult, error) {
 	if opts.ProjectDir == "" {
 		opts.ProjectDir = "."
 	}
-	if opts.TargetArch == "" {
-		opts.TargetArch = "amd64"
-	}
-	if opts.TargetOS == "" {
-		opts.TargetOS = "linux"
-	}
 	if opts.BundleDir == "" {
 		opts.BundleDir = filepath.Join(opts.ProjectDir, "bundles")
 	}
@@ -118,10 +121,17 @@ func BuildDeployment(opts BuildOptions) (*BuildResult, error) {
 		if opts.WorkflowPath == "" && prj.Workflow != "" {
 			opts.WorkflowPath = filepath.Join(opts.ProjectDir, "workflow.json")
 		}
-		if prj.TargetArch != "" {
+		if opts.TargetArch == "" && prj.TargetArch != "" {
 			opts.TargetArch = prj.TargetArch
 		}
 		secretNames = append(secretNames, prj.Secrets...)
+	}
+
+	if opts.TargetArch == "" {
+		opts.TargetArch = defaultArchitecture()
+	}
+	if opts.TargetOS == "" {
+		opts.TargetOS = "linux"
 	}
 
 	// 2. Discover task files in tasks/
@@ -170,40 +180,11 @@ func BuildDeployment(opts BuildOptions) (*BuildResult, error) {
 		}
 	}
 
-	// 3. Build deterministic tarball: sorted file keys, fixed modtime
-	var tarBuf bytes.Buffer
-	tw := tar.NewWriter(&tarBuf)
-
-	sortedPaths := make([]string, 0, len(taskFiles))
-	for p := range taskFiles {
-		sortedPaths = append(sortedPaths, p)
+	// 3. Build deterministic tarball with internal platform metadata: sorted file keys, fixed modtime
+	tarBytes, err := buildBundleTar(taskFiles, opts.TargetOS, opts.TargetArch)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(sortedPaths)
-
-	// Fixed epoch timestamp for deterministic reproducible builds
-	deterministicTime := time.Unix(1700000000, 0).UTC()
-
-	for _, relPath := range sortedPaths {
-		content := taskFiles[relPath]
-		hdr := &tar.Header{
-			Name:     relPath,
-			Mode:     0o644,
-			Size:     int64(len(content)),
-			ModTime:  deterministicTime,
-			Typeflag: tar.TypeReg,
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return nil, fmt.Errorf("write tar header: %w", err)
-		}
-		if _, err := tw.Write(content); err != nil {
-			return nil, fmt.Errorf("write tar content: %w", err)
-		}
-	}
-	if err := tw.Close(); err != nil {
-		return nil, fmt.Errorf("close tar archive: %w", err)
-	}
-
-	tarBytes := tarBuf.Bytes()
 	bundleSHA := sha256.Sum256(tarBytes)
 	bundleDigest := hex.EncodeToString(bundleSHA[:])
 
@@ -370,6 +351,59 @@ func BuildDeployment(opts BuildOptions) (*BuildResult, error) {
 		Tasks:                taskNames,
 		Workflows:            wfNames,
 	}, nil
+}
+
+// buildBundleTar assembles the deterministic bundle archive bytes for the given
+// task files and immutable platform target. The canonical platform metadata
+// entry (.deadbolt/platform.json) is part of the hashed bytes, so the same
+// source built for a different target OS or architecture yields different
+// archive bytes and therefore a different bundle digest. Entry ordering,
+// permissions, and timestamps are fixed for reproducible builds.
+func buildBundleTar(taskFiles map[string][]byte, targetOS, targetArch string) ([]byte, error) {
+	platformBytes, err := worker.CanonicalPlatformBytes(targetOS, targetArch)
+	if err != nil {
+		return nil, fmt.Errorf("canonical platform metadata: %w", err)
+	}
+
+	bundleArchiveFiles := make(map[string][]byte, len(taskFiles)+1)
+	for k, v := range taskFiles {
+		bundleArchiveFiles[k] = v
+	}
+	bundleArchiveFiles[worker.BundlePlatformPath] = platformBytes
+
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+
+	sortedPaths := make([]string, 0, len(bundleArchiveFiles))
+	for p := range bundleArchiveFiles {
+		sortedPaths = append(sortedPaths, p)
+	}
+	sort.Strings(sortedPaths)
+
+	// Fixed epoch timestamp for deterministic reproducible builds
+	deterministicTime := time.Unix(1700000000, 0).UTC()
+
+	for _, relPath := range sortedPaths {
+		content := bundleArchiveFiles[relPath]
+		hdr := &tar.Header{
+			Name:     relPath,
+			Mode:     0o644,
+			Size:     int64(len(content)),
+			ModTime:  deterministicTime,
+			Typeflag: tar.TypeReg,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return nil, fmt.Errorf("write tar header: %w", err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			return nil, fmt.Errorf("write tar content: %w", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil, fmt.Errorf("close tar archive: %w", err)
+	}
+
+	return tarBuf.Bytes(), nil
 }
 
 func calculateLockDigest(projectDir string) (string, error) {
