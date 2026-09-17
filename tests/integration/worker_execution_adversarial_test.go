@@ -550,3 +550,281 @@ func TestWorkerOperationIDStableAcrossRetriesAndUniqueAcrossRuns(t *testing.T) {
 		t.Fatalf("operation identity reused across runs: %s", third.OperationID)
 	}
 }
+
+// TestWorkerClaimExpiryAndDurableRecovery proves that when a worker claims an assignment
+// but fails to send Start, the system automatically invalidates stale ownership, reclaims
+// the step, assigns a replacement attempt with a newer epoch, rejects stale worker actions,
+// and completes the run normally.
+func TestWorkerClaimExpiryAndDurableRecovery(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	workerA, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "recovery-worker-a")
+	workerB, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "recovery-worker-b")
+
+	const digest = "bundle-claim-recovery"
+	deploymentID := seedExecutionDeployment(t, tc, orgID, envID, digest)
+	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		for _, s := range []*testWorkerSession{workerA, workerB} {
+			if _, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1::uuid,$2::uuid,$3)`, s.SessionID, orgID, digest); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Worker A polls and claims the assignment (Attempt 1, Epoch 1)
+	assignmentA := claimExecution(t, server, workerA, digest, "poll-recovery-a")
+	if assignmentA.AttemptID == "" || assignmentA.OwnershipEpoch != 1 {
+		t.Fatalf("expected attempt 1 with epoch 1, got attempt=%s epoch=%d", assignmentA.AttemptID, assignmentA.OwnershipEpoch)
+	}
+
+	// Verify Attempt 1 state in DB: CLAIMED, started_at IS NULL, 1 active lease
+	var attempt1Status string
+	var attempt1StartedAt *time.Time
+	var leasesCount int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT a.status, a.started_at,
+			(SELECT count(*) FROM task_leases l WHERE l.attempt_id=a.id)
+			FROM task_attempts a WHERE a.id=$1::uuid`, assignmentA.AttemptID).Scan(&attempt1Status, &attempt1StartedAt, &leasesCount)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attempt1Status != "CLAIMED" || attempt1StartedAt != nil || leasesCount != 1 {
+		t.Fatalf("unexpected attempt 1 initial state: status=%s started_at=%v leases=%d", attempt1Status, attempt1StartedAt, leasesCount)
+	}
+
+	// 2. Worker A intentionally NEVER sends Start. Claim start deadline expires.
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE task_attempts SET claim_start_deadline_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1::uuid`, assignmentA.AttemptID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Worker B polls for work.
+	// In the same poll transaction, the engine reconciles Worker A's expired claim,
+	// marks Attempt 1 as LOST, deletes the lease, resets the step to READY,
+	// and assigns Attempt 2 (with newer Epoch 2) to Worker B.
+	assignmentB := claimExecution(t, server, workerB, digest, "poll-recovery-b")
+	if assignmentB.AttemptID == "" || assignmentB.AttemptID == assignmentA.AttemptID {
+		t.Fatalf("expected new attempt ID for worker B, got %s (same as %s)", assignmentB.AttemptID, assignmentA.AttemptID)
+	}
+	if assignmentB.OwnershipEpoch <= assignmentA.OwnershipEpoch {
+		t.Fatalf("expected newer ownership epoch for worker B, got epoch=%d (worker A epoch=%d)", assignmentB.OwnershipEpoch, assignmentA.OwnershipEpoch)
+	}
+
+	// 4. Verify Attempt 1 was marked LOST with START_DEADLINE_EXCEEDED, lease deleted
+	var attempt1FinalStatus, attempt1ErrorCode string
+	var attempt1Leases int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT a.status, COALESCE(a.error->>'code', ''),
+			(SELECT count(*) FROM task_leases l WHERE l.attempt_id=a.id)
+			FROM task_attempts a WHERE a.id=$1::uuid`, assignmentA.AttemptID).Scan(&attempt1FinalStatus, &attempt1ErrorCode, &attempt1Leases)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attempt1FinalStatus != "LOST" || attempt1ErrorCode != "START_DEADLINE_EXCEEDED" || attempt1Leases != 0 {
+		t.Fatalf("attempt 1 not durably invalidated: status=%s error=%s leases=%d", attempt1FinalStatus, attempt1ErrorCode, attempt1Leases)
+	}
+
+	// Verify events in run_events: TASK_LOST and STEP_READY
+	var taskLostCount, stepReadyCount int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_LOST'),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_READY')`, runID).Scan(&taskLostCount, &stepReadyCount)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if taskLostCount < 1 || stepReadyCount < 1 {
+		t.Fatalf("missing recovery events: taskLost=%d stepReady=%d", taskLostCount, stepReadyCount)
+	}
+
+	// 5. Stale Worker A requests must ALL be rejected:
+	// a) Worker A calls Start(Attempt 1, Epoch 1) -> 409 Conflict
+	startA := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-start-a",
+		WorkerID: workerA.WorkerID, SessionID: workerA.SessionID,
+		AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch,
+	}
+	if status := postWorkerJSON(t, server, "/worker/v1/start", workerA.SessionToken, startA, &worker.ErrorEnvelopeDTO{}); status != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale Start, got status %d", status)
+	}
+
+	// b) Worker A calls Heartbeat(Attempt 1, Epoch 1) -> stop command with LEASE_NOT_FOUND
+	var heartbeatA worker.HeartbeatResponseDTO
+	statusHB := postWorkerJSON(t, server, "/worker/v1/heartbeat", workerA.SessionToken, worker.HeartbeatRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-heartbeat-a",
+		WorkerID: workerA.WorkerID, SessionID: workerA.SessionID,
+		Attempts: []worker.HeartbeatAttemptDTO{{AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch}},
+	}, &heartbeatA)
+	if statusHB != http.StatusOK || len(heartbeatA.Stops) != 1 || heartbeatA.Stops[0].Reason != "LEASE_NOT_FOUND" {
+		t.Fatalf("expected LEASE_NOT_FOUND stop command for stale Heartbeat, got status=%d stops=%+v", statusHB, heartbeatA.Stops)
+	}
+
+	// c) Worker A calls Complete(Attempt 1, Epoch 1) -> 409 Conflict
+	compA := worker.CompleteRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "stale-complete-a",
+		WorkerID: workerA.WorkerID, SessionID: workerA.SessionID,
+		AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch,
+		Outcome: "SUCCEEDED",
+	}
+	compA.ResultDigest, _ = worker.CanonicalCompletionDigest(&compA)
+	if status := postWorkerJSON(t, server, "/worker/v1/complete", workerA.SessionToken, compA, &worker.ErrorEnvelopeDTO{}); status != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale Complete, got status %d", status)
+	}
+
+	// 6. Replacement Worker B proceeds normally:
+	// a) Worker B calls Start(Attempt 2, Epoch 2) -> 200 OK
+	startB := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "start-b",
+		WorkerID: workerB.WorkerID, SessionID: workerB.SessionID,
+		AttemptID: assignmentB.AttemptID, OwnershipEpoch: assignmentB.OwnershipEpoch,
+	}
+	var startBResp worker.StartResponseDTO
+	if status := postWorkerJSON(t, server, "/worker/v1/start", workerB.SessionToken, startB, &startBResp); status != http.StatusOK || !startBResp.Accepted {
+		t.Fatalf("valid Start for worker B rejected: status=%d resp=%+v", status, startBResp)
+	}
+
+	// b) Worker B calls Complete(Attempt 2, Epoch 2) -> 200 OK
+	compB := worker.CompleteRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "complete-b",
+		WorkerID: workerB.WorkerID, SessionID: workerB.SessionID,
+		AttemptID: assignmentB.AttemptID, OwnershipEpoch: assignmentB.OwnershipEpoch,
+		Outcome: "SUCCEEDED",
+	}
+	compB.ResultDigest, _ = worker.CanonicalCompletionDigest(&compB)
+	var compBResp worker.CompleteResponseDTO
+	if status := postWorkerJSON(t, server, "/worker/v1/complete", workerB.SessionToken, compB, &compBResp); status != http.StatusOK || !compBResp.Accepted {
+		t.Fatalf("valid Complete for worker B rejected: status=%d resp=%+v", status, compBResp)
+	}
+
+	// 7. Verify Run completed SUCCEEDED and step completed SUCCEEDED
+	var runFinalStatus, stepFinalState string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT r.status, rs.state FROM runs r
+			JOIN run_steps rs ON rs.run_id=r.id WHERE r.id=$1::uuid AND rs.id=$2::uuid`, runID, stepID).Scan(&runFinalStatus, &stepFinalState)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if runFinalStatus != "SUCCEEDED" || stepFinalState != "SUCCEEDED" {
+		t.Fatalf("run failed to complete normally: run=%s step=%s", runFinalStatus, stepFinalState)
+	}
+}
+
+// TestWorkerRunningLeaseExpiryAndDurableRecovery proves that when a worker starts an attempt
+// but subsequently goes silent and its lease expires without renewal, the reconciler durably
+// recovers the step and allows a replacement worker to finish the run.
+func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	workerA, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "running-recovery-a")
+	workerB, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "running-recovery-b")
+
+	const digest = "bundle-running-lease-recovery"
+	deploymentID := seedExecutionDeployment(t, tc, orgID, envID, digest)
+	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		for _, s := range []*testWorkerSession{workerA, workerB} {
+			if _, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1::uuid,$2::uuid,$3)`, s.SessionID, orgID, digest); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Worker A claims and starts Attempt 1
+	assignmentA := claimExecution(t, server, workerA, digest, "poll-running-a")
+	startA := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "start-running-a",
+		WorkerID: workerA.WorkerID, SessionID: workerA.SessionID,
+		AttemptID: assignmentA.AttemptID, OwnershipEpoch: assignmentA.OwnershipEpoch,
+	}
+	var startAResp worker.StartResponseDTO
+	if status := postWorkerJSON(t, server, "/worker/v1/start", workerA.SessionToken, startA, &startAResp); status != http.StatusOK || !startAResp.Accepted {
+		t.Fatalf("Start for worker A rejected: status=%d resp=%+v", status, startAResp)
+	}
+
+	// 2. Worker A stops heartbeating and lease expires
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE task_leases SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE attempt_id=$1::uuid`, assignmentA.AttemptID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Worker Engine ReconcileExpiredLeases runs (as reconciler would)
+	engine := execution.NewWorkerEngine(tc.pool)
+	reclaimed, err := engine.ReconcileExpiredLeases(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("ReconcileExpiredLeases failed: %v", err)
+	}
+	if reclaimed != 1 {
+		t.Fatalf("expected 1 reclaimed attempt, got %d", reclaimed)
+	}
+
+	// 4. Verify Attempt 1 marked LOST with LEASE_EXPIRED and step requeued to READY
+	var attempt1Status, attempt1Error, stepState string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT a.status, COALESCE(a.error->>'code', ''), rs.state
+			FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id
+			WHERE a.id=$1::uuid`, assignmentA.AttemptID).Scan(&attempt1Status, &attempt1Error, &stepState)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attempt1Status != "LOST" || attempt1Error != "LEASE_EXPIRED" || stepState != "READY" {
+		t.Fatalf("unexpected state after lease expiry: attemptStatus=%s error=%s stepState=%s", attempt1Status, attempt1Error, stepState)
+	}
+
+	// 5. Worker B claims the recovered step
+	assignmentB := claimExecution(t, server, workerB, digest, "poll-running-b")
+	if assignmentB.AttemptID == assignmentA.AttemptID || assignmentB.OwnershipEpoch <= assignmentA.OwnershipEpoch {
+		t.Fatalf("expected replacement attempt with higher epoch, got attempt=%s epoch=%d", assignmentB.AttemptID, assignmentB.OwnershipEpoch)
+	}
+
+	// 6. Worker B starts and completes Attempt 2
+	startB := worker.StartRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "start-running-b",
+		WorkerID: workerB.WorkerID, SessionID: workerB.SessionID,
+		AttemptID: assignmentB.AttemptID, OwnershipEpoch: assignmentB.OwnershipEpoch,
+	}
+	var startBResp worker.StartResponseDTO
+	if status := postWorkerJSON(t, server, "/worker/v1/start", workerB.SessionToken, startB, &startBResp); status != http.StatusOK || !startBResp.Accepted {
+		t.Fatalf("Start for worker B rejected: status=%d resp=%+v", status, startBResp)
+	}
+
+	compB := worker.CompleteRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "complete-running-b",
+		WorkerID: workerB.WorkerID, SessionID: workerB.SessionID,
+		AttemptID: assignmentB.AttemptID, OwnershipEpoch: assignmentB.OwnershipEpoch,
+		Outcome: "SUCCEEDED",
+	}
+	compB.ResultDigest, _ = worker.CanonicalCompletionDigest(&compB)
+	var compBResp worker.CompleteResponseDTO
+	if status := postWorkerJSON(t, server, "/worker/v1/complete", workerB.SessionToken, compB, &compBResp); status != http.StatusOK || !compBResp.Accepted {
+		t.Fatalf("Complete for worker B rejected: status=%d resp=%+v", status, compBResp)
+	}
+
+	// 7. Verify final success
+	var runStatus, finalStepState string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT r.status, rs.state FROM runs r
+			JOIN run_steps rs ON rs.run_id=r.id WHERE r.id=$1::uuid AND rs.id=$2::uuid`, runID, stepID).Scan(&runStatus, &finalStepState)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if runStatus != "SUCCEEDED" || finalStepState != "SUCCEEDED" {
+		t.Fatalf("expected run and step SUCCEEDED, got run=%s step=%s", runStatus, finalStepState)
+	}
+}

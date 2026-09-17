@@ -26,6 +26,11 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 
 // BuildMuxWithMetrics wires all production routes and attaches an optional outbox.Metrics collector.
 func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, outboxMetrics *outbox.Metrics, logger *log.Logger) *http.ServeMux {
+	return BuildMuxWithComponents(cfg, pool, healthChecker, outboxMetrics, logger, nil, nil)
+}
+
+// BuildMuxWithComponents wires all production routes with optional shared execution hub and worker engine.
+func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, outboxMetrics *outbox.Metrics, logger *log.Logger, hub *execution.EventHub, engine *execution.WorkerEngine) *http.ServeMux {
 	mux := http.NewServeMux()
 	if healthChecker != nil {
 		healthChecker.Routes(mux)
@@ -52,8 +57,14 @@ func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gat
 		mux.Handle("POST /api/v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 		mux.Handle("POST /v1/workflows/{name}/activate", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope("", deploymentHandler.Activate))))
 
-		eventHub := execution.NewEventHub()
-		workerEngine := execution.NewWorkerEngine(storagePool, eventHub)
+		eventHub := hub
+		if eventHub == nil {
+			eventHub = execution.NewEventHub()
+		}
+		workerEngine := engine
+		if workerEngine == nil {
+			workerEngine = execution.NewWorkerEngine(storagePool, eventHub)
+		}
 		workerSvc := worker.NewService(storagePool, deploymentSvc, workerEngine)
 		outboxMetrics.SetTaskLogDroppedCounter(workerSvc.DroppedLogsCount)
 		workerHandler := worker.NewHTTPHandler(workerSvc, tenantService)
