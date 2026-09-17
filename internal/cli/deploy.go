@@ -48,7 +48,6 @@ func HandleDeploy(args []string) error {
 		candidates := []string{
 			"dist/manifest.json",
 			"bundles/manifest.json",
-			"workflow.json",
 		}
 		for _, c := range candidates {
 			if fileExists(c) {

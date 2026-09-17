@@ -313,3 +313,148 @@ func TestDoctorNodeToolchainDiagnostic(t *testing.T) {
 		t.Errorf("expected actionable remediation when Node check fails or warns")
 	}
 }
+
+func TestDoctorFreshInitWithoutBuild(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Fresh init generates workflow.json but no dist/manifest.json
+	err := InitProject(tmpDir, "fresh-service", false)
+	if err != nil {
+		t.Fatalf("InitProject failed: %v", err)
+	}
+
+	workflowPath := filepath.Join(tmpDir, "workflow.json")
+	if !fileExists(workflowPath) {
+		t.Fatalf("expected workflow.json to exist after init")
+	}
+	distManifestPath := filepath.Join(tmpDir, "dist", "manifest.json")
+	if fileExists(distManifestPath) {
+		t.Fatalf("expected dist/manifest.json to NOT exist before build")
+	}
+
+	origWd, _ := os.Getwd()
+	defer os.Chdir(origWd)
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+
+	// 2. Check manifest and bundles without explicit path (auto-discovery)
+	checks, passed := checkManifestAndBundles("", "")
+	if !passed {
+		t.Errorf("expected checkManifestAndBundles to pass (non-fatal WARN) before build, got passed=false")
+	}
+
+	foundManifestWarn := false
+	for _, c := range checks {
+		if c.Name == "Manifest Schema Conformance" {
+			t.Errorf("unexpected 'Manifest Schema Conformance' check found: status=%s message=%s (workflow.json was erroneously treated as deployment manifest)", c.Status, c.Message)
+		}
+		if c.Name == "Deployment Manifest" {
+			if c.Status != StatusWarn {
+				t.Errorf("expected Deployment Manifest status WARN, got %s", c.Status)
+			}
+			if !strings.Contains(c.Remediation, "runtime build") {
+				t.Errorf("expected remediation to mention 'runtime build', got %q", c.Remediation)
+			}
+			foundManifestWarn = true
+		}
+	}
+	if !foundManifestWarn {
+		t.Errorf("expected 'Deployment Manifest' check with status WARN in doctor results")
+	}
+
+	// 3. Verify RunDoctorChecks does not report Manifest Schema Conformance failure
+	cfg := Config{
+		APIURL: "http://127.0.0.1:8080",
+		Env:    "development",
+	}
+	report := RunDoctorChecks(cfg, "", "")
+	for _, c := range report.Checks {
+		if c.Name == "Manifest Schema Conformance" && c.Status == StatusFail {
+			t.Errorf("RunDoctorChecks reported critical schema conformance failure on fresh init: %s", c.Message)
+		}
+	}
+}
+
+func TestDoctorExplicitInvalidManifestFails(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create an invalid manifest file
+	invalidManifestPath := filepath.Join(tmpDir, "invalid-manifest.json")
+	invalidContent := `{"manifestVersion": 999, "notAValidField": true}`
+	if err := os.WriteFile(invalidManifestPath, []byte(invalidContent), 0644); err != nil {
+		t.Fatalf("failed to write invalid manifest: %v", err)
+	}
+
+	// Explicit path should fail validation
+	checks, passed := checkManifestAndBundles(invalidManifestPath, "")
+	if passed {
+		t.Errorf("expected checkManifestAndBundles to fail with invalid manifest path, got passed=true")
+	}
+
+	foundSchemaFailure := false
+	for _, c := range checks {
+		if c.Name == "Manifest Schema Conformance" && c.Status == StatusFail {
+			foundSchemaFailure = true
+			if !strings.Contains(c.Message, "deployment schema validation") {
+				t.Errorf("expected failure message to mention schema validation, got %s", c.Message)
+			}
+		}
+	}
+	if !foundSchemaFailure {
+		t.Errorf("expected 'Manifest Schema Conformance' check with StatusFail for invalid manifest")
+	}
+
+	// Auto-discovery of invalid manifest in dist/manifest.json should also fail
+	distDir := filepath.Join(tmpDir, "dist")
+	if err := os.MkdirAll(distDir, 0755); err != nil {
+		t.Fatalf("failed to create dist dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(distDir, "manifest.json"), []byte(invalidContent), 0644); err != nil {
+		t.Fatalf("failed to write dist/manifest.json: %v", err)
+	}
+
+	origWd, _ := os.Getwd()
+	defer os.Chdir(origWd)
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+
+	checksAuto, passedAuto := checkManifestAndBundles("", "")
+	if passedAuto {
+		t.Errorf("expected checkManifestAndBundles to fail for invalid dist/manifest.json, got passed=true")
+	}
+	foundAutoFail := false
+	for _, c := range checksAuto {
+		if c.Name == "Manifest Schema Conformance" && c.Status == StatusFail {
+			foundAutoFail = true
+		}
+	}
+	if !foundAutoFail {
+		t.Errorf("expected schema failure when dist/manifest.json is invalid")
+	}
+}
+
+func TestDeployRejectsFreshInitWithoutBuild(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	err := InitProject(tmpDir, "fresh-deploy", false)
+	if err != nil {
+		t.Fatalf("InitProject failed: %v", err)
+	}
+
+	origWd, _ := os.Getwd()
+	defer os.Chdir(origWd)
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+
+	// HandleDeploy without --manifest in a fresh project should fail with actionable message to run runtime build
+	err = HandleDeploy([]string{"--env", "development"})
+	if err == nil {
+		t.Fatalf("expected HandleDeploy to fail when dist/manifest.json does not exist")
+	}
+	if !strings.Contains(err.Error(), "Run `runtime build` first") {
+		t.Errorf("expected error to instruct running runtime build, got %v", err)
+	}
+}

@@ -280,7 +280,6 @@ func checkManifestAndBundles(manifestPath, bundleDir string) ([]DoctorCheckResul
 	if manifestPath == "" {
 		candidates := []string{
 			"dist/manifest.json",
-			"workflow.json",
 			"bundles/manifest.json",
 		}
 		for _, c := range candidates {
@@ -296,7 +295,7 @@ func checkManifestAndBundles(manifestPath, bundleDir string) ([]DoctorCheckResul
 			Name:        "Deployment Manifest",
 			Status:      StatusWarn,
 			Message:     "No deployment manifest found in workspace.",
-			Remediation: "Run `runtime init` to scaffold a project, or `runtime build` to produce a deployment manifest.",
+			Remediation: "Run `runtime build` to produce a deployment manifest.",
 		})
 		return results, true
 	}
