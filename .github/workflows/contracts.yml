@@ -168,5 +168,7 @@ jobs:
           cc -shared -fPIC -DNODE_GYP_MODULE_NAME=native_addon -I "$NODE_ROOT/include/node" tests/spikes/sp03/native-addon/native-addon.c -o tests/spikes/sp03/native-addon/native-addon.node
           test "$(node -p 'process.arch')" = "${{ matrix.arch == 'amd64' && 'x64' || 'arm64' }}"
           node tests/spikes/sp03/native-addon/native-addon.test.cjs
-          tar -C tests/spikes/sp03/native-addon -cf tests/spikes/sp03/native-addon/native-bundle.tar native-task.mjs native-addon.node
+          mkdir -p tests/spikes/sp03/native-addon/.deadbolt
+          printf '{"targetArchitecture":"%s","targetOS":"linux"}' "${{ matrix.arch }}" > tests/spikes/sp03/native-addon/.deadbolt/platform.json
+          tar -C tests/spikes/sp03/native-addon -cf tests/spikes/sp03/native-addon/native-bundle.tar native-task.mjs native-addon.node .deadbolt/platform.json
           SP03_NATIVE_BUNDLE="$GITHUB_WORKSPACE/tests/spikes/sp03/native-addon/native-bundle.tar" go test ./tests/spikes/sp03 -run TestSP03_VerifiedNativeBundle -count=1
