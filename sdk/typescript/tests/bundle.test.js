@@ -241,7 +241,10 @@ test("buildDeploymentBundle architecture changes produce distinct bundle digests
   });
 
   assert.notEqual(amd64Bundle.bundleDigest, arm64Bundle.bundleDigest);
-  assert.equal(amd64Bundle.dependencyLockDigest, arm64Bundle.dependencyLockDigest);
+  assert.equal(
+    amd64Bundle.dependencyLockDigest,
+    arm64Bundle.dependencyLockDigest,
+  );
 });
 
 test("buildDeploymentBundle embeds canonical platform identity matching the manifest target", () => {
@@ -270,4 +273,3 @@ test("buildDeploymentBundle embeds canonical platform identity matching the mani
   assert.equal(bundle.manifest.targetArchitecture, "arm64");
   assert.equal(bundle.manifest.targetOS, "linux");
 });
-
