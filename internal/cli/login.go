@@ -386,6 +386,23 @@ func runLocalDevLogin(cfg Config, email string, customOrg string, customEnv stri
 	return nil
 }
 
+// hostedLoopbackCallbackPort is the fixed loopback port registered as the
+// Allowed Callback URL (http://127.0.0.1:8765/callback) on the Auth0 Native
+// Application for hosted Deadbolt CLI login. A random port would not match
+// the registered callback and the identity provider would refuse the flow.
+const hostedLoopbackCallbackPort = 8765
+
+// hostedCallbackListener binds the fixed loopback callback for hosted browser
+// login and returns the exact redirect URI registered with the provider.
+func hostedCallbackListener() (net.Listener, string, error) {
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", hostedLoopbackCallbackPort))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to start local callback server on 127.0.0.1:%d (is another login already in progress?): %w", hostedLoopbackCallbackPort, err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	return listener, fmt.Sprintf("http://127.0.0.1:%d/callback", port), nil
+}
+
 // runHostedBrowserLogin executes PKCE authorization code flow with loopback redirect
 func runHostedBrowserLogin(cfg Config, customOrg string, customEnv string) error {
 	pkce, err := auth.GeneratePKCE()
@@ -393,15 +410,12 @@ func runHostedBrowserLogin(cfg Config, customOrg string, customEnv string) error
 		return fmt.Errorf("failed to initialize PKCE security parameters: %w", err)
 	}
 
-	// Bind loopback listener on random available port
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	// Bind the fixed loopback callback registered with the identity provider.
+	listener, redirectURI, err := hostedCallbackListener()
 	if err != nil {
-		return fmt.Errorf("failed to start local callback server: %w", err)
+		return err
 	}
 	defer listener.Close()
-
-	port := listener.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 
 	metadataResp, err := http.Get(cfg.APIURL + "/api/auth/cli/config")
 	if err != nil {
