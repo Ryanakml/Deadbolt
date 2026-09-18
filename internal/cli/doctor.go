@@ -341,6 +341,7 @@ func checkManifestAndBundles(manifestPath, bundleDir string) ([]DoctorCheckResul
 	// Extract bundleDigest and secretNames
 	var bundleDigest string
 	var targetArch string
+	var targetOS string
 	var secretNames []string
 	if m, ok := parsed.(map[string]any); ok {
 		if s, ok := m["bundleDigest"].(string); ok {
@@ -348,6 +349,9 @@ func checkManifestAndBundles(manifestPath, bundleDir string) ([]DoctorCheckResul
 		}
 		if s, ok := m["targetArchitecture"].(string); ok {
 			targetArch = s
+		}
+		if s, ok := m["targetOS"].(string); ok {
+			targetOS = s
 		}
 		if arr, ok := m["secretNames"].([]any); ok {
 			for _, item := range arr {
@@ -430,7 +434,16 @@ func checkManifestAndBundles(manifestPath, bundleDir string) ([]DoctorCheckResul
 
 			// Architecture compatibility
 			if targetArch != "" {
-				if err := worker.VerifyArchitecture(targetArch, ""); err != nil {
+				// Manifests store OS and architecture separately, while the worker
+				// verifier compares a canonical OS/arch pair.
+				checkArch := targetArch
+				if !strings.Contains(checkArch, "/") {
+					if targetOS == "" {
+						targetOS = "linux"
+					}
+					checkArch = strings.ToLower(strings.TrimSpace(targetOS)) + "/" + strings.ToLower(strings.TrimSpace(checkArch))
+				}
+				if err := worker.VerifyArchitecture(checkArch, ""); err != nil {
 					results = append(results, DoctorCheckResult{
 						Name:        "Architecture Compatibility",
 						Status:      StatusWarn,

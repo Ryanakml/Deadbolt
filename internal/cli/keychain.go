@@ -289,7 +289,11 @@ func storeFileCredential(service, account, secret string) error {
 		return fmt.Errorf("marshal credentials: %w", err)
 	}
 
-	return os.WriteFile(filePath, data, 0o600)
+	if err := os.WriteFile(filePath, data, 0o600); err != nil {
+		return err
+	}
+	// os.WriteFile does not tighten permissions when the file already exists.
+	return os.Chmod(filePath, 0o600)
 }
 
 func getFileCredential(service, account string) (string, error) {

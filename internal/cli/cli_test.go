@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -140,7 +141,7 @@ func TestKeychainStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("credentials.json not found: %v", err)
 	}
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Errorf("expected credentials.json permissions 0600, got %#o", info.Mode().Perm())
 	}
 

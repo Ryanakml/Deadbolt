@@ -32,7 +32,11 @@ func GetRoleDatabaseURL(role, dbName string) string {
 		return fmt.Sprintf("postgres://localhost:5432/%s?sslmode=disable", dbName)
 	}
 	if role != "" {
-		u.User = url.User(role)
+		if password, ok := u.User.Password(); ok {
+			u.User = url.UserPassword(role, password)
+		} else {
+			u.User = url.User(role)
+		}
 	}
 	u.Path = "/" + dbName
 	return u.String()

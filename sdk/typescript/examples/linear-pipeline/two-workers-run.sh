@@ -10,7 +10,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 # Resolve runtime CLI executable
 if command -v runtime &> /dev/null; then
@@ -22,7 +22,7 @@ else
 fi
 
 echo "======================================================================"
-echo " Deadbolt Two-Worker Linear Pipeline Demonstration ($A -> B -> C)"
+echo " Deadbolt Two-Worker Linear Pipeline Demonstration (A -> B -> C)"
 echo "======================================================================"
 echo "Runtime command: $RUNTIME"
 
@@ -155,7 +155,7 @@ $RUNTIME runs list --env "$DEADBOLT_ENV"
 
 # Step 11: Poll run snapshot until terminal outcome
 echo ""
-echo "==> Step 11: Monitoring run execution across workers ($A -> B -> C)..."
+echo "==> Step 11: Monitoring run execution across workers (A -> B -> C)..."
 MAX_ATTEMPTS=30
 ATTEMPT=0
 FINAL_STATUS="UNKNOWN"
