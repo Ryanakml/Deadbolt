@@ -8,14 +8,14 @@ The gate must use the public CLI/API to create one run, execute a real Node.js c
 
 ## Automated evidence
 
-| Evidence | Status | Source |
-| --- | --- | --- |
-| SDK bundle and workflow contracts | PASS | `pnpm --filter @runtime/sdk run test` — 208 tests passed. |
-| Node runner execution | PASS | `pnpm --filter @runtime/runner run test` — 8 tests passed. |
-| CLI package tests | PASS | `go test ./internal/cli` in the Linux acceptance image. |
-| CLI E2E assertions | IMPLEMENTED | `tests/integration/cli_e2e_test.go` checks deployment pinning, three successful steps, committed attempts, final output, and committed logs. |
-| Local PostgreSQL-backed CLI E2E | PASS | `TestCLIEndToEndDeveloperJourney` completed init/build/deploy, two workers, activation, `A → B → C`, inspect, and logs. |
-| Hosted staging execution | NOT YET VERIFIED | Must run this PR through the build-once staging workflow and record `/version`, image digest, run ID, event sequence, and redacted logs. |
+| Evidence                          | Status           | Source                                                                                                                                       |
+| --------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| SDK bundle and workflow contracts | PASS             | `pnpm --filter @runtime/sdk run test` — 208 tests passed.                                                                                    |
+| Node runner execution             | PASS             | `pnpm --filter @runtime/runner run test` — 8 tests passed.                                                                                   |
+| CLI package tests                 | PASS             | `go test ./internal/cli` in the Linux acceptance image.                                                                                      |
+| CLI E2E assertions                | IMPLEMENTED      | `tests/integration/cli_e2e_test.go` checks deployment pinning, three successful steps, committed attempts, final output, and committed logs. |
+| Local PostgreSQL-backed CLI E2E   | PASS             | `TestCLIEndToEndDeveloperJourney` completed init/build/deploy, two workers, activation, `A → B → C`, inspect, and logs.                      |
+| Hosted staging execution          | NOT YET VERIFIED | Must run this PR through the build-once staging workflow and record `/version`, image digest, run ID, event sequence, and redacted logs.     |
 
 ## Reproducible local acceptance
 
