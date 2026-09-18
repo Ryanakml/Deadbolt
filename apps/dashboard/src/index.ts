@@ -5,6 +5,15 @@ export * from "./api.js";
 
 import { DashboardApiClient, isUnauthorized } from "./api.js";
 import type { AuthMembership, AuthSession } from "./api.js";
+import {
+  createEnvironmentSelection,
+  formatEnvironmentLabel,
+  getSelectedEnvironmentId,
+  selectEnvironment,
+  setSelectionCatalog,
+  setSelectionOrganization,
+} from "./api.js";
+import type { CatalogEnvironment } from "./api.js";
 import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
 import {
@@ -23,7 +32,9 @@ if (typeof document !== "undefined") {
 
 function initDashboard(): void {
   const api = new DashboardApiClient();
-  let currentEnv = "staging";
+  // Canonical environment selection for the active organization. The
+  // selector value is always the environment UUID, never a bare name.
+  const envSelection = createEnvironmentSelection();
   let activeInspector: RunInspector | null = null;
 
   const envSelect = document.getElementById(
@@ -40,10 +51,9 @@ function initDashboard(): void {
   ) as HTMLButtonElement | null;
 
   if (envSelect) {
-    currentEnv = envSelect.value || "staging";
     envSelect.addEventListener("change", () => {
-      currentEnv = envSelect.value;
-      loadRunsList(api, currentEnv);
+      selectEnvironment(envSelection, envSelect.value || null);
+      loadRunsList(api, getSelectedEnvironmentId(envSelection));
     });
   }
 
@@ -58,14 +68,14 @@ function initDashboard(): void {
   if (runsNavBtn) {
     runsNavBtn.addEventListener("click", () => {
       showView("runs-view");
-      loadRunsList(api, currentEnv);
+      loadRunsList(api, getSelectedEnvironmentId(envSelection));
     });
   }
 
   if (workersNavBtn) {
     workersNavBtn.addEventListener("click", () => {
       showView("workers-view");
-      loadWorkersList(api, currentEnv);
+      loadWorkersList(api, getSelectedEnvironmentId(envSelection));
     });
   }
 
@@ -91,26 +101,30 @@ function initDashboard(): void {
 
   async function enterWithSession(session: AuthSession | null): Promise<void> {
     if (!session) {
+      clearEnvironmentState();
       showAuthRequired("Sign in to view workflow runs.");
       return;
     }
     const state = resolveOrgState(session);
     if (state.kind === "ready") {
-      enterApp(session);
+      await enterApp(session);
       return;
     }
     if (state.kind === "empty") {
+      clearEnvironmentState();
       showAuthRequired(
         "This identity has no organization yet. Create one with `runtime bootstrap`, then reload.",
       );
       return;
     }
     if (state.kind === "select") {
+      clearEnvironmentState();
       showOrgSelect(state.orgs);
       return;
     }
     // Exactly one membership: establish it deterministically, then enter.
     try {
+      clearEnvironmentState();
       await api.switchOrganization(state.orgId);
       await enterWithSession(await api.getSession());
     } catch (err: unknown) {
@@ -118,18 +132,115 @@ function initDashboard(): void {
     }
   }
 
-  function enterApp(session: AuthSession): void {
+  async function enterApp(session: AuthSession): Promise<void> {
     hideAuthView();
     const label = document.getElementById("session-label");
     if (label) {
       label.textContent = session.user?.email ?? "";
       label.classList.remove("hidden");
     }
+    // Bind the catalog to the newly established organization. Any selection
+    // from a previous org is cleared first so it can never be reused.
+    const orgId = session.active_organization_id ?? null;
+    await loadEnvironmentCatalog(orgId);
     if (runIdParam) {
       inspectRun(runIdParam);
     } else {
       showView("runs-view");
-      loadRunsList(api, currentEnv);
+      loadRunsList(api, getSelectedEnvironmentId(envSelection));
+    }
+  }
+
+  function clearEnvironmentState(): void {
+    setSelectionOrganization(envSelection, null);
+    const sel = document.getElementById(
+      "env-select",
+    ) as HTMLSelectElement | null;
+    if (sel) {
+      sel.innerHTML = "";
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "Loading environments…";
+      sel.appendChild(opt);
+      sel.disabled = true;
+    }
+  }
+
+  function populateEnvironmentSelector(catalog: CatalogEnvironment[]): void {
+    const sel = document.getElementById(
+      "env-select",
+    ) as HTMLSelectElement | null;
+    if (!sel) return;
+    sel.innerHTML = "";
+    if (catalog.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No environments yet";
+      sel.appendChild(opt);
+      sel.disabled = true;
+      return;
+    }
+    for (const env of catalog) {
+      const opt = document.createElement("option");
+      // Canonical environment UUID is the only value runs/workers use.
+      opt.value = env.environmentId;
+      opt.textContent = formatEnvironmentLabel(env);
+      sel.appendChild(opt);
+    }
+    sel.disabled = false;
+    const selected = getSelectedEnvironmentId(envSelection);
+    if (selected) sel.value = selected;
+  }
+
+  function renderEnvironmentEmptyState(): void {
+    const runsBody = document.getElementById("runs-table-body");
+    if (runsBody) {
+      runsBody.innerHTML =
+        '<tr><td colspan="5" class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</td></tr>';
+    }
+    const workersBody = document.getElementById("workers-table-body");
+    if (workersBody) {
+      workersBody.innerHTML =
+        '<tr><td colspan="4" class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</td></tr>';
+    }
+  }
+
+  async function loadEnvironmentCatalog(orgId: string | null): Promise<void> {
+    // Switching organizations clears stale catalog/selection first.
+    setSelectionOrganization(envSelection, orgId);
+    const loading = document.getElementById(
+      "env-select",
+    ) as HTMLSelectElement | null;
+    if (loading) {
+      loading.innerHTML = "";
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "Loading environments…";
+      loading.appendChild(opt);
+      loading.disabled = true;
+    }
+    let catalog: CatalogEnvironment[];
+    try {
+      catalog = await api.loadEnvironmentCatalog();
+    } catch (err: unknown) {
+      const sel = document.getElementById(
+        "env-select",
+      ) as HTMLSelectElement | null;
+      if (sel) {
+        sel.innerHTML = "";
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "Failed to load environments";
+        sel.appendChild(opt);
+        sel.disabled = true;
+      }
+      renderError(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    setSelectionCatalog(envSelection, catalog);
+    populateEnvironmentSelector(catalog);
+    if (catalog.length === 0) {
+      renderEnvironmentEmptyState();
     }
   }
 
@@ -173,6 +284,10 @@ function initDashboard(): void {
       cont.onclick = () => {
         if (!select.value) return;
         cont.textContent = "Switching...";
+        // Drop previous-org environment state before establishing the new
+        // org so its IDs can never be reused.
+        clearEnvironmentState();
+        teardownAppViews();
         api
           .switchOrganization(select.value)
           .then(() => api.getSession())
@@ -196,6 +311,7 @@ function initDashboard(): void {
       activeInspector.destroy();
       activeInspector = null;
     }
+    clearEnvironmentState();
     for (const id of ["runs-table-body", "workers-table-body"]) {
       const el = document.getElementById(id);
       if (el) el.innerHTML = "";
@@ -229,15 +345,21 @@ function initDashboard(): void {
 
   async function loadRunsList(
     client: DashboardApiClient,
-    env: string,
+    envId: string | null,
   ): Promise<void> {
     const listContainer = document.getElementById("runs-table-body");
     if (!listContainer) return;
+    // Zero-environment (or not-yet-loaded) state is honest and issues no
+    // protected request with an ambiguous/empty environment value.
+    if (!envId) {
+      renderEnvironmentEmptyState();
+      return;
+    }
     listContainer.innerHTML =
       '<tr><td colspan="5" class="loading">Loading workflow runs...</td></tr>';
 
     try {
-      const resp = await client.listRuns(env);
+      const resp = await client.listRuns(envId);
       if (resp.items.length === 0) {
         listContainer.innerHTML =
           '<tr><td colspan="5" class="empty-state">No workflow runs found in this environment.</td></tr>';
@@ -276,15 +398,19 @@ function initDashboard(): void {
 
   async function loadWorkersList(
     client: DashboardApiClient,
-    env: string,
+    envId: string | null,
   ): Promise<void> {
     const listContainer = document.getElementById("workers-table-body");
     if (!listContainer) return;
+    if (!envId) {
+      renderEnvironmentEmptyState();
+      return;
+    }
     listContainer.innerHTML =
       '<tr><td colspan="4" class="loading">Loading workers...</td></tr>';
 
     try {
-      const resp = await client.listWorkers(env);
+      const resp = await client.listWorkers(envId);
       if (resp.items.length === 0) {
         listContainer.innerHTML =
           '<tr><td colspan="4" class="empty-state">No workers registered for this environment.</td></tr>';

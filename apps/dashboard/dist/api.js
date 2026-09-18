@@ -1,3 +1,40 @@
+export function formatEnvironmentLabel(env) {
+    return `${env.projectName} / ${env.environmentName}`;
+}
+export function createEnvironmentSelection() {
+    return { orgId: null, catalog: [], selectedEnvironmentId: null };
+}
+export function setSelectionOrganization(sel, orgId) {
+    if (sel.orgId !== orgId) {
+        sel.orgId = orgId;
+        sel.catalog = [];
+        sel.selectedEnvironmentId = null;
+    }
+}
+export function setSelectionCatalog(sel, catalog) {
+    sel.catalog = [...catalog];
+    if (sel.selectedEnvironmentId &&
+        catalog.some((e) => e.environmentId === sel.selectedEnvironmentId)) {
+        return sel.selectedEnvironmentId;
+    }
+    sel.selectedEnvironmentId =
+        catalog.length > 0 ? catalog[0].environmentId : null;
+    return sel.selectedEnvironmentId;
+}
+export function selectEnvironment(sel, envId) {
+    if (!envId) {
+        sel.selectedEnvironmentId = null;
+        return null;
+    }
+    if (sel.catalog.some((e) => e.environmentId === envId)) {
+        sel.selectedEnvironmentId = envId;
+        return envId;
+    }
+    return sel.selectedEnvironmentId;
+}
+export function getSelectedEnvironmentId(sel) {
+    return sel.selectedEnvironmentId;
+}
 // apiFetch keeps every dashboard request on same-origin cookies explicitly.
 // The dashboard never handles bearer tokens; authentication is the HttpOnly
 // BFF session cookie.
@@ -55,6 +92,8 @@ export class DashboardApiClient {
         return res.json();
     }
     async listRuns(environment, cursor, limit = 25) {
+        // environment MUST be the canonical environment UUID. Bare names that
+        // exist in several projects are ambiguous and rejected server-side.
         const params = new URLSearchParams({ environment });
         if (cursor)
             params.set("cursor", cursor);
@@ -74,6 +113,7 @@ export class DashboardApiClient {
         return res.json();
     }
     async listWorkers(environment, cursor, limit = 25) {
+        // environment MUST be the canonical environment UUID (see listRuns).
         const params = new URLSearchParams({ environment });
         if (cursor)
             params.set("cursor", cursor);
@@ -116,6 +156,49 @@ export class DashboardApiClient {
             throw new Error(`Failed to get run logs (HTTP ${res.status}): ${res.statusText}`);
         }
         return res.json();
+    }
+    // listProjects discovers the active organization's projects through the
+    // existing public tenant API using the BFF session cookie.
+    async listProjects() {
+        const res = await apiFetch(`${this.baseUrl}/v1/projects`);
+        if (!res.ok) {
+            throw new Error(`Failed to list projects (HTTP ${res.status}): ${res.statusText}`);
+        }
+        const data = (await res.json());
+        return data.projects ?? [];
+    }
+    // listProjectEnvironments lists one project's environments through the
+    // existing public tenant API using the BFF session cookie.
+    async listProjectEnvironments(projectId) {
+        const res = await apiFetch(`${this.baseUrl}/v1/projects/${encodeURIComponent(projectId)}/environments`);
+        if (!res.ok) {
+            throw new Error(`Failed to list environments (HTTP ${res.status}): ${res.statusText}`);
+        }
+        const data = (await res.json());
+        return data.environments ?? [];
+    }
+    // loadEnvironmentCatalog discovers every environment in the active
+    // organization with project context. Callers MUST use environmentId as
+    // the selector value and for runs/workers requests.
+    async loadEnvironmentCatalog() {
+        const projects = await this.listProjects();
+        const catalog = [];
+        for (const p of projects) {
+            if (!p || !p.id)
+                continue;
+            const envs = await this.listProjectEnvironments(p.id);
+            for (const e of envs) {
+                if (!e || !e.id)
+                    continue;
+                catalog.push({
+                    projectId: p.id,
+                    projectName: p.name ?? p.id,
+                    environmentId: e.id,
+                    environmentName: e.name ?? e.id,
+                });
+            }
+        }
+        return catalog;
     }
 }
 //# sourceMappingURL=api.js.map

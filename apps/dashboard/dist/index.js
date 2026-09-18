@@ -3,6 +3,7 @@ export * from "./stream.js";
 export * from "./inspector.js";
 export * from "./api.js";
 import { DashboardApiClient, isUnauthorized } from "./api.js";
+import { createEnvironmentSelection, formatEnvironmentLabel, getSelectedEnvironmentId, selectEnvironment, setSelectionCatalog, setSelectionOrganization, } from "./api.js";
 import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
 // DOM Bootstrap for browser runtime
@@ -13,17 +14,18 @@ if (typeof document !== "undefined") {
 }
 function initDashboard() {
     const api = new DashboardApiClient();
-    let currentEnv = "staging";
+    // Canonical environment selection for the active organization. The
+    // selector value is always the environment UUID, never a bare name.
+    const envSelection = createEnvironmentSelection();
     let activeInspector = null;
     const envSelect = document.getElementById("env-select");
     const themeToggle = document.getElementById("theme-toggle");
     const runsNavBtn = document.getElementById("nav-runs");
     const workersNavBtn = document.getElementById("nav-workers");
     if (envSelect) {
-        currentEnv = envSelect.value || "staging";
         envSelect.addEventListener("change", () => {
-            currentEnv = envSelect.value;
-            loadRunsList(api, currentEnv);
+            selectEnvironment(envSelection, envSelect.value || null);
+            loadRunsList(api, getSelectedEnvironmentId(envSelection));
         });
     }
     if (themeToggle) {
@@ -36,13 +38,13 @@ function initDashboard() {
     if (runsNavBtn) {
         runsNavBtn.addEventListener("click", () => {
             showView("runs-view");
-            loadRunsList(api, currentEnv);
+            loadRunsList(api, getSelectedEnvironmentId(envSelection));
         });
     }
     if (workersNavBtn) {
         workersNavBtn.addEventListener("click", () => {
             showView("workers-view");
-            loadWorkersList(api, currentEnv);
+            loadWorkersList(api, getSelectedEnvironmentId(envSelection));
         });
     }
     // Check URL params for deep linking to /runs/:id
@@ -65,24 +67,28 @@ function initDashboard() {
     }
     async function enterWithSession(session) {
         if (!session) {
+            clearEnvironmentState();
             showAuthRequired("Sign in to view workflow runs.");
             return;
         }
         const state = resolveOrgState(session);
         if (state.kind === "ready") {
-            enterApp(session);
+            await enterApp(session);
             return;
         }
         if (state.kind === "empty") {
+            clearEnvironmentState();
             showAuthRequired("This identity has no organization yet. Create one with `runtime bootstrap`, then reload.");
             return;
         }
         if (state.kind === "select") {
+            clearEnvironmentState();
             showOrgSelect(state.orgs);
             return;
         }
         // Exactly one membership: establish it deterministically, then enter.
         try {
+            clearEnvironmentState();
             await api.switchOrganization(state.orgId);
             await enterWithSession(await api.getSession());
         }
@@ -90,19 +96,107 @@ function initDashboard() {
             renderError(err instanceof Error ? err : new Error(String(err)));
         }
     }
-    function enterApp(session) {
+    async function enterApp(session) {
         hideAuthView();
         const label = document.getElementById("session-label");
         if (label) {
             label.textContent = session.user?.email ?? "";
             label.classList.remove("hidden");
         }
+        // Bind the catalog to the newly established organization. Any selection
+        // from a previous org is cleared first so it can never be reused.
+        const orgId = session.active_organization_id ?? null;
+        await loadEnvironmentCatalog(orgId);
         if (runIdParam) {
             inspectRun(runIdParam);
         }
         else {
             showView("runs-view");
-            loadRunsList(api, currentEnv);
+            loadRunsList(api, getSelectedEnvironmentId(envSelection));
+        }
+    }
+    function clearEnvironmentState() {
+        setSelectionOrganization(envSelection, null);
+        const sel = document.getElementById("env-select");
+        if (sel) {
+            sel.innerHTML = "";
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "Loading environments…";
+            sel.appendChild(opt);
+            sel.disabled = true;
+        }
+    }
+    function populateEnvironmentSelector(catalog) {
+        const sel = document.getElementById("env-select");
+        if (!sel)
+            return;
+        sel.innerHTML = "";
+        if (catalog.length === 0) {
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "No environments yet";
+            sel.appendChild(opt);
+            sel.disabled = true;
+            return;
+        }
+        for (const env of catalog) {
+            const opt = document.createElement("option");
+            // Canonical environment UUID is the only value runs/workers use.
+            opt.value = env.environmentId;
+            opt.textContent = formatEnvironmentLabel(env);
+            sel.appendChild(opt);
+        }
+        sel.disabled = false;
+        const selected = getSelectedEnvironmentId(envSelection);
+        if (selected)
+            sel.value = selected;
+    }
+    function renderEnvironmentEmptyState() {
+        const runsBody = document.getElementById("runs-table-body");
+        if (runsBody) {
+            runsBody.innerHTML =
+                '<tr><td colspan="5" class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</td></tr>';
+        }
+        const workersBody = document.getElementById("workers-table-body");
+        if (workersBody) {
+            workersBody.innerHTML =
+                '<tr><td colspan="4" class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</td></tr>';
+        }
+    }
+    async function loadEnvironmentCatalog(orgId) {
+        // Switching organizations clears stale catalog/selection first.
+        setSelectionOrganization(envSelection, orgId);
+        const loading = document.getElementById("env-select");
+        if (loading) {
+            loading.innerHTML = "";
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "Loading environments…";
+            loading.appendChild(opt);
+            loading.disabled = true;
+        }
+        let catalog;
+        try {
+            catalog = await api.loadEnvironmentCatalog();
+        }
+        catch (err) {
+            const sel = document.getElementById("env-select");
+            if (sel) {
+                sel.innerHTML = "";
+                const opt = document.createElement("option");
+                opt.value = "";
+                opt.textContent = "Failed to load environments";
+                sel.appendChild(opt);
+                sel.disabled = true;
+            }
+            renderError(err instanceof Error ? err : new Error(String(err)));
+            return;
+        }
+        setSelectionCatalog(envSelection, catalog);
+        populateEnvironmentSelector(catalog);
+        if (catalog.length === 0) {
+            renderEnvironmentEmptyState();
         }
     }
     function showAuthRequired(message) {
@@ -149,6 +243,10 @@ function initDashboard() {
                 if (!select.value)
                     return;
                 cont.textContent = "Switching...";
+                // Drop previous-org environment state before establishing the new
+                // org so its IDs can never be reused.
+                clearEnvironmentState();
+                teardownAppViews();
                 api
                     .switchOrganization(select.value)
                     .then(() => api.getSession())
@@ -169,6 +267,7 @@ function initDashboard() {
             activeInspector.destroy();
             activeInspector = null;
         }
+        clearEnvironmentState();
         for (const id of ["runs-table-body", "workers-table-body"]) {
             const el = document.getElementById(id);
             if (el)
@@ -199,14 +298,20 @@ function initDashboard() {
             target.classList.remove("hidden");
         }
     }
-    async function loadRunsList(client, env) {
+    async function loadRunsList(client, envId) {
         const listContainer = document.getElementById("runs-table-body");
         if (!listContainer)
             return;
+        // Zero-environment (or not-yet-loaded) state is honest and issues no
+        // protected request with an ambiguous/empty environment value.
+        if (!envId) {
+            renderEnvironmentEmptyState();
+            return;
+        }
         listContainer.innerHTML =
             '<tr><td colspan="5" class="loading">Loading workflow runs...</td></tr>';
         try {
-            const resp = await client.listRuns(env);
+            const resp = await client.listRuns(envId);
             if (resp.items.length === 0) {
                 listContainer.innerHTML =
                     '<tr><td colspan="5" class="empty-state">No workflow runs found in this environment.</td></tr>';
@@ -240,14 +345,18 @@ function initDashboard() {
             listContainer.innerHTML = `<tr><td colspan="5" class="error-state">Failed to load runs: ${escapeHtml(err instanceof Error ? err.message : String(err))}</td></tr>`;
         }
     }
-    async function loadWorkersList(client, env) {
+    async function loadWorkersList(client, envId) {
         const listContainer = document.getElementById("workers-table-body");
         if (!listContainer)
             return;
+        if (!envId) {
+            renderEnvironmentEmptyState();
+            return;
+        }
         listContainer.innerHTML =
             '<tr><td colspan="4" class="loading">Loading workers...</td></tr>';
         try {
-            const resp = await client.listWorkers(env);
+            const resp = await client.listWorkers(envId);
             if (resp.items.length === 0) {
                 listContainer.innerHTML =
                     '<tr><td colspan="4" class="empty-state">No workers registered for this environment.</td></tr>';

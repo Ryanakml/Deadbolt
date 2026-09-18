@@ -35,6 +35,92 @@ export interface SwitchOrgResponse {
   csrf_token: string;
 }
 
+export interface ProjectSummary {
+  id: string;
+  name: string;
+}
+
+export interface EnvironmentSummary {
+  id: string;
+  name: string;
+}
+
+// CatalogEnvironment is one selectable environment with enough project
+// context to disambiguate identical environment names across projects.
+// The option value is always the canonical environment UUID.
+export interface CatalogEnvironment {
+  projectId: string;
+  projectName: string;
+  environmentId: string;
+  environmentName: string;
+}
+
+export function formatEnvironmentLabel(env: CatalogEnvironment): string {
+  return `${env.projectName} / ${env.environmentName}`;
+}
+
+// EnvironmentSelection tracks the dashboard's canonical environment choice
+// for the active organization. Switching organizations clears stale
+// catalog/selection so an environment ID from the previous org can never
+// be reused.
+export interface EnvironmentSelection {
+  orgId: string | null;
+  catalog: CatalogEnvironment[];
+  selectedEnvironmentId: string | null;
+}
+
+export function createEnvironmentSelection(): EnvironmentSelection {
+  return { orgId: null, catalog: [], selectedEnvironmentId: null };
+}
+
+export function setSelectionOrganization(
+  sel: EnvironmentSelection,
+  orgId: string | null,
+): void {
+  if (sel.orgId !== orgId) {
+    sel.orgId = orgId;
+    sel.catalog = [];
+    sel.selectedEnvironmentId = null;
+  }
+}
+
+export function setSelectionCatalog(
+  sel: EnvironmentSelection,
+  catalog: CatalogEnvironment[],
+): string | null {
+  sel.catalog = [...catalog];
+  if (
+    sel.selectedEnvironmentId &&
+    catalog.some((e) => e.environmentId === sel.selectedEnvironmentId)
+  ) {
+    return sel.selectedEnvironmentId;
+  }
+  sel.selectedEnvironmentId =
+    catalog.length > 0 ? catalog[0].environmentId : null;
+  return sel.selectedEnvironmentId;
+}
+
+export function selectEnvironment(
+  sel: EnvironmentSelection,
+  envId: string | null,
+): string | null {
+  if (!envId) {
+    sel.selectedEnvironmentId = null;
+    return null;
+  }
+  if (sel.catalog.some((e) => e.environmentId === envId)) {
+    sel.selectedEnvironmentId = envId;
+    return envId;
+  }
+  return sel.selectedEnvironmentId;
+}
+
+export function getSelectedEnvironmentId(
+  sel: EnvironmentSelection,
+): string | null {
+  return sel.selectedEnvironmentId;
+}
+
 // apiFetch keeps every dashboard request on same-origin cookies explicitly.
 // The dashboard never handles bearer tokens; authentication is the HttpOnly
 // BFF session cookie.
@@ -108,6 +194,8 @@ export class DashboardApiClient {
     cursor?: string,
     limit = 25,
   ): Promise<ListRunsResponse> {
+    // environment MUST be the canonical environment UUID. Bare names that
+    // exist in several projects are ambiguous and rejected server-side.
     const params = new URLSearchParams({ environment });
     if (cursor) params.set("cursor", cursor);
     if (limit) params.set("limit", String(limit));
@@ -138,6 +226,7 @@ export class DashboardApiClient {
     cursor?: string,
     limit = 25,
   ): Promise<ListWorkersResponse> {
+    // environment MUST be the canonical environment UUID (see listRuns).
     const params = new URLSearchParams({ environment });
     if (cursor) params.set("cursor", cursor);
     if (limit) params.set("limit", String(limit));
@@ -200,5 +289,59 @@ export class DashboardApiClient {
       );
     }
     return res.json() as Promise<TaskLogsResponse>;
+  }
+
+  // listProjects discovers the active organization's projects through the
+  // existing public tenant API using the BFF session cookie.
+  public async listProjects(): Promise<ProjectSummary[]> {
+    const res = await apiFetch(`${this.baseUrl}/v1/projects`);
+    if (!res.ok) {
+      throw new Error(
+        `Failed to list projects (HTTP ${res.status}): ${res.statusText}`,
+      );
+    }
+    const data = (await res.json()) as { projects?: ProjectSummary[] };
+    return data.projects ?? [];
+  }
+
+  // listProjectEnvironments lists one project's environments through the
+  // existing public tenant API using the BFF session cookie.
+  public async listProjectEnvironments(
+    projectId: string,
+  ): Promise<EnvironmentSummary[]> {
+    const res = await apiFetch(
+      `${this.baseUrl}/v1/projects/${encodeURIComponent(projectId)}/environments`,
+    );
+    if (!res.ok) {
+      throw new Error(
+        `Failed to list environments (HTTP ${res.status}): ${res.statusText}`,
+      );
+    }
+    const data = (await res.json()) as {
+      environments?: EnvironmentSummary[];
+    };
+    return data.environments ?? [];
+  }
+
+  // loadEnvironmentCatalog discovers every environment in the active
+  // organization with project context. Callers MUST use environmentId as
+  // the selector value and for runs/workers requests.
+  public async loadEnvironmentCatalog(): Promise<CatalogEnvironment[]> {
+    const projects = await this.listProjects();
+    const catalog: CatalogEnvironment[] = [];
+    for (const p of projects) {
+      if (!p || !p.id) continue;
+      const envs = await this.listProjectEnvironments(p.id);
+      for (const e of envs) {
+        if (!e || !e.id) continue;
+        catalog.push({
+          projectId: p.id,
+          projectName: p.name ?? p.id,
+          environmentId: e.id,
+          environmentName: e.name ?? e.id,
+        });
+      }
+    }
+    return catalog;
   }
 }

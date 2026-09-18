@@ -27,6 +27,31 @@ export interface SwitchOrgResponse {
     active_organization_id: string;
     csrf_token: string;
 }
+export interface ProjectSummary {
+    id: string;
+    name: string;
+}
+export interface EnvironmentSummary {
+    id: string;
+    name: string;
+}
+export interface CatalogEnvironment {
+    projectId: string;
+    projectName: string;
+    environmentId: string;
+    environmentName: string;
+}
+export declare function formatEnvironmentLabel(env: CatalogEnvironment): string;
+export interface EnvironmentSelection {
+    orgId: string | null;
+    catalog: CatalogEnvironment[];
+    selectedEnvironmentId: string | null;
+}
+export declare function createEnvironmentSelection(): EnvironmentSelection;
+export declare function setSelectionOrganization(sel: EnvironmentSelection, orgId: string | null): void;
+export declare function setSelectionCatalog(sel: EnvironmentSelection, catalog: CatalogEnvironment[]): string | null;
+export declare function selectEnvironment(sel: EnvironmentSelection, envId: string | null): string | null;
+export declare function getSelectedEnvironmentId(sel: EnvironmentSelection): string | null;
 export declare function apiFetch(input: string, init?: RequestInit): Promise<Response>;
 export declare function isUnauthorized(err: unknown): boolean;
 export declare function readCsrfToken(): string;
@@ -40,5 +65,8 @@ export declare class DashboardApiClient {
     listWorkers(environment: string, cursor?: string, limit?: number): Promise<ListWorkersResponse>;
     getRunEvents(runId: string, cursor?: number, limit?: number): Promise<RunEventsResponse>;
     getRunLogs(runId: string, stepId?: string, attemptId?: string, cursor?: string, limit?: number): Promise<TaskLogsResponse>;
+    listProjects(): Promise<ProjectSummary[]>;
+    listProjectEnvironments(projectId: string): Promise<EnvironmentSummary[]>;
+    loadEnvironmentCatalog(): Promise<CatalogEnvironment[]>;
 }
 //# sourceMappingURL=api.d.ts.map
