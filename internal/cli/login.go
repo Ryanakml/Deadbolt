@@ -23,7 +23,7 @@ import (
 func RunLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	localFlag := fs.Bool("local", false, "Use local developer authentication (loopback only)")
-	apiKeyFlag := fs.String("api-key", "", "Directly configure an API key into secure credentials store")
+	apiKeyFlag := fs.String("api-key", "", "Directly configure an API key into secure credentials store (only passed values are stored; organization/environment context is left unchanged unless --org/--env are given)")
 	orgFlag := fs.String("org", "", "Set default organization ID")
 	envFlag := fs.String("env", "", "Set default environment (e.g. development, staging, production)")
 	cpURLFlag := fs.String("control-plane-url", "", "Control plane base URL (defaults to DEADBOLT_API_URL or http://localhost:8080)")
@@ -552,6 +552,9 @@ type hostedTokenResponse struct {
 // overwrite previous context; values absent from the new login remove stale
 // context so a prior organization or environment can never leak into the new
 // session. Nothing is written when the exchange yielded no access token.
+// The replacement is failure-atomic from the caller's perspective: any write
+// failure restores the previously snapshotted context and reports an error,
+// never a partially replaced success.
 func commitHostedLoginContext(tokenResp hostedTokenResponse, customOrg, customEnv string) (orgID, envName string, err error) {
 	if tokenResp.AccessToken == "" {
 		return "", "", fmt.Errorf("hosted login did not return an access token")
@@ -564,24 +567,69 @@ func commitHostedLoginContext(tokenResp hostedTokenResponse, customOrg, customEn
 	if customEnv != "" {
 		envName = customEnv
 	}
+	prevKey, hadKey := priorCredential("deadbolt", "api_key")
+	prevOrg, hadOrg := priorCredential("deadbolt", "org_id")
+	prevEnv, hadEnv := priorCredential("deadbolt", "env")
+	rollback := func() error {
+		var firstErr error
+		fail := func(e error) {
+			if e != nil && firstErr == nil {
+				firstErr = e
+			}
+		}
+		fail(restoreCredential("deadbolt", "api_key", prevKey, hadKey))
+		fail(restoreCredential("deadbolt", "org_id", prevOrg, hadOrg))
+		fail(restoreCredential("deadbolt", "env", prevEnv, hadEnv))
+		return firstErr
+	}
 	if err := StoreCredential("deadbolt", "api_key", tokenResp.AccessToken); err != nil {
 		return "", "", err
 	}
 	if orgID != "" {
 		if err := StoreCredential("deadbolt", "org_id", orgID); err != nil {
-			return "", "", err
+			if rbErr := rollback(); rbErr != nil {
+				return "", "", fmt.Errorf("store org context: %v (rollback: %v)", err, rbErr)
+			}
+			return "", "", fmt.Errorf("store org context: %w", err)
 		}
 	} else if err := DeleteCredential("deadbolt", "org_id"); err != nil {
-		return "", "", err
+		if rbErr := rollback(); rbErr != nil {
+			return "", "", fmt.Errorf("clear stale org context: %v (rollback: %v)", err, rbErr)
+		}
+		return "", "", fmt.Errorf("clear stale org context: %w", err)
 	}
 	if envName != "" {
 		if err := StoreCredential("deadbolt", "env", envName); err != nil {
-			return "", "", err
+			if rbErr := rollback(); rbErr != nil {
+				return "", "", fmt.Errorf("store env context: %v (rollback: %v)", err, rbErr)
+			}
+			return "", "", fmt.Errorf("store env context: %w", err)
 		}
 	} else if err := DeleteCredential("deadbolt", "env"); err != nil {
-		return "", "", err
+		if rbErr := rollback(); rbErr != nil {
+			return "", "", fmt.Errorf("clear stale env context: %v (rollback: %v)", err, rbErr)
+		}
+		return "", "", fmt.Errorf("clear stale env context: %w", err)
 	}
 	return orgID, envName, nil
+}
+
+// priorCredential snapshots one credential for rollback. Any read failure is
+// treated as absent; the subsequent write will surface real store failures.
+func priorCredential(service, account string) (string, bool) {
+	v, err := GetCredential(service, account)
+	if err != nil {
+		return "", false
+	}
+	return v, true
+}
+
+// restoreCredential returns one credential to its snapshotted state.
+func restoreCredential(service, account, value string, existed bool) error {
+	if existed {
+		return StoreCredential(service, account, value)
+	}
+	return DeleteCredential(service, account)
 }
 
 func openBrowser(targetURL string) error {

@@ -22,10 +22,15 @@ Every step adheres to **Blueprint §4, §6, §12, §14, §20, §22, §24** and *
 - **Node.js 24.x** (`v24.21.0` pinned in runtime contracts)
 - **Docker & Docker Compose** (for running local control-plane and broker services)
 
-Install the Deadbolt CLI:
+Install the Deadbolt CLI from the packaged distribution (binary plus
+required companion assets). A bare `go build` alone is only a repository
+development build: without `share/deadbolt/` assets, `runtime dev` and
+`runtime worker start` fail fast instead of working.
 
 ```bash
-go build -o /usr/local/bin/runtime ./cmd/runtime/main.go
+go build -o bin/runtime ./cmd/runtime
+./scripts/package-cli-distribution.sh bin/runtime "<control-plane-image@sha256:...>" <install-prefix>
+export PATH="<install-prefix>/bin:$PATH"
 ```
 
 Verify the installation:
@@ -34,20 +39,22 @@ Verify the installation:
 runtime --help
 ```
 
-### Standalone Distribution & Companion Assets
+### Packaged Distribution & Companion Assets
 
-Deadbolt distributes the CLI binary together with its companion assets (`share/deadbolt/` containing the standalone Compose configuration, immutable control-plane release metadata, and the Node runner runtime):
-
-```bash
-./scripts/package-cli-distribution.sh bin/runtime "<control-plane-image@sha256:...>" <install-prefix>
-```
-
-Installed structure:
+The install prefix layout is the supported standalone contract
+(`runtime dev` and `runtime worker start` resolve assets relative to the
+executable, never from a source checkout):
 
 - `<install-prefix>/bin/runtime`
 - `<install-prefix>/share/deadbolt/compose.yaml`
 - `<install-prefix>/share/deadbolt/release.json`
 - `<install-prefix>/share/deadbolt/runner/index.js`
+
+> [!NOTE]
+> **Repository development vs packaged use:** inside a source checkout you
+> may run an uninstalled binary with `DEADBOLT_DEV_ASSETS=1` (Compose) and
+> `--runner-path`/`DEADBOLT_RUNNER_PATH` (runner). Outside a checkout, only
+> the packaged layout above is supported.
 
 ---
 
@@ -94,10 +101,10 @@ Key local mode characteristics:
 Compile your workflow code into an immutable `.tar` bundle archive and a validated deployment manifest:
 
 ```bash
-runtime build --dir . --arch arm64 --os linux
+runtime build --dir . --os linux
 ```
 
-When `--arch` is omitted, the build targets the current host architecture (or the project config `targetArch`); hosted/CI callers that need `linux/amd64` should pass it explicitly. The target platform is embedded in the bundle (`.deadbolt/platform.json`) and participates in the bundle digest, so different targets always produce different digests.
+When `--arch` is omitted, the build targets the current host architecture (or the project config `targetArch`); pass `--arch amd64|arm64` only to cross-compile for an explicit deployment target. Hosted/CI callers that need `linux/amd64` select it explicitly. The target platform is embedded in the bundle (`.deadbolt/platform.json`) and participates in the bundle digest, so different targets always produce different digests.
 
 Output:
 

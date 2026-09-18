@@ -4,15 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/auth/oidcfixture"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
+	"github.com/Ryanakml/Deadbolt/internal/storage"
+	"github.com/Ryanakml/Deadbolt/internal/tenant"
 )
 
 func TestPublicCLIOIDCExchangesPKCEForHumanBearer(t *testing.T) {
@@ -135,5 +139,113 @@ func getJSON(t *testing.T, method, target string, body *bytes.Buffer, dest any, 
 	}
 	if err := json.NewDecoder(response.Body).Decode(dest); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCLITokenOrgSelectionAcrossMembershipStates proves CLI token issuance
+// binds an active organization only for exactly one ACTIVE membership. Zero,
+// several, or suspended-only memberships yield an empty organization so the
+// CLI must select explicitly instead of inheriting an arbitrary one.
+func TestCLITokenOrgSelectionAcrossMembershipStates(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	fixture, err := oidcfixture.NewFixtureServer("deadbolt-cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fixture.Close()
+	tc.authCfg.RuntimeMode = auth.ModeHosted
+	tc.authCfg.OIDC = auth.OIDCConfig{Issuer: fixture.URL(), ClientID: "dashboard-bff", CLIClientID: "deadbolt-cli"}
+	server := httptest.NewServer(controlplane.BuildMux(tc.authCfg, tc.runtimePool, nil, nil))
+	defer server.Close()
+
+	// Unique subject root per run: the shared integration database persists
+	// across runs, so constant subjects would inherit earlier memberships.
+	runID, _ := tenant.NewUUID()
+	sub := func(name string) string {
+		return fmt.Sprintf("%s-%s", name, runID[:8])
+	}
+
+	exchange := func(subject string) (token, orgID string) {
+		t.Helper()
+		pkce, err := auth.GeneratePKCE()
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := "cli-matrix-" + subject
+		fixture.RegisterAuthCodeWithPKCE(code, oidcfixture.TokenClaimOverrides{
+			Subject: subject, Email: subject + "@example.com", Name: subject, Nonce: pkce.Nonce, Expiry: time.Hour,
+		}, pkce.CodeChallenge, "S256")
+		rec := postCLIToken(t, server.URL, code, pkce.CodeVerifier, "http://127.0.0.1:8765/callback", pkce.Nonce)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("exchange failed: %d (%s)", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			AccessToken    string `json:"access_token"`
+			OrganizationID string `json:"organization_id"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.AccessToken == "" {
+			t.Fatalf("invalid token response: %v", err)
+		}
+		return body.AccessToken, body.OrganizationID
+	}
+	userIDOf := func(subject string) string {
+		t.Helper()
+		var id string
+		if err := tc.runtimePool.QueryRow(context.Background(), `SELECT user_id::text FROM oidc_identities WHERE issuer = $1 AND subject = $2`, fixture.URL(), subject).Scan(&id); err != nil {
+			t.Fatalf("user lookup failed: %v", err)
+		}
+		return id
+	}
+	ctx := context.Background()
+	mkOrg := func(name string) string {
+		t.Helper()
+		owner, _ := tenant.NewUUID()
+		org, err := tc.service.CreateOrganization(ctx, owner, name)
+		if err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+		return org.ID
+	}
+	addMembership := func(orgID, userID, role, status string) {
+		t.Helper()
+		if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `INSERT INTO organization_members (organization_id, user_id, role, status) VALUES ($1, $2, $3, $4)`, orgID, userID, role, status)
+			return err
+		}); err != nil {
+			t.Fatalf("create membership: %v", err)
+		}
+	}
+
+	// 1. Zero memberships: no active org issued.
+	if _, orgID := exchange(sub("cli-matrix-zero")); orgID != "" {
+		t.Fatalf("zero memberships must yield empty organization, got %q", orgID)
+	}
+
+	// 2. Exactly one ACTIVE membership: selected.
+	exchange(sub("cli-matrix-one"))
+	orgOne := mkOrg("CLI Matrix One")
+	addMembership(orgOne, userIDOf(sub("cli-matrix-one")), "Owner", "ACTIVE")
+	if _, orgID := exchange(sub("cli-matrix-one")); orgID != orgOne {
+		t.Fatalf("single active membership must be selected, got %q", orgID)
+	}
+
+	// 3. Two ACTIVE memberships: unset for explicit selection.
+	exchange(sub("cli-matrix-two"))
+	uidTwo := userIDOf(sub("cli-matrix-two"))
+	addMembership(mkOrg("CLI Matrix Two A"), uidTwo, "Owner", "ACTIVE")
+	addMembership(mkOrg("CLI Matrix Two B"), uidTwo, "Viewer", "ACTIVE")
+	if _, orgID := exchange(sub("cli-matrix-two")); orgID != "" {
+		t.Fatalf("several memberships must yield empty organization, got %q", orgID)
+	}
+
+	// 4. Suspended plus active: only the active one is selected.
+	exchange(sub("cli-matrix-mix"))
+	uidMix := userIDOf(sub("cli-matrix-mix"))
+	addMembership(mkOrg("CLI Matrix Old"), uidMix, "Owner", "SUSPENDED")
+	orgMix := mkOrg("CLI Matrix New")
+	addMembership(orgMix, uidMix, "Developer", "ACTIVE")
+	if _, orgID := exchange(sub("cli-matrix-mix")); orgID != orgMix {
+		t.Fatalf("suspended membership must not be selected, got %q", orgID)
 	}
 }

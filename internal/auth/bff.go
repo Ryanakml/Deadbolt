@@ -169,7 +169,7 @@ func (h *BFFHandler) HandleCLIToken(w http.ResponseWriter, r *http.Request) {
 	}
 	var orgID *string
 	if len(memberships) > 0 {
-		orgID = &memberships[0].OrganizationID
+		orgID = SelectDefaultOrganization(memberships)
 	}
 	_, token, err := h.store.CreateCLISession(r.Context(), user.ID, orgID, r.RemoteAddr, r.UserAgent(), h.cfg.SessionIdleTimeout, h.cfg.SessionAbsoluteTimeout)
 	if err != nil {
@@ -345,10 +345,7 @@ func (h *BFFHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var defaultOrgID *string
-	if len(memberships) > 0 {
-		defaultOrgID = &memberships[0].OrganizationID
-	}
+	defaultOrgID := SelectDefaultOrganization(memberships)
 
 	ip := r.RemoteAddr
 	userAgent := r.UserAgent()

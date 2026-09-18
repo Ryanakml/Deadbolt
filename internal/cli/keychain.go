@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,9 @@ var (
 	ErrCredentialNotFound = errors.New("credential not found")
 	customCredentialsDir  string
 	credentialsMu         sync.Mutex
+	// credentialFault injects failures into StoreCredential/DeleteCredential.
+	// Test-only hook for failure-atomicity coverage; always nil in production.
+	credentialFault func(service, account, op string) error
 )
 
 // SetCustomCredentialsDir overrides the storage path for credentials (useful for testing).
@@ -57,6 +61,11 @@ func getCredentialsFilePath() (string, error) {
 // StoreCredential saves a credential to the native OS keychain. File storage is
 // deliberately restricted to explicitly configured test/local-fixture directories.
 func StoreCredential(service, account, secret string) error {
+	if credentialFault != nil {
+		if err := credentialFault(service, account, "store"); err != nil {
+			return err
+		}
+	}
 	// If custom directory or test environment is set, use secure file directly to avoid polluting system keychain
 	if customCredentialsDir != "" || os.Getenv("DEADBOLT_CREDENTIALS_DIR") != "" {
 		return storeFileCredential(service, account, secret)
@@ -110,22 +119,73 @@ func GetCredential(service, account string) (string, error) {
 }
 
 // DeleteCredential removes a credential from the OS keychain or fallback secure storage.
+// Genuine absence is success; real deletion failures are reported instead of
+// being silently swallowed.
 func DeleteCredential(service, account string) error {
+	if credentialFault != nil {
+		if err := credentialFault(service, account, "delete"); err != nil {
+			return err
+		}
+	}
 	if customCredentialsDir != "" || os.Getenv("DEADBOLT_CREDENTIALS_DIR") != "" {
 		return deleteFileCredential(service, account)
 	}
 
 	if runtime.GOOS == "darwin" {
-		cmd := exec.Command("security", "delete-generic-password", "-s", service, "-a", account)
-		_ = cmd.Run()
+		out, err := exec.Command("security", "delete-generic-password", "-s", service, "-a", account).CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		if credentialAbsent(service, account) {
+			return nil
+		}
+		return fmt.Errorf("delete credential from macOS Keychain: %v: %s", err, strings.TrimSpace(string(out)))
 	} else if runtime.GOOS == "linux" {
 		if _, err := exec.LookPath("secret-tool"); err == nil {
-			cmd := exec.Command("secret-tool", "clear", "service", service, "account", account)
-			_ = cmd.Run()
+			out, err := exec.Command("secret-tool", "clear", "service", service, "account", account).CombinedOutput()
+			if err == nil {
+				return nil
+			}
+			if credentialAbsent(service, account) {
+				return nil
+			}
+			return fmt.Errorf("delete credential from Linux Secret Service: %v: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
 
 	return nil
+}
+
+// credentialAbsent reports whether no credential exists for service/account.
+// Only positive evidence of absence counts: ambiguous lookup failures return
+// false so the original deletion error is reported fail-closed.
+func credentialAbsent(service, account string) bool {
+	if runtime.GOOS == "darwin" {
+		out, err := exec.Command("security", "find-generic-password", "-s", service, "-a", account).CombinedOutput()
+		if err == nil {
+			return false
+		}
+		return isKeychainNotFoundOutput(string(out))
+	} else if runtime.GOOS == "linux" {
+		if _, err := exec.LookPath("secret-tool"); err == nil {
+			out, err := exec.Command("secret-tool", "lookup", "service", service, "account", account).CombinedOutput()
+			if err == nil && len(bytes.TrimSpace(out)) == 0 {
+				return true
+			}
+			return isSecretToolNotFoundOutput(string(out))
+		}
+	}
+	return false
+}
+
+// isKeychainNotFoundOutput recognizes macOS `security` absence output.
+func isKeychainNotFoundOutput(out string) bool {
+	return strings.Contains(out, "could not be found")
+}
+
+// isSecretToolNotFoundOutput recognizes Secret Service absence output.
+func isSecretToolNotFoundOutput(out string) bool {
+	return strings.Contains(strings.ToLower(out), "no such")
 }
 
 func storeFileCredential(service, account, secret string) error {

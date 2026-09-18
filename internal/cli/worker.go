@@ -345,7 +345,13 @@ func resolveRunnerPath(flagVal string) (string, error) {
 	return runnerPath, nil
 }
 
-// resolveEnvironmentID uses only authenticated public tenant discovery routes.
+// resolveEnvironmentID resolves an environment name or UUID to its canonical
+// ID using only authenticated public tenant discovery routes. When a project
+// context is available (DEADBOLT_PROJECT or deadbolt.config.json project),
+// the name resolves within that project. Otherwise every match is collected:
+// zero matches fail, exactly one wins, and several fail with an explicit
+// ambiguity error instead of silently picking the first project that lists
+// one. UUIDs remain exact.
 func resolveEnvironmentID(cfg Config, nameOrID string) (string, error) {
 	req, err := cfg.NewRequest(http.MethodGet, "/v1/projects", nil)
 	if err != nil {
@@ -362,13 +368,37 @@ func resolveEnvironmentID(cfg Config, nameOrID string) (string, error) {
 	}
 	var projects struct {
 		Projects []struct {
-			ID string `json:"id"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
 		} `json:"projects"`
 	}
 	if err := json.Unmarshal(body, &projects); err != nil {
 		return "", fmt.Errorf("parse projects: %w", err)
 	}
-	for _, project := range projects.Projects {
+	scope := resolveProjectScope()
+	candidates := projects.Projects
+	if scope != "" {
+		var scoped []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		for _, p := range projects.Projects {
+			if p.Name == scope {
+				scoped = append(scoped, p)
+			}
+		}
+		if len(scoped) == 0 {
+			return "", fmt.Errorf("project %q was not found in the authenticated organization", scope)
+		}
+		candidates = scoped
+	}
+	type match struct {
+		projectName string
+		envID       string
+		envName     string
+	}
+	var matches []match
+	for _, project := range candidates {
 		req, err := cfg.NewRequest(http.MethodGet, fmt.Sprintf("/v1/projects/%s/environments", project.ID), nil)
 		if err != nil {
 			return "", err
@@ -393,11 +423,34 @@ func resolveEnvironmentID(cfg Config, nameOrID string) (string, error) {
 		}
 		for _, environment := range environments.Environments {
 			if environment.ID == nameOrID || environment.Name == nameOrID {
-				return environment.ID, nil
+				matches = append(matches, match{projectName: project.Name, envID: environment.ID, envName: environment.Name})
 			}
 		}
 	}
-	return "", fmt.Errorf("environment %q was not found in the authenticated organization", nameOrID)
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("environment %q was not found in the authenticated organization", nameOrID)
+	case 1:
+		return matches[0].envID, nil
+	default:
+		var lines []string
+		for _, m := range matches {
+			lines = append(lines, fmt.Sprintf("  %s (project %q, id %s)", m.envName, m.projectName, m.envID))
+		}
+		return "", fmt.Errorf("environment %q matches %d environments; rerun with an exact environment UUID:\n%s", nameOrID, len(matches), strings.Join(lines, "\n"))
+	}
+}
+
+// resolveProjectScope returns the currently selected project context, if any:
+// DEADBOLT_PROJECT first, then the local deadbolt.config.json project.
+func resolveProjectScope() string {
+	if v := strings.TrimSpace(os.Getenv("DEADBOLT_PROJECT")); v != "" {
+		return v
+	}
+	if prj, err := LoadProjectConfig("."); err == nil && prj != nil {
+		return strings.TrimSpace(prj.Project)
+	}
+	return ""
 }
 
 func handleWorkerList(args []string) error {

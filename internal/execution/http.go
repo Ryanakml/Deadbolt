@@ -65,8 +65,8 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.allowed(r, caller, req.Environment, tenant.CapRunsCreate) {
-		errJSON(w, r, http.StatusForbidden, "FORBIDDEN", "Run creation is not permitted")
+	ok, authErr := h.allowed(r, caller, req.Environment, tenant.CapRunsCreate)
+	if !h.denyAmbiguousOrForbidden(w, r, ok, authErr, "FORBIDDEN", "Run creation is not permitted") {
 		return
 	}
 
@@ -115,6 +115,10 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, ErrEnvironmentNotFound) {
 			errJSON(w, r, http.StatusNotFound, "ENVIRONMENT_NOT_FOUND", "Environment not found")
+			return
+		}
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			errJSON(w, r, http.StatusBadRequest, "AMBIGUOUS_ENVIRONMENT", "Environment name matches multiple environments; use the environment UUID")
 			return
 		}
 		errJSON(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
@@ -177,8 +181,8 @@ func (h *HTTPHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.allowed(r, caller, envParam, tenant.CapRunsRead) {
-		errJSON(w, r, http.StatusForbidden, "FORBIDDEN", "Reading runs is not permitted")
+	ok, authErr := h.allowed(r, caller, envParam, tenant.CapRunsRead)
+	if !h.denyAmbiguousOrForbidden(w, r, ok, authErr, "FORBIDDEN", "Reading runs is not permitted") {
 		return
 	}
 
@@ -197,6 +201,10 @@ func (h *HTTPHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, ErrEnvironmentNotFound) {
 			errJSON(w, r, http.StatusNotFound, "ENVIRONMENT_NOT_FOUND", "Environment not found")
+			return
+		}
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			errJSON(w, r, http.StatusBadRequest, "AMBIGUOUS_ENVIRONMENT", "Environment name matches multiple environments; use the environment UUID")
 			return
 		}
 		if errors.Is(err, ErrInvalidCursor) {
@@ -223,8 +231,8 @@ func (h *HTTPHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.allowed(r, caller, envParam, tenant.CapWorkersRead) {
-		errJSON(w, r, http.StatusForbidden, "FORBIDDEN", "Reading workers is not permitted")
+	ok, authErr := h.allowed(r, caller, envParam, tenant.CapWorkersRead)
+	if !h.denyAmbiguousOrForbidden(w, r, ok, authErr, "FORBIDDEN", "Reading workers is not permitted") {
 		return
 	}
 
@@ -243,6 +251,10 @@ func (h *HTTPHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, ErrEnvironmentNotFound) {
 			errJSON(w, r, http.StatusNotFound, "ENVIRONMENT_NOT_FOUND", "Environment not found")
+			return
+		}
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			errJSON(w, r, http.StatusBadRequest, "AMBIGUOUS_ENVIRONMENT", "Environment name matches multiple environments; use the environment UUID")
 			return
 		}
 		if errors.Is(err, ErrInvalidCursor) {
@@ -496,19 +508,41 @@ func (h *HTTPHandler) hasPayloadRead(r *http.Request, c *tenant.CallerIdentity, 
 	return err == nil && m.Status == tenant.StatusActive && tenant.CanRolePerform(m.Role, tenant.CapPayloadRead)
 }
 
-func (h *HTTPHandler) allowed(r *http.Request, c *tenant.CallerIdentity, envParam, cap string) bool {
+func (h *HTTPHandler) allowed(r *http.Request, c *tenant.CallerIdentity, envParam, cap string) (bool, error) {
 	if c.OrganizationID == "" {
-		return false
+		return false, nil
 	}
 	env, err := h.service.resolveEnvironment(r.Context(), c.OrganizationID, envParam)
 	if err != nil {
-		return false
+		// Unresolvable names keep the historical deny verdict; an ambiguous
+		// name is surfaced so callers report it explicitly instead.
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			return false, err
+		}
+		return false, nil
 	}
 	if c.Type == tenant.IdentityTypeMachine {
-		return c.EnvironmentID == env.ID && tenant.CanAPIKeyPerform(c.Capabilities, cap)
+		return c.EnvironmentID == env.ID && tenant.CanAPIKeyPerform(c.Capabilities, cap), nil
 	}
 	m, err := h.tenants.GetMember(r.Context(), c.OrganizationID, c.UserID)
-	return err == nil && m.Status == tenant.StatusActive && tenant.CanRolePerform(m.Role, cap)
+	return err == nil && m.Status == tenant.StatusActive && tenant.CanRolePerform(m.Role, cap), nil
+}
+
+// denyAmbiguousOrForbidden maps an allowed() verdict to its response.
+// Ambiguous environment names fail with an explicit client error; denials
+// stay forbidden. It returns false when a response was written.
+func (h *HTTPHandler) denyAmbiguousOrForbidden(w http.ResponseWriter, r *http.Request, ok bool, err error, forbiddenCode, forbiddenMsg string) bool {
+	if err != nil {
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			errJSON(w, r, http.StatusBadRequest, "AMBIGUOUS_ENVIRONMENT", "Environment name matches multiple environments; use the environment UUID")
+			return false
+		}
+	}
+	if !ok {
+		errJSON(w, r, http.StatusForbidden, forbiddenCode, forbiddenMsg)
+		return false
+	}
+	return true
 }
 
 func auditFromCaller(c *tenant.CallerIdentity, r *http.Request) *tenant.AuditContext {

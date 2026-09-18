@@ -109,7 +109,7 @@ func handleActivateDeployment(args []string) error {
 			return fmt.Errorf("%s", errMsg)
 		}
 		if envErr.Code == "REVISION_CONFLICT" {
-			return fmt.Errorf("Revision conflict: Expected revision %d does not match current channel revision. Fetch latest revision and retry.", *expectedRevFlag)
+			return fmt.Errorf("Revision conflict: Expected revision %d does not match current channel revision. Fetch latest revision and retry. (command key: %s, request ID: %s)", *expectedRevFlag, idempKey, resp.Header.Get("X-Request-ID"))
 		}
 
 		return fmt.Errorf("%s", FormatAPIError(resp.StatusCode, body))
@@ -137,6 +137,7 @@ func handleActivateDeployment(args []string) error {
 	}
 	fmt.Printf("Channel Revision:   %d\n", res.Revision)
 	fmt.Printf("Environment:        %s\n", env)
+	fmt.Printf("Command Key:        %s\n", idempKey)
 
 	if res.Warning != "" {
 		fmt.Printf("\nNotice: %s\n", res.Warning)

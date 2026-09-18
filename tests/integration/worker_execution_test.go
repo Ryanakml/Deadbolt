@@ -9,8 +9,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/Ryanakml/Deadbolt/internal/auth"
+	"github.com/Ryanakml/Deadbolt/internal/cli"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -740,5 +746,127 @@ func TestWorkerRevocationAndDraining(t *testing.T) {
 	defer pResp.Body.Close()
 	if pResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden on revoked worker poll, got %d", pResp.StatusCode)
+	}
+}
+
+// TestWorkerEnrollAmbiguousEnvironmentName proves `runtime worker enroll
+// --env <name>` never silently picks the first matching environment across
+// projects: an ambiguous name fails with an explicit error while the exact
+// UUID still enrolls through the real CLI boundary. A human caller is used
+// because machine keys only ever see their own project.
+func TestWorkerEnrollAmbiguousEnvironmentName(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	ctx := context.Background()
+
+	// Human owner identity with an active org, mirroring post-login context.
+	subject, _ := tenant.NewUUID()
+	user, err := tc.sessionStore.GetOrCreateUserFromOIDC(ctx, &auth.Identity{
+		Issuer: "https://issuer.example", Subject: "enroll-" + subject,
+		Email: "enroll-" + subject + "@example.com", Name: "Enroll Human",
+	})
+	if err != nil {
+		t.Fatalf("create OIDC user: %v", err)
+	}
+	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO organization_members (organization_id, user_id, role, status) VALUES ($1, $2, 'Owner', 'ACTIVE')`, orgID, user.ID)
+		return err
+	}); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
+	_, token, err := tc.sessionStore.CreateCLISession(ctx, user.ID, &orgID, "127.0.0.1", "enroll-test", 12*time.Hour, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("create human session: %v", err)
+	}
+
+	// Second project owning another "staging" environment.
+	project2, err := tc.service.CreateProject(ctx, orgID, "Second Project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tc.service.CreateEnvironment(ctx, orgID, project2.ID, tenant.EnvStaging, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	credDir := t.TempDir()
+	cli.SetCustomCredentialsDir(credDir)
+	origAPIURL := os.Getenv("DEADBOLT_API_URL")
+	origAPIKey := os.Getenv("DEADBOLT_API_KEY")
+	origOrgID := os.Getenv("DEADBOLT_ORG_ID")
+	origEnv := os.Getenv("DEADBOLT_ENV")
+	defer func() {
+		os.Setenv("DEADBOLT_API_URL", origAPIURL)
+		os.Setenv("DEADBOLT_API_KEY", origAPIKey)
+		os.Setenv("DEADBOLT_ORG_ID", origOrgID)
+		os.Setenv("DEADBOLT_ENV", origEnv)
+	}()
+	os.Setenv("DEADBOLT_API_URL", server.URL)
+	os.Setenv("DEADBOLT_API_KEY", token)
+	os.Unsetenv("DEADBOLT_ORG_ID")
+	os.Unsetenv("DEADBOLT_ENV")
+
+	enroll := func(env string) error {
+		return cli.HandleWorkerEnroll([]string{
+			"--key-path", filepath.Join(t.TempDir(), "worker.key"),
+			"--env", env,
+			"--pool", "default",
+			"--create-token",
+			"--control-plane-url", server.URL,
+		})
+	}
+
+	// Ambiguous name across two projects fails explicitly.
+	if err := enroll(tenant.EnvStaging); err == nil || !strings.Contains(err.Error(), "matches 2 environments") {
+		t.Fatalf("expected explicit ambiguity error, got %v", err)
+	}
+
+	// Exact UUID still enrolls.
+	if err := enroll(envID); err != nil {
+		t.Fatalf("enroll by UUID failed: %v", err)
+	}
+}
+
+// TestListRunsAmbiguousEnvironmentName proves run/worker reads fail with an
+// explicit ambiguity error instead of silently serving one project's data
+// when several projects own the same environment name.
+func TestListRunsAmbiguousEnvironmentName(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	ctx := context.Background()
+
+	project2, err := tc.service.CreateProject(ctx, orgID, "Second Project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tc.service.CreateEnvironment(ctx, orgID, project2.ID, tenant.EnvStaging, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	adminKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapRunsRead, tenant.CapWorkersRead})
+
+	get := func(path string) (int, map[string]any) {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+		req.Header.Set("X-Organization-ID", orgID)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body
+	}
+
+	if code, body := get("/v1/runs?environment=" + tenant.EnvStaging); code != http.StatusBadRequest || body["code"] != "AMBIGUOUS_ENVIRONMENT" {
+		t.Fatalf("expected 400 AMBIGUOUS_ENVIRONMENT for runs, got %d (%v)", code, body)
+	}
+	if code, body := get("/v1/workers?environment=" + tenant.EnvStaging); code != http.StatusBadRequest || body["code"] != "AMBIGUOUS_ENVIRONMENT" {
+		t.Fatalf("expected 400 AMBIGUOUS_ENVIRONMENT for workers, got %d (%v)", code, body)
+	}
+	if code, _ := get("/v1/runs?environment=" + envID); code != http.StatusOK {
+		t.Fatalf("expected 200 for runs by UUID, got %d", code)
 	}
 }

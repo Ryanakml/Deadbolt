@@ -66,8 +66,11 @@ func (s *Service) resolveEnvironment(ctx context.Context, orgID, envParam string
 	if err == nil {
 		return env, nil
 	}
-	// Fallback to query by name
-	var out tenant.Environment
+	// Fallback to query by name. Several projects in one organization may
+	// each own an environment with the same name, so every match is
+	// collected: zero matches fail, exactly one wins, and several fail with
+	// an explicit ambiguity error instead of silently picking one.
+	var matches []tenant.Environment
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		query := `
 			SELECT e.id, e.organization_id, e.project_id, e.name, COALESCE(ea.max_concurrency, 10), e.created_at, e.updated_at
@@ -75,17 +78,30 @@ func (s *Service) resolveEnvironment(ctx context.Context, orgID, envParam string
 			LEFT JOIN environment_admissions ea ON ea.environment_id = e.id AND ea.organization_id = e.organization_id
 			WHERE e.organization_id = $1 AND e.name = $2
 		`
-		scanErr := tx.QueryRow(ctx, query, orgID, envParam).
-			Scan(&out.ID, &out.OrganizationID, &out.ProjectID, &out.Name, &out.MaxConcurrency, &out.CreatedAt, &out.UpdatedAt)
-		if errors.Is(scanErr, pgx.ErrNoRows) {
-			return ErrEnvironmentNotFound
+		rows, err := tx.Query(ctx, query, orgID, envParam)
+		if err != nil {
+			return err
 		}
-		return scanErr
+		defer rows.Close()
+		for rows.Next() {
+			var out tenant.Environment
+			if err := rows.Scan(&out.ID, &out.OrganizationID, &out.ProjectID, &out.Name, &out.MaxConcurrency, &out.CreatedAt, &out.UpdatedAt); err != nil {
+				return err
+			}
+			matches = append(matches, out)
+		}
+		return rows.Err()
 	})
 	if err != nil {
 		return nil, ErrEnvironmentNotFound
 	}
-	return &out, nil
+	if len(matches) == 0 {
+		return nil, ErrEnvironmentNotFound
+	}
+	if len(matches) > 1 {
+		return nil, tenant.ErrEnvironmentAmbiguous
+	}
+	return &matches[0], nil
 }
 
 // CreateRun implements Blueprint §8 & §14.2 & §20.1:
@@ -112,6 +128,9 @@ func (s *Service) CreateRun(
 
 	env, err := s.resolveEnvironment(ctx, orgID, envParam)
 	if err != nil {
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			return nil, false, err
+		}
 		return nil, false, ErrEnvironmentNotFound
 	}
 	envID := env.ID
@@ -538,6 +557,9 @@ func (s *Service) ListRuns(ctx context.Context, orgID, envParam string, cursor *
 	}
 	env, err := s.resolveEnvironment(ctx, orgID, envParam)
 	if err != nil {
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			return nil, err
+		}
 		return nil, ErrEnvironmentNotFound
 	}
 
@@ -643,6 +665,9 @@ func (s *Service) ListWorkers(ctx context.Context, orgID, envParam string, curso
 	}
 	env, err := s.resolveEnvironment(ctx, orgID, envParam)
 	if err != nil {
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			return nil, err
+		}
 		return nil, ErrEnvironmentNotFound
 	}
 

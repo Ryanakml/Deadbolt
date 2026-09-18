@@ -1262,3 +1262,165 @@ func TestRealChromeBrowserSmoke(t *testing.T) {
 		t.Fatalf("expected browser smoke test to succeed, but success marker was not found in output:\n%s", outputStr)
 	}
 }
+
+// TestBFFCallbackDefaultOrgSelectionAcrossMembershipStates proves the fresh
+// browser session binds an active organization only for exactly one ACTIVE
+// membership. Zero, several, or suspended-only memberships leave the active
+// organization unset so explicit selection stays reachable.
+func TestBFFCallbackDefaultOrgSelectionAcrossMembershipStates(t *testing.T) {
+	db, runtimePool, _ := setupTestDB(t)
+	defer db.Close()
+	defer runtimePool.Close()
+
+	fixture, err := oidcfixture.NewFixtureServer("deadbolt-dashboard-client")
+	if err != nil {
+		t.Fatalf("failed to start OIDC fixture server: %v", err)
+	}
+	defer fixture.Close()
+
+	cfg := auth.Config{
+		RuntimeMode: auth.ModeHosted,
+		OIDC: auth.OIDCConfig{
+			Issuer:       fixture.URL(),
+			ClientID:     fixture.ClientID(),
+			ClientSecret: "fixture-client-secret",
+			RedirectURL:  "http://localhost:8080/api/auth/callback",
+		},
+		AllowedOrigins:         []string{"http://localhost:3000", "http://localhost:8080"},
+		DevAuthEnabled:         false,
+		CookieSecure:           true,
+		SessionIdleTimeout:     12 * time.Hour,
+		SessionAbsoluteTimeout: 7 * 24 * time.Hour,
+	}
+	if err := cfg.Validate("127.0.0.1"); err != nil {
+		t.Fatalf("config validation failed: %v", err)
+	}
+	oidcClient := auth.NewOIDCClient(cfg.OIDC, nil)
+	store := auth.NewSessionStore(runtimePool)
+	bff := auth.NewBFFHandler(cfg, oidcClient, store, runtimePool)
+
+	// Unique subject root per run: the shared integration database persists
+	// across runs, so constant subjects would inherit earlier memberships.
+	var subjectSuffix [8]byte
+	if _, err := rand.Read(subjectSuffix[:]); err != nil {
+		t.Fatal(err)
+	}
+	sub := func(name string) string {
+		return fmt.Sprintf("%s-%x", name, subjectSuffix)
+	}
+
+	browserLogin := func(subject, email string) *http.Cookie {
+		t.Helper()
+		loginRec := httptest.NewRecorder()
+		bff.HandleLogin(loginRec, httptest.NewRequest(http.MethodGet, "/api/auth/login", nil))
+		if loginRec.Code != http.StatusFound {
+			t.Fatalf("login initiation failed: %d", loginRec.Code)
+		}
+		var pkceCookie *http.Cookie
+		for _, c := range loginRec.Result().Cookies() {
+			if c.Name == auth.PKCECookieName {
+				pkceCookie = c
+			}
+		}
+		if pkceCookie == nil {
+			t.Fatal("PKCE cookie missing")
+		}
+		rawPKCE, err := base64.RawURLEncoding.DecodeString(pkceCookie.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pkce auth.PKCEParams
+		if err := json.Unmarshal(rawPKCE, &pkce); err != nil {
+			t.Fatal(err)
+		}
+		code := "code-" + subject
+		fixture.RegisterAuthCodeWithPKCE(code, oidcfixture.TokenClaimOverrides{
+			Subject: subject, Email: email, Name: subject, Nonce: pkce.Nonce, Expiry: time.Hour,
+		}, pkce.CodeChallenge, "S256")
+
+		callbackReq := httptest.NewRequest(http.MethodGet, "/api/auth/callback?code="+code+"&state="+pkce.State, nil)
+		callbackReq.AddCookie(pkceCookie)
+		callbackRec := httptest.NewRecorder()
+		bff.HandleCallback(callbackRec, callbackReq)
+		if callbackRec.Code != http.StatusFound {
+			t.Fatalf("callback failed: %d (%s)", callbackRec.Code, callbackRec.Body.String())
+		}
+		for _, c := range callbackRec.Result().Cookies() {
+			if c.Name == auth.SessionCookieName && c.Value != "" {
+				return c
+			}
+		}
+		t.Fatal("session cookie missing after callback")
+		return nil
+	}
+	activeOrgOf := func(sessionCookie *http.Cookie) *string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+		req.AddCookie(sessionCookie)
+		rec := httptest.NewRecorder()
+		bff.RequireAuth(http.HandlerFunc(bff.HandleGetSession)).ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("session lookup failed: %d", rec.Code)
+		}
+		var body struct {
+			ActiveOrganizationID *string `json:"active_organization_id"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return body.ActiveOrganizationID
+	}
+	userIDOf := func(subject string) string {
+		t.Helper()
+		var id string
+		if err := db.QueryRow("SELECT user_id FROM oidc_identities WHERE issuer = $1 AND subject = $2", fixture.URL(), subject).Scan(&id); err != nil {
+			t.Fatalf("user lookup failed: %v", err)
+		}
+		return id
+	}
+	addMembership := func(orgName, userID, role, status string) string {
+		t.Helper()
+		var orgID string
+		if err := db.QueryRow("INSERT INTO organizations (name) VALUES ($1) RETURNING id::text", orgName).Scan(&orgID); err != nil {
+			t.Fatalf("create org: %v", err)
+		}
+		if _, err := db.Exec("INSERT INTO organization_members (organization_id, user_id, role, status) VALUES ($1, $2, $3, $4)", orgID, userID, role, status); err != nil {
+			t.Fatalf("create membership: %v", err)
+		}
+		return orgID
+	}
+
+	// 1. Zero memberships: active org unset.
+	cookieZero := browserLogin(sub("matrix-zero"), sub("zero")+"@example.com")
+	if got := activeOrgOf(cookieZero); got != nil {
+		t.Fatalf("zero memberships must leave active org unset, got %q", *got)
+	}
+
+	// Memberships below are added after a first login creates the user;
+	// selection is asserted on a second login so the session reflects the
+	// membership state under test.
+	// 2. Exactly one ACTIVE membership: selected.
+	browserLogin(sub("matrix-one"), sub("one")+"@example.com")
+	orgOne := addMembership("Matrix One Org", userIDOf(sub("matrix-one")), "Owner", "ACTIVE")
+	if got := activeOrgOf(browserLogin(sub("matrix-one"), sub("one")+"@example.com")); got == nil || *got != orgOne {
+		t.Fatalf("single active membership must be selected, got %v", got)
+	}
+
+	// 3. Two ACTIVE memberships: unset for explicit selection.
+	browserLogin(sub("matrix-two"), sub("two")+"@example.com")
+	uidTwo := userIDOf(sub("matrix-two"))
+	addMembership("Matrix Two A", uidTwo, "Owner", "ACTIVE")
+	addMembership("Matrix Two B", uidTwo, "Viewer", "ACTIVE")
+	if got := activeOrgOf(browserLogin(sub("matrix-two"), sub("two")+"@example.com")); got != nil {
+		t.Fatalf("several memberships must leave active org unset, got %q", *got)
+	}
+
+	// 4. Suspended plus active: only the active one is selected.
+	browserLogin(sub("matrix-mix"), sub("mix")+"@example.com")
+	uidMix := userIDOf(sub("matrix-mix"))
+	addMembership("Matrix Old Org", uidMix, "Owner", "SUSPENDED")
+	orgMix := addMembership("Matrix New Org", uidMix, "Developer", "ACTIVE")
+	if got := activeOrgOf(browserLogin(sub("matrix-mix"), sub("mix")+"@example.com")); got == nil || *got != orgMix {
+		t.Fatalf("suspended membership must not be selected, got %v", got)
+	}
+}
