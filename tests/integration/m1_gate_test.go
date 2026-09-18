@@ -94,14 +94,22 @@ func TestM1RunPinningAcrossDeploymentActivation(t *testing.T) {
 	completeM1Node(t, server, workerSession, v2Assignment.AttemptID, v2Assignment.OwnershipEpoch, map[string]any{"unexpected": true}, "complete-invalid-output")
 	var failed execution.RunSnapshotDTO
 	getRunM1(t, server, adminKey, orgID, runV2.ID, &failed)
-	if failed.Status != "FAILED" || failed.ReasonCode == nil || *failed.ReasonCode != "STEP_FAILED" {
+	if failed.Status != "FAILED" || failed.ReasonCode == nil || *failed.ReasonCode != "OUTPUT_SCHEMA_VIOLATION" {
 		t.Fatalf("invalid task output was not terminal: status=%s reason=%v", failed.Status, failed.ReasonCode)
 	}
-	if len(failed.Steps) != 1 || len(failed.Steps[0].Attempts) != 1 {
-		t.Fatalf("invalid output snapshot missing attempt: %+v", failed.Steps)
+	steps := make(map[string]execution.RunStepDTO, len(failed.Steps))
+	for _, step := range failed.Steps {
+		steps[step.NodeID] = step
 	}
-	if err, ok := failed.Steps[0].Attempts[0].Error.(map[string]any); !ok || err["code"] != "OUTPUT_SCHEMA_VIOLATION" || err["retryable"] != false {
-		t.Fatalf("invalid output was not recorded as non-retryable: %+v", failed.Steps[0].Attempts[0].Error)
+	invalidStep, ok := steps["node-a"]
+	if !ok || len(invalidStep.Attempts) != 1 {
+		t.Fatalf("invalid output snapshot missing node-a attempt: %+v", failed.Steps)
+	}
+	if err, ok := invalidStep.Attempts[0].Error.(map[string]any); !ok || err["code"] != "OUTPUT_SCHEMA_VIOLATION" || err["retryable"] != false {
+		t.Fatalf("invalid output was not recorded as non-retryable: %+v", invalidStep.Attempts[0].Error)
+	}
+	if blocked, ok := steps["node-b"]; !ok || blocked.Status != "CANCELLED" || len(blocked.Attempts) != 0 {
+		t.Fatalf("remaining V2 node was not cancelled safely: %+v", blocked)
 	}
 
 	// A digest that was never deployed cannot claim the new V2 run.
