@@ -16,6 +16,13 @@ import {
 import type { CatalogEnvironment } from "./api.js";
 import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
+import { shouldShowWorkerWait, terminalStepEmptyText } from "./inspector.js";
+import {
+  clearStreamErrorOnLive,
+  createStreamErrorBanner,
+  markGlobalError,
+  markStreamError,
+} from "./stream.js";
 import {
   RunSnapshot,
   RunEvent,
@@ -36,6 +43,9 @@ function initDashboard(): void {
   // selector value is always the environment UUID, never a bare name.
   const envSelection = createEnvironmentSelection();
   let activeInspector: RunInspector | null = null;
+  // Scoped banner state: only a transient stream error may be cleared on
+  // SSE reconnect. Bootstrap/API errors stay visible.
+  const streamBanner = createStreamErrorBanner();
 
   const envSelect = document.getElementById(
     "env-select",
@@ -465,6 +475,9 @@ function initDashboard(): void {
       onFreshnessChanged: (freshness) => {
         currentStreamFreshness = freshness;
         renderFreshness(freshness);
+        if (freshness === "LIVE" && clearStreamErrorOnLive(streamBanner)) {
+          clearBanner();
+        }
       },
       onEventsUpdated: (events, hasMore, nextCursor) =>
         renderEvents(events, hasMore, nextCursor),
@@ -474,7 +487,7 @@ function initDashboard(): void {
           handleUnauthorized();
           return;
         }
-        renderError(err);
+        renderStreamError(err);
       },
     });
 
@@ -510,8 +523,11 @@ function initDashboard(): void {
           let noAttemptsHtml =
             '<div class="no-attempts text-muted">No attempts claimed yet</div>';
           if (
-            snap.waitingReason === "NO_COMPATIBLE_WORKERS" ||
-            snap.activeCompatibleWorkers === 0
+            shouldShowWorkerWait(
+              st.status,
+              snap.waitingReason,
+              snap.activeCompatibleWorkers,
+            )
           ) {
             noAttemptsHtml = `
               <div class="no-attempts waiting-warning">
@@ -521,6 +537,12 @@ function initDashboard(): void {
                 </div>
               </div>
             `;
+          } else if (
+            st.status === "CANCELLED" ||
+            st.status === "FAILED" ||
+            st.status === "SUCCEEDED"
+          ) {
+            noAttemptsHtml = `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(st.status))}</div>`;
           }
 
           return `
@@ -736,10 +758,33 @@ function initDashboard(): void {
   }
 
   function renderError(err: Error): void {
+    // Bootstrap/API errors are unrelated to transient stream recovery and
+    // must never be cleared implicitly on reconnect.
+    markGlobalError(streamBanner, err.message);
     const banner = document.getElementById("global-error-banner");
     if (banner) {
       banner.textContent = err.message;
       banner.classList.remove("hidden");
+      banner.dataset.errorKind = "global";
+    }
+  }
+
+  function renderStreamError(err: Error): void {
+    markStreamError(streamBanner, err.message);
+    const banner = document.getElementById("global-error-banner");
+    if (banner) {
+      banner.textContent = err.message;
+      banner.classList.remove("hidden");
+      banner.dataset.errorKind = "stream";
+    }
+  }
+
+  function clearBanner(): void {
+    const banner = document.getElementById("global-error-banner");
+    if (banner) {
+      banner.textContent = "";
+      banner.classList.add("hidden");
+      delete banner.dataset.errorKind;
     }
   }
 

@@ -4,11 +4,36 @@ import {
   RunEventsResponse,
   TaskAttempt,
   AttemptStatus,
+  StepStatus,
   TaskLogsResponse,
   StreamFreshness,
 } from "./types.js";
 import { RunEventStreamClient } from "./stream.js";
 import { apiFetch } from "./api.js";
+
+// shouldShowWorkerWait gates the "No compatible workers available" hint so
+// terminal steps are never described as waiting for workers. Only steps in
+// a claimable/waiting state (READY/WAITING) plus the authoritative waiting
+// condition may show the recovery hint.
+export function shouldShowWorkerWait(
+  stepStatus: StepStatus,
+  waitingReason: string | null | undefined,
+  activeCompatibleWorkers: number | undefined,
+): boolean {
+  if (stepStatus !== "READY" && stepStatus !== "WAITING") return false;
+  return (
+    waitingReason === "NO_COMPATIBLE_WORKERS" || activeCompatibleWorkers === 0
+  );
+}
+
+// terminalStepEmptyText is the neutral explanation for a terminal step that
+// executed no attempts. It carries no worker recovery hint.
+export function terminalStepEmptyText(stepStatus: StepStatus): string {
+  if (stepStatus === "CANCELLED") {
+    return "Cancelled before execution — no attempt executed.";
+  }
+  return "No attempt executed.";
+}
 
 export interface InspectorListener {
   onSnapshotUpdated?: (snapshot: RunSnapshot) => void;

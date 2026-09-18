@@ -6,6 +6,8 @@ import { DashboardApiClient, isUnauthorized } from "./api.js";
 import { createEnvironmentSelection, formatEnvironmentLabel, getSelectedEnvironmentId, selectEnvironment, setSelectionCatalog, setSelectionOrganization, } from "./api.js";
 import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
+import { shouldShowWorkerWait, terminalStepEmptyText } from "./inspector.js";
+import { clearStreamErrorOnLive, createStreamErrorBanner, markGlobalError, markStreamError, } from "./stream.js";
 // DOM Bootstrap for browser runtime
 if (typeof document !== "undefined") {
     document.addEventListener("DOMContentLoaded", () => {
@@ -18,6 +20,9 @@ function initDashboard() {
     // selector value is always the environment UUID, never a bare name.
     const envSelection = createEnvironmentSelection();
     let activeInspector = null;
+    // Scoped banner state: only a transient stream error may be cleared on
+    // SSE reconnect. Bootstrap/API errors stay visible.
+    const streamBanner = createStreamErrorBanner();
     const envSelect = document.getElementById("env-select");
     const themeToggle = document.getElementById("theme-toggle");
     const runsNavBtn = document.getElementById("nav-runs");
@@ -403,6 +408,9 @@ function initDashboard() {
             onFreshnessChanged: (freshness) => {
                 currentStreamFreshness = freshness;
                 renderFreshness(freshness);
+                if (freshness === "LIVE" && clearStreamErrorOnLive(streamBanner)) {
+                    clearBanner();
+                }
             },
             onEventsUpdated: (events, hasMore, nextCursor) => renderEvents(events, hasMore, nextCursor),
             onLogsUpdated: (logs, err) => renderLogs(logs, err),
@@ -411,7 +419,7 @@ function initDashboard() {
                     handleUnauthorized();
                     return;
                 }
-                renderError(err);
+                renderStreamError(err);
             },
         });
         activeInspector.load();
@@ -442,8 +450,7 @@ function initDashboard() {
                 })
                     .join("");
                 let noAttemptsHtml = '<div class="no-attempts text-muted">No attempts claimed yet</div>';
-                if (snap.waitingReason === "NO_COMPATIBLE_WORKERS" ||
-                    snap.activeCompatibleWorkers === 0) {
+                if (shouldShowWorkerWait(st.status, snap.waitingReason, snap.activeCompatibleWorkers)) {
                     noAttemptsHtml = `
               <div class="no-attempts waiting-warning">
                 <strong>No compatible workers available.</strong>
@@ -452,6 +459,11 @@ function initDashboard() {
                 </div>
               </div>
             `;
+                }
+                else if (st.status === "CANCELLED" ||
+                    st.status === "FAILED" ||
+                    st.status === "SUCCEEDED") {
+                    noAttemptsHtml = `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(st.status))}</div>`;
                 }
                 return `
           <div class="step-card" data-step-id="${st.id}">
@@ -635,10 +647,31 @@ function initDashboard() {
         }
     }
     function renderError(err) {
+        // Bootstrap/API errors are unrelated to transient stream recovery and
+        // must never be cleared implicitly on reconnect.
+        markGlobalError(streamBanner, err.message);
         const banner = document.getElementById("global-error-banner");
         if (banner) {
             banner.textContent = err.message;
             banner.classList.remove("hidden");
+            banner.dataset.errorKind = "global";
+        }
+    }
+    function renderStreamError(err) {
+        markStreamError(streamBanner, err.message);
+        const banner = document.getElementById("global-error-banner");
+        if (banner) {
+            banner.textContent = err.message;
+            banner.classList.remove("hidden");
+            banner.dataset.errorKind = "stream";
+        }
+    }
+    function clearBanner() {
+        const banner = document.getElementById("global-error-banner");
+        if (banner) {
+            banner.textContent = "";
+            banner.classList.add("hidden");
+            delete banner.dataset.errorKind;
         }
     }
     function escapeHtml(str) {

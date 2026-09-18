@@ -1,4 +1,6 @@
-import { RunSnapshot, RunEvent, RunEventsResponse, TaskLogsResponse, StreamFreshness } from "./types.js";
+import { RunSnapshot, RunEvent, RunEventsResponse, StepStatus, TaskLogsResponse, StreamFreshness } from "./types.js";
+export declare function shouldShowWorkerWait(stepStatus: StepStatus, waitingReason: string | null | undefined, activeCompatibleWorkers: number | undefined): boolean;
+export declare function terminalStepEmptyText(stepStatus: StepStatus): string;
 export interface InspectorListener {
     onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
     onFreshnessChanged?: (freshness: StreamFreshness) => void;

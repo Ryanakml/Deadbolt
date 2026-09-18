@@ -1,4 +1,12 @@
 import { RunEvent, StreamFreshness, ResyncControlEvent } from "./types.js";
+export interface StreamErrorBanner {
+    message: string | null;
+    isStreamError: boolean;
+}
+export declare function createStreamErrorBanner(): StreamErrorBanner;
+export declare function markStreamError(banner: StreamErrorBanner, message: string): void;
+export declare function markGlobalError(banner: StreamErrorBanner, message: string): void;
+export declare function clearStreamErrorOnLive(banner: StreamErrorBanner): boolean;
 export interface StreamClientOptions {
     baseUrl?: string;
     runId: string;
