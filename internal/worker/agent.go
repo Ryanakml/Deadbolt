@@ -212,8 +212,11 @@ func (a *Agent) ensureIdentity(ctx context.Context) error {
 	challengeReq := &ChallengeRequestDTO{
 		ProtocolVersion: ProtocolVersion,
 		RequestID:       fmt.Sprintf("req_chal_%d", time.Now().UnixNano()),
-		PublicKey:       EncodePublicKey(a.pubKey),
-		WorkerID:        a.workerID,
+	}
+	if a.workerID != "" {
+		challengeReq.WorkerID = a.workerID
+	} else {
+		challengeReq.PublicKey = EncodePublicKey(a.pubKey)
 	}
 	challengeRes, err := a.requestChallenge(ctx, challengeReq)
 	if err != nil {
@@ -415,6 +418,7 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		Path:       filepath.Join(a.cfg.BundleDir, assignment.BundleDigest+".tar"),
 		SHA256:     assignment.BundleDigest,
 		TargetArch: assignment.TargetArchitecture,
+		TargetOS:   assignment.TargetOS,
 		Entrypoint: assignment.TaskEntrypoint,
 	}
 	if bundleSpec.TargetArch == "" {
@@ -648,13 +652,13 @@ func (a *Agent) sendLogBatch(ctx context.Context, attemptID string, logs *Execut
 
 	for _, line := range strings.Split(logs.Stdout, "\n") {
 		if strings.TrimSpace(line) != "" {
-			records = append(records, LogRecordDTO{Sequence: seq, Timestamp: now, Level: "info", Message: line})
+			records = append(records, LogRecordDTO{Sequence: seq, Timestamp: now, Level: classifyLogLevel(line, "info"), Message: line})
 			seq++
 		}
 	}
 	for _, line := range strings.Split(logs.Stderr, "\n") {
 		if strings.TrimSpace(line) != "" {
-			records = append(records, LogRecordDTO{Sequence: seq, Timestamp: now, Level: "warn", Message: line})
+			records = append(records, LogRecordDTO{Sequence: seq, Timestamp: now, Level: classifyLogLevel(line, "warn"), Message: line})
 			seq++
 		}
 	}
@@ -672,6 +676,26 @@ func (a *Agent) sendLogBatch(ctx context.Context, attemptID string, logs *Execut
 		return err
 	}
 	return nil
+}
+
+// classifyLogLevel recovers the runner's structured log level from a captured
+// stream line. The Node runner emits JSON entries to stderr for every level,
+// so the outer record must preserve that level instead of inheriting the
+// stream. Lines that do not parse as structured entries keep the stream
+// default (stderr warn, stdout info).
+func classifyLogLevel(line, streamDefault string) string {
+	var entry struct {
+		Level string `json:"level"`
+	}
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		return streamDefault
+	}
+	switch lvl := strings.ToLower(strings.TrimSpace(entry.Level)); lvl {
+	case "debug", "info", "warn", "error":
+		return lvl
+	default:
+		return streamDefault
+	}
 }
 
 func (a *Agent) isRevoked() bool {
@@ -716,7 +740,6 @@ func (a *Agent) refreshSession(ctx context.Context) error {
 		ProtocolVersion: ProtocolVersion,
 		RequestID:       fmt.Sprintf("req_chal_%d", time.Now().UnixNano()),
 		WorkerID:        a.workerID,
-		PublicKey:       EncodePublicKey(a.pubKey),
 	})
 	if err != nil {
 		return err

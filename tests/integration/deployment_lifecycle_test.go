@@ -946,3 +946,284 @@ func TestDeploymentHTTPAcceptanceMatrix(t *testing.T) {
 		t.Fatalf("expected deployment deletion to succeed once run reference is removed: %v", err)
 	}
 }
+
+// TestHumanDeployResolvesEnvironmentName proves a human caller can register a
+// deployment with ?environment=<name>: the name resolves to the exact
+// environment UUID, unknown names 404, and ambiguous names fail closed
+// without touching UUID-scoped storage. UUID input keeps working unchanged.
+func TestHumanDeployResolvesEnvironmentName(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+	owner, _ := tenant.NewUUID()
+	org, err := tc.service.CreateOrganization(ctx, owner, "env name fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := tc.service.CreateProject(ctx, org.ID, "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := tc.service.CreateEnvironment(ctx, org.ID, project.ID, tenant.EnvStaging, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Name != tenant.EnvStaging {
+		t.Fatalf("expected staging environment, got %q", env.Name)
+	}
+
+	svc := deployment.NewService(tc.pool, tc.service)
+	handler := deployment.NewHTTPHandler(svc, tc.service)
+	// Caller carries the post-middleware identity: RequireOrgScope resolves
+	// the organization before the deployment handler runs.
+	humanCtx := tenant.ContextWithCaller(ctx, &tenant.CallerIdentity{Type: tenant.IdentityTypeHuman, UserID: owner, OrganizationID: org.ID})
+
+	register := func(envParam, idemKey, bundle string) (int, deployment.Deployment) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, "/v1/deployments?environment="+envParam, bytes.NewReader(deploymentManifest(t, bundle)))
+		req.Header.Set("Idempotency-Key", idemKey)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.Register(rec, req.WithContext(humanCtx))
+		var dep deployment.Deployment
+		_ = json.NewDecoder(rec.Body).Decode(&dep)
+		return rec.Code, dep
+	}
+
+	// 1. Human deploy by environment name registers against the exact UUID.
+	code, dep := register(tenant.EnvStaging, "human-name-1", strings.Repeat("d", 64))
+	if code != http.StatusCreated {
+		t.Fatalf("expected 201 for human deploy by name, got %d (%+v)", code, dep)
+	}
+	if dep.BundleDigest != strings.Repeat("d", 64) {
+		t.Fatalf("unexpected bundle digest %+v", dep)
+	}
+	var storedEnv string
+	if err := tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT environment_id::text FROM deployments WHERE id = $1`, dep.ID).Scan(&storedEnv)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if storedEnv != env.ID {
+		t.Fatalf("expected deployment bound to environment UUID %s, got %s", env.ID, storedEnv)
+	}
+
+	// 2. Human deploy by UUID still works.
+	if code, _ := register(env.ID, "human-uuid-1", strings.Repeat("e", 64)); code != http.StatusCreated {
+		t.Fatalf("expected 201 for human deploy by UUID, got %d", code)
+	}
+
+	// 3. Unknown environment name -> 404, never a UUID-column 500.
+	unknownReq, _ := http.NewRequest(http.MethodPost, "/v1/deployments?environment=no-such-env", bytes.NewReader(deploymentManifest(t, strings.Repeat("f", 64))))
+	unknownReq.Header.Set("Idempotency-Key", "human-unknown-1")
+	unknownRec := httptest.NewRecorder()
+	handler.Register(unknownRec, unknownReq.WithContext(humanCtx))
+	if unknownRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown environment, got %d", unknownRec.Code)
+	}
+
+	// 4. Ambiguous name (second project owns another "staging") fails closed.
+	project2, err := tc.service.CreateProject(ctx, org.ID, "project-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tc.service.CreateEnvironment(ctx, org.ID, project2.ID, tenant.EnvStaging, 1); err != nil {
+		t.Fatal(err)
+	}
+	ambReq, _ := http.NewRequest(http.MethodPost, "/v1/deployments?environment="+tenant.EnvStaging, bytes.NewReader(deploymentManifest(t, strings.Repeat("a", 64))))
+	ambReq.Header.Set("Idempotency-Key", "human-ambiguous-1")
+	ambRec := httptest.NewRecorder()
+	handler.Register(ambRec, ambReq.WithContext(humanCtx))
+	if ambRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for ambiguous environment name, got %d", ambRec.Code)
+	}
+	var ambBody map[string]any
+	_ = json.NewDecoder(ambRec.Body).Decode(&ambBody)
+	if ambBody["code"] != "AMBIGUOUS_ENVIRONMENT" {
+		t.Fatalf("expected AMBIGUOUS_ENVIRONMENT code, got %v", ambBody)
+	}
+}
+
+// TestActivateIdempotentReplayHasUnambiguousOutcome proves a single logical
+// activation command has an unambiguous outcome: redelivery with the same
+// idempotency key replays the recorded success without creating another
+// revision, while a genuinely conflicting command fails without mutating
+// state. A committed activation must never surface as an apparent failure.
+func TestActivateIdempotentReplayHasUnambiguousOutcome(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+	owner, _ := tenant.NewUUID()
+	org, err := tc.service.CreateOrganization(ctx, owner, "activate replay fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := tc.service.CreateProject(ctx, org.ID, "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagingEnv, err := tc.service.CreateEnvironment(ctx, org.ID, project.ID, tenant.EnvStaging, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(controlplane.BuildMux(tc.authCfg, tc.runtimePool, nil, nil))
+	defer server.Close()
+
+	regKey := bootstrapTestKey(t, tc.service, org.ID, stagingEnv.ID, []string{tenant.CapDeploymentsRegister})
+	actKey := bootstrapTestKey(t, tc.service, org.ID, stagingEnv.ID, []string{tenant.CapDeploymentsActivateStaging})
+
+	bundle := "2222222222222222222222222222222222222222222222222222222222222222"
+	regReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/deployments?environment=%s", server.URL, stagingEnv.ID), bytes.NewReader(deploymentManifest(t, bundle)))
+	regReq.Header.Set("Authorization", "Bearer "+regKey.PlaintextKey)
+	regReq.Header.Set("X-Organization-ID", org.ID)
+	regReq.Header.Set("Idempotency-Key", "replay-reg-1")
+	regReq.Header.Set("Content-Type", "application/json")
+	respReg, err := http.DefaultClient.Do(regReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var regBody deployment.Deployment
+	_ = json.NewDecoder(respReg.Body).Decode(&regBody)
+	respReg.Body.Close()
+	if respReg.StatusCode != http.StatusCreated {
+		t.Fatalf("register failed: %d (%+v)", respReg.StatusCode, regBody)
+	}
+
+	// Seed 1 compatible worker so staging activation passes preflight.
+	workerID, _ := tenant.NewUUID()
+	sessionID, _ := tenant.NewUUID()
+	if err := tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO workers (id,organization_id,environment_id,public_key,status) VALUES ($1,$2,$3,'pk','ACTIVE')`, workerID, org.ID, stagingEnv.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO worker_sessions (id,organization_id,worker_id,environment_id,session_token_hash,expires_at) VALUES ($1,$2,$3,$4,'h',clock_timestamp()+interval '1 hour')`, sessionID, org.ID, workerID, stagingEnv.ID); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1,$2,$3)`, sessionID, org.ID, bundle)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	activate := func(idemKey string, expectedRevision int64) (int, deployment.Workflow) {
+		t.Helper()
+		body := fmt.Sprintf(`{"deploymentId":%q,"expectedRevision":%d,"allowSingleWorker":true}`, regBody.ID, expectedRevision)
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/workflows/wf/activate?environment=%s", server.URL, stagingEnv.ID), bytes.NewReader([]byte(body)))
+		req.Header.Set("Authorization", "Bearer "+actKey.PlaintextKey)
+		req.Header.Set("X-Organization-ID", org.ID)
+		req.Header.Set("Idempotency-Key", idemKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out deployment.Workflow
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		return resp.StatusCode, out
+	}
+	channelRevision := func() (int64, string) {
+		t.Helper()
+		var rev int64
+		var active string
+		err := tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT revision, active_deployment_id::text FROM workflow_channels WHERE environment_id=$1 AND workflow_name=$2`, stagingEnv.ID, "wf").Scan(&rev, &active)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rev, active
+	}
+
+	// 1. First activation with expected revision 0 commits revision 1.
+	code, first := activate("replay-act-1", 0)
+	if code != http.StatusOK || first.Revision != 1 || first.ActiveDeploymentID == nil || *first.ActiveDeploymentID != regBody.ID {
+		t.Fatalf("first activation failed: %d (%+v)", code, first)
+	}
+
+	// 2. Redelivery of the same logical command replays success: same
+	// revision, same active deployment, no additional revision created.
+	code, replayed := activate("replay-act-1", 0)
+	if code != http.StatusOK || replayed.Revision != 1 || replayed.ActiveDeploymentID == nil || *replayed.ActiveDeploymentID != regBody.ID {
+		t.Fatalf("idempotent replay turned success into failure: %d (%+v)", code, replayed)
+	}
+	if rev, active := channelRevision(); rev != 1 || active != regBody.ID {
+		t.Fatalf("replay mutated channel: revision=%d active=%s", rev, active)
+	}
+
+	// 3. A genuinely conflicting command (fresh key, stale expectation)
+	// fails without mutating committed state.
+	conflictReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/workflows/wf/activate?environment=%s", server.URL, stagingEnv.ID), bytes.NewReader([]byte(fmt.Sprintf(`{"deploymentId":%q,"expectedRevision":0,"allowSingleWorker":true}`, regBody.ID))))
+	conflictReq.Header.Set("Authorization", "Bearer "+actKey.PlaintextKey)
+	conflictReq.Header.Set("X-Organization-ID", org.ID)
+	conflictReq.Header.Set("Idempotency-Key", "replay-act-conflict")
+	conflictReq.Header.Set("Content-Type", "application/json")
+	respConflict, err := http.DefaultClient.Do(conflictReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conflictBody map[string]any
+	_ = json.NewDecoder(respConflict.Body).Decode(&conflictBody)
+	respConflict.Body.Close()
+	if respConflict.StatusCode != http.StatusConflict || conflictBody["code"] != "REVISION_CONFLICT" {
+		t.Fatalf("expected 409 REVISION_CONFLICT, got %d (%v)", respConflict.StatusCode, conflictBody)
+	}
+	if rev, active := channelRevision(); rev != 1 || active != regBody.ID {
+		t.Fatalf("conflict mutated channel: revision=%d active=%s", rev, active)
+	}
+}
+
+// TestRegisterRejectsForeignEnvironment proves a UUID alone never
+// authorizes cross-organization binding: registering into another
+// organization's environment fails closed with NOT_FOUND and persists
+// nothing, instead of leaking a 500 or writing a cross-org row.
+func TestRegisterRejectsForeignEnvironment(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+	ownerA, _ := tenant.NewUUID()
+	orgA, err := tc.service.CreateOrganization(ctx, ownerA, "foreign-env-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, _ := tenant.NewUUID()
+	orgB, err := tc.service.CreateOrganization(ctx, ownerB, "foreign-env-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectB, err := tc.service.CreateProject(ctx, orgB.ID, "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envB, err := tc.service.CreateEnvironment(ctx, orgB.ID, projectB.ID, tenant.EnvStaging, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc := deployment.NewService(tc.pool, tc.service)
+	handler := deployment.NewHTTPHandler(svc, tc.service)
+	callerA := tenant.ContextWithCaller(ctx, &tenant.CallerIdentity{Type: tenant.IdentityTypeHuman, UserID: ownerA, OrganizationID: orgA.ID})
+	bundle := strings.Repeat("b", 64)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/deployments?environment="+envB.ID, bytes.NewReader(deploymentManifest(t, bundle)))
+	req.Header.Set("Idempotency-Key", "foreign-env-1")
+	rec := httptest.NewRecorder()
+	handler.Register(rec, req.WithContext(callerA))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for foreign environment, got %d", rec.Code)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&body)
+	if body["code"] != "NOT_FOUND" {
+		t.Fatalf("expected NOT_FOUND code, got %v", body)
+	}
+	var count int
+	if err := tc.pool.WithTenantTx(ctx, orgA.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM deployments WHERE bundle_digest = $1`, bundle).Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("foreign registration persisted %d row(s)", count)
+	}
+}

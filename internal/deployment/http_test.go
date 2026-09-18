@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
@@ -45,6 +47,24 @@ func TestRegisterReturns413ForOversizedManifest(t *testing.T) {
 	h.Register(rec, deploymentRequest(http.MethodPost, "/v1/deployments?environment=env", bytes.Repeat([]byte("x"), (2<<20)+1), []string{tenant.CapDeploymentsRegister}))
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", rec.Code)
+	}
+}
+
+func TestUnexpectedFailureStaysSanitized(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeServiceErr(rec, httptest.NewRequest(http.MethodPost, "/v1/deployments", nil), errors.New("boom: password=hunter2 password=deadbolt_runtime://db:5432/x"))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+	var got map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if got["code"] != "INTERNAL_ERROR" {
+		t.Fatalf("expected sanitized INTERNAL_ERROR code, got %#v", got)
+	}
+	if body := rec.Body.String(); strings.Contains(body, "boom") || strings.Contains(body, "hunter2") {
+		t.Fatalf("sanitized envelope leaked internals: %s", body)
 	}
 }
 

@@ -40,6 +40,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
   DEADBOLT_OIDC_ISSUER="https://mock-issuer.com" \
   DEADBOLT_OIDC_CLIENT_ID="mock_client_id" \
   DEADBOLT_OIDC_CLIENT_SECRET="mock_client_secret" \
+  DEADBOLT_OIDC_CLI_CLIENT_ID="mock_cli_client_id" \
   DEADBOLT_STAGING_DOMAIN="staging.deadbolt.cloud" \
   docker compose -f "$COMPOSE_FILE" --profile slot-blue --profile slot-green config --quiet || { err "Staging Compose validation failed"; exit 1; }
   log "DRY RUN passed: Cluster bootstrap workflow is valid."

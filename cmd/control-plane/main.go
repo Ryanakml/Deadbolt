@@ -131,6 +131,7 @@ func run() error {
 			ClientID:     os.Getenv("DEADBOLT_OIDC_CLIENT_ID"),
 			ClientSecret: os.Getenv("DEADBOLT_OIDC_CLIENT_SECRET"),
 			RedirectURL:  os.Getenv("DEADBOLT_OIDC_REDIRECT_URL"),
+			CLIClientID:  os.Getenv("DEADBOLT_OIDC_CLI_CLIENT_ID"),
 		},
 	}
 
@@ -235,20 +236,32 @@ func run() error {
 		reconcilerPool = pool
 	}
 
+	eventHub := execution.NewEventHub()
+	var workerEngine *execution.WorkerEngine
+	if pool != nil {
+		workerEngine = execution.NewWorkerEngine(storage.NewPool(pool), eventHub)
+	}
+
 	var reconciler *scheduling.Reconciler
 	if reconcilerPool != nil {
-		reconciler = scheduling.NewReconciler(reconcilerPool, 5*time.Second, logger)
+		// Authoritative reconciler sweeps every 1 second per Blueprint §13.3
+		reconciler = scheduling.NewReconciler(reconcilerPool, 1*time.Second, logger)
 		// The system role may enumerate tenants, but deliberately has no direct
-		// table DML privileges. Retention must execute through the runtime pool so
-		// each delete remains constrained by WithTenantTx(orgID) and RLS.
+		// table DML privileges. Retention and lease recovery must execute through
+		// the runtime pool so each write remains constrained by WithTenantTx(orgID) and RLS.
 		if pool != nil {
 			retentionService := execution.NewService(storage.NewPool(pool), nil)
 			reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
+				if workerEngine != nil {
+					if _, err := workerEngine.ReconcileExpiredLeases(ctx, orgID); err != nil {
+						return err
+					}
+				}
 				_, err := retentionService.PruneExpiredTaskLogs(ctx, orgID, 1000)
 				return err
 			})
 		} else {
-			logger.Printf("[SCHEDULER] Task-log retention disabled: runtime database pool unavailable")
+			logger.Printf("[SCHEDULER] Task-log retention and lease recovery disabled: runtime database pool unavailable")
 		}
 		healthChecker.SetSchedulerTicker(reconciler.Ticker(), gateway.DefaultSchedulerTimeout)
 		go func() {
@@ -294,7 +307,7 @@ func run() error {
 		}()
 	}
 
-	mux := BuildMuxWithMetrics(cfg, pool, healthChecker, outboxMetrics, logger)
+	mux := BuildMuxWithComponents(cfg, pool, healthChecker, outboxMetrics, logger, eventHub, workerEngine)
 
 	server := &http.Server{
 		Addr:         listenAddr,
@@ -341,6 +354,11 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 // BuildMuxWithMetrics wires all production routes and attaches an optional outbox metrics collector.
 func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, metrics *outbox.Metrics, logger *log.Logger) *http.ServeMux {
 	return controlplane.BuildMuxWithMetrics(cfg, pool, healthChecker, metrics, logger)
+}
+
+// BuildMuxWithComponents wires all production routes with optional shared execution hub and worker engine.
+func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, metrics *outbox.Metrics, logger *log.Logger, hub *execution.EventHub, engine *execution.WorkerEngine) *http.ServeMux {
+	return controlplane.BuildMuxWithComponents(cfg, pool, healthChecker, metrics, logger, hub, engine)
 }
 
 // runMigrations executes database schema migrations using DDL-capable migrator credentials

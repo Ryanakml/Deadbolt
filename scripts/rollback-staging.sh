@@ -55,6 +55,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
   DEADBOLT_OIDC_ISSUER="https://mock-issuer.com" \
   DEADBOLT_OIDC_CLIENT_ID="mock_client_id" \
   DEADBOLT_OIDC_CLIENT_SECRET="mock_client_secret" \
+  DEADBOLT_OIDC_CLI_CLIENT_ID="mock_cli_client_id" \
   DEADBOLT_STAGING_DOMAIN="staging.deadbolt.cloud" \
   docker compose -f "$COMPOSE_FILE" --profile slot-blue --profile slot-green config --quiet || { err "Staging Compose validation failed"; exit 1; }
   log "DRY RUN passed: Rollback configuration and Compose syntax are valid."
@@ -105,7 +106,7 @@ fi
 export DEADBOLT_POSTGRES_IMAGE
 
 # 2. Strict validation of required staging variables (no invented domain or default passwords)
-for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL SYSTEM_DATABASE_URL DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_POSTGRES_IMAGE; do
+for var in DEADBOLT_STAGING_DOMAIN DATABASE_URL SYSTEM_DATABASE_URL DEADBOLT_DB_ADMIN_PASSWORD DEADBOLT_MIGRATOR_PASSWORD DEADBOLT_RUNTIME_PASSWORD DEADBOLT_SYSTEM_PASSWORD DEADBOLT_OIDC_ISSUER DEADBOLT_OIDC_CLIENT_ID DEADBOLT_OIDC_CLIENT_SECRET DEADBOLT_OIDC_CLI_CLIENT_ID DEADBOLT_POSTGRES_IMAGE; do
   if [[ -z "${!var:-}" ]]; then
     err "Required configuration variable $var is missing or empty!"
     err "Configure in $CONFIG_FILE or via environment. Rollback cannot proceed without valid staging configuration."

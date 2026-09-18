@@ -243,6 +243,40 @@ func (s *ProcessSupervisor) verifyBundle(input *TaskInput) (string, func(), erro
 		cleanup()
 		return "", nil, ErrBundleEntrypoint
 	}
+	platformFile := filepath.Join(dir, BundlePlatformPath)
+	platformData, err := os.ReadFile(platformFile)
+	if err != nil {
+		cleanup()
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil, ErrNoBundlePlatform
+		}
+		return "", nil, fmt.Errorf("read bundle platform metadata: %w", err)
+	}
+	var plat BundlePlatform
+	if err := json.Unmarshal(platformData, &plat); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("%w: %v", ErrBundlePlatformInvalid, err)
+	}
+	if normalizeBundleOS(plat.TargetOS) == "" || normalizeBundleArch(plat.TargetArchitecture) == "" {
+		cleanup()
+		return "", nil, ErrBundlePlatformInvalid
+	}
+	// Identity equality: the embedded target must exactly match the assigned
+	// execution target, not merely be independently host-compatible.
+	specArch := normalizeBundleArch(input.Bundle.TargetArch)
+	if specArch == "" || normalizeBundleArch(plat.TargetArchitecture) != specArch {
+		cleanup()
+		return "", nil, ErrBundlePlatformMismatch
+	}
+	if specOS := normalizeBundleOS(input.Bundle.TargetOS); specOS != "" && normalizeBundleOS(plat.TargetOS) != specOS {
+		cleanup()
+		return "", nil, ErrBundlePlatformMismatch
+	}
+	// Identity proven; host compatibility is still enforced.
+	if err := VerifyArchitecture(plat.TargetArchitecture, ""); err != nil {
+		cleanup()
+		return "", nil, err
+	}
 	return entrypoint, cleanup, nil
 }
 

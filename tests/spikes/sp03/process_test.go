@@ -349,7 +349,7 @@ func TestSP03_VerifiedNativeBundle(t *testing.T) {
 	digest := sha256.Sum256(digestBytes)
 	s := worker.NewProcessSupervisor("node", runnerPath)
 	authorize(s)
-	input := &worker.TaskInput{AttemptID: "native", OperationID: "native", StepID: "step_native", TaskName: "default", Entrypoint: "native-task.mjs", Input: map[string]any{}, Bundle: &worker.BundleSpec{Path: archive, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture(), Entrypoint: "native-task.mjs"}}
+	input := &worker.TaskInput{AttemptID: "native", OperationID: "native", StepID: "step_native", TaskName: "default", Entrypoint: "native-task.mjs", Input: map[string]any{}, Bundle: &worker.BundleSpec{Path: archive, SHA256: hex.EncodeToString(digest[:]), TargetArch: worker.CurrentHostArchitecture(), TargetOS: "linux", Entrypoint: "native-task.mjs"}}
 	completion, _, err := s.ExecuteAttempt(context.Background(), input, 1)
 	if err != nil || completion.Status != "SUCCEEDED" {
 		t.Fatalf("verified native bundle failed: completion=%v err=%v", completion, err)

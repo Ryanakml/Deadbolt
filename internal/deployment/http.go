@@ -6,6 +6,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"io"
+	"log"
 	"net/http"
 )
 
@@ -23,10 +24,27 @@ func (h *HTTPHandler) Register(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, r, 401, "UNAUTHENTICATED", "Authentication required")
 		return
 	}
-	env := r.URL.Query().Get("environment")
-	if env == "" {
+	envParam := r.URL.Query().Get("environment")
+	if envParam == "" {
 		errJSON(w, r, 400, "MISSING_ENVIRONMENT", "Environment is required")
 		return
+	}
+	env := envParam
+	if caller.Type == tenant.IdentityTypeMachine && (env == caller.EnvironmentName || env == caller.EnvironmentID) {
+		env = caller.EnvironmentID
+	} else if caller.Type != tenant.IdentityTypeMachine {
+		// Human callers may use the canonical UUID or an unambiguous
+		// environment name; resolve before any UUID-scoped storage access.
+		environment, err := h.tenants.ResolveEnvironment(r.Context(), caller.OrganizationID, envParam)
+		if err != nil {
+			if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+				errJSON(w, r, 400, "AMBIGUOUS_ENVIRONMENT", "Environment name matches multiple environments; use the environment UUID")
+				return
+			}
+			errJSON(w, r, 404, "NOT_FOUND", "Environment not found")
+			return
+		}
+		env = environment.ID
 	}
 	if !h.allowed(r, caller, env, tenant.CapDeploymentsRegister) {
 		errJSON(w, r, 403, "FORBIDDEN", "Deployment registration is not permitted")
@@ -57,6 +75,9 @@ func (h *HTTPHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	env := r.URL.Query().Get("environment")
+	if caller.Type == tenant.IdentityTypeMachine && (env == caller.EnvironmentName || env == caller.EnvironmentID) {
+		env = caller.EnvironmentID
+	}
 	var in struct {
 		DeploymentID      string `json:"deploymentId"`
 		ExpectedRevision  *int64 `json:"expectedRevision"`
@@ -68,8 +89,12 @@ func (h *HTTPHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, r, 400, "INVALID_REQUEST", "deploymentId, expectedRevision, and environment are required")
 		return
 	}
-	environment, err := h.tenants.GetEnvironment(r.Context(), caller.OrganizationID, env)
+	environment, err := h.tenants.ResolveEnvironment(r.Context(), caller.OrganizationID, env)
 	if err != nil {
+		if errors.Is(err, tenant.ErrEnvironmentAmbiguous) {
+			errJSON(w, r, 400, "AMBIGUOUS_ENVIRONMENT", "Environment name matches multiple environments; use the environment UUID")
+			return
+		}
 		errJSON(w, r, 404, "NOT_FOUND", "Environment not found")
 		return
 	}
@@ -81,7 +106,7 @@ func (h *HTTPHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, r, 403, "FORBIDDEN", "Deployment activation is not permitted")
 		return
 	}
-	out, err := h.service.Activate(r.Context(), caller.OrganizationID, env, r.PathValue("name"), in.DeploymentID, *in.ExpectedRevision, in.AllowSingleWorker, auditFromCaller(caller, r))
+	out, err := h.service.Activate(r.Context(), caller.OrganizationID, environment.ID, r.PathValue("name"), in.DeploymentID, *in.ExpectedRevision, in.AllowSingleWorker, auditFromCaller(caller, r))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
@@ -114,6 +139,19 @@ func writeServiceErr(w http.ResponseWriter, r *http.Request, e error) {
 	}
 	if errors.Is(e, ErrNotFound) {
 		code, status = "NOT_FOUND", 404
+	}
+	if status >= 500 {
+		// The client envelope above stays sanitized. Record the underlying
+		// failure server-side with request correlation and safe operation
+		// context. Never log request bodies: manifests may carry secrets.
+		reqID := tenant.RequestIDFromContext(r.Context())
+		if reqID == "" {
+			reqID = r.Header.Get("X-Request-ID")
+		}
+		if reqID == "" {
+			reqID = "req-unknown"
+		}
+		log.Printf("[ERROR] [request_id=%s] deployment %s %s failed: %v", reqID, r.Method, r.URL.Path, e)
 	}
 	errJSON(w, r, status, code, "Request could not be completed")
 }

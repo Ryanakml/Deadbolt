@@ -20,11 +20,11 @@
         </nav>
       </div>
       <div class="header-right">
+        <span id="session-label" class="session-label hidden"></span>
         <div class="env-selector">
           <label for="env-select">Environment:</label>
           <select id="env-select" aria-label="Select Environment">
-            <option value="staging">staging</option>
-            <option value="production">production</option>
+            <option value="">Loading environments…</option>
           </select>
         </div>
         <button
@@ -120,6 +120,32 @@
         </div>
         <div id="inspector-content" class="inspector-body">
           <!-- Dynamically rendered via inspector.ts -->
+        </div>
+      </section>
+
+      <!-- Authentication View -->
+      <section
+        id="auth-view"
+        class="view-panel hidden"
+        aria-labelledby="auth-heading"
+      >
+        <div class="panel-header">
+          <h2 id="auth-heading">Sign in required</h2>
+        </div>
+        <div class="table-container">
+          <p id="auth-message" class="empty-state">Checking session...</p>
+          <p>
+            <a id="login-link" class="link-btn hidden" href="/api/auth/login"
+              >Sign in with Deadbolt</a
+            >
+          </p>
+          <div id="org-select-wrap" class="hidden">
+            <label for="org-select">Organization:</label>
+            <select id="org-select" aria-label="Select Organization"></select>
+            <button id="org-continue-btn" class="link-btn" type="button">
+              Continue
+            </button>
+          </div>
         </div>
       </section>
     </main>

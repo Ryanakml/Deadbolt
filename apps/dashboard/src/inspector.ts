@@ -4,10 +4,36 @@ import {
   RunEventsResponse,
   TaskAttempt,
   AttemptStatus,
+  StepStatus,
   TaskLogsResponse,
   StreamFreshness,
 } from "./types.js";
 import { RunEventStreamClient } from "./stream.js";
+import { apiFetch } from "./api.js";
+
+// shouldShowWorkerWait gates the "No compatible workers available" hint so
+// terminal steps are never described as waiting for workers. Only steps in
+// a claimable/waiting state (READY/WAITING) plus the authoritative waiting
+// condition may show the recovery hint.
+export function shouldShowWorkerWait(
+  stepStatus: StepStatus,
+  waitingReason: string | null | undefined,
+  activeCompatibleWorkers: number | undefined,
+): boolean {
+  if (stepStatus !== "READY" && stepStatus !== "WAITING") return false;
+  return (
+    waitingReason === "NO_COMPATIBLE_WORKERS" || activeCompatibleWorkers === 0
+  );
+}
+
+// terminalStepEmptyText is the neutral explanation for a terminal step that
+// executed no attempts. It carries no worker recovery hint.
+export function terminalStepEmptyText(stepStatus: StepStatus): string {
+  if (stepStatus === "CANCELLED") {
+    return "Cancelled before execution — no attempt executed.";
+  }
+  return "No attempt executed.";
+}
 
 export interface InspectorListener {
   onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
@@ -89,7 +115,7 @@ export class RunInspector {
 
   public async fetchSnapshot(): Promise<RunSnapshot> {
     const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}`;
-    const res = await fetch(url);
+    const res = await apiFetch(url);
     if (!res.ok) {
       throw new Error(
         `Failed to load run snapshot (HTTP ${res.status}): ${res.statusText}`,
@@ -113,7 +139,7 @@ export class RunInspector {
     const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/events${queryStr}`;
 
     try {
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       if (!res.ok) {
         throw new Error(
           `Failed to fetch events (HTTP ${res.status}): ${res.statusText}`,
@@ -162,7 +188,7 @@ export class RunInspector {
     const url = `${this.baseUrl}/v1/runs/${encodeURIComponent(this.runId)}/logs${queryStr}`;
 
     try {
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       if (res.status === 403) {
         this.logsError =
           "Diagnostic task logs require payload:read capability (redacted by tenant policy).";

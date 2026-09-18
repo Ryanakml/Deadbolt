@@ -1,3 +1,26 @@
+import { apiFetch } from "./api.js";
+export function createStreamErrorBanner() {
+    return { message: null, isStreamError: false };
+}
+export function markStreamError(banner, message) {
+    banner.message = message;
+    banner.isStreamError = true;
+}
+export function markGlobalError(banner, message) {
+    banner.message = message;
+    banner.isStreamError = false;
+}
+// clearStreamErrorOnLive clears only a prior transient stream error. It
+// returns true when the caller should hide the banner; unrelated global
+// errors return false and stay visible.
+export function clearStreamErrorOnLive(banner) {
+    if (banner.isStreamError && banner.message !== null) {
+        banner.message = null;
+        banner.isStreamError = false;
+        return true;
+    }
+    return false;
+}
 export class RunEventStreamClient {
     runId;
     baseUrl;
@@ -93,7 +116,7 @@ export class RunEventStreamClient {
             if (this.lastProcessedSequence > 0) {
                 headers["Last-Event-ID"] = String(this.lastProcessedSequence);
             }
-            const response = await fetch(url, {
+            const response = await apiFetch(url, {
                 headers,
                 signal: this.abortController.signal,
             });

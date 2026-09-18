@@ -144,6 +144,14 @@ func (s *Service) Register(ctx context.Context, orgID, envID string, raw []byte,
 	if audit == nil {
 		return nil, 0, tenant.ErrAuditRequired
 	}
+	// The environment must belong to the organization: a UUID alone never
+	// authorizes cross-organization binding, including for stale client IDs.
+	if _, err := s.commands.GetEnvironment(ctx, orgID, envID); err != nil {
+		if errors.Is(err, tenant.ErrNotFound) {
+			return nil, 0, ErrNotFound
+		}
+		return nil, 0, err
+	}
 	responseCode := 201
 	_, recordedCode, err := s.commands.WithCommandTxDynamic(ctx, orgID, "", func(ctx context.Context, tx storage.Tx) error {
 		// A bundle digest identifies executable immutable bytes. It may not be

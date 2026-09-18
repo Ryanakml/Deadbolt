@@ -52,7 +52,7 @@ func (b *synchronizedBuffer) String() string {
 	return b.buffer.String()
 }
 
-func writeAgentBundle(t *testing.T, dir string) string {
+func writeAgentBundle(t *testing.T, dir, targetOS, targetArch string) string {
 	t.Helper()
 	var archive bytes.Buffer
 	tw := tar.NewWriter(&archive)
@@ -61,6 +61,19 @@ func writeAgentBundle(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	if _, err := tw.Write(code); err != nil {
+		t.Fatal(err)
+	}
+	// Platform identity is part of the immutable artifact: the fixture must
+	// carry the same embedded target the manifest declares, mirroring
+	// production `runtime build` output, or worker preflight rejects it.
+	platformBytes, err := worker.CanonicalPlatformBytes(targetOS, targetArch)
+	if err != nil {
+		t.Fatalf("canonical platform bytes: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: worker.BundlePlatformPath, Mode: 0o644, Size: int64(len(platformBytes))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(platformBytes); err != nil {
 		t.Fatal(err)
 	}
 	if err := tw.Close(); err != nil {
@@ -716,8 +729,8 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 	defer tc.cleanup()
 	defer server.Close()
 	bundleDir := t.TempDir()
-	bundle := writeAgentBundle(t, bundleDir)
 	targetOS, targetArch := "linux", runtime.GOARCH
+	bundle := writeAgentBundle(t, bundleDir, targetOS, targetArch)
 	tasks := []map[string]any{{"name": "agent-task", "entrypoint": "tasks/agent.mjs", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000,
 		"inputSchema":  map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}},
 		"outputSchema": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}}}

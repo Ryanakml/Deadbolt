@@ -3,8 +3,26 @@ export * from "./stream.js";
 export * from "./inspector.js";
 export * from "./api.js";
 
-import { DashboardApiClient } from "./api.js";
+import { DashboardApiClient, isUnauthorized } from "./api.js";
+import type { AuthMembership, AuthSession } from "./api.js";
+import {
+  createEnvironmentSelection,
+  formatEnvironmentLabel,
+  getSelectedEnvironmentId,
+  selectEnvironment,
+  setSelectionCatalog,
+  setSelectionOrganization,
+} from "./api.js";
+import type { CatalogEnvironment } from "./api.js";
+import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
+import { shouldShowWorkerWait, terminalStepEmptyText } from "./inspector.js";
+import {
+  clearStreamErrorOnLive,
+  createStreamErrorBanner,
+  markGlobalError,
+  markStreamError,
+} from "./stream.js";
 import {
   RunSnapshot,
   RunEvent,
@@ -21,8 +39,13 @@ if (typeof document !== "undefined") {
 
 function initDashboard(): void {
   const api = new DashboardApiClient();
-  let currentEnv = "staging";
+  // Canonical environment selection for the active organization. The
+  // selector value is always the environment UUID, never a bare name.
+  const envSelection = createEnvironmentSelection();
   let activeInspector: RunInspector | null = null;
+  // Scoped banner state: only a transient stream error may be cleared on
+  // SSE reconnect. Bootstrap/API errors stay visible.
+  const streamBanner = createStreamErrorBanner();
 
   const envSelect = document.getElementById(
     "env-select",
@@ -38,10 +61,9 @@ function initDashboard(): void {
   ) as HTMLButtonElement | null;
 
   if (envSelect) {
-    currentEnv = envSelect.value || "staging";
     envSelect.addEventListener("change", () => {
-      currentEnv = envSelect.value;
-      loadRunsList(api, currentEnv);
+      selectEnvironment(envSelection, envSelect.value || null);
+      loadRunsList(api, getSelectedEnvironmentId(envSelection));
     });
   }
 
@@ -56,24 +78,266 @@ function initDashboard(): void {
   if (runsNavBtn) {
     runsNavBtn.addEventListener("click", () => {
       showView("runs-view");
-      loadRunsList(api, currentEnv);
+      loadRunsList(api, getSelectedEnvironmentId(envSelection));
     });
   }
 
   if (workersNavBtn) {
     workersNavBtn.addEventListener("click", () => {
       showView("workers-view");
-      loadWorkersList(api, currentEnv);
+      loadWorkersList(api, getSelectedEnvironmentId(envSelection));
     });
   }
 
   // Check URL params for deep linking to /runs/:id
   const urlParams = new URLSearchParams(window.location.search);
   const runIdParam = urlParams.get("runId");
-  if (runIdParam) {
-    inspectRun(runIdParam);
-  } else {
-    loadRunsList(api, currentEnv);
+
+  // Auth bootstrap gate: Issue #14 data loading starts only after the BFF
+  // session (and a valid organization context) is established. While
+  // unauthenticated, no protected API is called.
+  void bootstrap();
+
+  async function bootstrap(): Promise<void> {
+    let session: AuthSession | null;
+    try {
+      session = await api.getSession();
+    } catch (err: unknown) {
+      renderError(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    await enterWithSession(session);
+  }
+
+  async function enterWithSession(session: AuthSession | null): Promise<void> {
+    if (!session) {
+      clearEnvironmentState();
+      showAuthRequired("Sign in to view workflow runs.");
+      return;
+    }
+    const state = resolveOrgState(session);
+    if (state.kind === "ready") {
+      await enterApp(session);
+      return;
+    }
+    if (state.kind === "empty") {
+      clearEnvironmentState();
+      showAuthRequired(
+        "This identity has no organization yet. Create one with `runtime bootstrap`, then reload.",
+      );
+      return;
+    }
+    if (state.kind === "select") {
+      clearEnvironmentState();
+      showOrgSelect(state.orgs);
+      return;
+    }
+    // Exactly one membership: establish it deterministically, then enter.
+    try {
+      clearEnvironmentState();
+      await api.switchOrganization(state.orgId);
+      await enterWithSession(await api.getSession());
+    } catch (err: unknown) {
+      renderError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  async function enterApp(session: AuthSession): Promise<void> {
+    hideAuthView();
+    const label = document.getElementById("session-label");
+    if (label) {
+      label.textContent = session.user?.email ?? "";
+      label.classList.remove("hidden");
+    }
+    // Bind the catalog to the newly established organization. Any selection
+    // from a previous org is cleared first so it can never be reused.
+    const orgId = session.active_organization_id ?? null;
+    await loadEnvironmentCatalog(orgId);
+    if (runIdParam) {
+      inspectRun(runIdParam);
+    } else {
+      showView("runs-view");
+      loadRunsList(api, getSelectedEnvironmentId(envSelection));
+    }
+  }
+
+  function clearEnvironmentState(): void {
+    setSelectionOrganization(envSelection, null);
+    const sel = document.getElementById(
+      "env-select",
+    ) as HTMLSelectElement | null;
+    if (sel) {
+      sel.innerHTML = "";
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "Loading environments…";
+      sel.appendChild(opt);
+      sel.disabled = true;
+    }
+  }
+
+  function populateEnvironmentSelector(catalog: CatalogEnvironment[]): void {
+    const sel = document.getElementById(
+      "env-select",
+    ) as HTMLSelectElement | null;
+    if (!sel) return;
+    sel.innerHTML = "";
+    if (catalog.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No environments yet";
+      sel.appendChild(opt);
+      sel.disabled = true;
+      return;
+    }
+    for (const env of catalog) {
+      const opt = document.createElement("option");
+      // Canonical environment UUID is the only value runs/workers use.
+      opt.value = env.environmentId;
+      opt.textContent = formatEnvironmentLabel(env);
+      sel.appendChild(opt);
+    }
+    sel.disabled = false;
+    const selected = getSelectedEnvironmentId(envSelection);
+    if (selected) sel.value = selected;
+  }
+
+  function renderEnvironmentEmptyState(): void {
+    const runsBody = document.getElementById("runs-table-body");
+    if (runsBody) {
+      runsBody.innerHTML =
+        '<tr><td colspan="5" class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</td></tr>';
+    }
+    const workersBody = document.getElementById("workers-table-body");
+    if (workersBody) {
+      workersBody.innerHTML =
+        '<tr><td colspan="4" class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</td></tr>';
+    }
+  }
+
+  async function loadEnvironmentCatalog(orgId: string | null): Promise<void> {
+    // Switching organizations clears stale catalog/selection first.
+    setSelectionOrganization(envSelection, orgId);
+    const loading = document.getElementById(
+      "env-select",
+    ) as HTMLSelectElement | null;
+    if (loading) {
+      loading.innerHTML = "";
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "Loading environments…";
+      loading.appendChild(opt);
+      loading.disabled = true;
+    }
+    let catalog: CatalogEnvironment[];
+    try {
+      catalog = await api.loadEnvironmentCatalog();
+    } catch (err: unknown) {
+      const sel = document.getElementById(
+        "env-select",
+      ) as HTMLSelectElement | null;
+      if (sel) {
+        sel.innerHTML = "";
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "Failed to load environments";
+        sel.appendChild(opt);
+        sel.disabled = true;
+      }
+      renderError(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    setSelectionCatalog(envSelection, catalog);
+    populateEnvironmentSelector(catalog);
+    if (catalog.length === 0) {
+      renderEnvironmentEmptyState();
+    }
+  }
+
+  function showAuthRequired(message: string): void {
+    teardownAppViews();
+    const msg = document.getElementById("auth-message");
+    if (msg) msg.textContent = message;
+    const login = document.getElementById("login-link");
+    if (login) login.classList.remove("hidden");
+    const orgWrap = document.getElementById("org-select-wrap");
+    if (orgWrap) orgWrap.classList.add("hidden");
+    showView("auth-view");
+  }
+
+  function hideAuthView(): void {
+    const login = document.getElementById("login-link");
+    if (login) login.classList.add("hidden");
+    const orgWrap = document.getElementById("org-select-wrap");
+    if (orgWrap) orgWrap.classList.add("hidden");
+  }
+
+  function showOrgSelect(orgs: AuthMembership[]): void {
+    teardownAppViews();
+    const msg = document.getElementById("auth-message");
+    if (msg) msg.textContent = "Select an organization to continue.";
+    const login = document.getElementById("login-link");
+    if (login) login.classList.add("hidden");
+    const orgWrap = document.getElementById("org-select-wrap");
+    const select = document.getElementById(
+      "org-select",
+    ) as HTMLSelectElement | null;
+    const cont = document.getElementById("org-continue-btn");
+    if (orgWrap && select && cont) {
+      select.innerHTML = "";
+      for (const o of orgs) {
+        const opt = document.createElement("option");
+        opt.value = o.OrganizationID;
+        opt.textContent = `${o.OrganizationName} (${o.Role})`;
+        select.appendChild(opt);
+      }
+      cont.onclick = () => {
+        if (!select.value) return;
+        cont.textContent = "Switching...";
+        // Drop previous-org environment state before establishing the new
+        // org so its IDs can never be reused.
+        clearEnvironmentState();
+        teardownAppViews();
+        api
+          .switchOrganization(select.value)
+          .then(() => api.getSession())
+          .then((s) => enterWithSession(s))
+          .catch((err: unknown) =>
+            renderError(err instanceof Error ? err : new Error(String(err))),
+          )
+          .finally(() => {
+            cont.textContent = "Continue";
+          });
+      };
+      orgWrap.classList.remove("hidden");
+    }
+    showView("auth-view");
+  }
+
+  // teardownAppViews stops live streams and clears protected data so an
+  // expired session neither leaks data nor invents workflow failure.
+  function teardownAppViews(): void {
+    if (activeInspector) {
+      activeInspector.destroy();
+      activeInspector = null;
+    }
+    clearEnvironmentState();
+    for (const id of ["runs-table-body", "workers-table-body"]) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = "";
+    }
+    const insp = document.getElementById("inspector-content");
+    if (insp) insp.innerHTML = "";
+    const label = document.getElementById("session-label");
+    if (label) {
+      label.textContent = "";
+      label.classList.add("hidden");
+    }
+  }
+
+  function handleUnauthorized(): void {
+    teardownAppViews();
+    showAuthRequired("Session expired. Sign in again to continue.");
   }
 
   function showView(viewId: string): void {
@@ -91,15 +355,21 @@ function initDashboard(): void {
 
   async function loadRunsList(
     client: DashboardApiClient,
-    env: string,
+    envId: string | null,
   ): Promise<void> {
     const listContainer = document.getElementById("runs-table-body");
     if (!listContainer) return;
+    // Zero-environment (or not-yet-loaded) state is honest and issues no
+    // protected request with an ambiguous/empty environment value.
+    if (!envId) {
+      renderEnvironmentEmptyState();
+      return;
+    }
     listContainer.innerHTML =
       '<tr><td colspan="5" class="loading">Loading workflow runs...</td></tr>';
 
     try {
-      const resp = await client.listRuns(env);
+      const resp = await client.listRuns(envId);
       if (resp.items.length === 0) {
         listContainer.innerHTML =
           '<tr><td colspan="5" class="empty-state">No workflow runs found in this environment.</td></tr>';
@@ -128,21 +398,29 @@ function initDashboard(): void {
         });
       });
     } catch (err: unknown) {
+      if (isUnauthorized(err)) {
+        handleUnauthorized();
+        return;
+      }
       listContainer.innerHTML = `<tr><td colspan="5" class="error-state">Failed to load runs: ${escapeHtml(err instanceof Error ? err.message : String(err))}</td></tr>`;
     }
   }
 
   async function loadWorkersList(
     client: DashboardApiClient,
-    env: string,
+    envId: string | null,
   ): Promise<void> {
     const listContainer = document.getElementById("workers-table-body");
     if (!listContainer) return;
+    if (!envId) {
+      renderEnvironmentEmptyState();
+      return;
+    }
     listContainer.innerHTML =
       '<tr><td colspan="4" class="loading">Loading workers...</td></tr>';
 
     try {
-      const resp = await client.listWorkers(env);
+      const resp = await client.listWorkers(envId);
       if (resp.items.length === 0) {
         listContainer.innerHTML =
           '<tr><td colspan="4" class="empty-state">No workers registered for this environment.</td></tr>';
@@ -170,6 +448,10 @@ function initDashboard(): void {
         listContainer.appendChild(row);
       }
     } catch (err: unknown) {
+      if (isUnauthorized(err)) {
+        handleUnauthorized();
+        return;
+      }
       listContainer.innerHTML = `<tr><td colspan="4" class="error-state">Failed to load workers: ${escapeHtml(err instanceof Error ? err.message : String(err))}</td></tr>`;
     }
   }
@@ -193,11 +475,20 @@ function initDashboard(): void {
       onFreshnessChanged: (freshness) => {
         currentStreamFreshness = freshness;
         renderFreshness(freshness);
+        if (freshness === "LIVE" && clearStreamErrorOnLive(streamBanner)) {
+          clearBanner();
+        }
       },
       onEventsUpdated: (events, hasMore, nextCursor) =>
         renderEvents(events, hasMore, nextCursor),
       onLogsUpdated: (logs, err) => renderLogs(logs, err),
-      onError: (err) => renderError(err),
+      onError: (err) => {
+        if (isUnauthorized(err)) {
+          handleUnauthorized();
+          return;
+        }
+        renderStreamError(err);
+      },
     });
 
     activeInspector.load();
@@ -232,8 +523,11 @@ function initDashboard(): void {
           let noAttemptsHtml =
             '<div class="no-attempts text-muted">No attempts claimed yet</div>';
           if (
-            snap.waitingReason === "NO_COMPATIBLE_WORKERS" ||
-            snap.activeCompatibleWorkers === 0
+            shouldShowWorkerWait(
+              st.status,
+              snap.waitingReason,
+              snap.activeCompatibleWorkers,
+            )
           ) {
             noAttemptsHtml = `
               <div class="no-attempts waiting-warning">
@@ -243,6 +537,12 @@ function initDashboard(): void {
                 </div>
               </div>
             `;
+          } else if (
+            st.status === "CANCELLED" ||
+            st.status === "FAILED" ||
+            st.status === "SUCCEEDED"
+          ) {
+            noAttemptsHtml = `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(st.status))}</div>`;
           }
 
           return `
@@ -458,10 +758,33 @@ function initDashboard(): void {
   }
 
   function renderError(err: Error): void {
+    // Bootstrap/API errors are unrelated to transient stream recovery and
+    // must never be cleared implicitly on reconnect.
+    markGlobalError(streamBanner, err.message);
     const banner = document.getElementById("global-error-banner");
     if (banner) {
       banner.textContent = err.message;
       banner.classList.remove("hidden");
+      banner.dataset.errorKind = "global";
+    }
+  }
+
+  function renderStreamError(err: Error): void {
+    markStreamError(streamBanner, err.message);
+    const banner = document.getElementById("global-error-banner");
+    if (banner) {
+      banner.textContent = err.message;
+      banner.classList.remove("hidden");
+      banner.dataset.errorKind = "stream";
+    }
+  }
+
+  function clearBanner(): void {
+    const banner = document.getElementById("global-error-banner");
+    if (banner) {
+      banner.textContent = "";
+      banner.classList.add("hidden");
+      delete banner.dataset.errorKind;
     }
   }
 

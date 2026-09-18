@@ -1,4 +1,46 @@
 import { RunEvent, StreamFreshness, ResyncControlEvent } from "./types.js";
+import { apiFetch } from "./api.js";
+
+// StreamErrorBanner tracks whether the visible global banner currently
+// represents a transient stream/network failure. Only that scoped state is
+// cleared when SSE recovers to LIVE; unrelated bootstrap/API errors are
+// never cleared implicitly.
+export interface StreamErrorBanner {
+  message: string | null;
+  isStreamError: boolean;
+}
+
+export function createStreamErrorBanner(): StreamErrorBanner {
+  return { message: null, isStreamError: false };
+}
+
+export function markStreamError(
+  banner: StreamErrorBanner,
+  message: string,
+): void {
+  banner.message = message;
+  banner.isStreamError = true;
+}
+
+export function markGlobalError(
+  banner: StreamErrorBanner,
+  message: string,
+): void {
+  banner.message = message;
+  banner.isStreamError = false;
+}
+
+// clearStreamErrorOnLive clears only a prior transient stream error. It
+// returns true when the caller should hide the banner; unrelated global
+// errors return false and stay visible.
+export function clearStreamErrorOnLive(banner: StreamErrorBanner): boolean {
+  if (banner.isStreamError && banner.message !== null) {
+    banner.message = null;
+    banner.isStreamError = false;
+    return true;
+  }
+  return false;
+}
 
 export interface StreamClientOptions {
   baseUrl?: string;
@@ -121,7 +163,7 @@ export class RunEventStreamClient {
         headers["Last-Event-ID"] = String(this.lastProcessedSequence);
       }
 
-      const response = await fetch(url, {
+      const response = await apiFetch(url, {
         headers,
         signal: this.abortController.signal,
       });

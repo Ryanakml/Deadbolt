@@ -155,6 +155,27 @@ body {
   color: var(--text-secondary);
 }
 
+.session-label {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+#org-select-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+#org-select-wrap select {
+  padding: 0.375rem 0.625rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.375rem;
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
 .env-selector select {
   padding: 0.375rem 0.625rem;
   border: 1px solid var(--border-color);

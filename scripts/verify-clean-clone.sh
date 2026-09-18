@@ -79,7 +79,7 @@ docker build -f deploy/Dockerfile.control-plane --build-arg COMMIT_SHA="$(git re
 docker compose -f deploy/compose/docker-compose.yml --profile core config --quiet
 docker compose -f deploy/compose/docker-compose.yml --profile telemetry config --quiet
 docker compose -f deploy/compose/docker-compose.yml --profile fault config --quiet
-DEADBOLT_DB_ADMIN_PASSWORD=mock_admin DEADBOLT_MIGRATOR_PASSWORD=mock_migrator DEADBOLT_RUNTIME_PASSWORD=mock_runtime DEADBOLT_SYSTEM_PASSWORD=mock_system DATABASE_URL=postgres://deadbolt_runtime:mock_runtime@localhost:5432/mock MIGRATOR_DATABASE_URL=postgres://deadbolt_migrator:mock_migrator@localhost:5432/mock SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system@localhost:5432/mock DEADBOLT_IMAGE=ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_POSTGRES_IMAGE=ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_OIDC_ISSUER=https://i DEADBOLT_OIDC_CLIENT_ID=id DEADBOLT_OIDC_CLIENT_SECRET=s DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud docker compose -f deploy/compose/docker-compose.staging.yml --profile slot-blue --profile slot-green config --quiet
+DEADBOLT_DB_ADMIN_PASSWORD=mock_admin DEADBOLT_MIGRATOR_PASSWORD=mock_migrator DEADBOLT_RUNTIME_PASSWORD=mock_runtime DEADBOLT_SYSTEM_PASSWORD=mock_system DATABASE_URL=postgres://deadbolt_runtime:mock_runtime@localhost:5432/mock MIGRATOR_DATABASE_URL=postgres://deadbolt_migrator:mock_migrator@localhost:5432/mock SYSTEM_DATABASE_URL=postgres://deadbolt_system:mock_system@localhost:5432/mock DEADBOLT_IMAGE=ghcr.io/ryanakml/deadbolt/control-plane@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_POSTGRES_IMAGE=ghcr.io/ryanakml/deadbolt/postgres@sha256:1111222233334444555566667777888899990000aaaaabbbbbcccccdddddeeeee DEADBOLT_OIDC_ISSUER=https://i DEADBOLT_OIDC_CLIENT_ID=id DEADBOLT_OIDC_CLIENT_SECRET=s DEADBOLT_OIDC_CLI_CLIENT_ID=mock_cli_client_id DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud docker compose -f deploy/compose/docker-compose.staging.yml --profile slot-blue --profile slot-green config --quiet
 DEADBOLT_STAGING_DOMAIN=staging.deadbolt.cloud DEADBOLT_SNIPPET_ONLY=true DRY_RUN=true ./scripts/reload-caddy.sh
 DRY_RUN=true ./scripts/check-backup-readiness.sh
 DRY_RUN=true ./scripts/bootstrap-staging-cluster.sh
@@ -106,6 +106,7 @@ curl -fs http://127.0.0.1:8080/livez >/dev/null || compose_logs_and_fail
 curl -fs http://127.0.0.1:8080/dashboard/ >/dev/null || compose_logs_and_fail
 curl -fs http://127.0.0.1:8080/dashboard/index.js >/dev/null || compose_logs_and_fail
 curl -fs http://127.0.0.1:8080/dashboard/styles.css >/dev/null || compose_logs_and_fail
+node scripts/verify-dashboard-esm.mjs http://127.0.0.1:8080/dashboard || compose_logs_and_fail
 compose exec -T control-plane /usr/local/bin/control-plane --migrate
 READYZ_OK=false
 for i in $(seq 1 15); do

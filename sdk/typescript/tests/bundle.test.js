@@ -7,6 +7,7 @@ import {
   output,
   buildDeploymentBundle,
   validateDeployment,
+  canonicalize,
   ContractError,
 } from "../dist/index.js";
 
@@ -219,4 +220,56 @@ test("buildDeploymentBundle digests are stable for identical bytes and change wi
   assert.equal(first.dependencyLockDigest, second.dependencyLockDigest);
   assert.notEqual(first.bundleDigest, changedBundle.bundleDigest);
   assert.notEqual(first.dependencyLockDigest, changedLock.dependencyLockDigest);
+});
+
+test("buildDeploymentBundle architecture changes produce distinct bundle digests", () => {
+  const baseOptions = {
+    workflows: [workflow],
+    dependencyLockContent: "lockfile-content-v1",
+    bundleFiles: {
+      "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+    },
+  };
+
+  const amd64Bundle = buildDeploymentBundle({
+    ...baseOptions,
+    targetArchitecture: "amd64",
+  });
+  const arm64Bundle = buildDeploymentBundle({
+    ...baseOptions,
+    targetArchitecture: "arm64",
+  });
+
+  assert.notEqual(amd64Bundle.bundleDigest, arm64Bundle.bundleDigest);
+  assert.equal(
+    amd64Bundle.dependencyLockDigest,
+    arm64Bundle.dependencyLockDigest,
+  );
+});
+
+test("buildDeploymentBundle embeds canonical platform identity matching the manifest target", () => {
+  const bundle = buildDeploymentBundle({
+    workflows: [workflow],
+    targetArchitecture: "arm64",
+    dependencyLockContent: "lockfile-content-v1",
+    bundleFiles: {
+      "tasks.js": "export const task = async () => ({ msg: 'ok' });",
+    },
+  });
+
+  const raw = bundle.files[".deadbolt/platform.json"];
+  assert.ok(raw, "expected .deadbolt/platform.json in bundle files");
+  const platformJson = new TextDecoder().decode(raw);
+  assert.deepEqual(JSON.parse(platformJson), {
+    targetArchitecture: "arm64",
+    targetOS: "linux",
+  });
+  // Embedded bytes must be the deterministic canonical form and agree with
+  // the manifest target, so identity cannot drift from the manifest.
+  assert.equal(
+    platformJson,
+    canonicalize({ targetArchitecture: "arm64", targetOS: "linux" }),
+  );
+  assert.equal(bundle.manifest.targetArchitecture, "arm64");
+  assert.equal(bundle.manifest.targetOS, "linux");
 });
