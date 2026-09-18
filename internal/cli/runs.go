@@ -56,7 +56,7 @@ Subcommands:
 func runRunsCreate(cfg Config, args []string) error {
 	fs := flag.NewFlagSet("runs create", flag.ContinueOnError)
 	workflowFlag := fs.String("workflow", "", "Name of workflow to execute")
-	envFlag := fs.String("env", cfg.Env, "Target environment (e.g. development, staging, production)")
+	envFlag := fs.String("env", "", "Target environment name or UUID (defaults to stored bootstrap context)")
 	cpURLFlag := fs.String("control-plane-url", "", "Control plane base URL")
 	inputFlag := fs.String("input", "", "JSON input payload or @filename.json")
 	idempKeyFlag := fs.String("idempotency-key", "", "Custom idempotency key (defaults to generated key)")
@@ -86,10 +86,6 @@ func runRunsCreate(cfg Config, args []string) error {
 
 	if workflowName == "" {
 		return fmt.Errorf("workflow name is required: use --workflow <name>")
-	}
-
-	if *envFlag == "" {
-		return fmt.Errorf("environment is required: use --env <env> or set DEADBOLT_ENV")
 	}
 
 	// Parse input payload
@@ -198,7 +194,7 @@ func runRunsCreate(cfg Config, args []string) error {
 
 func runRunsList(cfg Config, args []string) error {
 	fs := flag.NewFlagSet("runs list", flag.ContinueOnError)
-	envFlag := fs.String("env", cfg.Env, "Environment name or ID")
+	envFlag := fs.String("env", "", "Environment name or UUID (defaults to stored bootstrap context)")
 	cpURLFlag := fs.String("control-plane-url", "", "Control plane base URL")
 	cursorFlag := fs.String("cursor", "", "Pagination cursor")
 	limitFlag := fs.Int("limit", 25, "Maximum number of items")
@@ -210,10 +206,6 @@ func runRunsList(cfg Config, args []string) error {
 
 	if *cpURLFlag != "" {
 		cfg.APIURL = strings.TrimRight(*cpURLFlag, "/")
-	}
-
-	if *envFlag == "" {
-		return fmt.Errorf("--env or DEADBOLT_ENV is required")
 	}
 
 	// Operate on the canonical environment identity.

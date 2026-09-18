@@ -576,49 +576,30 @@ func commitHostedLoginContext(tokenResp hostedTokenResponse, customOrg, customEn
 		}
 		prev[account] = snap
 	}
-	rollback := func() error {
-		var firstErr error
-		for _, account := range []string{"api_key", "org_id", "env", "env_id", "project_id", "project"} {
-			if e := restoreCredential("deadbolt", account, prev[account]); e != nil && firstErr == nil {
-				firstErr = e
+	muts := []credentialMutation{{account: "api_key", value: tokenResp.AccessToken, desc: "API credential"}}
+	if orgID != "" {
+		muts = append(muts, credentialMutation{account: "org_id", value: orgID, desc: "org context"})
+		if prev["org_id"].exists && prev["org_id"].value != orgID {
+			// Organization switch: environment context from the previous
+			// org must not survive attached to the new org.
+			for _, account := range []string{"env", "env_id", "project_id", "project"} {
+				muts = append(muts, credentialMutation{account: account, remove: true, desc: "stale env context"})
 			}
 		}
-		return firstErr
-	}
-	if err := StoreCredential("deadbolt", "api_key", tokenResp.AccessToken); err != nil {
-		return "", "", err
-	}
-	if orgID != "" {
-		if err := StoreCredential("deadbolt", "org_id", orgID); err != nil {
-			if rbErr := rollback(); rbErr != nil {
-				return "", "", fmt.Errorf("store org context: %v (rollback: %v)", err, rbErr)
-			}
-			return "", "", fmt.Errorf("store org context: %w", err)
+		if envName != "" {
+			muts = append(muts, credentialMutation{account: "env", value: envName, desc: "env context"})
+		} else {
+			muts = append(muts, credentialMutation{account: "env", remove: true, desc: "env context"})
 		}
 	} else {
 		// No organization in the new login: no stale context of any kind
 		// may survive, including canonical IDs from a previous bootstrap.
 		for _, account := range []string{"org_id", "env", "env_id", "project_id", "project"} {
-			if err := DeleteCredential("deadbolt", account); err != nil {
-				if rbErr := rollback(); rbErr != nil {
-					return "", "", fmt.Errorf("clear stale %s context: %v (rollback: %v)", account, err, rbErr)
-				}
-				return "", "", fmt.Errorf("clear stale %s context: %w", account, err)
-			}
+			muts = append(muts, credentialMutation{account: account, remove: true, desc: "stale " + account + " context"})
 		}
 	}
-	if envName != "" {
-		if err := StoreCredential("deadbolt", "env", envName); err != nil {
-			if rbErr := rollback(); rbErr != nil {
-				return "", "", fmt.Errorf("store env context: %v (rollback: %v)", err, rbErr)
-			}
-			return "", "", fmt.Errorf("store env context: %w", err)
-		}
-	} else if err := DeleteCredential("deadbolt", "env"); err != nil {
-		if rbErr := rollback(); rbErr != nil {
-			return "", "", fmt.Errorf("clear stale env context: %v (rollback: %v)", err, rbErr)
-		}
-		return "", "", fmt.Errorf("clear stale env context: %w", err)
+	if err := applyCredentialMutations(muts); err != nil {
+		return "", "", err
 	}
 	return orgID, envName, nil
 }

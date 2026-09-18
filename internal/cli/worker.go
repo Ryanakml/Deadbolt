@@ -81,20 +81,18 @@ func handleWorkerEnroll(args []string) error {
 
 	// If --create-token requested, call control plane admin API to issue enrollment token
 	if *createTokenFlag {
-		env := *envFlag
-		if env == "" {
-			env = cfg.Env
-		}
-		if env == "" {
-			return fmt.Errorf("--env is required when using --create-token")
-		}
-
-		sel, err := resolveEnvSelection(cfg, env)
+		// Pass the raw flag: only the resolver decides fallback precedence,
+		// so stored canonical EnvID wins when --env is omitted.
+		sel, err := resolveEnvSelection(cfg, *envFlag)
 		if err != nil {
 			return err
 		}
 		envID := sel.EnvID
-		fmt.Printf("Requesting worker enrollment token for environment %s (pool: %s)...\n", env, *poolFlag)
+		envDisplay := *envFlag
+		if envDisplay == "" {
+			envDisplay = sel.EnvName
+		}
+		fmt.Printf("Requesting worker enrollment token for environment %s (pool: %s)...\n", envDisplay, *poolFlag)
 		inPayload, _ := json.Marshal(map[string]string{"pool": *poolFlag})
 		req, err := cfg.NewRequest(http.MethodPost, fmt.Sprintf("/v1/environments/%s/worker-enrollments", envID), bytes.NewReader(inPayload))
 		if err != nil {

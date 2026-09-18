@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -39,5 +42,125 @@ func TestSelectBootstrapOrg(t *testing.T) {
 	}
 	if _, _, err := selectBootstrapOrg([]bootstrapOrg{orgA}, "nope", "", ""); err == nil {
 		t.Fatal("expected error for unknown --org, got nil")
+	}
+}
+
+// stubBootstrapServer serves canned tenant discovery/creation endpoints and
+// records mutation order.
+func stubBootstrapServer(t *testing.T, createdIDs map[string]string, mutations *[]string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/organizations", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"organizations":[]}`))
+			return
+		}
+		*mutations = append(*mutations, "POST organizations")
+		_, _ = w.Write([]byte(`{"id":"` + createdIDs["org"] + `","name":"acme"}`))
+	})
+	mux.HandleFunc("/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"projects":[]}`))
+			return
+		}
+		*mutations = append(*mutations, "POST projects")
+		_, _ = w.Write([]byte(`{"id":"` + createdIDs["project"] + `","name":"svc"}`))
+	})
+	mux.HandleFunc("/v1/projects/proj-new/environments", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"environments":[]}`))
+			return
+		}
+		*mutations = append(*mutations, "POST environments")
+		_, _ = w.Write([]byte(`{"id":"` + createdIDs["env"] + `","name":"staging"}`))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server
+}
+
+func bootstrapTestEnv(t *testing.T, server *httptest.Server) {
+	t.Helper()
+	t.Setenv("DEADBOLT_API_URL", server.URL)
+	t.Setenv("DEADBOLT_API_KEY", "test-key")
+	t.Setenv("DEADBOLT_ORG_ID", "")
+	t.Setenv("DEADBOLT_ENV", "")
+}
+
+// TestHandleBootstrapWritesCoherentContext proves a clean bootstrap persists
+// the full canonical selection coherently.
+func TestHandleBootstrapWritesCoherentContext(t *testing.T) {
+	isolatedCredentials(t)
+	ids := map[string]string{"org": "org-new", "project": "proj-new", "env": "env-new"}
+	var mutations []string
+	server := stubBootstrapServer(t, ids, &mutations)
+	bootstrapTestEnv(t, server)
+
+	if err := HandleBootstrap([]string{"--org-name", "acme", "--project", "svc", "--env", "staging"}); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+	for account, want := range map[string]string{
+		"org_id": "org-new", "project_id": "proj-new", "project": "svc", "env_id": "env-new", "env": "staging",
+	} {
+		if got := mustCredential(t, account); got != want {
+			t.Fatalf("%s: got %q want %q", account, got, want)
+		}
+	}
+}
+
+// TestHandleBootstrapContextWriteIsAtomic proves a mid-write storage failure
+// aborts bootstrap and restores all prior context instead of persisting a
+// contradictory mix.
+func TestHandleBootstrapContextWriteIsAtomic(t *testing.T) {
+	isolatedCredentials(t)
+	for account, value := range map[string]string{
+		"org_id": "old-org", "project_id": "old-proj", "project": "old-svc",
+		"env_id": "old-env", "env": "old-staging",
+	} {
+		if err := StoreCredential("deadbolt", account, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := map[string]string{"org": "org-new", "project": "proj-new", "env": "env-new"}
+	var mutations []string
+	server := stubBootstrapServer(t, ids, &mutations)
+	bootstrapTestEnv(t, server)
+
+	var stores []string
+	faulted := false
+	credentialFault = func(service, account, op string) error {
+		if op == "store" {
+			stores = append(stores, account)
+		}
+		if !faulted && service == "deadbolt" && account == "env_id" && op == "store" {
+			faulted = true
+			return errors.New("injected env_id failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { credentialFault = nil })
+
+	if err := HandleBootstrap([]string{"--org-name", "acme", "--project", "svc", "--env", "staging"}); err == nil {
+		t.Fatal("expected bootstrap to fail, got nil")
+	}
+	// Deterministic order: org, project IDs/names before env identity.
+	// (Rollback restores append further entries; only the primary prefix
+	// is asserted here.)
+	wantOrder := []string{"org_id", "project_id", "project", "env_id"}
+	if len(stores) < len(wantOrder) {
+		t.Fatalf("expected primary stores %v, got %v", wantOrder, stores)
+	}
+	for i := range wantOrder {
+		if stores[i] != wantOrder[i] {
+			t.Fatalf("expected primary stores %v, got %v", wantOrder, stores)
+		}
+	}
+	for account, want := range map[string]string{
+		"org_id": "old-org", "project_id": "old-proj", "project": "old-svc",
+		"env_id": "old-env", "env": "old-staging",
+	} {
+		if got := mustCredential(t, account); got != want {
+			t.Fatalf("%s not restored: got %q want %q", account, got, want)
+		}
 	}
 }

@@ -438,6 +438,37 @@ func TestCommitHostedLoginContextClearsCanonicalIDs(t *testing.T) {
 	}
 }
 
+// TestCommitHostedLoginContextClearsEnvOnOrgSwitch proves logging into a
+// different organization drops environment context from the previous org
+// instead of attaching it to the new one.
+func TestCommitHostedLoginContextClearsEnvOnOrgSwitch(t *testing.T) {
+	isolatedCredentials(t)
+	for account, value := range map[string]string{
+		"api_key": "old-key", "org_id": "org-a",
+		"env": "staging", "env_id": "env-a", "project_id": "proj-a", "project": "proj-a",
+	} {
+		if err := StoreCredential("deadbolt", account, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orgID, _, err := commitHostedLoginContext(hostedTokenResponse{AccessToken: "new-key", OrganizationID: "org-b"}, "", "")
+	if err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+	if orgID != "org-b" {
+		t.Fatalf("expected org-b, got %q", orgID)
+	}
+	if got := mustCredential(t, "api_key"); got != "new-key" {
+		t.Fatalf("api_key not replaced, got %q", got)
+	}
+	if got := mustCredential(t, "org_id"); got != "org-b" {
+		t.Fatalf("org_id not replaced, got %q", got)
+	}
+	for _, account := range []string{"env", "env_id", "project_id", "project"} {
+		mustNoCredential(t, account)
+	}
+}
+
 // TestSnapshotCredentialDistinguishesAbsenceFromBackendFailure proves the
 // three snapshot outcomes: present carries the value, genuine absence is
 // non-existent, and backend failures surface instead of masquerading as

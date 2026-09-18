@@ -231,7 +231,12 @@ func TestHostedBootstrapPublicBoundary(t *testing.T) {
 		t.Fatalf("default-context enroll failed: %v", err)
 	}
 
-	// 7. Ambiguous name with no project/canonical context still fails
+	// 7. Default-context runs list also targets the stored UUID.
+	if err := cli.RunRuns([]string{"list"}); err != nil {
+		t.Fatalf("default-context runs list failed: %v", err)
+	}
+
+	// 8. Ambiguous name with no project/canonical context still fails
 	// explicitly instead of silently picking one project's staging.
 	for _, account := range []string{"env_id", "project_id", "project"} {
 		if err := cli.DeleteCredential("deadbolt", account); err != nil {

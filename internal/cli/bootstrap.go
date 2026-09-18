@@ -84,9 +84,8 @@ func HandleBootstrap(args []string) error {
 			return err
 		}
 	}
-	if err := StoreCredential("deadbolt", "org_id", org.ID); err != nil {
-		return err
-	}
+	// Organization identity joins the atomic context commit below so a
+	// failed bootstrap never leaves a half-selected organization behind.
 
 	// 2. Resolve project (list-first, then create).
 	projectName := *projectFlag
@@ -118,17 +117,16 @@ func HandleBootstrap(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Persist the canonical selection: IDs are authoritative identity,
-	// names are display context and resolution scope.
-	for account, value := range map[string]string{
-		"env":        env.Name,
-		"env_id":     env.ID,
-		"project_id": project.ID,
-		"project":    project.Name,
-	} {
-		if err := StoreCredential("deadbolt", account, value); err != nil {
-			return err
-		}
+	// Persist the canonical selection atomically: IDs are authoritative
+	// identity, names are display context and resolution scope.
+	if err := applyCredentialMutations([]credentialMutation{
+		{account: "org_id", value: org.ID, desc: "org context"},
+		{account: "project_id", value: project.ID, desc: "project context"},
+		{account: "project", value: project.Name, desc: "project context"},
+		{account: "env_id", value: env.ID, desc: "env context"},
+		{account: "env", value: env.Name, desc: "env context"},
+	}); err != nil {
+		return err
 	}
 
 	result := BootstrapResult{
