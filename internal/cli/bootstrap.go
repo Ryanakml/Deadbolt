@@ -118,8 +118,17 @@ func HandleBootstrap(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := StoreCredential("deadbolt", "env", env.Name); err != nil {
-		return err
+	// Persist the canonical selection: IDs are authoritative identity,
+	// names are display context and resolution scope.
+	for account, value := range map[string]string{
+		"env":        env.Name,
+		"env_id":     env.ID,
+		"project_id": project.ID,
+		"project":    project.Name,
+	} {
+		if err := StoreCredential("deadbolt", account, value); err != nil {
+			return err
+		}
 	}
 
 	result := BootstrapResult{

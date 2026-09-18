@@ -17,7 +17,13 @@ type Config struct {
 	APIKey string
 	OrgID  string
 	Env    string
-	JSON   bool
+	// EnvID, ProjectID and Project are the canonical selected context
+	// established by `runtime bootstrap`. EnvID is authoritative when set;
+	// Env/Project are human-readable display context and resolution scope.
+	EnvID     string
+	ProjectID string
+	Project   string
+	JSON      bool
 }
 
 type profile struct {
@@ -82,11 +88,27 @@ func LoadConfig() Config {
 		}
 	}
 
+	// Canonical selected context established by `runtime bootstrap`. Each is
+	// optional; resolution precedence is defined by resolveEnvSelection.
+	var envID, projectID, project string
+	if v, err := GetCredential("deadbolt", "env_id"); err == nil && v != "" {
+		envID = v
+	}
+	if v, err := GetCredential("deadbolt", "project_id"); err == nil && v != "" {
+		projectID = v
+	}
+	if v, err := GetCredential("deadbolt", "project"); err == nil && v != "" {
+		project = v
+	}
+
 	return Config{
-		APIURL: apiURL,
-		APIKey: apiKey,
-		OrgID:  orgID,
-		Env:    env,
+		APIURL:    apiURL,
+		APIKey:    apiKey,
+		OrgID:     orgID,
+		Env:       env,
+		EnvID:     envID,
+		ProjectID: projectID,
+		Project:   project,
 	}
 }
 

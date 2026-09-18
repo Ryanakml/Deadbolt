@@ -181,7 +181,7 @@ Behavior:
 - **Project/environment:** selected by name when present, created otherwise. Rerunning is safe and creates no duplicates.
 - Project name defaults to `deadbolt.config.json`; environment defaults to stored context, then `staging`.
 
-The selected organization and environment are stored in the OS credential store and become the defaults for `deploy`, `activate`, and `runs` commands.
+The selected organization and environment are stored in the OS credential store and become the defaults for `deploy`, `activate`, and `runs` commands. The canonical environment UUID is stored alongside the human-readable names, so later commands target exactly the bootstrapped environment: explicit `--env <UUID>` always resolves exactly, and an environment name shared by several projects fails with an explicit ambiguity error instead of silently picking one.
 
 ---
 

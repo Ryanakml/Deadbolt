@@ -124,9 +124,13 @@ func runRunsCreate(cfg Config, args []string) error {
 		idempKey = "cli-run-" + hex.EncodeToString(b)
 	}
 
-	// Build request payload
+	// Build request payload. Operate on the canonical environment identity.
+	sel, err := resolveEnvSelection(cfg, *envFlag)
+	if err != nil {
+		return err
+	}
 	reqBody := map[string]any{
-		"environment": *envFlag,
+		"environment": sel.EnvID,
 		"input":       inputVal,
 	}
 	if *deploymentIDFlag != "" {
@@ -212,8 +216,14 @@ func runRunsList(cfg Config, args []string) error {
 		return fmt.Errorf("--env or DEADBOLT_ENV is required")
 	}
 
+	// Operate on the canonical environment identity.
+	sel, err := resolveEnvSelection(cfg, *envFlag)
+	if err != nil {
+		return err
+	}
+
 	q := url.Values{}
-	q.Set("environment", *envFlag)
+	q.Set("environment", sel.EnvID)
 	if *cursorFlag != "" {
 		q.Set("cursor", *cursorFlag)
 	}

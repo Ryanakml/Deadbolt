@@ -1173,3 +1173,57 @@ func TestActivateIdempotentReplayHasUnambiguousOutcome(t *testing.T) {
 		t.Fatalf("conflict mutated channel: revision=%d active=%s", rev, active)
 	}
 }
+
+// TestRegisterRejectsForeignEnvironment proves a UUID alone never
+// authorizes cross-organization binding: registering into another
+// organization's environment fails closed with NOT_FOUND and persists
+// nothing, instead of leaking a 500 or writing a cross-org row.
+func TestRegisterRejectsForeignEnvironment(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+	ownerA, _ := tenant.NewUUID()
+	orgA, err := tc.service.CreateOrganization(ctx, ownerA, "foreign-env-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, _ := tenant.NewUUID()
+	orgB, err := tc.service.CreateOrganization(ctx, ownerB, "foreign-env-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectB, err := tc.service.CreateProject(ctx, orgB.ID, "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envB, err := tc.service.CreateEnvironment(ctx, orgB.ID, projectB.ID, tenant.EnvStaging, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc := deployment.NewService(tc.pool, tc.service)
+	handler := deployment.NewHTTPHandler(svc, tc.service)
+	callerA := tenant.ContextWithCaller(ctx, &tenant.CallerIdentity{Type: tenant.IdentityTypeHuman, UserID: ownerA, OrganizationID: orgA.ID})
+	bundle := strings.Repeat("b", 64)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/deployments?environment="+envB.ID, bytes.NewReader(deploymentManifest(t, bundle)))
+	req.Header.Set("Idempotency-Key", "foreign-env-1")
+	rec := httptest.NewRecorder()
+	handler.Register(rec, req.WithContext(callerA))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for foreign environment, got %d", rec.Code)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&body)
+	if body["code"] != "NOT_FOUND" {
+		t.Fatalf("expected NOT_FOUND code, got %v", body)
+	}
+	var count int
+	if err := tc.pool.WithTenantTx(ctx, orgA.ID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM deployments WHERE bundle_digest = $1`, bundle).Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("foreign registration persisted %d row(s)", count)
+	}
+}

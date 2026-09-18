@@ -71,7 +71,14 @@ func HandleDeploy(args []string) error {
 		return fmt.Errorf("manifest is invalid JSON: %w", err)
 	}
 
-	dep, rawBody, err := RegisterDeployment(cfg, env, manifestBytes)
+	// Operate on the canonical environment identity; display keeps the
+	// human-provided value.
+	sel, err := resolveEnvSelection(cfg, *envFlag)
+	if err != nil {
+		return err
+	}
+
+	dep, rawBody, err := RegisterDeployment(cfg, sel.EnvID, manifestBytes)
 	if err != nil {
 		return err
 	}

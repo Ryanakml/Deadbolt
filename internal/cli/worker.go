@@ -89,10 +89,11 @@ func handleWorkerEnroll(args []string) error {
 			return fmt.Errorf("--env is required when using --create-token")
 		}
 
-		envID, err := resolveEnvironmentID(cfg, env)
+		sel, err := resolveEnvSelection(cfg, env)
 		if err != nil {
 			return err
 		}
+		envID := sel.EnvID
 		fmt.Printf("Requesting worker enrollment token for environment %s (pool: %s)...\n", env, *poolFlag)
 		inPayload, _ := json.Marshal(map[string]string{"pool": *poolFlag})
 		req, err := cfg.NewRequest(http.MethodPost, fmt.Sprintf("/v1/environments/%s/worker-enrollments", envID), bytes.NewReader(inPayload))
@@ -345,112 +346,184 @@ func resolveRunnerPath(flagVal string) (string, error) {
 	return runnerPath, nil
 }
 
-// resolveEnvironmentID resolves an environment name or UUID to its canonical
-// ID using only authenticated public tenant discovery routes. When a project
-// context is available (DEADBOLT_PROJECT or deadbolt.config.json project),
-// the name resolves within that project. Otherwise every match is collected:
-// zero matches fail, exactly one wins, and several fail with an explicit
-// ambiguity error instead of silently picking the first project that lists
-// one. UUIDs remain exact.
-func resolveEnvironmentID(cfg Config, nameOrID string) (string, error) {
-	req, err := cfg.NewRequest(http.MethodGet, "/v1/projects", nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("list projects: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("list projects: %s", FormatAPIError(resp.StatusCode, body))
-	}
-	var projects struct {
-		Projects []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"projects"`
-	}
-	if err := json.Unmarshal(body, &projects); err != nil {
-		return "", fmt.Errorf("parse projects: %w", err)
-	}
-	scope := resolveProjectScope()
-	candidates := projects.Projects
-	if scope != "" {
-		var scoped []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
+// EnvSelection is the canonical environment context for one CLI command.
+// Commands operate on EnvID; names are display context and scope.
+type EnvSelection struct {
+	EnvID       string
+	EnvName     string
+	ProjectID   string
+	ProjectName string
+}
+
+// resolveEnvSelection determines the canonical environment context using
+// only authenticated public tenant discovery routes. Precedence:
+//
+//	explicit UUID (exact, no scope filter)
+//	→ explicit name + project scope
+//	→ stored env UUID
+//	→ stored name + stored project scope
+//	→ unique org-wide name
+//	→ explicit ambiguity error
+//
+// It never silently picks the first match.
+func resolveEnvSelection(cfg Config, explicit string) (EnvSelection, error) {
+	if explicit != "" {
+		if isUUIDString(explicit) {
+			return EnvSelection{EnvID: explicit}, nil
 		}
-		for _, p := range projects.Projects {
-			if p.Name == scope {
-				scoped = append(scoped, p)
+		return selectEnvByName(cfg, explicit, resolveProjectScope(cfg))
+	}
+	if cfg.EnvID != "" {
+		return EnvSelection{EnvID: cfg.EnvID, EnvName: cfg.Env, ProjectID: cfg.ProjectID, ProjectName: cfg.Project}, nil
+	}
+	if cfg.Env == "" {
+		return EnvSelection{}, fmt.Errorf("no environment selected: pass --env <name-or-UUID> or run `runtime bootstrap`")
+	}
+	return selectEnvByName(cfg, cfg.Env, resolveProjectScope(cfg))
+}
+
+// isUUIDString reports whether s has canonical UUID text shape. It gates
+// exact-identity handling only; existence and authorization stay server-side.
+func isUUIDString(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// resolveProjectScope returns the currently selected project context, if
+// any: DEADBOLT_PROJECT first, then the local deadbolt.config.json project,
+// then the stored bootstrap selection.
+func resolveProjectScope(cfg Config) string {
+	if v := strings.TrimSpace(os.Getenv("DEADBOLT_PROJECT")); v != "" {
+		return v
+	}
+	if prj, err := LoadProjectConfig("."); err == nil && prj != nil && strings.TrimSpace(prj.Project) != "" {
+		return strings.TrimSpace(prj.Project)
+	}
+	return strings.TrimSpace(cfg.Project)
+}
+
+// selectEnvByName collects every environment matching nameOrID across the
+// scoped projects: zero matches fail, exactly one wins, and several fail
+// with an explicit ambiguity error.
+func selectEnvByName(cfg Config, nameOrID, scope string) (EnvSelection, error) {
+	projects, err := listBootstrapProjects(cfg)
+	if err != nil {
+		return EnvSelection{}, err
+	}
+	candidates := projects
+	if scope != "" {
+		candidates = nil
+		for _, p := range projects {
+			if p.Name == scope || p.ID == scope {
+				candidates = append(candidates, p)
 			}
 		}
-		if len(scoped) == 0 {
-			return "", fmt.Errorf("project %q was not found in the authenticated organization", scope)
+		if len(candidates) == 0 {
+			return EnvSelection{}, fmt.Errorf("project %q was not found in the authenticated organization", scope)
 		}
-		candidates = scoped
 	}
 	type match struct {
-		projectName string
-		envID       string
-		envName     string
+		project bootstrapProjectRef
+		envID   string
+		envName string
 	}
 	var matches []match
 	for _, project := range candidates {
-		req, err := cfg.NewRequest(http.MethodGet, fmt.Sprintf("/v1/projects/%s/environments", project.ID), nil)
+		envs, err := listProjectEnvironments(cfg, project.ID)
 		if err != nil {
-			return "", err
+			return EnvSelection{}, err
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return "", fmt.Errorf("list environments: %w", err)
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("list environments: %s", FormatAPIError(resp.StatusCode, body))
-		}
-		var environments struct {
-			Environments []struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"environments"`
-		}
-		if err := json.Unmarshal(body, &environments); err != nil {
-			return "", fmt.Errorf("parse environments: %w", err)
-		}
-		for _, environment := range environments.Environments {
+		for _, environment := range envs {
 			if environment.ID == nameOrID || environment.Name == nameOrID {
-				matches = append(matches, match{projectName: project.Name, envID: environment.ID, envName: environment.Name})
+				matches = append(matches, match{project: project, envID: environment.ID, envName: environment.Name})
 			}
 		}
 	}
 	switch len(matches) {
 	case 0:
-		return "", fmt.Errorf("environment %q was not found in the authenticated organization", nameOrID)
+		return EnvSelection{}, fmt.Errorf("environment %q was not found in the authenticated organization", nameOrID)
 	case 1:
-		return matches[0].envID, nil
+		m := matches[0]
+		return EnvSelection{EnvID: m.envID, EnvName: m.envName, ProjectID: m.project.ID, ProjectName: m.project.Name}, nil
 	default:
 		var lines []string
 		for _, m := range matches {
-			lines = append(lines, fmt.Sprintf("  %s (project %q, id %s)", m.envName, m.projectName, m.envID))
+			lines = append(lines, fmt.Sprintf("  %s (project %q, id %s)", m.envName, m.project.Name, m.envID))
 		}
-		return "", fmt.Errorf("environment %q matches %d environments; rerun with an exact environment UUID:\n%s", nameOrID, len(matches), strings.Join(lines, "\n"))
+		return EnvSelection{}, fmt.Errorf("environment %q matches %d environments; rerun with an exact environment UUID:\n%s", nameOrID, len(matches), strings.Join(lines, "\n"))
 	}
 }
 
-// resolveProjectScope returns the currently selected project context, if any:
-// DEADBOLT_PROJECT first, then the local deadbolt.config.json project.
-func resolveProjectScope() string {
-	if v := strings.TrimSpace(os.Getenv("DEADBOLT_PROJECT")); v != "" {
-		return v
+type bootstrapProjectRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type bootstrapEnvRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func listBootstrapProjects(cfg Config) ([]bootstrapProjectRef, error) {
+	req, err := cfg.NewRequest(http.MethodGet, "/v1/projects", nil)
+	if err != nil {
+		return nil, err
 	}
-	if prj, err := LoadProjectConfig("."); err == nil && prj != nil {
-		return strings.TrimSpace(prj.Project)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list projects: %w", err)
 	}
-	return ""
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list projects: %s", FormatAPIError(resp.StatusCode, body))
+	}
+	var list struct {
+		Projects []bootstrapProjectRef `json:"projects"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("parse projects: %w", err)
+	}
+	return list.Projects, nil
+}
+
+func listProjectEnvironments(cfg Config, projectID string) ([]bootstrapEnvRef, error) {
+	req, err := cfg.NewRequest(http.MethodGet, fmt.Sprintf("/v1/projects/%s/environments", projectID), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list environments: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list environments: %s", FormatAPIError(resp.StatusCode, body))
+	}
+	var list struct {
+		Environments []bootstrapEnvRef `json:"environments"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("parse environments: %w", err)
+	}
+	return list.Environments, nil
 }
 
 func handleWorkerList(args []string) error {
@@ -476,8 +549,14 @@ func handleWorkerList(args []string) error {
 		return fmt.Errorf("--env is required")
 	}
 
+	// Operate on the canonical environment identity.
+	sel, err := resolveEnvSelection(cfg, *envFlag)
+	if err != nil {
+		return err
+	}
+
 	q := url.Values{}
-	q.Set("environment", env)
+	q.Set("environment", sel.EnvID)
 	if *cursorFlag != "" {
 		q.Set("cursor", *cursorFlag)
 	}

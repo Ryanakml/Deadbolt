@@ -76,7 +76,14 @@ func handleActivateDeployment(args []string) error {
 	}
 
 	idempKey := fmt.Sprintf("dep-act-%s-%d", workflowName, time.Now().UnixNano())
-	reqPath := fmt.Sprintf("/v1/workflows/%s/activate?environment=%s", workflowName, env)
+
+	// Operate on the canonical environment identity; display keeps the
+	// human-provided value.
+	sel, err := resolveEnvSelection(cfg, *envFlag)
+	if err != nil {
+		return err
+	}
+	reqPath := fmt.Sprintf("/v1/workflows/%s/activate?environment=%s", workflowName, sel.EnvID)
 	req, err := cfg.NewRequest(http.MethodPost, reqPath, bytes.NewReader(reqBytes))
 	if err != nil {
 		return fmt.Errorf("create activate request: %w", err)

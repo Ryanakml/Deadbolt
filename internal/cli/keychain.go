@@ -15,9 +15,10 @@ import (
 
 var (
 	ErrCredentialNotFound = errors.New("credential not found")
+	ErrCredentialBackend  = errors.New("credential backend failure")
 	customCredentialsDir  string
 	credentialsMu         sync.Mutex
-	// credentialFault injects failures into StoreCredential/DeleteCredential.
+	// credentialFault injects failures into credential operations.
 	// Test-only hook for failure-atomicity coverage; always nil in production.
 	credentialFault func(service, account, op string) error
 )
@@ -94,28 +95,46 @@ func StoreCredential(service, account, secret string) error {
 }
 
 // GetCredential retrieves a credential from the OS keychain or fallback secure storage.
+// Genuine absence returns ErrCredentialNotFound; any backend/read failure
+// returns a distinct error so callers never mistake an unknown prior state
+// for absence.
 func GetCredential(service, account string) (string, error) {
+	if credentialFault != nil {
+		if err := credentialFault(service, account, "get"); err != nil {
+			return "", err
+		}
+	}
 	if customCredentialsDir != "" || os.Getenv("DEADBOLT_CREDENTIALS_DIR") != "" {
 		return getFileCredential(service, account)
 	}
 
 	if runtime.GOOS == "darwin" {
-		cmd := exec.Command("security", "find-generic-password", "-s", service, "-a", account, "-w")
-		out, err := cmd.Output()
+		out, err := exec.Command("security", "find-generic-password", "-s", service, "-a", account, "-w").Output()
 		if err == nil {
 			return strings.TrimSpace(string(out)), nil
 		}
+		if isKeychainNotFoundOutput(string(out)) {
+			return "", ErrCredentialNotFound
+		}
+		return "", fmt.Errorf("%w: macOS Keychain lookup failed: %v", ErrCredentialBackend, err)
 	} else if runtime.GOOS == "linux" {
 		if _, err := exec.LookPath("secret-tool"); err == nil {
-			cmd := exec.Command("secret-tool", "lookup", "service", service, "account", account)
-			out, err := cmd.Output()
-			if err == nil && len(out) > 0 {
+			out, err := exec.Command("secret-tool", "lookup", "service", service, "account", account).CombinedOutput()
+			if err == nil {
+				if len(bytes.TrimSpace(out)) == 0 {
+					return "", ErrCredentialNotFound
+				}
 				return strings.TrimSpace(string(out)), nil
 			}
+			if isSecretToolNotFoundOutput(string(out)) {
+				return "", ErrCredentialNotFound
+			}
+			return "", fmt.Errorf("%w: Linux Secret Service lookup failed: %v", ErrCredentialBackend, err)
 		}
+		return "", fmt.Errorf("%w: secret-tool is required for hosted credentials on Linux; install a Secret Service provider", ErrCredentialBackend)
 	}
 
-	return "", fmt.Errorf("native credential store is unavailable: %w", ErrCredentialNotFound)
+	return "", fmt.Errorf("%w: no supported native credential store for %s", ErrCredentialBackend, runtime.GOOS)
 }
 
 // DeleteCredential removes a credential from the OS keychain or fallback secure storage.

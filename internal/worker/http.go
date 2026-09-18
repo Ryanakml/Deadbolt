@@ -379,6 +379,16 @@ func (h *HTTPHandler) HandleCreateEnrollmentToken(w http.ResponseWriter, r *http
 		h.writeError(w, r, http.StatusBadRequest, "MISSING_ENVIRONMENT", "Environment ID is required", false)
 		return
 	}
+	// The environment must belong to the caller's organization: a UUID alone
+	// never authorizes cross-organization enrollment.
+	if _, err := h.tenants.GetEnvironment(r.Context(), caller.OrganizationID, envID); err != nil {
+		if errors.Is(err, tenant.ErrNotFound) {
+			h.writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Environment not found", false)
+			return
+		}
+		h.writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Request could not be completed", true)
+		return
+	}
 
 	var in struct {
 		Pool string `json:"pool"`

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -567,19 +568,21 @@ func commitHostedLoginContext(tokenResp hostedTokenResponse, customOrg, customEn
 	if customEnv != "" {
 		envName = customEnv
 	}
-	prevKey, hadKey := priorCredential("deadbolt", "api_key")
-	prevOrg, hadOrg := priorCredential("deadbolt", "org_id")
-	prevEnv, hadEnv := priorCredential("deadbolt", "env")
+	prev := make(map[string]credentialSnapshot, 6)
+	for _, account := range []string{"api_key", "org_id", "env", "env_id", "project_id", "project"} {
+		snap, err := snapshotCredential("deadbolt", account)
+		if err != nil {
+			return "", "", fmt.Errorf("snapshot credential context: %w", err)
+		}
+		prev[account] = snap
+	}
 	rollback := func() error {
 		var firstErr error
-		fail := func(e error) {
-			if e != nil && firstErr == nil {
+		for _, account := range []string{"api_key", "org_id", "env", "env_id", "project_id", "project"} {
+			if e := restoreCredential("deadbolt", account, prev[account]); e != nil && firstErr == nil {
 				firstErr = e
 			}
 		}
-		fail(restoreCredential("deadbolt", "api_key", prevKey, hadKey))
-		fail(restoreCredential("deadbolt", "org_id", prevOrg, hadOrg))
-		fail(restoreCredential("deadbolt", "env", prevEnv, hadEnv))
 		return firstErr
 	}
 	if err := StoreCredential("deadbolt", "api_key", tokenResp.AccessToken); err != nil {
@@ -592,11 +595,17 @@ func commitHostedLoginContext(tokenResp hostedTokenResponse, customOrg, customEn
 			}
 			return "", "", fmt.Errorf("store org context: %w", err)
 		}
-	} else if err := DeleteCredential("deadbolt", "org_id"); err != nil {
-		if rbErr := rollback(); rbErr != nil {
-			return "", "", fmt.Errorf("clear stale org context: %v (rollback: %v)", err, rbErr)
+	} else {
+		// No organization in the new login: no stale context of any kind
+		// may survive, including canonical IDs from a previous bootstrap.
+		for _, account := range []string{"org_id", "env", "env_id", "project_id", "project"} {
+			if err := DeleteCredential("deadbolt", account); err != nil {
+				if rbErr := rollback(); rbErr != nil {
+					return "", "", fmt.Errorf("clear stale %s context: %v (rollback: %v)", account, err, rbErr)
+				}
+				return "", "", fmt.Errorf("clear stale %s context: %w", account, err)
+			}
 		}
-		return "", "", fmt.Errorf("clear stale org context: %w", err)
 	}
 	if envName != "" {
 		if err := StoreCredential("deadbolt", "env", envName); err != nil {
@@ -614,20 +623,31 @@ func commitHostedLoginContext(tokenResp hostedTokenResponse, customOrg, customEn
 	return orgID, envName, nil
 }
 
-// priorCredential snapshots one credential for rollback. Any read failure is
-// treated as absent; the subsequent write will surface real store failures.
-func priorCredential(service, account string) (string, bool) {
+// credentialSnapshot is one prior credential state: present with its value,
+// genuinely absent, or unknown when the backend read itself failed.
+type credentialSnapshot struct {
+	value  string
+	exists bool
+}
+
+// snapshotCredential reads one prior credential for rollback. Genuine
+// absence snapshots as non-existent; any backend/read failure aborts the
+// caller before mutation because the prior state is unknown, never absent.
+func snapshotCredential(service, account string) (credentialSnapshot, error) {
 	v, err := GetCredential(service, account)
-	if err != nil {
-		return "", false
+	if err == nil {
+		return credentialSnapshot{value: v, exists: true}, nil
 	}
-	return v, true
+	if errors.Is(err, ErrCredentialNotFound) {
+		return credentialSnapshot{}, nil
+	}
+	return credentialSnapshot{}, err
 }
 
 // restoreCredential returns one credential to its snapshotted state.
-func restoreCredential(service, account, value string, existed bool) error {
-	if existed {
-		return StoreCredential(service, account, value)
+func restoreCredential(service, account string, snap credentialSnapshot) error {
+	if snap.exists {
+		return StoreCredential(service, account, snap.value)
 	}
 	return DeleteCredential(service, account)
 }

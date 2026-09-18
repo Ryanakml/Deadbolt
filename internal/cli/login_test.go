@@ -51,10 +51,10 @@ func TestMutatingCommandsSendIdempotencyKeys(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "staging", "--control-plane-url", server.URL}); err != nil {
+	if err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "11111111-1111-1111-1111-111111111111", "--control-plane-url", server.URL}); err != nil {
 		t.Fatalf("activate failed: %v", err)
 	}
-	if err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "staging", "--control-plane-url", server.URL}); err != nil {
+	if err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "11111111-1111-1111-1111-111111111111", "--control-plane-url", server.URL}); err != nil {
 		t.Fatalf("second activate failed: %v", err)
 	}
 	if len(keys) != 2 {
@@ -90,7 +90,7 @@ func TestActivateConflictReportsCorrelation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "staging", "--control-plane-url", server.URL})
+	err := HandleDeployments([]string{"activate", "dep-1", "--workflow", "wf", "--env", "11111111-1111-1111-1111-111111111111", "--control-plane-url", server.URL})
 	if err == nil || !strings.Contains(err.Error(), "Revision conflict") {
 		t.Fatalf("expected revision conflict error, got %v", err)
 	}
@@ -413,5 +413,142 @@ func TestLoginAPIKeyProvisioningIsExplicitPartialUpdate(t *testing.T) {
 	}
 	if got := mustCredential(t, "env"); got != "new-env" {
 		t.Fatalf("env flag not stored, got %q", got)
+	}
+}
+
+// TestCommitHostedLoginContextClearsCanonicalIDs proves an org-less login
+// removes stored canonical IDs as well as names, so no stale bootstrap
+// context can survive it.
+func TestCommitHostedLoginContextClearsCanonicalIDs(t *testing.T) {
+	isolatedCredentials(t)
+	seedLoginContext(t)
+	for account, value := range map[string]string{"env_id": "old-env-id", "project_id": "old-proj-id", "project": "old-proj"} {
+		if err := StoreCredential("deadbolt", account, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := commitHostedLoginContext(hostedTokenResponse{AccessToken: "new-key"}, "", ""); err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+	for _, account := range []string{"org_id", "env", "env_id", "project_id", "project"} {
+		mustNoCredential(t, account)
+	}
+	if got := mustCredential(t, "api_key"); got != "new-key" {
+		t.Fatalf("api_key not replaced, got %q", got)
+	}
+}
+
+// TestSnapshotCredentialDistinguishesAbsenceFromBackendFailure proves the
+// three snapshot outcomes: present carries the value, genuine absence is
+// non-existent, and backend failures surface instead of masquerading as
+// absence.
+func TestSnapshotCredentialDistinguishesAbsenceFromBackendFailure(t *testing.T) {
+	isolatedCredentials(t)
+	if err := StoreCredential("deadbolt", "api_key", "present-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := snapshotCredential("deadbolt", "api_key")
+	if err != nil || !snap.exists || snap.value != "present-key" {
+		t.Fatalf("expected PRESENT(present-key), got %+v (%v)", snap, err)
+	}
+	snap, err = snapshotCredential("deadbolt", "missing-account")
+	if err != nil || snap.exists {
+		t.Fatalf("expected ABSENT, got %+v (%v)", snap, err)
+	}
+
+	faultCredentialOps(t, "deadbolt/org_id/get")
+	if _, err := snapshotCredential("deadbolt", "org_id"); err == nil {
+		t.Fatal("expected backend read failure to surface, got nil")
+	} else if errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("backend failure must not map to ErrCredentialNotFound, got %v", err)
+	}
+}
+
+// TestCommitAbortsBeforeMutationOnSnapshotFailure proves a backend read
+// failure during snapshotting aborts hosted context replacement with zero
+// mutation attempts and untouched previous context.
+func TestCommitAbortsBeforeMutationOnSnapshotFailure(t *testing.T) {
+	isolatedCredentials(t)
+	seedLoginContext(t)
+	mutations := 0
+	prev := credentialFault
+	credentialFault = func(service, account, op string) error {
+		if op == "store" || op == "delete" {
+			mutations++
+		}
+		if service == "deadbolt" && account == "org_id" && op == "get" {
+			return errors.New("injected backend read failure")
+		}
+		if prev != nil {
+			return prev(service, account, op)
+		}
+		return nil
+	}
+	t.Cleanup(func() { credentialFault = nil })
+
+	_, _, err := commitHostedLoginContext(hostedTokenResponse{AccessToken: "new-key", OrganizationID: "new-org"}, "", "")
+	if err == nil {
+		t.Fatal("expected snapshot failure to abort, got nil")
+	}
+	if mutations != 0 {
+		t.Fatalf("expected zero mutation attempts, got %d", mutations)
+	}
+	credentialFault = nil
+	if got := mustCredential(t, "api_key"); got != "old-key" {
+		t.Fatalf("prior api_key touched, got %q", got)
+	}
+	if got := mustCredential(t, "org_id"); got != "old-org" {
+		t.Fatalf("prior org_id touched, got %q", got)
+	}
+}
+
+// TestCommitSurfacesRollbackFailure proves that when both the primary write
+// and the rollback fail, both errors stay visible without leaking values.
+func TestCommitSurfacesRollbackFailure(t *testing.T) {
+	isolatedCredentials(t)
+	seedLoginContext(t)
+	keyStores := 0
+	credentialFault = func(service, account, op string) error {
+		if service == "deadbolt" && account == "api_key" && op == "store" {
+			keyStores++
+			if keyStores > 1 {
+				return errors.New("injected rollback failure")
+			}
+		}
+		if service == "deadbolt" && account == "org_id" && op == "store" {
+			return errors.New("injected primary failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { credentialFault = nil })
+
+	_, _, err := commitHostedLoginContext(hostedTokenResponse{AccessToken: "new-key", OrganizationID: "new-org"}, "", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "store org context") || !strings.Contains(msg, "rollback") {
+		t.Fatalf("expected primary and rollback failures visible, got %q", msg)
+	}
+	for _, secret := range []string{"old-key", "new-key", "old-org", "new-org"} {
+		if strings.Contains(msg, secret) {
+			t.Fatalf("error leaked credential value %q: %s", secret, msg)
+		}
+	}
+}
+
+// TestLoginAPIKeyPartialFailureReportsError proves explicit manual
+// provisioning never prints success after a requested write failed.
+func TestLoginAPIKeyPartialFailureReportsError(t *testing.T) {
+	isolatedCredentials(t)
+	seedLoginContext(t)
+	faultCredentialOps(t, "deadbolt/org_id/store")
+
+	if err := RunLogin([]string{"--api-key", "rotated-key", "--org", "new-org"}); err == nil {
+		t.Fatal("expected error for failed org write, got nil")
+	}
+	if got := mustCredential(t, "api_key"); got != "rotated-key" {
+		t.Fatalf("first write should stand, got %q", got)
 	}
 }

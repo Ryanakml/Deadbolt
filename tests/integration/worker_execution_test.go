@@ -870,3 +870,44 @@ func TestListRunsAmbiguousEnvironmentName(t *testing.T) {
 		t.Fatalf("expected 200 for runs by UUID, got %d", code)
 	}
 }
+
+// TestEnrollmentTokenRejectsForeignEnvironment proves a UUID alone never
+// authorizes cross-organization enrollment: requesting a token for another
+// organization's environment fails closed with NOT_FOUND.
+func TestEnrollmentTokenRejectsForeignEnvironment(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+	ownerA, _ := tenant.NewUUID()
+	orgA, err := tc.service.CreateOrganization(ctx, ownerA, "foreign-enroll-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, _ := tenant.NewUUID()
+	orgB, err := tc.service.CreateOrganization(ctx, ownerB, "foreign-enroll-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectB, err := tc.service.CreateProject(ctx, orgB.ID, "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envB, err := tc.service.CreateEnvironment(ctx, orgB.ID, projectB.ID, tenant.EnvStaging, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := worker.NewHTTPHandler(nil, tc.service)
+	callerA := tenant.ContextWithCaller(ctx, &tenant.CallerIdentity{
+		Type: tenant.IdentityTypeHuman, UserID: ownerA, OrganizationID: orgA.ID, Role: tenant.RoleOwner,
+	})
+	req, _ := http.NewRequest(http.MethodPost, "/v1/environments/"+envB.ID+"/worker-enrollments", bytes.NewReader([]byte(`{"pool":"default"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	// Route pattern equivalent: envId path value must be set for the handler.
+	req.SetPathValue("envId", envB.ID)
+	handler.HandleCreateEnrollmentToken(rec, req.WithContext(callerA))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for foreign environment, got %d", rec.Code)
+	}
+}

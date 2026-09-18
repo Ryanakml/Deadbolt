@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/cli"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
+	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 )
 
@@ -168,4 +170,81 @@ func TestHostedBootstrapPublicBoundary(t *testing.T) {
 		t.Fatal("expected deployment ID in response")
 	}
 	fmt.Printf("bootstrap usability deployment: %s\n", depBody.ID)
+
+	deploymentEnvOf := func(depID string) string {
+		t.Helper()
+		var envID string
+		if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT environment_id::text FROM deployments WHERE id = $1`, depID).Scan(&envID)
+		}); err != nil {
+			t.Fatalf("deployment env lookup: %v", err)
+		}
+		return envID
+	}
+	envA := deploymentEnvOf(depBody.ID)
+
+	// 5. Second project owning another "staging": re-bootstrap pins the
+	// exact selection, and default-context deploy targets ENV-A without
+	// manual UUID copying.
+	project2, err := tc.service.CreateProject(ctx, orgID, "second-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tc.service.CreateEnvironment(ctx, orgID, project2.ID, tenant.EnvStaging, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.HandleBootstrap([]string{"--project", "svc", "--env", "staging"}); err != nil {
+		t.Fatalf("bootstrap with two stagings failed: %v", err)
+	}
+	storedEnvID, err := cli.GetCredential("deadbolt", "env_id")
+	if err != nil || storedEnvID != envA {
+		t.Fatalf("expected stored env UUID %s, got %q (%v)", envA, storedEnvID, err)
+	}
+
+	manifest2Path := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(manifest2Path, deploymentManifest(t, strings.Repeat("d", 64)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.HandleDeploy([]string{"--manifest", manifest2Path}); err != nil {
+		t.Fatalf("default-context deploy failed: %v", err)
+	}
+	var lastDepID string
+	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT id::text FROM deployments WHERE environment_id = $1 ORDER BY created_at DESC LIMIT 1`, envA).Scan(&lastDepID)
+	}); err != nil || lastDepID == "" {
+		t.Fatalf("expected default-context deploy bound to %s: %v", envA, err)
+	}
+
+	// 6. Default-context worker enrollment succeeds against the stored UUID.
+	// The human session carries the active org, mirroring post-login context.
+	_, token2, err := tc.sessionStore.CreateCLISession(ctx, user.ID, &orgID, "127.0.0.1", "bootstrap-test-2", 12*time.Hour, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("create human session: %v", err)
+	}
+	os.Setenv("DEADBOLT_API_KEY", token2)
+	if err := cli.HandleWorkerEnroll([]string{
+		"--key-path", filepath.Join(t.TempDir(), "worker-default.key"),
+		"--pool", "default",
+		"--create-token",
+		"--control-plane-url", server.URL,
+	}); err != nil {
+		t.Fatalf("default-context enroll failed: %v", err)
+	}
+
+	// 7. Ambiguous name with no project/canonical context still fails
+	// explicitly instead of silently picking one project's staging.
+	for _, account := range []string{"env_id", "project_id", "project"} {
+		if err := cli.DeleteCredential("deadbolt", account); err != nil {
+			t.Fatalf("clear stored %s: %v", account, err)
+		}
+	}
+	if err := cli.HandleWorkerEnroll([]string{
+		"--key-path", filepath.Join(t.TempDir(), "worker-amb.key"),
+		"--env", "staging",
+		"--pool", "default",
+		"--create-token",
+		"--control-plane-url", server.URL,
+	}); err == nil || !strings.Contains(err.Error(), "matches 2 environments") {
+		t.Fatalf("expected explicit ambiguity error, got %v", err)
+	}
 }
