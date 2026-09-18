@@ -112,11 +112,14 @@ func RunDev(args []string) error {
 		for _, name := range []string{"worker-a", "worker-b"} {
 			workerKeyPath := filepath.Join(credDir, name+".key")
 			if _, err := os.Stat(workerKeyPath); os.IsNotExist(err) {
+				// Automatic enrollment consumes the canonical EnvID stored by
+				// local bootstrap. No explicit --env is passed so name
+				// re-resolution against the workspace project scope cannot
+				// redirect or fail.
 				enrollArgs := []string{
 					"--control-plane-url", apiURL,
 					"--key-path", workerKeyPath,
 					"--pool", *poolFlag,
-					"--env", "development",
 					"--create-token",
 				}
 				if err := HandleWorkerEnroll(enrollArgs); err != nil {

@@ -242,12 +242,15 @@ func runLocalDevLogin(cfg Config, email string, customOrg string, customEnv stri
 		targetEnv = customEnv
 	}
 
-	if err := StoreCredential("deadbolt", "org_id", orgID); err != nil {
-		return err
-	}
+	// The workspace project identity is authoritative for local bootstrap.
+	// Inside a generated project deadbolt.config.json carries e.g.
+	// project = order-service; outside a workspace the documented local
+	// fallback applies. Never select projects[0] merely because it exists.
+	desiredProject := localBootstrapProjectName()
 
-	// List or create project
+	// List or create project by exact workspace name.
 	var projectID string
+	var projectName string
 	res, resBody, err := doAuthReq("GET", "/v1/projects", nil)
 	if err != nil {
 		return fmt.Errorf("local bootstrap list projects: %w", err)
@@ -264,12 +267,16 @@ func runLocalDevLogin(cfg Config, email string, customOrg string, customEnv stri
 	if err := json.Unmarshal(resBody, &prjList); err != nil {
 		return fmt.Errorf("local bootstrap parse projects: %w", err)
 	}
-	if len(prjList.Projects) > 0 {
-		projectID = prjList.Projects[0].ID
+	for _, p := range prjList.Projects {
+		if p.Name == desiredProject && p.ID != "" {
+			projectID = p.ID
+			projectName = p.Name
+			break
+		}
 	}
 
 	if projectID == "" {
-		res, resBody, err := doAuthReq("POST", "/v1/projects", map[string]string{"name": "default"})
+		res, resBody, err := doAuthReq("POST", "/v1/projects", map[string]string{"name": desiredProject})
 		if err != nil {
 			return fmt.Errorf("local bootstrap create project: %w", err)
 		}
@@ -277,12 +284,17 @@ func runLocalDevLogin(cfg Config, email string, customOrg string, customEnv stri
 			return fmt.Errorf("local bootstrap create project: status %d: %s", res.StatusCode, string(resBody))
 		}
 		var newPrj struct {
-			ID string `json:"id"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
 		}
 		if err := json.Unmarshal(resBody, &newPrj); err != nil || newPrj.ID == "" {
 			return fmt.Errorf("local bootstrap parse created project: %w", err)
 		}
 		projectID = newPrj.ID
+		projectName = newPrj.Name
+		if projectName == "" {
+			projectName = desiredProject
+		}
 	}
 
 	// Find or create environment
@@ -366,15 +378,20 @@ func runLocalDevLogin(cfg Config, email string, customOrg string, customEnv stri
 	if rawKey == "" {
 		return fmt.Errorf("local bootstrap created api key is empty in response: %s", string(resBody))
 	}
-	if err := StoreCredential("deadbolt", "api_key", rawKey); err != nil {
+	// Atomically persist the complete canonical CLI context. The replacement
+	// overwrites every canonical field so no project/env identity from a
+	// previous local organization can survive attached to the new org. Any
+	// storage failure fails closed with prior context restored; success is
+	// printed only after the context is actually usable.
+	if err := applyCredentialMutations([]credentialMutation{
+		{account: "org_id", value: orgID, desc: "org context"},
+		{account: "project_id", value: projectID, desc: "project context"},
+		{account: "project", value: projectName, desc: "project context"},
+		{account: "env_id", value: envID, desc: "env context"},
+		{account: "env", value: targetEnv, desc: "env context"},
+		{account: "api_key", value: rawKey, desc: "API credential"},
+	}); err != nil {
 		return err
-	}
-
-	if err := StoreCredential("deadbolt", "env", targetEnv); err != nil {
-		return err
-	}
-	if _, err := GetCredential("deadbolt", "api_key"); err != nil {
-		return fmt.Errorf("local bootstrap did not create a usable API key: %w", err)
 	}
 
 	fmt.Println("✓ Successfully authenticated to local Deadbolt environment.")
@@ -382,9 +399,24 @@ func runLocalDevLogin(cfg Config, email string, customOrg string, customEnv stri
 	if orgID != "" {
 		fmt.Printf("  Organization: %s\n", orgID)
 	}
+	fmt.Printf("  Project:      %s\n", projectName)
 	fmt.Printf("  Environment:  %s\n", targetEnv)
 	fmt.Println("  Credentials stored securely in OS credentials store.")
 	return nil
+}
+
+// localBootstrapProjectName resolves the workspace project identity for local
+// dev bootstrap: DEADBOLT_PROJECT first, then deadbolt.config.json project,
+// otherwise the documented local fallback. Stored CLI context is deliberately
+// not consulted so stale identity from a previous organization can never win.
+func localBootstrapProjectName() string {
+	if v := strings.TrimSpace(os.Getenv("DEADBOLT_PROJECT")); v != "" {
+		return v
+	}
+	if prj, err := LoadProjectConfig("."); err == nil && prj != nil && strings.TrimSpace(prj.Project) != "" {
+		return strings.TrimSpace(prj.Project)
+	}
+	return "default"
 }
 
 // hostedLoopbackCallbackPort is the fixed loopback port registered as the
