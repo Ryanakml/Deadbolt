@@ -94,6 +94,28 @@ Key local mode characteristics:
 - **Two local worker processes:** Automatically enrolls and runs `worker-a` and `worker-b` as separate processes with distinct PIDs, satisfying local HA activation preflight requirements out of the box.
 - **Auto-terminating:** Press `Ctrl+C` to gracefully drain running tasks and stop all containers.
 
+### Local canonical context
+
+Inside a Deadbolt workspace, `runtime dev` uses the workspace project
+identity from `DEADBOLT_PROJECT` first, otherwise `deadbolt.config.json`
+(`project`). Local bootstrap exact-selects that project by name or creates
+it when missing; it never picks `projects[0]`. The `development`
+environment (or an explicit custom local env) is selected or created inside
+that exact project.
+
+Bootstrap then stores the canonical local CLI context:
+
+- `org_id`, `project_id`, `project`, `env_id`, `env`
+
+together with the generated local API credential. Automatic worker
+enrollment during `runtime dev` consumes the stored canonical `EnvID` and
+deliberately does not pass `--env development`, so name re-resolution
+cannot diverge from the already-established workspace context.
+`runtime login --local` outside a workspace falls back to project
+`"default"`. Explicit user-supplied `--env` behavior is unchanged. Local
+bootstrap uses only public HTTP APIs and is idempotent: rerunning selects
+the same project and environment instead of duplicating them.
+
 ---
 
 ## 3. Deterministic Bundle Assembly (`runtime build`)
@@ -181,7 +203,7 @@ Behavior:
 - **Project/environment:** selected by name when present, created otherwise. Rerunning is safe and creates no duplicates.
 - Project name defaults to `deadbolt.config.json`; environment defaults to stored context, then `staging`.
 
-The selected organization and environment are stored in the OS credential store and become the defaults for `deploy`, `activate`, and `runs` commands. The canonical environment UUID is stored alongside the human-readable names, so later commands target exactly the bootstrapped environment: explicit `--env <UUID>` always resolves exactly, and an environment name shared by several projects fails with an explicit ambiguity error instead of silently picking one.
+The selected organization, project, and environment — including the canonical project/environment IDs — are stored in the OS credential store and become the defaults for `deploy`, `activate`, and `runs` commands. The canonical environment UUID is stored alongside the human-readable names, so later commands target exactly the bootstrapped environment: explicit `--env <UUID>` always resolves exactly, and an environment name shared by several projects fails with an explicit ambiguity error instead of silently picking one.
 
 ---
 
