@@ -32,9 +32,11 @@ var (
 const maxInlinePayloadBytes = worker.MaxInlinePayloadBytes
 
 type Service struct {
-	pool    *storage.Pool
-	tenants *tenant.Service
-	hub     *EventHub
+	pool               *storage.Pool
+	tenants            *tenant.Service
+	hub                *EventHub
+	beforeCreateCommit func() error
+	afterCreateCommit  func() error
 }
 
 func NewService(pool *storage.Pool, tenants *tenant.Service, hub ...*EventHub) *Service {
@@ -53,6 +55,19 @@ func NewService(pool *storage.Pool, tenants *tenant.Service, hub ...*EventHub) *
 
 func (s *Service) Hub() *EventHub {
 	return s.hub
+}
+
+// SetBeforeCreateCommitHookForTest injects a deterministic failure after all
+// create writes have been staged but before the transaction is allowed to
+// commit. Production constructors leave it nil.
+func (s *Service) SetBeforeCreateCommitHookForTest(hook func() error) {
+	s.beforeCreateCommit = hook
+}
+
+// SetAfterCreateCommitHookForTest injects a caller-visible failure only after
+// CreateRun has committed. Production constructors leave it nil.
+func (s *Service) SetAfterCreateCommitHookForTest(hook func() error) {
+	s.afterCreateCommit = hook
 }
 
 type payloadHashModel struct {
@@ -353,11 +368,19 @@ func (s *Service) CreateRun(
 			CreatedAt:      createdAt.UTC().Format(time.RFC3339),
 			DeadlineAt:     deadlineStr,
 		}
+		if s.beforeCreateCommit != nil {
+			return s.beforeCreateCommit()
+		}
 		return nil
 	})
 
 	if err != nil {
 		return nil, false, err
+	}
+	if s.afterCreateCommit != nil {
+		if err := s.afterCreateCommit(); err != nil {
+			return nil, false, err
+		}
 	}
 	if s.hub != nil {
 		s.hub.Publish(resultRun.ID)
