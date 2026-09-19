@@ -369,7 +369,7 @@ func (s *Service) PollAssignments(ctx context.Context, sessionCtx *WorkerSession
 	if err := s.advertiseDeployments(ctx, sessionCtx, req.DeploymentDigests); err != nil {
 		return nil, err
 	}
-	if s.deployments != nil && len(req.DeploymentDigests) > 0 {
+	if s.deployments != nil {
 		_ = s.deployments.ReconcileAvailability(ctx, sessionCtx.OrganizationID, sessionCtx.EnvironmentID)
 	}
 	if req.AvailableSlots <= 0 {
@@ -403,6 +403,22 @@ func (s *Service) advertiseDeployments(ctx context.Context, sessionCtx *WorkerSe
 		if _, err := tx.Exec(ctx, `UPDATE workers SET last_seen_at = clock_timestamp()
 			WHERE id=$1::uuid AND organization_id=$2::uuid`, sessionCtx.WorkerID, sessionCtx.OrganizationID); err != nil {
 			return err
+		}
+		// A poll's DeploymentDigests is the session's CURRENT advertised bundle
+		// set, not an append-only history. Replace persisted compatibility
+		// atomically so a worker that drops V1 and advertises only V2 is no
+		// longer eligible for V1-pinned runs via a stale worker_deployments row.
+		if len(digests) == 0 {
+			if _, err := tx.Exec(ctx, `DELETE FROM worker_deployments
+				WHERE session_id=$1::uuid AND organization_id=$2::uuid`, sessionCtx.SessionID, sessionCtx.OrganizationID); err != nil {
+				return fmt.Errorf("clear worker deployments: %w", err)
+			}
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM worker_deployments
+			WHERE session_id=$1::uuid AND organization_id=$2::uuid AND NOT (bundle_digest = ANY($3::text[]))`,
+			sessionCtx.SessionID, sessionCtx.OrganizationID, digests); err != nil {
+			return fmt.Errorf("remove stale worker deployments: %w", err)
 		}
 		for _, digest := range digests {
 			if _, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id, organization_id, bundle_digest)
