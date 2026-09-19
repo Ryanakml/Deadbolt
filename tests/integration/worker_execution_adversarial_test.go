@@ -1004,6 +1004,16 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 	}
 
 	// 3. Worker Engine ReconcileExpiredLeases runs (as reconciler would)
+	var preTransitionLostEvents, preTransitionReadyEvents, preTransitionOutbox int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_LOST'),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_READY'),
+			(SELECT count(*) FROM outbox_events WHERE subject='execution.state_changed' AND payload->>'runId'=$1::text)`, runID).
+			Scan(&preTransitionLostEvents, &preTransitionReadyEvents, &preTransitionOutbox)
+	}); err != nil {
+		t.Fatal(err)
+	}
 	engine := execution.NewWorkerEngine(tc.pool)
 	reclaimed, err := engine.ReconcileExpiredLeases(context.Background(), orgID)
 	if err != nil {
@@ -1037,6 +1047,10 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 			Scan(&lostEvents, &readyEvents, &stateChangedOutbox)
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if lostEvents != preTransitionLostEvents+1 || readyEvents != preTransitionReadyEvents+1 || stateChangedOutbox != preTransitionOutbox+2 {
+		t.Fatalf("lease expiry did not record the required durable effects: before=%d/%d/%d after=%d/%d/%d",
+			preTransitionLostEvents, preTransitionReadyEvents, preTransitionOutbox, lostEvents, readyEvents, stateChangedOutbox)
 	}
 
 	preSweepLostEvents, preSweepReadyEvents, preSweepOutbox := lostEvents, readyEvents, stateChangedOutbox
