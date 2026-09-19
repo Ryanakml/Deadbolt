@@ -1028,13 +1028,6 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 
 	// A second sweep must be a no-op. Lease expiry is an authoritative state
 	// transition, not a notification that can be emitted again on every sweep.
-	reclaimed, err = engine.ReconcileExpiredLeases(context.Background(), orgID)
-	if err != nil {
-		t.Fatalf("second ReconcileExpiredLeases failed: %v", err)
-	}
-	if reclaimed != 0 {
-		t.Fatalf("expected idempotent second sweep to reclaim nothing, got %d", reclaimed)
-	}
 	var lostEvents, readyEvents, stateChangedOutbox int
 	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT
@@ -1045,8 +1038,27 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if lostEvents != 1 || readyEvents != 1 || stateChangedOutbox != 2 {
-		t.Fatalf("lease expiry was not idempotent: lost=%d ready=%d stateChangedOutbox=%d", lostEvents, readyEvents, stateChangedOutbox)
+
+	preSweepLostEvents, preSweepReadyEvents, preSweepOutbox := lostEvents, readyEvents, stateChangedOutbox
+	reclaimed, err = engine.ReconcileExpiredLeases(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("second ReconcileExpiredLeases failed: %v", err)
+	}
+	if reclaimed != 0 {
+		t.Fatalf("expected idempotent second sweep to reclaim nothing, got %d", reclaimed)
+	}
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_LOST'),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_READY'),
+			(SELECT count(*) FROM outbox_events WHERE subject='execution.state_changed' AND payload->>'runId'=$1::text)`, runID).
+			Scan(&lostEvents, &readyEvents, &stateChangedOutbox)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if lostEvents != preSweepLostEvents || readyEvents != preSweepReadyEvents || stateChangedOutbox != preSweepOutbox {
+		t.Fatalf("lease expiry was not idempotent: before=%d/%d/%d after=%d/%d/%d",
+			preSweepLostEvents, preSweepReadyEvents, preSweepOutbox, lostEvents, readyEvents, stateChangedOutbox)
 	}
 
 	// 5. Worker B claims the recovered step
