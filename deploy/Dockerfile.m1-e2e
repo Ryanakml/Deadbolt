@@ -1,0 +1,10 @@
+# Linux execution environment for the M1 real-worker acceptance test.
+FROM node:24-alpine AS node-runtime
+
+FROM golang:1.27.1-alpine
+
+RUN apk add --no-cache bash git libstdc++
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+
+WORKDIR /workspace
+ENTRYPOINT ["go"]

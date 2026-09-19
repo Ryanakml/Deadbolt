@@ -14,6 +14,7 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/cli"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
+	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
@@ -29,6 +30,10 @@ import (
 //   - Bundle digest identity is verified end-to-end between build manifest and worker loader.
 //   - Activation strictly enforces worker availability preflight.
 func TestCLIEndToEndDeveloperJourney(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("real CLI-to-worker execution requires the Linux worker runtime; current host is %s", runtime.GOOS)
+	}
+
 	// 1. Initialize control plane server backed by test database
 	tc := setupTenantContext(t)
 	defer tc.cleanup()
@@ -374,18 +379,18 @@ func TestCLIEndToEndDeveloperJourney(t *testing.T) {
 	t.Logf("==> Polling run progress until completion: %s", createdRunID)
 	deadline := time.Now().Add(15 * time.Second)
 	finalStatus := ""
+	var finalSnapshot execution.RunSnapshotDTO
 	for time.Now().Before(deadline) {
 		statusReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+createdRunID, nil)
 		statusReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 		statusReq.Header.Set("X-Organization-ID", org.ID)
 		statusResp, err := http.DefaultClient.Do(statusReq)
 		if err == nil && statusResp.StatusCode == http.StatusOK {
-			var snap struct {
-				Status string `json:"status"`
-			}
+			var snap execution.RunSnapshotDTO
 			_ = json.NewDecoder(statusResp.Body).Decode(&snap)
 			statusResp.Body.Close()
-			finalStatus = snap.Status
+			finalStatus = string(snap.Status)
+			finalSnapshot = snap
 			if snap.Status == "SUCCEEDED" || snap.Status == "FAILED" {
 				break
 			}
@@ -409,6 +414,44 @@ func TestCLIEndToEndDeveloperJourney(t *testing.T) {
 
 	if finalStatus != "SUCCEEDED" {
 		t.Fatalf("expected run to reach status SUCCEEDED, got %s", finalStatus)
+	}
+
+	if finalSnapshot.DeploymentID != deploymentID {
+		t.Fatalf("run was not pinned to registered deployment: got %s want %s", finalSnapshot.DeploymentID, deploymentID)
+	}
+	if len(finalSnapshot.Steps) != 3 {
+		t.Fatalf("expected three completed steps, got %d", len(finalSnapshot.Steps))
+	}
+	for _, step := range finalSnapshot.Steps {
+		if string(step.Status) != "SUCCEEDED" {
+			t.Fatalf("step %s did not succeed: status=%s attempts=%d", step.NodeID, step.Status, len(step.Attempts))
+		}
+		if len(step.Attempts) == 0 {
+			t.Fatalf("step %s has no committed attempt", step.NodeID)
+		}
+	}
+	finalOutput, ok := finalSnapshot.Output.(map[string]any)
+	if !ok || finalOutput["accountId"] == nil || finalOutput["deliveryId"] == nil {
+		t.Fatalf("final A->B->C output is incomplete: %+v", finalSnapshot.Output)
+	}
+
+	logsReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+createdRunID+"/logs", nil)
+	logsReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	logsReq.Header.Set("X-Organization-ID", org.ID)
+	logsResp, err := http.DefaultClient.Do(logsReq)
+	if err != nil {
+		t.Fatalf("failed to fetch committed task logs: %v", err)
+	}
+	defer logsResp.Body.Close()
+	if logsResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected committed task logs endpoint to return 200, got %d", logsResp.StatusCode)
+	}
+	var logsResult execution.RunLogsResponseDTO
+	if err := json.NewDecoder(logsResp.Body).Decode(&logsResult); err != nil {
+		t.Fatalf("failed to decode committed task logs: %v", err)
+	}
+	if len(logsResult.Items) == 0 {
+		t.Fatalf("expected worker stdout/stderr to be committed as task logs")
 	}
 
 	t.Log("✓ Developer Journey End-to-End Test PASSED with zero manual database backdoors!")
