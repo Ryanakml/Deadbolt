@@ -49,6 +49,13 @@ jobs:
           GHCR_REPOSITORY="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           echo "path=$GHCR_REPOSITORY" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve release metadata
+        id: release-meta
+        run: |
+          BUILD_TIME="$(git show -s --format=%cI "$RELEASE_COMMIT_SHA")"
+          echo "build-time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+          echo "release-commit=$RELEASE_COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
 
@@ -65,8 +72,11 @@ jobs:
         with:
           images: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/control-plane
           tags: |
-            type=sha,format=long,prefix=
+            type=raw,value=${{ env.RELEASE_COMMIT_SHA }},priority=1000
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.RELEASE_COMMIT_SHA }}
+            org.opencontainers.image.created=${{ steps.release-meta.outputs.build-time }}
 
       - name: Build and Push Linux amd64 Control Plane Image
         id: build
@@ -81,7 +91,7 @@ jobs:
           build-args: |
             VERSION=0.1.0
             COMMIT_SHA=${{ env.RELEASE_COMMIT_SHA }}
-            BUILD_TIME=${{ steps.meta.outputs.version }}
+            BUILD_TIME=${{ steps.release-meta.outputs.build-time }}
           provenance: mode=max
           sbom: true
 
@@ -95,8 +105,11 @@ jobs:
         with:
           images: ghcr.io/${{ steps.ghcr-repository.outputs.path }}/postgres
           tags: |
-            type=sha,format=long,prefix=
+            type=raw,value=${{ env.RELEASE_COMMIT_SHA }},priority=1000
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.RELEASE_COMMIT_SHA }}
+            org.opencontainers.image.created=${{ steps.release-meta.outputs.build-time }}
 
       - name: Build and Push Linux amd64 Postgres Archiver Image
         id: build-postgres
