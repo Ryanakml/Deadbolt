@@ -50,7 +50,7 @@ The literal gate wording is satisfied as one task, then A to B to C. This report
 | CLI package tests                 | AUTOMATED TEST PASS | go test ./internal/cli in Linux acceptance image                                                                                      |
 | CLI E2E assertions                | IMPLEMENTED         | tests/integration/cli_e2e_test.go checks deployment pinning, three successful steps, committed attempts, final output, committed logs |
 | Local PostgreSQL-backed CLI E2E   | AUTOMATED TEST PASS | TestCLIEndToEndDeveloperJourney completed init, build, deploy, two workers, activation, A to B to C, inspect, logs                    |
-| Hosted staging execution          | STAGING PASS        | Staging run 35447576183 SUCCESS on 0be2f30; provenance, /version, and RepoDigest verified below                                             |
+| Hosted staging execution          | STAGING PASS        | Staging run 35447576183 SUCCESS on 0be2f30; provenance, /version, and RepoDigest verified below                                       |
 | Browser Inspector and SSE         | MANUAL PASS         | Hosted run 92d6ea0e-93f8-4c50-922c-1b5af8e76d79 Inspector SUCCEEDED, LIVE to RECONNECTING to LIVE, Last-Event-Id 13                   |
 
 ## Requirement and failure-case matrix
