@@ -93,6 +93,7 @@ export type ResolveAction =
 export interface ResolveReconciliationRequest {
   action: ResolveAction;
   evidence: string;
+  reason: string;
   result?: unknown;
   expectedRevision: number;
 }

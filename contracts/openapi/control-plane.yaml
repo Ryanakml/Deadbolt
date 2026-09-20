@@ -2243,12 +2243,18 @@ components:
             - fail_run
         evidence:
           type: string
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 280
+          description: Human decision reason bound to the transition and audit record.
         result: {}
         expectedRevision:
           type: integer
       required:
         - action
         - evidence
+        - reason
         - expectedRevision
       allOf:
         - if:

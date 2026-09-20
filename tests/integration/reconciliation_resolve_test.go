@@ -121,11 +121,10 @@ func TestResolveConfirmSucceeded(t *testing.T) {
 		t.Fatal(err)
 	}
 	caseID, rev := openReconciliationCase(t, tc, orgID, stepID)
-	_ = firstOp
 
 	token, userID := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "succeed")
 	status, body := resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "confirm_succeeded", "evidence": "prov-pay-1",
+		"action": "confirm_succeeded", "evidence": "prov-pay-1", "reason": "operator verified provider state",
 		"result": map[string]any{"ok": true}, "expectedRevision": rev,
 	})
 	if status != http.StatusOK {
@@ -162,19 +161,37 @@ func TestResolveConfirmSucceeded(t *testing.T) {
 	if out["ok"] != true {
 		t.Fatalf("run output should carry the confirmed result, got %s", string(rawOutput))
 	}
-	// Case closed with the deciding actor; audit trail bound.
+	// Case closed with the deciding actor; audit trail bound. The hold's
+	// original evidence stays untouched; the human evidence and decision
+	// reason live in the resolution audit record.
 	var resolution, actorID string
+	var rawCaseEvidence, rawAuditMeta []byte
 	var auditCount int
 	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT resolution, actor_id::text FROM reconciliation_cases WHERE id=$1::uuid`, caseID).Scan(&resolution, &actorID); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT resolution, actor_id::text, evidence FROM reconciliation_cases WHERE id=$1::uuid`, caseID).Scan(&resolution, &actorID, &rawCaseEvidence); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE target_id=$1::uuid AND action='reconciliation.resolve'`, caseID).Scan(&auditCount)
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE target_id=$1::uuid AND action='reconciliation.resolve'`, caseID).Scan(&auditCount); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT metadata FROM audit_events WHERE target_id=$1::uuid AND action='reconciliation.resolve' ORDER BY created_at DESC LIMIT 1`, caseID).Scan(&rawAuditMeta)
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if resolution != "SUCCEED" || actorID != userID || auditCount != 1 {
 		t.Fatalf("case/audit binding wrong: resolution=%s actor=%s audit=%d", resolution, actorID, auditCount)
+	}
+	var holdEvidence, auditMeta map[string]any
+	_ = json.Unmarshal(rawCaseEvidence, &holdEvidence)
+	_ = json.Unmarshal(rawAuditMeta, &auditMeta)
+	if holdEvidence["operationId"] != firstOp || holdEvidence["attemptId"] != a1.AttemptID {
+		t.Fatalf("original hold evidence must survive resolution, got %v", holdEvidence)
+	}
+	if _, overwritten := holdEvidence["reference"]; overwritten {
+		t.Fatalf("resolution must not overwrite hold evidence, got %v", holdEvidence)
+	}
+	if auditMeta["evidence"] != "prov-pay-1" || auditMeta["decisionReason"] != "operator verified provider state" || auditMeta["action"] != "confirm_succeeded" {
+		t.Fatalf("audit must carry human evidence+reason+action, got %v", auditMeta)
 	}
 }
 
@@ -199,7 +216,7 @@ func TestResolveConfirmNotExecutedRetry(t *testing.T) {
 
 	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "retry")
 	status, body := resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "confirm_not_executed_retry", "evidence": "prov-no-charge",
+		"action": "confirm_not_executed_retry", "evidence": "prov-no-charge", "reason": "operator verified provider state",
 		"expectedRevision": rev,
 	})
 	if status != http.StatusOK {
@@ -250,7 +267,7 @@ func TestResolveFailRun(t *testing.T) {
 
 	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "fail")
 	status, _ := resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "fail_run", "evidence": "prov-confirmed-duplicate",
+		"action": "fail_run", "evidence": "prov-confirmed-duplicate", "reason": "operator verified provider state",
 		"expectedRevision": rev,
 	})
 	if status != http.StatusOK {
@@ -290,19 +307,19 @@ func TestResolveRevisionConflictAndDoubleResolve(t *testing.T) {
 	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "conflict")
 
 	status, body := resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "fail_run", "evidence": "x", "expectedRevision": rev + 99,
+		"action": "fail_run", "evidence": "x", "reason": "operator verified provider state", "expectedRevision": rev + 99,
 	})
 	if status != http.StatusConflict || body["code"] != "REVISION_CONFLICT" {
 		t.Fatalf("expected 409 REVISION_CONFLICT, got %d (%v)", status, body)
 	}
 	status, _ = resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "fail_run", "evidence": "x", "expectedRevision": rev,
+		"action": "fail_run", "evidence": "x", "reason": "operator verified provider state", "expectedRevision": rev,
 	})
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d", status)
 	}
 	status, body = resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "fail_run", "evidence": "x", "expectedRevision": rev + 1,
+		"action": "fail_run", "evidence": "x", "reason": "operator verified provider state", "expectedRevision": rev + 1,
 	})
 	if status != http.StatusConflict || body["code"] != "CASE_RESOLVED" {
 		t.Fatalf("expected 409 CASE_RESOLVED, got %d (%v)", status, body)
@@ -343,7 +360,7 @@ func TestResolveConcurrentSingleWinner(t *testing.T) {
 			defer func() { results <- o }()
 			<-start
 			raw, _ := json.Marshal(map[string]any{
-				"action": "fail_run", "evidence": "race", "expectedRevision": rev,
+				"action": "fail_run", "evidence": "race", "reason": "operator verified provider state", "expectedRevision": rev,
 			})
 			atomic.AddInt64(&resolveKeySeq, 1)
 			req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/reconciliation-cases/"+caseID+"/resolve", bytes.NewReader(raw))
@@ -405,7 +422,7 @@ func TestResolveRetryBudgetExhaustedDenied(t *testing.T) {
 	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "budget")
 
 	status, body := resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "confirm_not_executed_retry", "evidence": "prov-no-charge",
+		"action": "confirm_not_executed_retry", "evidence": "prov-no-charge", "reason": "operator verified provider state",
 		"expectedRevision": rev,
 	})
 	if status != http.StatusConflict || body["code"] != "BUDGET_EXHAUSTED" {
@@ -446,14 +463,14 @@ func TestResolveDeniedActors(t *testing.T) {
 
 	machineKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{tenant.CapRunsCreate, tenant.CapRunsRead})
 	status, body := resolveCaseHTTP(t, server, machineKey.PlaintextKey, orgID, caseID, map[string]any{
-		"action": "fail_run", "evidence": "x", "expectedRevision": rev,
+		"action": "fail_run", "evidence": "x", "reason": "operator verified provider state", "expectedRevision": rev,
 	})
 	if status != http.StatusForbidden {
 		t.Fatalf("machine key must be denied, got %d (%v)", status, body)
 	}
 	devToken, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleDeveloper, "denied-dev")
 	status, body = resolveCaseHTTP(t, server, devToken, orgID, caseID, map[string]any{
-		"action": "fail_run", "evidence": "x", "expectedRevision": rev,
+		"action": "fail_run", "evidence": "x", "reason": "operator verified provider state", "expectedRevision": rev,
 	})
 	if status != http.StatusForbidden {
 		t.Fatalf("developer must be denied runs:reconcile, got %d (%v)", status, body)
@@ -493,10 +510,12 @@ func TestResolveValidationFailures(t *testing.T) {
 		body   map[string]any
 		status int
 	}{
-		{"missing-evidence", map[string]any{"action": "fail_run", "expectedRevision": rev}, http.StatusBadRequest},
-		{"missing-result", map[string]any{"action": "confirm_succeeded", "evidence": "prov-x", "expectedRevision": rev}, http.StatusBadRequest},
-		{"bad-action", map[string]any{"action": "retry_anyway", "evidence": "prov-x", "expectedRevision": rev}, http.StatusBadRequest},
-		{"schema-violation", map[string]any{"action": "confirm_succeeded", "evidence": "prov-x", "result": "not-an-object", "expectedRevision": rev}, http.StatusUnprocessableEntity},
+		{"missing-evidence", map[string]any{"action": "fail_run", "reason": "operator verified provider state", "expectedRevision": rev}, http.StatusBadRequest},
+		{"missing-reason", map[string]any{"action": "fail_run", "evidence": "prov-x", "expectedRevision": rev}, http.StatusBadRequest},
+		{"reason-too-long", map[string]any{"action": "fail_run", "evidence": "prov-x", "reason": string(make([]byte, 281)), "expectedRevision": rev}, http.StatusBadRequest},
+		{"missing-result", map[string]any{"action": "confirm_succeeded", "evidence": "prov-x", "reason": "operator verified provider state", "expectedRevision": rev}, http.StatusBadRequest},
+		{"bad-action", map[string]any{"action": "retry_anyway", "evidence": "prov-x", "reason": "operator verified provider state", "expectedRevision": rev}, http.StatusBadRequest},
+		{"schema-violation", map[string]any{"action": "confirm_succeeded", "evidence": "prov-x", "reason": "operator verified provider state", "result": "not-an-object", "expectedRevision": rev}, http.StatusUnprocessableEntity},
 	} {
 		status, _ := resolveCaseHTTP(t, server, token, orgID, caseID, tc2.body)
 		if status != tc2.status {
@@ -576,7 +595,7 @@ func TestMultiHoldReleaseOnlyWhenAllResolve(t *testing.T) {
 	}
 
 	status, _ := resolveCaseHTTP(t, server, token, orgID, caseA, map[string]any{
-		"action": "confirm_succeeded", "evidence": "prov-a",
+		"action": "confirm_succeeded", "evidence": "prov-a", "reason": "operator verified provider state",
 		"result": map[string]any{"x": 1}, "expectedRevision": revA,
 	})
 	if status != http.StatusOK {
@@ -593,7 +612,7 @@ func TestMultiHoldReleaseOnlyWhenAllResolve(t *testing.T) {
 	}
 
 	status, _ = resolveCaseHTTP(t, server, token, orgID, caseB, map[string]any{
-		"action": "confirm_succeeded", "evidence": "prov-b",
+		"action": "confirm_succeeded", "evidence": "prov-b", "reason": "operator verified provider state",
 		"result": map[string]any{"y": 2}, "expectedRevision": revB,
 	})
 	if status != http.StatusOK {
@@ -645,7 +664,7 @@ func TestDeadlineDuringHoldFailsRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, body := resolveCaseHTTP(t, server, token, orgID, caseID, map[string]any{
-		"action": "confirm_succeeded", "evidence": "prov-x",
+		"action": "confirm_succeeded", "evidence": "prov-x", "reason": "operator verified provider state",
 		"result": map[string]any{"ok": true}, "expectedRevision": rev,
 	})
 	if status != http.StatusConflict || body["code"] != "RUN_DEADLINE_EXCEEDED" {
@@ -763,5 +782,205 @@ func TestSiblingCompletionDuringHoldAndDrain(t *testing.T) {
 	}
 	if runStatus != "WAITING" || runReason == nil || *runReason != "RECONCILIATION" {
 		t.Fatalf("run must park after siblings drain, got %s/%v", runStatus, runReason)
+	}
+}
+
+// TestResolveBrowserShapedRequestReachesResolver proves finding 1: a
+// dashboard-shaped resolve (human auth + Idempotency-Key, no bearer machine
+// key) reaches the resolver, while the RequireOrgScope idempotency
+// requirement itself stays enforced.
+func TestResolveBrowserShapedRequestReachesResolver(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "resolve-browsershape")
+	const digest = "bundle-resolve-browsershape-19"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, reconcileManifest(3, 60000))
+	_, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	advertiseDigest(t, tc, orgID, session.SessionID, digest)
+
+	a1 := claimExecution(t, server, session, digest, "resolve-browsershape-claim")
+	startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+	completeWithError(t, server, session, a1, "PROVIDER_500", true, "UNKNOWN", "")
+	caseID, rev := openReconciliationCase(t, tc, orgID, stepID)
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "browsershape")
+
+	post := func(idemKey string) (int, map[string]any) {
+		raw, _ := json.Marshal(map[string]any{
+			"action": "fail_run", "evidence": "prov-x",
+			"reason": "operator verified provider state", "expectedRevision": rev,
+		})
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/reconciliation-cases/"+caseID+"/resolve", bytes.NewReader(raw))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Organization-ID", orgID)
+		req.Header.Set("Content-Type", "application/json")
+		if idemKey != "" {
+			req.Header.Set("Idempotency-Key", idemKey)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("resolve request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		var parsed map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&parsed)
+		return resp.StatusCode, parsed
+	}
+
+	if status, body := post(""); status != http.StatusBadRequest || body["code"] != "MISSING_IDEMPOTENCY_KEY" {
+		t.Fatalf("keyless mutation must stay rejected, got %d (%v)", status, body)
+	}
+	if status, body := post("browser-decision-1"); status != http.StatusOK || body["resolved"] != true {
+		t.Fatalf("browser-shaped resolve must reach the resolver, got %d (%v)", status, body)
+	}
+}
+
+// TestOrdinaryFailureEmitsNoCaseResolved proves finding 4: a normal terminal
+// failure with zero reconciliation cases commits no CASE_RESOLVED history.
+func TestOrdinaryFailureEmitsNoCaseResolved(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "resolve-nohistory")
+	const digest = "bundle-resolve-nohistory-19"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, safeManifest(3, 1000, 30000))
+	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	advertiseDigest(t, tc, orgID, session.SessionID, digest)
+
+	a1 := claimExecution(t, server, session, digest, "resolve-nohistory-claim")
+	startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+	completeWithError(t, server, session, a1, "TASK_FAILED", false, "NOT_APPLIED", "")
+
+	var runStatus string
+	var caseCount, caseResolvedEvents int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid`, runID).Scan(&runStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM reconciliation_cases rc
+			JOIN run_steps rs ON rs.id=rc.step_id WHERE rs.run_id=$1::uuid`, runID).Scan(&caseCount); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='CASE_RESOLVED'`, runID).Scan(&caseResolvedEvents)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = stepID
+	if runStatus != "FAILED" || caseCount != 0 || caseResolvedEvents != 0 {
+		t.Fatalf("ordinary failure must leave no reconciliation history: run=%s cases=%d events=%d",
+			runStatus, caseCount, caseResolvedEvents)
+	}
+}
+
+// TestMootedHoldsProduceResolutionHistory proves finding 4's counterpart: a
+// fail_run decision closes the sibling hold too, the closure names the
+// affected cases, and the canonical RECONCILIATION_FAILED code stays stable
+// while the human reason is preserved in the audit trail.
+func TestMootedHoldsProduceResolutionHistory(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	const digest = "bundle-mooted-holds-19"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, twoNodeHoldManifest())
+	runID, _, _, caseA, caseB := seedTwoHoldRun(t, tc, orgID, envID, deploymentID)
+	token, userID := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "mooted")
+
+	var revA int64
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT revision FROM reconciliation_cases WHERE id=$1::uuid`, caseA).Scan(&revA)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := resolveCaseHTTP(t, server, token, orgID, caseA, map[string]any{
+		"action": "fail_run", "evidence": "prov-duplicate",
+		"reason": "duplicate confirmed under another operation", "expectedRevision": revA,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("expected 200, got %d", status)
+	}
+	var runStatus string
+	var runReason *string
+	var openCases int
+	var resolutions []string
+	var actorIDs []string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status, reason_code FROM runs WHERE id=$1::uuid`, runID).Scan(&runStatus, &runReason); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM reconciliation_cases rc
+			JOIN run_steps rs ON rs.id=rc.step_id WHERE rs.run_id=$1::uuid AND rc.status='OPEN'`, runID).Scan(&openCases); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT resolution, actor_id::text FROM reconciliation_cases rc
+			JOIN run_steps rs ON rs.id=rc.step_id WHERE rs.run_id=$1::uuid ORDER BY rc.created_at`, runID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var res, actor *string
+			if err := rows.Scan(&res, &actor); err != nil {
+				return err
+			}
+			if res != nil {
+				resolutions = append(resolutions, *res)
+			}
+			if actor != nil {
+				actorIDs = append(actorIDs, *actor)
+			}
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if runStatus != "FAILED" || runReason == nil || *runReason != "RECONCILIATION_FAILED" {
+		t.Fatalf("canonical failure code must stay stable, got %s/%v", runStatus, runReason)
+	}
+	if openCases != 0 || len(resolutions) != 2 {
+		t.Fatalf("both holds must close, got open=%d resolutions=%v", openCases, resolutions)
+	}
+	for _, r := range resolutions {
+		if r != "FAIL" {
+			t.Fatalf("mooted holds must resolve FAIL, got %v", resolutions)
+		}
+	}
+	for _, a := range actorIDs {
+		if a != userID {
+			t.Fatalf("mooted holds must carry the deciding actor, got %v", actorIDs)
+		}
+	}
+	_ = caseB
+	var scopedEvents int
+	var caseIDsPayload []byte
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM run_events
+			WHERE run_id=$1::uuid AND event_type='CASE_RESOLVED' AND payload->>'scope'='run'`, runID).Scan(&scopedEvents); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT payload->'caseIds' FROM run_events
+			WHERE run_id=$1::uuid AND event_type='CASE_RESOLVED' AND payload->>'scope'='run'
+			ORDER BY sequence DESC LIMIT 1`, runID).Scan(&caseIDsPayload)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if scopedEvents == 0 {
+		t.Fatalf("mooted closure must emit run-scoped resolution history")
+	}
+	var named []string
+	_ = json.Unmarshal(caseIDsPayload, &named)
+	if len(named) == 0 {
+		t.Fatalf("resolution history must name affected cases, got %s", string(caseIDsPayload))
+	}
+	var auditMeta []byte
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT metadata FROM audit_events
+			WHERE target_id=$1::uuid AND action='reconciliation.resolve'`, caseA).Scan(&auditMeta)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	_ = json.Unmarshal(auditMeta, &meta)
+	if meta["decisionReason"] != "duplicate confirmed under another operation" {
+		t.Fatalf("audit must preserve the human decision reason, got %v", meta)
 	}
 }

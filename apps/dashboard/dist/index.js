@@ -2,7 +2,7 @@ export * from "./types.js";
 export * from "./stream.js";
 export * from "./inspector.js";
 export * from "./api.js";
-import { DashboardApiClient, isUnauthorized, isConflict } from "./api.js";
+import { DashboardApiClient, isUnauthorized, isConflict, newIdempotencyKey, } from "./api.js";
 import { createEnvironmentSelection, formatEnvironmentLabel, getSelectedEnvironmentId, selectEnvironment, setSelectionCatalog, setSelectionOrganization, } from "./api.js";
 import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
@@ -751,6 +751,9 @@ function initDashboard() {
         <label>Evidence reference (required)
           <input id="resolve-evidence" type="text" placeholder="e.g. provider payment ID, message ID" autocomplete="off" />
         </label>
+        <label>Decision reason (required, max 280 characters)
+          <input id="resolve-reason" type="text" placeholder="Why is this decision correct?" maxlength="280" autocomplete="off" />
+        </label>
         <label id="resolve-result-label" style="display:none">Result JSON (required for confirm succeeded)
           <textarea id="resolve-result" rows="4" placeholder='{"key": "value"}'></textarea>
         </label>
@@ -762,8 +765,12 @@ function initDashboard() {
       </div>
     `;
         document.body.appendChild(overlay);
+        // One command identity for this decision: retries of the same ambiguous
+        // submit reuse it, so the server can dedupe instead of double-deciding.
+        const idempotencyKey = newIdempotencyKey();
         const errorBox = overlay.querySelector("#resolve-error");
         const evidenceInput = overlay.querySelector("#resolve-evidence");
+        const reasonInput = overlay.querySelector("#resolve-reason");
         const resultLabel = overlay.querySelector("#resolve-result-label");
         const resultInput = overlay.querySelector("#resolve-result");
         const submitBtn = overlay.querySelector("#resolve-submit");
@@ -802,6 +809,15 @@ function initDashboard() {
                 showError("Evidence reference is required.");
                 return;
             }
+            const reason = reasonInput.value.trim();
+            if (!reason) {
+                showError("Decision reason is required.");
+                return;
+            }
+            if (reason.length > 280) {
+                showError("Decision reason must be at most 280 characters.");
+                return;
+            }
             let result;
             if (action === "confirm_succeeded") {
                 if (!resultInput.value.trim()) {
@@ -817,11 +833,11 @@ function initDashboard() {
                 }
             }
             submitBtn.setAttribute("disabled", "true");
-            const body = { action, evidence, expectedRevision: revision };
+            const body = { action, evidence, reason, expectedRevision: revision };
             if (action === "confirm_succeeded")
                 body.result = result;
             api
-                .resolveReconciliationCase(caseId, body)
+                .resolveReconciliationCase(caseId, body, idempotencyKey)
                 .then(() => {
                 close();
                 void activeInspector

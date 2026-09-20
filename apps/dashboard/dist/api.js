@@ -47,6 +47,16 @@ export function isUnauthorized(err) {
 export function isConflict(err) {
     return err instanceof Error && err.message.includes("HTTP 409");
 }
+// newIdempotencyKey mints a unique command key for one user decision. The
+// dialog keeps the key for the lifetime of its submission so a retry of the
+// same ambiguous submit reuses the identity instead of forking commands.
+export function newIdempotencyKey() {
+    const cryptoObj = typeof crypto !== "undefined" ? crypto : undefined;
+    if (cryptoObj && "randomUUID" in cryptoObj) {
+        return cryptoObj.randomUUID();
+    }
+    return `resolve-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+}
 // readCsrfToken reads the SPA-readable CSRF bootstrap cookie without ever
 // touching the HttpOnly session value. Both hosted (__Host-) and local
 // (non-secure) cookie names are accepted.
@@ -163,13 +173,16 @@ export class DashboardApiClient {
     // resolveReconciliationCase submits one audited human decision for an
     // unknown-outcome hold. The caller binds the expectedRevision read from
     // the snapshot; a 409 means the case changed and the dialog must refresh
-    // instead of retrying blindly.
-    async resolveReconciliationCase(caseId, body) {
+    // instead of retrying blindly. Every decision carries an Idempotency-Key:
+    // pass the dialog's key so an ambiguous resubmit reuses the same command
+    // identity instead of creating a second decision.
+    async resolveReconciliationCase(caseId, body, idempotencyKey) {
         const res = await apiFetch(`${this.baseUrl}/v1/reconciliation-cases/${encodeURIComponent(caseId)}/resolve`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
                 "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
             },
             body: JSON.stringify(body),
         });

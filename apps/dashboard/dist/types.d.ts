@@ -58,6 +58,7 @@ export type ResolveAction = "confirm_succeeded" | "confirm_not_executed_retry" |
 export interface ResolveReconciliationRequest {
     action: ResolveAction;
     evidence: string;
+    reason: string;
     result?: unknown;
     expectedRevision: number;
 }

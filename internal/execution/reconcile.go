@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
@@ -38,6 +39,8 @@ var (
 	ErrBudgetExhausted     = errors.New("BUDGET_EXHAUSTED: No retry attempts remain")
 	ErrInvalidAction       = errors.New("INVALID_ACTION: Unknown reconciliation action")
 	ErrMissingEvidence     = errors.New("MISSING_EVIDENCE: Evidence reference is required")
+	ErrMissingReason       = errors.New("MISSING_REASON: Decision reason is required")
+	ErrReasonTooLong       = errors.New("INVALID_REASON: Decision reason exceeds 280 characters")
 	ErrMissingResult       = errors.New("MISSING_RESULT: Result is required to confirm success")
 	ErrResultTooLarge      = errors.New("RESULT_TOO_LARGE: Resolution result exceeds 256 KiB")
 	ErrResultSchema        = errors.New("RESULT_SCHEMA_VIOLATION: Result does not conform to output schema")
@@ -46,6 +49,11 @@ var (
 	ErrRunDeadlineExceeded = errors.New("RUN_DEADLINE_EXCEEDED: Run deadline has passed")
 	ErrInvalidRecovery     = errors.New("INVALID_RECOVERY_POLICY: Task recovery policy is absent or invalid")
 )
+
+// maxDecisionReasonRunes bounds the human decision reason (OpenAPI
+// maxLength 280). Canonical machine reason codes stay stable; free-form
+// operator text never replaces them.
+const maxDecisionReasonRunes = 280
 
 // Reconciliation actions as named by the OpenAPI resolve contract.
 const (
@@ -63,10 +71,12 @@ const (
 
 // ResolveReconciliationRequest mirrors ResolveReconciliationRequest in
 // contracts/openapi/control-plane.yaml: evidence is the external reference
-// string, result is required only for confirm_succeeded.
+// string, reason is the bounded human decision reason, result is required
+// only for confirm_succeeded.
 type ResolveReconciliationRequest struct {
 	Action           string `json:"action"`
 	Evidence         string `json:"evidence"`
+	Reason           string `json:"reason"`
 	Result           any    `json:"result,omitempty"`
 	ExpectedRevision int64  `json:"expectedRevision"`
 }
@@ -113,6 +123,12 @@ func (e *WorkerEngine) ResolveReconciliationCase(
 	}
 	if strings.TrimSpace(req.Evidence) == "" {
 		return nil, ErrMissingEvidence
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		return nil, ErrMissingReason
+	}
+	if utf8.RuneCountInString(req.Reason) > maxDecisionReasonRunes {
+		return nil, ErrReasonTooLong
 	}
 	if action == ResolveActionSucceed && req.Result == nil {
 		return nil, ErrMissingResult
@@ -274,7 +290,7 @@ func resolveCaseSucceedTx(
 		string(canonicalResult), row.stepID, orgID); err != nil {
 		return err
 	}
-	if err := markCaseResolvedTx(ctx, tx, orgID, row, CaseResolutionSucceed, req.Evidence, audit); err != nil {
+	if err := markCaseResolvedTx(ctx, tx, orgID, row, CaseResolutionSucceed, audit); err != nil {
 		return err
 	}
 	if err := appendRunEvent(ctx, tx, orgID, runID, "STEP_SUCCEEDED", map[string]any{
@@ -365,7 +381,7 @@ func resolveCaseRetryTx(
 		dueAt, row.stepID, orgID); err != nil {
 		return err
 	}
-	if err := markCaseResolvedTx(ctx, tx, orgID, row, CaseResolutionRetry, req.Evidence, audit); err != nil {
+	if err := markCaseResolvedTx(ctx, tx, orgID, row, CaseResolutionRetry, audit); err != nil {
 		return err
 	}
 	if err := appendRunEvent(ctx, tx, orgID, runID, "STEP_WAITING", map[string]any{
@@ -397,7 +413,7 @@ func resolveCaseFailTx(
 	if audit.ActorID != nil && strings.TrimSpace(*audit.ActorID) != "" {
 		actorID = audit.ActorID
 	}
-	if err := markCaseResolvedTx(ctx, tx, orgID, row, CaseResolutionFail, req.Evidence, audit); err != nil {
+	if err := markCaseResolvedTx(ctx, tx, orgID, row, CaseResolutionFail, audit); err != nil {
 		return err
 	}
 	if err := closeOpenCasesAsFailTx(ctx, tx, orgID, runID, actorID, "RECONCILIATION_FAILED"); err != nil {
@@ -408,6 +424,7 @@ func resolveCaseFailTx(
 	}
 	if err := appendRunEvent(ctx, tx, orgID, runID, "CASE_RESOLVED", map[string]any{
 		"caseId": row.id, "stepId": row.stepID, "resolution": CaseResolutionFail,
+		"decisionReason": strings.TrimSpace(req.Reason),
 	}); err != nil {
 		return err
 	}
@@ -416,22 +433,22 @@ func resolveCaseFailTx(
 	})
 }
 
-// markCaseResolvedTx transitions one OPEN case to RESOLVED with the actor,
-// evidence reference, and a revision bump. The revision guard is enforced by
-// the caller holding the case row lock; the bump keeps the row monotonic.
+// markCaseResolvedTx transitions one OPEN case to RESOLVED with the actor
+// and a revision bump. The hold's original evidence column stays untouched:
+// resolution evidence and the human decision reason belong to the resolution
+// audit record, never to an overwrite of what the hold observed.
 func markCaseResolvedTx(
 	ctx context.Context, tx storage.Tx, orgID string,
-	row resolveCaseRow, resolution, evidence string, audit *tenant.AuditContext,
+	row resolveCaseRow, resolution string, audit *tenant.AuditContext,
 ) error {
 	var actorID *string
 	if audit.ActorID != nil && strings.TrimSpace(*audit.ActorID) != "" {
 		actorID = audit.ActorID
 	}
 	tag, err := tx.Exec(ctx, `UPDATE reconciliation_cases SET status='RESOLVED', resolution=$1,
-		actor_id=$2, evidence=jsonb_build_object('reference',$3::text),
-		revision=revision+1, resolved_at=clock_timestamp()
-		WHERE id=$4::uuid AND organization_id=$5::uuid AND status='OPEN'`,
-		resolution, actorID, evidence, row.id, orgID)
+		actor_id=$2, revision=revision+1, resolved_at=clock_timestamp()
+		WHERE id=$3::uuid AND organization_id=$4::uuid AND status='OPEN'`,
+		resolution, actorID, row.id, orgID)
 	if err != nil {
 		return err
 	}
@@ -443,19 +460,38 @@ func markCaseResolvedTx(
 
 // closeOpenCasesAsFailTx moots every remaining OPEN case of a terminalizing
 // run. System terminalization passes a nil actor; human fail decisions pass
-// the deciding actor through.
+// the deciding actor through. History is emitted only when at least one OPEN
+// case actually closes, identifying the affected cases.
 func closeOpenCasesAsFailTx(ctx context.Context, tx storage.Tx, orgID, runID string, actorID *string, reason string) error {
-	_, err := tx.Exec(ctx, `UPDATE reconciliation_cases rc SET status='RESOLVED', resolution='FAIL',
+	rows, err := tx.Query(ctx, `UPDATE reconciliation_cases rc SET status='RESOLVED', resolution='FAIL',
 		actor_id=$1, revision=revision+1, resolved_at=clock_timestamp()
 		FROM run_steps rs
 		WHERE rc.step_id=rs.id AND rc.organization_id=rs.organization_id
-			AND rs.run_id=$2::uuid AND rc.organization_id=$3::uuid AND rc.status='OPEN'`,
-		actorID, runID, orgID)
+			AND rs.run_id=$2::uuid AND rc.organization_id=$3::uuid AND rc.status='OPEN'
+		RETURNING rc.id::text`, actorID, runID, orgID)
 	if err != nil {
 		return err
 	}
+	closed := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		closed = append(closed, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(closed) == 0 {
+		return nil
+	}
 	return appendRunEvent(ctx, tx, orgID, runID, "CASE_RESOLVED", map[string]any{
 		"resolution": CaseResolutionFail, "reason": reason, "scope": "run",
+		"caseIds": closed,
 	})
 }
 
@@ -573,12 +609,13 @@ func appendCaseAuditTx(
 	row resolveCaseRow, req ResolveReconciliationRequest, audit *tenant.AuditContext, extra map[string]any,
 ) error {
 	meta := map[string]any{
-		"actor_type":   audit.ActorType,
-		"role":         audit.Role,
-		"capabilities": audit.Capabilities,
-		"action":       strings.TrimSpace(req.Action),
-		"evidence":     strings.TrimSpace(req.Evidence),
-		"holdReason":   row.reason,
+		"actor_type":     audit.ActorType,
+		"role":           audit.Role,
+		"capabilities":   audit.Capabilities,
+		"action":         strings.TrimSpace(req.Action),
+		"evidence":       strings.TrimSpace(req.Evidence),
+		"decisionReason": strings.TrimSpace(req.Reason),
+		"holdReason":     row.reason,
 	}
 	for k, v := range extra {
 		meta[k] = v

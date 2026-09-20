@@ -55,6 +55,7 @@ export declare function getSelectedEnvironmentId(sel: EnvironmentSelection): str
 export declare function apiFetch(input: string, init?: RequestInit): Promise<Response>;
 export declare function isUnauthorized(err: unknown): boolean;
 export declare function isConflict(err: unknown): boolean;
+export declare function newIdempotencyKey(): string;
 export declare function readCsrfToken(): string;
 export declare class DashboardApiClient {
     private baseUrl;
@@ -66,7 +67,7 @@ export declare class DashboardApiClient {
     listWorkers(environment: string, cursor?: string, limit?: number): Promise<ListWorkersResponse>;
     getRunEvents(runId: string, cursor?: number, limit?: number): Promise<RunEventsResponse>;
     getRunLogs(runId: string, stepId?: string, attemptId?: string, cursor?: string, limit?: number): Promise<TaskLogsResponse>;
-    resolveReconciliationCase(caseId: string, body: ResolveReconciliationRequest): Promise<ResolveReconciliationResponse>;
+    resolveReconciliationCase(caseId: string, body: ResolveReconciliationRequest, idempotencyKey?: string): Promise<ResolveReconciliationResponse>;
     listProjects(): Promise<ProjectSummary[]>;
     listProjectEnvironments(projectId: string): Promise<EnvironmentSummary[]>;
     loadEnvironmentCatalog(): Promise<CatalogEnvironment[]>;

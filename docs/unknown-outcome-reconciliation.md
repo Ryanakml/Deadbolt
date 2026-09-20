@@ -42,7 +42,8 @@ Check the external reference, then confirm succeeded / confirm not executed / fa
 
 Every decision binds the case `expectedRevision` (stale readers get `409
 REVISION_CONFLICT` and must refresh from the dialog), an evidence
-reference, and the deciding human identity. Machine API keys are denied
+reference, a bounded human decision reason (required, max 280 characters),
+and the deciding human identity. Machine API keys are denied
 (`403`); `runs:reconcile` requires the Operator, Admin, or Owner role.
 
 | Action                       | Requires                                                | Effect                                                                                                                                                                                                                     |

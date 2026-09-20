@@ -6,7 +6,11 @@ import {
   reconciliationHoldText,
   RESOLVE_ACTIONS,
 } from "../dist/inspector.js";
-import { isConflict } from "../dist/api.js";
+import {
+  DashboardApiClient,
+  isConflict,
+  newIdempotencyKey,
+} from "../dist/api.js";
 
 function holdSnapshot() {
   return {
@@ -102,6 +106,39 @@ describe("reconciliation holds", () => {
       isConflict(new Error("Failed to resolve case (HTTP 422): Unprocessable")),
       false,
     );
+  });
+
+  test("resolve sends a unique Idempotency-Key and reuses the dialog key", async () => {
+    const seen = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      seen.push([input, init]);
+      return new Response(
+        JSON.stringify({ caseId: "case-1", resolved: true, revision: 2 }),
+        { status: 200 },
+      );
+    };
+    try {
+      const client = new DashboardApiClient();
+      const body = {
+        action: "fail_run",
+        evidence: "prov-x",
+        reason: "duplicate confirmed",
+        expectedRevision: 1,
+      };
+      await client.resolveReconciliationCase("case-1", body);
+      await client.resolveReconciliationCase("case-1", body, "dialog-key-1");
+      await client.resolveReconciliationCase("case-1", body, "dialog-key-1");
+      assert.equal(seen.length, 3);
+      const keys = seen.map(([, init]) => init.headers["Idempotency-Key"]);
+      assert.ok(keys[0] && typeof keys[0] === "string");
+      assert.equal(keys[1], "dialog-key-1");
+      assert.equal(keys[2], "dialog-key-1");
+      assert.notEqual(keys[0], "dialog-key-1");
+      assert.equal(newIdempotencyKey() === newIdempotencyKey(), false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   test("step.waiting parks the step without inventing success", () => {

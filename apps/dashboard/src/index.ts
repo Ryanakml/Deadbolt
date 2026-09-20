@@ -3,7 +3,12 @@ export * from "./stream.js";
 export * from "./inspector.js";
 export * from "./api.js";
 
-import { DashboardApiClient, isUnauthorized, isConflict } from "./api.js";
+import {
+  DashboardApiClient,
+  isUnauthorized,
+  isConflict,
+  newIdempotencyKey,
+} from "./api.js";
 import type { AuthMembership, AuthSession } from "./api.js";
 import {
   createEnvironmentSelection,
@@ -886,6 +891,9 @@ function initDashboard(): void {
         <label>Evidence reference (required)
           <input id="resolve-evidence" type="text" placeholder="e.g. provider payment ID, message ID" autocomplete="off" />
         </label>
+        <label>Decision reason (required, max 280 characters)
+          <input id="resolve-reason" type="text" placeholder="Why is this decision correct?" maxlength="280" autocomplete="off" />
+        </label>
         <label id="resolve-result-label" style="display:none">Result JSON (required for confirm succeeded)
           <textarea id="resolve-result" rows="4" placeholder='{"key": "value"}'></textarea>
         </label>
@@ -898,9 +906,16 @@ function initDashboard(): void {
     `;
     document.body.appendChild(overlay);
 
+    // One command identity for this decision: retries of the same ambiguous
+    // submit reuse it, so the server can dedupe instead of double-deciding.
+    const idempotencyKey = newIdempotencyKey();
+
     const errorBox = overlay.querySelector("#resolve-error") as HTMLElement;
     const evidenceInput = overlay.querySelector(
       "#resolve-evidence",
+    ) as HTMLInputElement;
+    const reasonInput = overlay.querySelector(
+      "#resolve-reason",
     ) as HTMLInputElement;
     const resultLabel = overlay.querySelector(
       "#resolve-result-label",
@@ -952,6 +967,15 @@ function initDashboard(): void {
         showError("Evidence reference is required.");
         return;
       }
+      const reason = reasonInput.value.trim();
+      if (!reason) {
+        showError("Decision reason is required.");
+        return;
+      }
+      if (reason.length > 280) {
+        showError("Decision reason must be at most 280 characters.");
+        return;
+      }
       let result: unknown;
       if (action === "confirm_succeeded") {
         if (!resultInput.value.trim()) {
@@ -969,12 +993,13 @@ function initDashboard(): void {
       const body: {
         action: ResolveAction;
         evidence: string;
+        reason: string;
         expectedRevision: number;
         result?: unknown;
-      } = { action, evidence, expectedRevision: revision };
+      } = { action, evidence, reason, expectedRevision: revision };
       if (action === "confirm_succeeded") body.result = result;
       api
-        .resolveReconciliationCase(caseId, body)
+        .resolveReconciliationCase(caseId, body, idempotencyKey)
         .then(() => {
           close();
           void activeInspector
