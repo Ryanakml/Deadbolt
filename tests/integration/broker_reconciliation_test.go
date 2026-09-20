@@ -9,7 +9,9 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/outbox"
+	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func reconciliationTwoNodeManifest() string {
@@ -144,5 +146,58 @@ func TestReconcileReadyWorkRotatesPastUnrepairableBatch(t *testing.T) {
 	}
 	if state := reconciliationStepState(t, tc, orgID, repairableStep); state != "READY" {
 		t.Fatalf("repairable run starved behind first batch: state=%s", state)
+	}
+}
+
+func TestSchedulerRestartRepairsCommittedCompletionWithoutBrokerHistory(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	// The upstream completion is already durable while the previous scheduler is
+	// gone. A fresh scheduler instance must discover the tenant and repair the
+	// dependent work without replaying a broker history.
+	_, downstreamID := seedReconciliationRun(t, tc, orgID, envID, "scheduler-restart", "SUCCEEDED")
+	ctx := context.Background()
+	systemPool, err := pgxpool.New(ctx, tc.systemURL)
+	if err != nil {
+		t.Fatalf("connect scheduler pool: %v", err)
+	}
+	defer systemPool.Close()
+
+	restarted := scheduling.NewReconciler(systemPool, time.Second, nil)
+	engine := execution.NewWorkerEngine(tc.pool)
+	restarted.SetSlowTenantSweep(func(ctx context.Context, tenantID string) error {
+		_, err := engine.ReconcileReadyWork(ctx, tenantID)
+		return err
+	})
+	if err := restarted.SlowSweep(ctx); err != nil {
+		t.Fatalf("restarted scheduler slow sweep: %v", err)
+	}
+	if state := reconciliationStepState(t, tc, orgID, downstreamID); state != "READY" {
+		t.Fatalf("scheduler restart stranded downstream work in %s", state)
+	}
+}
+
+func TestReconcileReadyWorkFailsClosedWhenDatabaseUnavailable(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	_, downstreamID := seedReconciliationRun(t, tc, orgID, envID, "database-unavailable", "SUCCEEDED")
+	engine := execution.NewWorkerEngine(tc.pool)
+	// Closing the only runtime pool simulates an unavailable application
+	// database boundary. Reconciliation must return an error before it can grant
+	// execution, and the independent migrator connection verifies no mutation.
+	tc.runtimePool.Close()
+	if _, err := engine.ReconcileReadyWork(context.Background(), orgID); err == nil {
+		t.Fatal("database-unavailable reconciliation unexpectedly succeeded")
+	}
+	var state string
+	if err := tc.database.QueryRow(`SELECT state FROM run_steps WHERE id=$1::uuid`, downstreamID).Scan(&state); err != nil {
+		t.Fatalf("read step after database outage: %v", err)
+	}
+	if state != "BLOCKED" {
+		t.Fatalf("database outage mutated execution state to %s", state)
 	}
 }
