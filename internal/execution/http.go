@@ -654,6 +654,8 @@ func (h *HTTPHandler) ResolveCase(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, r, http.StatusConflict, "RUN_DEADLINE_EXCEEDED", "Run deadline has passed")
 		case errors.Is(err, ErrInvalidRecovery):
 			errJSON(w, r, http.StatusConflict, "INVALID_RECOVERY_POLICY", "Task recovery policy is absent or invalid")
+		case errors.Is(err, tenant.ErrIdempotencyConflict):
+			errJSON(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different request content")
 		case errors.Is(err, ErrInvalidAction), errors.Is(err, ErrMissingEvidence), errors.Is(err, ErrMissingResult), errors.Is(err, ErrMissingReason), errors.Is(err, ErrReasonTooLong):
 			errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 		case errors.Is(err, ErrResultSchema):

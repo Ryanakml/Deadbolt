@@ -12,6 +12,7 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
+	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 	"github.com/jackc/pgx/v5"
 )
@@ -24,6 +25,7 @@ const defaultAttemptTimeout = 5 * time.Minute
 type WorkerEngine struct {
 	pool                 *storage.Pool
 	hub                  *EventHub
+	commands             *tenant.Service
 	beforeCompleteCommit func() error
 	afterCompleteCommit  func() error
 }
@@ -38,6 +40,13 @@ func NewWorkerEngine(pool *storage.Pool, hub ...*EventHub) *WorkerEngine {
 
 func (e *WorkerEngine) SetHub(hub *EventHub) {
 	e.hub = hub
+}
+
+// SetCommands attaches the canonical tenant command service so mutations
+// record idempotent command outcomes atomically with state transitions.
+// Engines without it (unit-style construction) execute bare transactions.
+func (e *WorkerEngine) SetCommands(commands *tenant.Service) {
+	e.commands = commands
 }
 
 // SetBeforeCompleteCommitHookForTest injects a deterministic failure after all

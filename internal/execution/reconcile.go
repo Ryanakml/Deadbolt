@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -136,135 +137,165 @@ func (e *WorkerEngine) ResolveReconciliationCase(
 
 	var resp *ResolveReconciliationResponse
 	var resolvedRunID string
-	err := e.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		// Candidate read without locks; ownership is taken in lock order below.
-		var row resolveCaseRow
-		var status string
-		err := tx.QueryRow(ctx, `SELECT id::text, environment_id::text, step_id::text,
-				attempt_id::text, reason, status, revision
-			FROM reconciliation_cases
-			WHERE id=$1::uuid AND organization_id=$2::uuid`,
-			caseID, orgID).Scan(&row.id, &row.environmentID, &row.stepID, &row.attemptID, &row.reason, &status, &row.revision)
+	mutate := func(ctx context.Context, tx storage.Tx) error {
+		r, rid, err := e.resolveReconciliationCaseTx(ctx, tx, orgID, caseID, req, audit)
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrCaseNotFound
-			}
 			return err
 		}
-		row.status = status
-
-		// Lock run → step, then revalidate the case under its own lock.
-		var runID, nodeID, runStatus, runReason string
-		var runDeadline *time.Time
-		if err := tx.QueryRow(ctx, `SELECT r.id::text, rs.node_id, r.status,
-				COALESCE(r.reason_code,''), r.deadline_at
-			FROM runs r JOIN run_steps rs ON rs.run_id=r.id AND rs.organization_id=r.organization_id
-			JOIN reconciliation_cases rc ON rc.step_id=rs.id AND rc.organization_id=rs.organization_id
-			WHERE rc.id=$1::uuid AND rc.organization_id=$2::uuid
-			FOR UPDATE OF r, rs`, caseID, orgID).Scan(&runID, &nodeID, &runStatus, &runReason, &runDeadline); err != nil {
-			return err
-		}
-		var locked resolveCaseRow
-		var lockedStatus string
-		if err := tx.QueryRow(ctx, `SELECT id::text, environment_id::text, step_id::text,
-				attempt_id::text, reason, status, revision FROM reconciliation_cases
-			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`,
-			caseID, orgID).Scan(&locked.id, &locked.environmentID, &locked.stepID, &locked.attemptID, &locked.reason, &lockedStatus, &locked.revision); err != nil {
-			return err
-		}
-		locked.status = lockedStatus
-		row = locked
-
-		if row.status != "OPEN" {
-			return ErrCaseResolved
-		}
-		if row.revision != req.ExpectedRevision {
-			return ErrRevisionConflict
-		}
-		switch runStatus {
-		case "SUCCEEDED", "FAILED", "CANCELLED":
-			return ErrRunTerminal
-		}
-		var dbNow time.Time
-		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
-			return err
-		}
-		if runDeadline != nil && !dbNow.Before(*runDeadline) {
-			return ErrRunDeadlineExceeded
-		}
-
-		var manifest deploymentManifest
-		var workflowName string
-		var manifestBytes []byte
-		if err := tx.QueryRow(ctx, `SELECT d.manifest, r.workflow_name
-			FROM runs r JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-			WHERE r.id=$1::uuid AND r.organization_id=$2::uuid`, runID, orgID).Scan(&manifestBytes, &workflowName); err != nil {
-			return err
-		}
-		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-			return fmt.Errorf("decode manifest: %w", err)
-		}
-		policy := manifest.taskRetryPolicy(workflowName, nodeID)
-		if !IsValidRecoveryPolicy(policy.Recovery) {
-			return ErrInvalidRecovery
-		}
-
-		var resolution string
-		switch action {
-		case ResolveActionSucceed:
-			resolution = CaseResolutionSucceed
-			if err := resolveCaseSucceedTx(ctx, tx, orgID, runID, row, nodeID, manifest, workflowName, req, audit); err != nil {
-				return err
-			}
-		case ResolveActionRetry:
-			resolution = CaseResolutionRetry
-			if err := resolveCaseRetryTx(ctx, tx, orgID, runID, row, nodeID, policy, req, audit, dbNow, runDeadline); err != nil {
-				return err
-			}
-		default:
-			resolution = CaseResolutionFail
-			if err := resolveCaseFailTx(ctx, tx, orgID, runID, row, nodeID, req, audit); err != nil {
-				return err
-			}
-		}
-
-		var openCases int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM reconciliation_cases rc
-			JOIN run_steps rs ON rs.id=rc.step_id AND rs.organization_id=rc.organization_id
-			WHERE rs.run_id=$1::uuid AND rc.organization_id=$2::uuid AND rc.status='OPEN'`,
-			runID, orgID).Scan(&openCases); err != nil {
-			return err
-		}
-		if openCases == 0 {
-			// Last hold released: continue the workflow from the resolved
-			// success, then leave the hold reason behind.
-			if action == ResolveActionSucceed {
-				if err := advanceAfterStepSuccessTx(ctx, tx, orgID, runID, req.Result); err != nil {
-					return err
-				}
-			}
-			if err := releaseHoldTx(ctx, tx, orgID, runID, action); err != nil {
-				return err
-			}
-		}
-
-		var newRevision int64
-		if err := tx.QueryRow(ctx, `SELECT revision FROM reconciliation_cases
-			WHERE id=$1::uuid AND organization_id=$2::uuid`, caseID, orgID).Scan(&newRevision); err != nil {
-			return err
-		}
-		_ = resolution
-		resp = &ResolveReconciliationResponse{CaseID: caseID, Resolved: true, Revision: newRevision}
-		resolvedRunID = runID
+		resp, resolvedRunID = r, rid
 		return nil
-	})
-	if err != nil {
+	}
+	// Route through the canonical tenant command path when available so the
+	// recorded outcome replays for retried command identities instead of
+	// re-entering the engine as a second decision.
+	if e.commands != nil {
+		replayed, err := e.commands.WithCommandTx(ctx, orgID, "", http.StatusOK, mutate,
+			func() any { return resp },
+			func(raw json.RawMessage) error { return json.Unmarshal(raw, &resp) })
+		if err != nil {
+			return nil, err
+		}
+		if !replayed && e.hub != nil {
+			e.hub.Publish(resolvedRunID)
+		}
+		return resp, nil
+	}
+	if err := e.pool.WithTenantTx(ctx, orgID, mutate); err != nil {
 		return nil, err
 	}
 	if e.hub != nil {
 		e.hub.Publish(resolvedRunID)
 	}
 	return resp, nil
+}
+
+func (e *WorkerEngine) resolveReconciliationCaseTx(
+	ctx context.Context,
+	tx storage.Tx,
+	orgID, caseID string,
+	req ResolveReconciliationRequest,
+	audit *tenant.AuditContext,
+) (*ResolveReconciliationResponse, string, error) {
+
+	// Candidate read without locks; ownership is taken in lock order below.
+	var row resolveCaseRow
+	var status string
+	err := tx.QueryRow(ctx, `SELECT id::text, environment_id::text, step_id::text,
+			attempt_id::text, reason, status, revision
+		FROM reconciliation_cases
+		WHERE id=$1::uuid AND organization_id=$2::uuid`,
+		caseID, orgID).Scan(&row.id, &row.environmentID, &row.stepID, &row.attemptID, &row.reason, &status, &row.revision)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", ErrCaseNotFound
+		}
+		return nil, "", err
+	}
+	row.status = status
+
+	// Lock run → step, then revalidate the case under its own lock.
+	var runID, nodeID, runStatus, runReason string
+	var runDeadline *time.Time
+	if err := tx.QueryRow(ctx, `SELECT r.id::text, rs.node_id, r.status,
+			COALESCE(r.reason_code,''), r.deadline_at
+		FROM runs r JOIN run_steps rs ON rs.run_id=r.id AND rs.organization_id=r.organization_id
+		JOIN reconciliation_cases rc ON rc.step_id=rs.id AND rc.organization_id=rs.organization_id
+		WHERE rc.id=$1::uuid AND rc.organization_id=$2::uuid
+		FOR UPDATE OF r, rs`, caseID, orgID).Scan(&runID, &nodeID, &runStatus, &runReason, &runDeadline); err != nil {
+		return nil, "", err
+	}
+	var locked resolveCaseRow
+	var lockedStatus string
+	if err := tx.QueryRow(ctx, `SELECT id::text, environment_id::text, step_id::text,
+			attempt_id::text, reason, status, revision FROM reconciliation_cases
+		WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`,
+		caseID, orgID).Scan(&locked.id, &locked.environmentID, &locked.stepID, &locked.attemptID, &locked.reason, &lockedStatus, &locked.revision); err != nil {
+		return nil, "", err
+	}
+	locked.status = lockedStatus
+	row = locked
+
+	if row.status != "OPEN" {
+		return nil, "", ErrCaseResolved
+	}
+	if row.revision != req.ExpectedRevision {
+		return nil, "", ErrRevisionConflict
+	}
+	switch runStatus {
+	case "SUCCEEDED", "FAILED", "CANCELLED":
+		return nil, "", ErrRunTerminal
+	}
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return nil, "", err
+	}
+	if runDeadline != nil && !dbNow.Before(*runDeadline) {
+		return nil, "", ErrRunDeadlineExceeded
+	}
+
+	var manifest deploymentManifest
+	var workflowName string
+	var manifestBytes []byte
+	if err := tx.QueryRow(ctx, `SELECT d.manifest, r.workflow_name
+		FROM runs r JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+		WHERE r.id=$1::uuid AND r.organization_id=$2::uuid`, runID, orgID).Scan(&manifestBytes, &workflowName); err != nil {
+		return nil, "", err
+	}
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return nil, "", fmt.Errorf("decode manifest: %w", err)
+	}
+	policy := manifest.taskRetryPolicy(workflowName, nodeID)
+	if !IsValidRecoveryPolicy(policy.Recovery) {
+		return nil, "", ErrInvalidRecovery
+	}
+
+	var resolution string
+	action := strings.TrimSpace(req.Action)
+	switch action {
+	case ResolveActionSucceed:
+		resolution = CaseResolutionSucceed
+		if err := resolveCaseSucceedTx(ctx, tx, orgID, runID, row, nodeID, manifest, workflowName, req, audit); err != nil {
+			return nil, "", err
+		}
+	case ResolveActionRetry:
+		resolution = CaseResolutionRetry
+		if err := resolveCaseRetryTx(ctx, tx, orgID, runID, row, nodeID, policy, req, audit, dbNow, runDeadline); err != nil {
+			return nil, "", err
+		}
+	default:
+		resolution = CaseResolutionFail
+		if err := resolveCaseFailTx(ctx, tx, orgID, runID, row, nodeID, req, audit); err != nil {
+			return nil, "", err
+		}
+	}
+
+	var openCases int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM reconciliation_cases rc
+		JOIN run_steps rs ON rs.id=rc.step_id AND rs.organization_id=rc.organization_id
+		WHERE rs.run_id=$1::uuid AND rc.organization_id=$2::uuid AND rc.status='OPEN'`,
+		runID, orgID).Scan(&openCases); err != nil {
+		return nil, "", err
+	}
+	if openCases == 0 {
+		// Last hold released: continue the workflow from the resolved
+		// success, then leave the hold reason behind.
+		if action == ResolveActionSucceed {
+			if err := advanceAfterStepSuccessTx(ctx, tx, orgID, runID, req.Result); err != nil {
+				return nil, "", err
+			}
+		}
+		if err := releaseHoldTx(ctx, tx, orgID, runID, action); err != nil {
+			return nil, "", err
+		}
+	}
+
+	var newRevision int64
+	if err := tx.QueryRow(ctx, `SELECT revision FROM reconciliation_cases
+		WHERE id=$1::uuid AND organization_id=$2::uuid`, caseID, orgID).Scan(&newRevision); err != nil {
+		return nil, "", err
+	}
+	_ = resolution
+	return &ResolveReconciliationResponse{CaseID: caseID, Resolved: true, Revision: newRevision}, runID, nil
 }
 
 // resolveCaseSucceedTx records a human-confirmed success. The held attempt

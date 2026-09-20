@@ -65,6 +65,7 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		if workerEngine == nil {
 			workerEngine = execution.NewWorkerEngine(storagePool, eventHub)
 		}
+		workerEngine.SetCommands(tenantService)
 		workerSvc := worker.NewService(storagePool, deploymentSvc, workerEngine)
 		outboxMetrics.SetTaskLogDroppedCounter(workerSvc.DroppedLogsCount)
 		workerHandler := worker.NewHTTPHandler(workerSvc, tenantService)

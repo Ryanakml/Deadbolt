@@ -984,3 +984,132 @@ func TestMootedHoldsProduceResolutionHistory(t *testing.T) {
 		t.Fatalf("audit must preserve the human decision reason, got %v", meta)
 	}
 }
+
+func resolveCaseHTTPWithKey(t *testing.T, server *httptest.Server, token, orgID, caseID, key string, body map[string]any) (int, map[string]any) {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/reconciliation-cases/"+caseID+"/resolve", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Organization-ID", orgID)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("resolve request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var parsed map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&parsed)
+	return resp.StatusCode, parsed
+}
+
+func countResolveSideEffects(t *testing.T, tc *tenantTestContext, orgID, caseID, runID string) (audit, events int, revision int64) {
+	t.Helper()
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE target_id=$1::uuid AND action='reconciliation.resolve'`, caseID).Scan(&audit); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM run_events WHERE run_id=$1::uuid`, runID).Scan(&events); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT revision FROM reconciliation_cases WHERE id=$1::uuid`, caseID).Scan(&revision)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return audit, events, revision
+}
+
+// TestResolveIdenticalReplayReplaysOutcome proves the blocker fix: when the
+// HTTP response is lost and the browser retries the identical body with the
+// same Idempotency-Key, the recorded command outcome replays instead of
+// re-entering the engine as a second decision (no CASE_RESOLVED, no new
+// audit/event, no state change).
+func TestResolveIdenticalReplayReplaysOutcome(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "resolve-replay")
+	const digest = "bundle-resolve-replay-19"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, reconcileManifest(3, 60000))
+	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	advertiseDigest(t, tc, orgID, session.SessionID, digest)
+
+	a1 := claimExecution(t, server, session, digest, "resolve-replay-claim")
+	startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+	completeWithError(t, server, session, a1, "PROVIDER_500", true, "UNKNOWN", "")
+	caseID, rev := openReconciliationCase(t, tc, orgID, stepID)
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "replay")
+
+	body := map[string]any{
+		"action": "fail_run", "evidence": "prov-x",
+		"reason": "operator verified provider state", "expectedRevision": rev,
+	}
+	firstStatus, firstBody := resolveCaseHTTPWithKey(t, server, token, orgID, caseID, "replay-key-1", body)
+	if firstStatus != http.StatusOK {
+		t.Fatalf("first resolve expected 200, got %d (%v)", firstStatus, firstBody)
+	}
+	auditBefore, eventsBefore, revBefore := countResolveSideEffects(t, tc, orgID, caseID, runID)
+
+	secondStatus, secondBody := resolveCaseHTTPWithKey(t, server, token, orgID, caseID, "replay-key-1", body)
+	if secondStatus != http.StatusOK {
+		t.Fatalf("identical replay must return 200, got %d (%v)", secondStatus, secondBody)
+	}
+	if secondBody["caseId"] != firstBody["caseId"] || secondBody["resolved"] != firstBody["resolved"] || secondBody["revision"] != firstBody["revision"] {
+		t.Fatalf("replay must return the same outcome: first=%v second=%v", firstBody, secondBody)
+	}
+	auditAfter, eventsAfter, revAfter := countResolveSideEffects(t, tc, orgID, caseID, runID)
+	if auditAfter != auditBefore || eventsAfter != eventsBefore || revAfter != revBefore {
+		t.Fatalf("replay must not mutate: audit %d->%d events %d->%d revision %d->%d",
+			auditBefore, auditAfter, eventsBefore, eventsAfter, revBefore, revAfter)
+	}
+}
+
+// TestResolveConflictingReplayIsRejected proves same-key/different-body
+// retries return 409 IDEMPOTENCY_CONFLICT without changing the committed
+// reconciliation result.
+func TestResolveConflictingReplayIsRejected(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "resolve-conflict-key")
+	const digest = "bundle-resolve-conflict-key-19"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, reconcileManifest(3, 60000))
+	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	advertiseDigest(t, tc, orgID, session.SessionID, digest)
+
+	a1 := claimExecution(t, server, session, digest, "resolve-conflict-key-claim")
+	startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+	completeWithError(t, server, session, a1, "PROVIDER_500", true, "UNKNOWN", "")
+	caseID, rev := openReconciliationCase(t, tc, orgID, stepID)
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "conflict-key")
+
+	firstBody := map[string]any{
+		"action": "fail_run", "evidence": "prov-x",
+		"reason": "operator verified provider state", "expectedRevision": rev,
+	}
+	if status, _ := resolveCaseHTTPWithKey(t, server, token, orgID, caseID, "conflict-key-1", firstBody); status != http.StatusOK {
+		t.Fatalf("first resolve expected 200, got %d", status)
+	}
+	secondBody := map[string]any{
+		"action": "fail_run", "evidence": "prov-DIFFERENT",
+		"reason": "operator verified provider state", "expectedRevision": rev,
+	}
+	status, body := resolveCaseHTTPWithKey(t, server, token, orgID, caseID, "conflict-key-1", secondBody)
+	if status != http.StatusConflict || body["code"] != "IDEMPOTENCY_CONFLICT" {
+		t.Fatalf("conflicting replay must be rejected, got %d (%v)", status, body)
+	}
+	var resolution string
+	var revision int64
+	var runStatus string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT resolution, revision FROM reconciliation_cases WHERE id=$1::uuid`, caseID).Scan(&resolution, &revision); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid`, runID).Scan(&runStatus)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if resolution != "FAIL" || revision != rev+1 || runStatus != "FAILED" {
+		t.Fatalf("conflicting replay must not change the result: %s/%d/%s", resolution, revision, runStatus)
+	}
+}
