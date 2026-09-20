@@ -1785,7 +1785,7 @@ func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID st
 	err := e.pool.WithTenantTx(ctx, organizationID, func(ctx context.Context, tx storage.Tx) error {
 		type readyWorkCandidate struct {
 			runID, workflowName string
-			manifestBytes      []byte
+			manifestBytes       []byte
 		}
 		rows, err := tx.Query(ctx, `
 			SELECT r.id::text, r.workflow_name, d.manifest

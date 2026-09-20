@@ -14,12 +14,12 @@ import (
 // Reconciler executes periodic authoritative reconciliation sweeps across active tenants (Blueprint §24.3 & §25.2).
 // The heartbeat is updated ONLY when a reconciliation sweep successfully queries the database.
 type Reconciler struct {
-	pool          *pgxpool.Pool
-	sweepInterval time.Duration
-	ticker        *atomic.Int64
-	wakeup        chan struct{}
-	logger        *log.Logger
-	tenantSweep   func(context.Context, string) error
+	pool            *pgxpool.Pool
+	sweepInterval   time.Duration
+	ticker          *atomic.Int64
+	wakeup          chan struct{}
+	logger          *log.Logger
+	tenantSweep     func(context.Context, string) error
 	slowTenantSweep func(context.Context, string) error
 }
 
