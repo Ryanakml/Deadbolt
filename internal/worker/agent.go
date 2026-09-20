@@ -75,6 +75,10 @@ type Agent struct {
 	stopPoll        chan struct{}
 	stopOnce        sync.Once
 	slotsChan       chan struct{}
+	// PublishArtifactFn publishes result bytes through the scoped artifact
+	// APIs. Nil preserves the control-plane implementation; tests inject a
+	// stub to assert completion substitution without network.
+	PublishArtifactFn func(ctx context.Context, assignment AssignmentDTO, data []byte, contentType string) (string, error)
 }
 
 func NewAgent(cfg AgentConfig) (*Agent, error) {
@@ -507,7 +511,23 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		Outcome:         outcome,
 	}
 	if outcome == "SUCCEEDED" && completion != nil {
-		compReq.Output = completion.Output
+		if artifactID, handled, pubErr := a.maybePublishArtifact(attCtx, assignment, completion.Output); pubErr != nil {
+			outcome = "FAILED"
+			code, retryable := "UPLOAD_FAILED", true
+			if pub, ok := pubErr.(*ArtifactPublishError); ok {
+				code, retryable = pub.Code, pub.Retryable
+			}
+			compReq.Error = &TaskErrorDTO{
+				Code:         code,
+				Message:      pubErr.Error(),
+				Retryable:    retryable,
+				EffectStatus: "NOT_APPLIED",
+			}
+		} else if handled {
+			compReq.ArtifactID = artifactID
+		} else {
+			compReq.Output = completion.Output
+		}
 	} else if completion != nil && completion.Error != nil {
 		compReq.Error = &TaskErrorDTO{
 			Code:         completion.Error.Code,

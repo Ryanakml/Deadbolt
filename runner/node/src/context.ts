@@ -82,5 +82,18 @@ export function createTaskContext(
     logger,
     log: logger,
     env: Object.freeze({ ...(env ?? {}) }),
+    artifacts: {
+      upload: (data: Uint8Array, contentType = "application/octet-stream") => {
+        if (!(data instanceof Uint8Array) || data.length === 0) {
+          throw new TypeError("non-empty bytes are required");
+        }
+        return {
+          $artifactUpload: {
+            data: Buffer.from(data).toString("base64"),
+            contentType,
+          },
+        };
+      },
+    },
   };
 }

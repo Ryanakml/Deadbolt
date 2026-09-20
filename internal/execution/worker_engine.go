@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ryanakml/Deadbolt/internal/artifacts"
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -26,6 +27,7 @@ type WorkerEngine struct {
 	pool                 *storage.Pool
 	hub                  *EventHub
 	commands             *tenant.Service
+	artifacts            *artifacts.Service
 	beforeCompleteCommit func() error
 	afterCompleteCommit  func() error
 }
@@ -47,6 +49,13 @@ func (e *WorkerEngine) SetHub(hub *EventHub) {
 // Engines without it (unit-style construction) execute bare transactions.
 func (e *WorkerEngine) SetCommands(commands *tenant.Service) {
 	e.commands = commands
+}
+
+// SetArtifacts attaches the scoped artifact service for result association
+// and consumer integrity admission. Engines without it fail artifact paths
+// closed.
+func (e *WorkerEngine) SetArtifacts(svc *artifacts.Service) {
+	e.artifacts = svc
 }
 
 // SetBeforeCompleteCommitHookForTest injects a deterministic failure after all
@@ -925,6 +934,39 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				assignmentInput = mapped
 			}
 
+			// Consumer integrity admission: every artifact referenced by the
+			// mapped input must be READY. A missing or corrupt artifact fails
+			// the consumer without rerunning the already-successful producer,
+			// and spends no attempt.
+			if refs := artifacts.CollectArtifactRefs(assignmentInput); len(refs) > 0 {
+				verified, err := e.artifactsReady(ctx, session.OrganizationID, refs)
+				if err != nil {
+					return err
+				}
+				if !verified {
+					missing := refs
+					if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED',wait_reason='ARTIFACT_UNAVAILABLE',updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid`, match.stepID, session.OrganizationID); uErr != nil {
+						return uErr
+					}
+					if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='ARTIFACT_UNAVAILABLE',updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid`, match.runID, session.OrganizationID); uErr != nil {
+						return uErr
+					}
+					if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED',updated_at=clock_timestamp()
+						WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`,
+						match.runID, session.OrganizationID); uErr != nil {
+						return uErr
+					}
+					if err := appendRunEvent(ctx, tx, session.OrganizationID, match.runID, "RUN_FAILED", map[string]any{
+						"reason": "ARTIFACT_UNAVAILABLE", "nodeId": match.nodeID, "artifactIds": missing,
+					}); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+
 			var epoch int64
 			var attemptNumber int
 			if err := tx.QueryRow(ctx, `UPDATE run_steps
@@ -1172,6 +1214,39 @@ func terminalAttempt(status string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// artifactsReady enforces consumer integrity: referenced artifacts must be
+// READY with intact objects. Integrity absences fail closed as unverified;
+// transport failures propagate. A missing service fails closed.
+func (e *WorkerEngine) artifactsReady(ctx context.Context, orgID string, ids []string) (bool, error) {
+	if e.artifacts == nil {
+		return false, nil
+	}
+	if err := e.artifacts.VerifyReferences(ctx, orgID, ids); err != nil {
+		if errors.Is(err, artifacts.ErrArtifactNotFound) ||
+			errors.Is(err, artifacts.ErrObjectNotFound) ||
+			errors.Is(err, artifacts.ErrSizeMismatch) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// artifactFailureCode maps association failures to terminal codes. Every
+// mapping is a deterministic failure: the producer is never silently rerun.
+func artifactFailureCode(err error) string {
+	switch {
+	case errors.Is(err, artifacts.ErrArtifactNotFound):
+		return "ARTIFACT_NOT_FOUND"
+	case errors.Is(err, artifacts.ErrArtifactNotReady):
+		return "ARTIFACT_NOT_READY"
+	case errors.Is(err, artifacts.ErrNotOwned):
+		return "ARTIFACT_NOT_OWNED"
+	default:
+		return "ARTIFACT_UNAVAILABLE"
 	}
 }
 
@@ -1437,15 +1512,42 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		// Contract/schema failures are deterministic terminal failures, never retryable
 		// successes with a bad payload.
 		if req.Outcome == "SUCCEEDED" {
-			var manifest deploymentManifest
-			if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-				return fmt.Errorf("decode manifest: %w", err)
+			artifactResult := false
+			if req.ArtifactID != "" {
+				// Large results travel as typed references: the artifact must
+				// be READY and bound to this attempt by current ownership.
+				// Anything else fails closed without touching run state.
+				// Artifact bytes are opaque to the control plane, so the
+				// reference bypasses output-schema validation.
+				if req.Output != nil {
+					req.Outcome = "FAILED"
+					req.Output = nil
+					req.ArtifactID = ""
+					req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Result carries both inline output and an artifact reference", Retryable: false, EffectStatus: "NOT_APPLIED"}
+				} else if e.artifacts == nil {
+					return fmt.Errorf("artifact association unavailable")
+				} else if _, aerr := e.artifacts.LookupForCompletion(
+					ctx, session.OrganizationID, stepID, req.AttemptID, req.OwnershipEpoch, req.ArtifactID); aerr != nil {
+					req.Outcome = "FAILED"
+					req.Output = nil
+					req.ArtifactID = ""
+					req.Error = &worker.TaskErrorDTO{Code: artifactFailureCode(aerr), Message: "Artifact result cannot be associated", Retryable: false, EffectStatus: "NOT_APPLIED"}
+				} else {
+					req.Output = map[string]any{artifacts.ArtifactRefKey: req.ArtifactID}
+					artifactResult = true
+				}
 			}
-			_, outputSchema := manifest.taskSchemas(workflowName, nodeID)
-			if outputSchema != nil && contracts.ValidatePayload(outputSchema, req.Output) != nil {
-				req.Outcome = "FAILED"
-				req.Output = nil
-				req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Task output does not conform to output schema", Retryable: false, EffectStatus: "NOT_APPLIED"}
+			if req.Outcome == "SUCCEEDED" && !artifactResult {
+				var manifest deploymentManifest
+				if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+					return fmt.Errorf("decode manifest: %w", err)
+				}
+				_, outputSchema := manifest.taskSchemas(workflowName, nodeID)
+				if outputSchema != nil && contracts.ValidatePayload(outputSchema, req.Output) != nil {
+					req.Outcome = "FAILED"
+					req.Output = nil
+					req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Task output does not conform to output schema", Retryable: false, EffectStatus: "NOT_APPLIED"}
+				}
 			}
 		}
 

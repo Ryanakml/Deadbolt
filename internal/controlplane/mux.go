@@ -4,9 +4,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Ryanakml/Deadbolt/internal/artifacts"
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/deployment"
 	"github.com/Ryanakml/Deadbolt/internal/execution"
@@ -27,6 +29,15 @@ func BuildMux(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.Health
 // BuildMuxWithMetrics wires all production routes and attaches an optional outbox.Metrics collector.
 func BuildMuxWithMetrics(cfg auth.Config, pool *pgxpool.Pool, healthChecker *gateway.HealthChecker, outboxMetrics *outbox.Metrics, logger *log.Logger) *http.ServeMux {
 	return BuildMuxWithComponents(cfg, pool, healthChecker, outboxMetrics, logger, nil, nil)
+}
+
+// bearerToken extracts a Bearer credential without validating it.
+func bearerToken(r *http.Request) (string, bool) {
+	raw := r.Header.Get("Authorization")
+	if raw == "" || !strings.HasPrefix(raw, "Bearer ") {
+		return "", false
+	}
+	return strings.TrimPrefix(raw, "Bearer "), true
 }
 
 // BuildMuxWithComponents wires all production routes with optional shared execution hub and worker engine.
@@ -90,6 +101,32 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("POST /v1/reconciliation-cases/{id}/resolve", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsReconcile, executionHandler.ResolveCase))))
 		mux.Handle("POST /api/v1/runs/{id}/cancel", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.CancelRun))))
 		mux.Handle("POST /v1/runs/{id}/cancel", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.CancelRun))))
+
+		// Scoped artifacts: worker sessions (dbs_ bearers) authenticate
+		// through the worker chain with attempt-ownership checks inside the
+		// handler; all other callers use the tenant chain with the route
+		// capability. CSRF/Origin rules for cookie callers are preserved by
+		// delegating to the same middleware.
+		// Unconfigured stores fail closed per endpoint with 503.
+		artifactStore, _ := artifacts.StoreFromEnv()
+		artifactSvc := artifacts.NewService(storagePool, artifactStore)
+		workerEngine.SetArtifacts(artifactSvc)
+		artifactHandler := artifacts.NewHTTPHandler(artifactSvc, tenantService)
+		artifactRoute := func(pattern, capability string, handle http.HandlerFunc) {
+			mux.Handle(pattern, tenantHandler.WithRequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if token, ok := bearerToken(r); ok && worker.IsSessionTokenFormat(token) {
+					workerHandler.RequireWorkerSession(handle)(w, r)
+					return
+				}
+				tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(capability, handle))(w, r)
+			})))
+		}
+		artifactRoute("POST /api/v1/artifacts", tenant.CapArtifactsWrite, artifactHandler.Create)
+		artifactRoute("POST /v1/artifacts", tenant.CapArtifactsWrite, artifactHandler.Create)
+		artifactRoute("POST /api/v1/artifacts/{id}/finalize", tenant.CapArtifactsWrite, artifactHandler.Finalize)
+		artifactRoute("POST /v1/artifacts/{id}/finalize", tenant.CapArtifactsWrite, artifactHandler.Finalize)
+		artifactRoute("GET /api/v1/artifacts/{id}", tenant.CapPayloadRead, artifactHandler.Download)
+		artifactRoute("GET /v1/artifacts/{id}", tenant.CapPayloadRead, artifactHandler.Download)
 
 		mux.Handle("GET /api/v1/workers", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersRead, executionHandler.ListWorkers))))
 		mux.Handle("GET /v1/workers", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersRead, executionHandler.ListWorkers))))

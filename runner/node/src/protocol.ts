@@ -37,6 +37,16 @@ export interface TaskLogger {
   debug(message: string, ...meta: unknown[]): void;
 }
 
+export interface TaskArtifactsClient {
+  /**
+   * Builds an upload marker for raw result bytes. The runner has no network
+   * access; the worker agent publishes marked bytes through the scoped
+   * artifact APIs and completes with the typed reference. Marker shape is
+   * canonical with the TypeScript SDK (`artifacts.ts`).
+   */
+  upload(data: Uint8Array, contentType?: string): unknown;
+}
+
 export interface TaskContext {
   readonly stepId: string;
   readonly attemptId: string;
@@ -45,4 +55,5 @@ export interface TaskContext {
   readonly logger: TaskLogger;
   readonly log: TaskLogger;
   readonly env: Readonly<Record<string, string>>;
+  readonly artifacts: TaskArtifactsClient;
 }

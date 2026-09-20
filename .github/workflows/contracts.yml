@@ -28,9 +28,26 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      minio:
+        image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        env:
+          MINIO_ROOT_USER: miniotest
+          MINIO_ROOT_PASSWORD: miniotest123
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres?sslmode=disable
       DATABASE_URL: postgres://postgres@localhost:5432/postgres?sslmode=disable
+      DEADBOLT_ARTIFACTS_S3_ENDPOINT: 127.0.0.1:9000
+      DEADBOLT_ARTIFACTS_S3_BUCKET: deadbolt-artifacts-test
+      DEADBOLT_ARTIFACTS_S3_ACCESS_KEY: miniotest
+      DEADBOLT_ARTIFACTS_S3_SECRET_KEY: miniotest123
+      DEADBOLT_ARTIFACTS_S3_REGION: us-east-1
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

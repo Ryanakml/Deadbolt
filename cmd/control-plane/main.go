@@ -20,6 +20,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/Ryanakml/Deadbolt/internal/auth"
+	"github.com/Ryanakml/Deadbolt/internal/artifacts"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
@@ -242,6 +243,19 @@ func run() error {
 		workerEngine = execution.NewWorkerEngine(storage.NewPool(pool), eventHub)
 	}
 
+	// Ensure the artifact bucket exists when object storage is configured.
+	// Best effort at boot: endpoints fail closed per request when the store
+	// is unreachable, and the reconciler sweep retries collection later.
+	if store, ok := artifacts.StoreFromEnv(); ok {
+		bootCtx, bootCancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := store.EnsureBucket(bootCtx); err != nil {
+			logger.Printf("[ARTIFACTS] Warning: artifact bucket not ready: %v", err)
+		}
+		bootCancel()
+	} else {
+		logger.Printf("[ARTIFACTS] Object storage unconfigured: artifact endpoints return 503 until DEADBOLT_ARTIFACTS_S3_* is set")
+	}
+
 	var reconciler *scheduling.Reconciler
 	if reconcilerPool != nil {
 		// Authoritative reconciler sweeps every 1 second per Blueprint §13.3
@@ -257,6 +271,7 @@ func run() error {
 						return err
 					}
 				}
+<<<<<<< HEAD
 				return nil
 			})
 			reconciler.SetSlowTenantSweep(func(ctx context.Context, orgID string) error {
@@ -265,8 +280,19 @@ func run() error {
 						return err
 					}
 				}
-				_, err := retentionService.PruneExpiredTaskLogs(ctx, orgID, 1000)
-				return err
+				if _, err := retentionService.PruneExpiredTaskLogs(ctx, orgID, 1000); err != nil {
+					return err
+				}
+				// Orphan artifact collection runs on the same bounded sweep.
+				// Unconfigured stores skip silently; configured ones collect
+				// one bounded batch per pass.
+				if store, ok := artifacts.StoreFromEnv(); ok {
+					gc := artifacts.NewService(storage.NewPool(pool), store)
+					if _, err := gc.CollectGarbage(ctx, orgID, 50, time.Now()); err != nil {
+						return err
+					}
+				}
+				return nil
 			})
 		} else {
 			logger.Printf("[SCHEDULER] Task-log retention and lease recovery disabled: runtime database pool unavailable")

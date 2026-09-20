@@ -4,6 +4,7 @@ export * from "./mapping.js";
 export * from "./schema.js";
 export * from "./validator.js";
 export * from "./enums.js";
+export * from "./artifacts.js";
 export * from "./context.js";
 export * from "./task.js";
 export * from "./workflow.js";
