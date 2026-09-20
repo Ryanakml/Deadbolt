@@ -561,7 +561,7 @@ func TestAttemptTimeoutFollowsPolicy(t *testing.T) {
 		manifest func() string
 		holds    bool
 	}{
-		{"safe-retries", func() string { return safeManifest(3, 10, 100) }, false},
+		{"safe-retries", func() string { return safeManifest(3, 10000, 30000) }, false},
 		{"reconcile-holds", func() string { return reconcileManifest(3, 60000) }, true},
 	} {
 		t.Run(tc2.name, func(t *testing.T) {
