@@ -1,4 +1,4 @@
-import { RunSnapshot, RunEvent, RunEventsResponse, StepStatus, TaskLogsResponse, StreamFreshness, ReconciliationCase, ResolveAction } from "./types.js";
+import { RunSnapshot, RunStatus, RunEvent, RunEventsResponse, StepStatus, TaskLogsResponse, StreamFreshness, ReconciliationCase, ResolveAction } from "./types.js";
 export declare function shouldShowWorkerWait(stepStatus: StepStatus, waitingReason: string | null | undefined, activeCompatibleWorkers: number | undefined): boolean;
 export declare function terminalStepEmptyText(stepStatus: StepStatus): string;
 export declare function openCaseForStep(snapshot: RunSnapshot, stepId: string): ReconciliationCase | null;
@@ -10,6 +10,7 @@ export interface ResolveActionOption {
     needsResult: boolean;
 }
 export declare const RESOLVE_ACTIONS: ResolveActionOption[];
+export declare function terminationBannerText(status: RunStatus, terminationConfirmed: boolean | null | undefined): string | null;
 export interface InspectorListener {
     onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
     onFreshnessChanged?: (freshness: StreamFreshness) => void;

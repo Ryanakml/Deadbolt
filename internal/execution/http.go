@@ -674,3 +674,63 @@ func (h *HTTPHandler) ResolveCase(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, resp)
 }
+
+func (h *HTTPHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
+	caller, ok := tenant.CallerFromContext(r.Context())
+	if !ok {
+		errJSON(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
+	if h.engine == nil {
+		errJSON(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+
+	runID := r.PathValue("id")
+	if runID == "" {
+		errJSON(w, r, http.StatusBadRequest, "INVALID_RUN_ID", "Run ID is required")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		errJSON(w, r, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "Request body exceeds transport limit")
+		return
+	}
+	parsed, err := contracts.ParseJSON(raw)
+	if err != nil {
+		errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
+		return
+	}
+	canonical, _ := json.Marshal(parsed)
+	var req CancelRunRequest
+	dec := json.NewDecoder(bytes.NewReader(canonical))
+	if err := dec.Decode(&req); err != nil {
+		errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
+		return
+	}
+
+	resp, err := h.engine.CancelRun(
+		r.Context(), caller.OrganizationID, runID, req, auditFromCaller(caller, r),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrRunNotFound):
+			errJSON(w, r, http.StatusNotFound, "RUN_NOT_FOUND", "Run not found")
+		case errors.Is(err, ErrRunTerminal):
+			errJSON(w, r, http.StatusConflict, "RUN_TERMINAL", "Run is already terminal")
+		case errors.Is(err, ErrRevisionConflict):
+			errJSON(w, r, http.StatusConflict, "REVISION_CONFLICT", "Run changed since it was read; refresh before acting")
+		case errors.Is(err, tenant.ErrAuditRequired):
+			errJSON(w, r, http.StatusUnauthorized, "AUDIT_REQUIRED", "Audit context is required")
+		case errors.Is(err, tenant.ErrIdempotencyConflict):
+			errJSON(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different request content")
+		default:
+			errJSON(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}

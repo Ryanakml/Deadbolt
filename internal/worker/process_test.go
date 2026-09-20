@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -195,5 +196,43 @@ func TestProcessTerminationOnContextCancel(t *testing.T) {
 
 	if completion != nil && completion.Status == "SUCCEEDED" {
 		t.Fatalf("expected aborted task not to succeed")
+	}
+}
+
+func TestTerminateHungProcessGroupEscalatesToSIGKILL(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node binary not found in PATH")
+	}
+	// A hung child that ignores graceful termination must be force-killed
+	// after the supervisor grace period (Blueprint §12.3 stop sequence).
+	// The node child swallows SIGTERM, so only SIGKILL can stop the group.
+	cmd := exec.Command("node", "-e", `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("spawn sleep failed: %v", err)
+	}
+	pid := cmd.Process.Pid
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	// Let the child install its SIGTERM handler before terminating: an
+	// immediate signal would race node startup and kill a healthy child.
+	time.Sleep(time.Second)
+
+	supervisor := worker.NewProcessSupervisor("node", "runner")
+	supervisor.GracePeriod = 200 * time.Millisecond
+	res := supervisor.TerminateProcessGroup(pid)
+	if res == nil {
+		t.Fatalf("expected a stop result")
+	}
+	if !res.GraceExceeded {
+		t.Fatalf("hung process must exceed the grace period: %+v", res)
+	}
+	if !res.Stopped {
+		t.Fatalf("hung process must be stopped after SIGKILL: %+v", res)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("child process did not exit after SIGKILL")
 	}
 }

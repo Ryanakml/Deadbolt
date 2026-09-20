@@ -1,5 +1,6 @@
 import {
   RunSnapshot,
+  RunStatus,
   RunEvent,
   RunEventsResponse,
   TaskAttempt,
@@ -98,6 +99,21 @@ export const RESOLVE_ACTIONS: ResolveActionOption[] = [
     needsResult: false,
   },
 ];
+
+// terminationBannerText describes cancellation settlement without ever
+// promising external rollback. A null confirmation means not yet settled.
+export function terminationBannerText(
+  status: RunStatus,
+  terminationConfirmed: boolean | null | undefined,
+): string | null {
+  if (status === "CANCELLING") {
+    return "Cancelling — waiting for workers to acknowledge the stop or for the grace period to expire.";
+  }
+  if (status === "CANCELLED" && terminationConfirmed === false) {
+    return "Cancellation unconfirmed — worker processes may still be running. External effects already performed were not rolled back; verify provider state.";
+  }
+  return null;
+}
 
 export interface InspectorListener {
   onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
@@ -498,6 +514,16 @@ export class RunInspector {
 
       case "run.cancelled":
         this.snapshot.status = "CANCELLED";
+        if (typeof payload.terminationConfirmed === "boolean") {
+          this.snapshot.terminationConfirmed = payload.terminationConfirmed;
+        }
+        break;
+
+      case "run.cancelling":
+        this.snapshot.status = "CANCELLING";
+        if (typeof payload.reason === "string") {
+          this.snapshot.reasonCode = payload.reason;
+        }
         break;
     }
 

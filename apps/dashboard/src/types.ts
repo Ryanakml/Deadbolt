@@ -59,6 +59,7 @@ export interface Run {
   revision: number;
   createdAt: string;
   deadlineAt?: string;
+  terminationConfirmed?: boolean | null;
 }
 
 export interface RunSnapshot extends Run {

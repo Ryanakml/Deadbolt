@@ -33,7 +33,12 @@ func sendProcessGroupSignal(pgid int, force bool) error {
 }
 
 func isProcessGroupAlive(pgid int) bool {
-	return syscall.Kill(-pgid, syscall.Signal(0)) == nil
+	// EPERM from signal 0 means the group exists but is not signalable by
+	// us: that is still alive. Only ESRCH (no such process) means gone.
+	// Treating EPERM as dead would report a hung group stopped without
+	// ever escalating to SIGKILL.
+	err := syscall.Kill(-pgid, syscall.Signal(0))
+	return err == nil || err == syscall.EPERM
 }
 
 func checkProcessAliveOS(proc *os.Process, pid int) bool {

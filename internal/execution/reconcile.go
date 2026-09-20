@@ -447,7 +447,7 @@ func resolveCaseFailTx(
 	if err := markCaseResolvedTx(ctx, tx, orgID, row, CaseResolutionFail, audit); err != nil {
 		return err
 	}
-	if err := closeOpenCasesAsFailTx(ctx, tx, orgID, runID, actorID, "RECONCILIATION_FAILED"); err != nil {
+	if err := closeOpenCasesTx(ctx, tx, orgID, runID, actorID, "RECONCILIATION_FAILED", CaseResolutionFail); err != nil {
 		return err
 	}
 	if err := failRunForStepTx(ctx, tx, orgID, runID, row.stepID, "RECONCILIATION_FAILED", actorID); err != nil {
@@ -489,17 +489,17 @@ func markCaseResolvedTx(
 	return nil
 }
 
-// closeOpenCasesAsFailTx moots every remaining OPEN case of a terminalizing
-// run. System terminalization passes a nil actor; human fail decisions pass
-// the deciding actor through. History is emitted only when at least one OPEN
-// case actually closes, identifying the affected cases.
-func closeOpenCasesAsFailTx(ctx context.Context, tx storage.Tx, orgID, runID string, actorID *string, reason string) error {
-	rows, err := tx.Query(ctx, `UPDATE reconciliation_cases rc SET status='RESOLVED', resolution='FAIL',
+// closeOpenCasesTx moots every remaining OPEN case of a terminalizing run
+// with the given resolution. System terminalization passes a nil actor;
+// human decisions pass the deciding actor through. History is emitted only
+// when at least one OPEN case actually closes, identifying the affected cases.
+func closeOpenCasesTx(ctx context.Context, tx storage.Tx, orgID, runID string, actorID *string, reason, resolution string) error {
+	rows, err := tx.Query(ctx, `UPDATE reconciliation_cases rc SET status='RESOLVED', resolution=$4,
 		actor_id=$1, revision=revision+1, resolved_at=clock_timestamp()
 		FROM run_steps rs
 		WHERE rc.step_id=rs.id AND rc.organization_id=rs.organization_id
 			AND rs.run_id=$2::uuid AND rc.organization_id=$3::uuid AND rc.status='OPEN'
-		RETURNING rc.id::text`, actorID, runID, orgID)
+		RETURNING rc.id::text`, actorID, runID, orgID, resolution)
 	if err != nil {
 		return err
 	}
@@ -521,7 +521,7 @@ func closeOpenCasesAsFailTx(ctx context.Context, tx storage.Tx, orgID, runID str
 		return nil
 	}
 	return appendRunEvent(ctx, tx, orgID, runID, "CASE_RESOLVED", map[string]any{
-		"resolution": CaseResolutionFail, "reason": reason, "scope": "run",
+		"resolution": resolution, "reason": reason, "scope": "run",
 		"caseIds": closed,
 	})
 }
@@ -567,70 +567,6 @@ func releaseHoldTx(ctx context.Context, tx storage.Tx, orgID, runID, action stri
 	return appendRunEvent(ctx, tx, orgID, runID, "RUN_RESUMED", map[string]any{
 		"trigger": action,
 	})
-}
-
-// failOverdueHeldRunsTx terminalizes runs whose deadline passed while held
-// for reconciliation (or parked in retry backoff) with no active attempts.
-// The run deadline stays active while held (Blueprint §14.3).
-func failOverdueHeldRunsTx(ctx context.Context, tx storage.Tx, orgID string) (int, []string, error) {
-	rows, err := tx.Query(ctx, `SELECT DISTINCT r.id::text
-		FROM runs r
-		WHERE r.organization_id=$1::uuid
-			AND r.status IN ('QUEUED','RUNNING','WAITING')
-			AND r.deadline_at IS NOT NULL AND r.deadline_at <= clock_timestamp()
-			AND NOT EXISTS (SELECT 1 FROM task_attempts a
-				JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
-				WHERE rs.run_id=r.id AND a.organization_id=r.organization_id
-					AND a.status IN ('CLAIMED','RUNNING'))
-			AND EXISTS (SELECT 1 FROM reconciliation_cases rc
-				JOIN run_steps rs ON rs.id=rc.step_id AND rs.organization_id=rc.organization_id
-				WHERE rs.run_id=r.id AND rc.organization_id=r.organization_id AND rc.status='OPEN')
-		LIMIT 50`, orgID)
-	if err != nil {
-		return 0, nil, fmt.Errorf("query overdue held runs: %w", err)
-	}
-	runIDs := make([]string, 0)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return 0, nil, err
-		}
-		runIDs = append(runIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, nil, err
-	}
-	rows.Close()
-	affected := make([]string, 0, len(runIDs))
-	for _, runID := range runIDs {
-		// Lock order: run → step (Blueprint §11.2).
-		var runStatus string
-		if err := tx.QueryRow(ctx, `SELECT status FROM runs
-			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, runID, orgID).Scan(&runStatus); err != nil {
-			continue
-		}
-		switch runStatus {
-		case "SUCCEEDED", "FAILED", "CANCELLED":
-			continue
-		}
-		var stepID string
-		if err := tx.QueryRow(ctx, `SELECT rs.id::text FROM run_steps rs
-			JOIN reconciliation_cases rc ON rc.step_id=rs.id AND rc.organization_id=rs.organization_id
-			WHERE rs.run_id=$1::uuid AND rs.organization_id=$2::uuid AND rc.status='OPEN'
-			ORDER BY rs.id LIMIT 1 FOR UPDATE OF rs`, runID, orgID).Scan(&stepID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				continue
-			}
-			return 0, nil, err
-		}
-		if err := failRunForStepTx(ctx, tx, orgID, runID, stepID, "RUN_DEADLINE_EXCEEDED", nil); err != nil {
-			return 0, nil, err
-		}
-		affected = append(affected, runID)
-	}
-	return len(affected), affected, nil
 }
 
 // appendCaseAuditTx records the human decision in the append-only audit trail
