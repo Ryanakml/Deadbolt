@@ -8,9 +8,17 @@ import (
 )
 
 func TestNormalizeRetryPolicyDefaultsAndClamp(t *testing.T) {
-	p := NormalizeRetryPolicy(0, 0, 0, 0, "", nil)
+	p := NormalizeRetryPolicy(0, 0, 0, 0, "safe", nil)
 	if p.MaxAttempts != DefaultMaxAttempts || p.InitialDelayMs != DefaultInitialDelayMs || p.MaxDelayMs != DefaultMaxDelayMs {
 		t.Fatalf("defaults wrong: %+v", p)
+	}
+	// Absent/invalid recovery is preserved, never defaulted: the engine must
+	// fail closed instead of treating it as permission to retry.
+	for _, recovery := range []string{"", "bogus", "SAFE "} {
+		got := NormalizeRetryPolicy(3, 1000, 30000, 60000, recovery, nil).Recovery
+		if got != recovery {
+			t.Fatalf("recovery %q was reinterpreted as %q", recovery, got)
+		}
 	}
 	p = NormalizeRetryPolicy(99, 1000, 30000, 60000, "safe", nil)
 	if p.MaxAttempts != MaxMaxAttempts {
@@ -76,6 +84,45 @@ func TestComputeRetryDelayRetryAfterIncreaseAndCap(t *testing.T) {
 	// No Retry-After: pure jitter.
 	if got := ComputeRetryDelayMs(2, 1000, 30000, 0.5, nil); got != 1000 {
 		t.Fatalf("expected 0.5*2000=1000, got %d", got)
+	}
+}
+
+func TestIsValidRecoveryPolicyFailsClosed(t *testing.T) {
+	for _, recovery := range []string{"safe", "idempotent", "reconcile", " Safe ", "IDEMPOTENT"} {
+		if !IsValidRecoveryPolicy(recovery) {
+			t.Fatalf("expected valid recovery for %q", recovery)
+		}
+	}
+	for _, recovery := range []string{"", "bogus", "at-most-once", "safe-ish"} {
+		if IsValidRecoveryPolicy(recovery) {
+			t.Fatalf("expected invalid recovery for %q", recovery)
+		}
+	}
+}
+
+func TestParseRetryAfterOverflowSaturates(t *testing.T) {
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	// Normal seconds still behave exactly.
+	if ms, ok := ParseRetryAfter("90", now); !ok || ms != 90000 {
+		t.Fatalf("normal seconds failed: %d %v", ms, ok)
+	}
+	// Near-MaxInt64 seconds must saturate, never overflow negative.
+	huge := "9223372036854775807"
+	ms, ok := ParseRetryAfter(huge, now)
+	if !ok {
+		t.Fatalf("huge Retry-After should parse as saturating, got ok=false")
+	}
+	if ms < 0 {
+		t.Fatalf("overflow turned huge Retry-After negative: %d", ms)
+	}
+	// Downstream capping must yield the policy max, not an immediate retry.
+	if got := ComputeRetryDelayMs(1, 1000, 30000, 0, &ms); got != 30000 {
+		t.Fatalf("saturated Retry-After should cap to maxDelay 30000, got %d", got)
+	}
+	// A large-but-representable value also caps rather than overflowing.
+	big := int64(1 << 50)
+	if got := ComputeRetryDelayMs(1, 1000, 30000, 0, &big); got != 30000 {
+		t.Fatalf("large Retry-After should cap to maxDelay 30000, got %d", got)
 	}
 }
 

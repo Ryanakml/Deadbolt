@@ -504,3 +504,157 @@ func TestRetryAfterIncreasesDelay(t *testing.T) {
 	}
 	// Cap: Retry-After 9999s must cap at 30s policy max.
 }
+
+// TestMigratedNullWindowNeverMintsFreshDeadline proves review finding 1: an
+// already-active idempotent attempt whose idempotency_valid_until is NULL
+// (pre-M2/migrated row) must NOT gain a fresh now+window deadline during
+// recovery. The original deadline is derived from the earliest persisted
+// attempt; here it is long expired, so recovery holds for reconciliation
+// instead of scheduling a blind retry.
+func TestMigratedNullWindowNeverMintsFreshDeadline(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "retry-migrated-window")
+	const digest = "bundle-retry-migrated-18"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, idempotentManifest(3, 5000, 30000))
+	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1::uuid,$2::uuid,$3)`, session.SessionID, orgID, digest)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a1 := claimExecution(t, server, session, digest, "migrated-claim-1")
+	startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+
+	// Simulate a migrated row: a claimed attempt exists, but no first-claim
+	// deadline was ever persisted. Backdate the attempt so the derived
+	// original deadline (first claim + 30s window) is long expired.
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE task_attempts SET created_at=clock_timestamp()-INTERVAL '1 hour' WHERE id=$1::uuid`, a1.AttemptID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE run_steps SET idempotency_valid_until=NULL WHERE id=$1::uuid`, stepID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE task_leases SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE attempt_id=$1::uuid`, a1.AttemptID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := execution.NewWorkerEngine(tc.pool)
+	if _, err := engine.ReconcileExpiredLeases(context.Background(), orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	var stepState, waitReason, runStatus, runReason, caseReason string
+	var pendingTimers, attempts int
+	var validUntil time.Time
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		var wr, rr, cr *string
+		if err := tx.QueryRow(ctx, `SELECT state, wait_reason, idempotency_valid_until FROM run_steps WHERE id=$1::uuid`, stepID).Scan(&stepState, &wr, &validUntil); err != nil {
+			return err
+		}
+		if wr != nil {
+			waitReason = *wr
+		}
+		if err := tx.QueryRow(ctx, `SELECT status, reason_code FROM runs WHERE id=$1::uuid`, runID).Scan(&runStatus, &rr); err != nil {
+			return err
+		}
+		if rr != nil {
+			runReason = *rr
+		}
+		if err := tx.QueryRow(ctx, `SELECT reason FROM reconciliation_cases WHERE step_id=$1::uuid AND status='OPEN' ORDER BY created_at DESC LIMIT 1`, stepID).Scan(&cr); err != nil {
+			return err
+		}
+		if cr != nil {
+			caseReason = *cr
+		}
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM timers WHERE step_id=$1::uuid AND state='PENDING'`, stepID).Scan(&pendingTimers); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT count(*) FROM task_attempts WHERE step_id=$1::uuid`, stepID).Scan(&attempts)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stepState != "WAITING" || waitReason != "RECONCILIATION" || runStatus != "WAITING" || runReason != "RECONCILIATION" {
+		t.Fatalf("migrated NULL window must hold, got step %s/%s run %s/%s", stepState, waitReason, runStatus, runReason)
+	}
+	if caseReason != "IDEMPOTENCY_WINDOW_INSUFFICIENT" {
+		t.Fatalf("expected INSUFFICIENT hold from derived expired deadline, got %q", caseReason)
+	}
+	if pendingTimers != 0 {
+		t.Fatalf("hold must leave no pending retry timer, got %d", pendingTimers)
+	}
+	if attempts != 1 {
+		t.Fatalf("hold must create no new attempt, got %d attempts", attempts)
+	}
+	if !validUntil.Before(time.Now()) {
+		t.Fatalf("deadline must be the derived original (long past), not a fresh now+window: %s", validUntil)
+	}
+}
+
+// TestMalformedRecoveryPolicyCannotRetry proves review finding 2: a persisted
+// task without an explicit safe/idempotent/reconcile policy fails closed.
+// A retryable worker error must terminalize the run without a timer or a
+// second attempt, for missing, bogus, and unknown-task policies alike.
+func TestMalformedRecoveryPolicyCannotRetry(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "retry-malformed-recovery")
+	cases := []struct {
+		name     string
+		digest   string
+		manifest string
+	}{
+		{"missing-recovery", "bundle-malformed-missing-18",
+			`{"targetOS":"linux","targetArchitecture":"amd64","tasks":[{"name":"task-a","entrypoint":"tasks/a.js","timeoutMs":60000,"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"retry":{"maxAttempts":3,"initialDelayMs":1000,"maxDelayMs":30000}}],"workflows":[{"name":"workflow-a","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"nodes":[{"id":"node-a","type":"task","task":"task-a"}]}]}`},
+		{"bogus-recovery", "bundle-malformed-bogus-18",
+			`{"targetOS":"linux","targetArchitecture":"amd64","tasks":[{"name":"task-a","entrypoint":"tasks/a.js","recovery":"bogus","timeoutMs":60000,"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"retry":{"maxAttempts":3,"initialDelayMs":1000,"maxDelayMs":30000}}],"workflows":[{"name":"workflow-a","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"nodes":[{"id":"node-a","type":"task","task":"task-a"}]}]}`},
+		{"unknown-task", "bundle-malformed-unknown-18",
+			`{"targetOS":"linux","targetArchitecture":"amd64","tasks":[{"name":"task-a","entrypoint":"tasks/a.js","recovery":"safe","timeoutMs":60000,"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"retry":{"maxAttempts":3,"initialDelayMs":1000,"maxDelayMs":30000}}],"workflows":[{"name":"workflow-a","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"nodes":[{"id":"node-a","type":"task","task":"task-ghost"}]}]}`},
+	}
+	for _, c := range cases {
+		deploymentID := seedRetryDeployment(t, tc, orgID, envID, c.digest, c.manifest)
+		runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+		if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1::uuid,$2::uuid,$3) ON CONFLICT DO NOTHING`, session.SessionID, orgID, c.digest)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		a1 := claimExecution(t, server, session, c.digest, "malformed-claim-"+c.name)
+		startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+		completeWithError(t, server, session, a1, "PROVIDER_500", true, "NOT_APPLIED", "")
+
+		var stepState, runStatus string
+		var reasonCode *string
+		var pendingTimers, attempts int
+		if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			if err := tx.QueryRow(ctx, `SELECT state FROM run_steps WHERE id=$1::uuid`, stepID).Scan(&stepState); err != nil {
+				return err
+			}
+			if err := tx.QueryRow(ctx, `SELECT status, reason_code FROM runs WHERE id=$1::uuid`, runID).Scan(&runStatus, &reasonCode); err != nil {
+				return err
+			}
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM timers WHERE step_id=$1::uuid AND state='PENDING'`, stepID).Scan(&pendingTimers); err != nil {
+				return err
+			}
+			return tx.QueryRow(ctx, `SELECT count(*) FROM task_attempts WHERE step_id=$1::uuid`, stepID).Scan(&attempts)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if stepState != "FAILED" || runStatus != "FAILED" {
+			t.Fatalf("%s: malformed policy must fail, got step %s run %s", c.name, stepState, runStatus)
+		}
+		if reasonCode == nil || *reasonCode != "INVALID_RECOVERY_POLICY" {
+			t.Fatalf("%s: expected INVALID_RECOVERY_POLICY, got %v", c.name, reasonCode)
+		}
+		if pendingTimers != 0 || attempts != 1 {
+			t.Fatalf("%s: no timer and no second attempt allowed, got timers=%d attempts=%d", c.name, pendingTimers, attempts)
+		}
+	}
+}

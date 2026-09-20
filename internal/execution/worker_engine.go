@@ -108,7 +108,9 @@ func (m deploymentManifest) taskRetryPolicy(workflowName, nodeID string) RetryPo
 			return NormalizeRetryPolicy(task.Retry.MaxAttempts, task.Retry.InitialDelayMs, task.Retry.MaxDelayMs, task.TimeoutMs, task.Recovery, task.IdempotencyWindowMs)
 		}
 	}
-	return NormalizeRetryPolicy(0, 0, 0, 0, "safe", nil)
+	// Unknown task reference: never fall back to a retryable policy. The
+	// empty recovery fails closed downstream (no automatic retry).
+	return NormalizeRetryPolicy(0, 0, 0, 0, "", nil)
 }
 
 func (m deploymentManifest) taskRecoveryPolicy(workflowName, nodeID string) (string, int) {
@@ -211,6 +213,53 @@ func ensureIdempotencyWindowTx(ctx context.Context, tx storage.Tx, organizationI
 	return &set, nil
 }
 
+// claimIdempotencyAdmissionTx resolves the idempotency deadline for a READY
+// step about to be claimed. It returns (deadline, holdReason, err):
+//   - non-idempotent policy: (nil, "", nil), no admission applies;
+//   - true first claim (no prior attempts, no persisted deadline): the window
+//     is minted exactly once via ensureIdempotencyWindowTx;
+//   - legacy step with prior attempts but NULL deadline: the ORIGINAL
+//     first-claim deadline is derived from attempt history, never now+window;
+//   - holdReason != "": the deadline cannot be established, so the caller must
+//     route to reconciliation without creating an attempt.
+func claimIdempotencyAdmissionTx(ctx context.Context, tx storage.Tx, organizationID, stepID string, policy RetryPolicy) (*time.Time, string, error) {
+	if strings.ToLower(strings.TrimSpace(policy.Recovery)) != "idempotent" {
+		return nil, "", nil
+	}
+	var valid *time.Time
+	var next int
+	if err := tx.QueryRow(ctx, `SELECT idempotency_valid_until, next_attempt_number FROM run_steps
+		WHERE id=$1::uuid AND organization_id=$2::uuid`, stepID, organizationID).Scan(&valid, &next); err != nil {
+		return nil, "", err
+	}
+	if valid != nil {
+		return valid, "", nil
+	}
+	if policy.IdempotencyWindowMs == nil {
+		// No declared dedup bound. A first execution repeats nothing, so it
+		// may proceed; any later retry is held by the scheduler instead.
+		if next > 1 {
+			return nil, "IDEMPOTENCY_WINDOW_UNKNOWN", nil
+		}
+		return nil, "", nil
+	}
+	if next == 1 {
+		minted, err := ensureIdempotencyWindowTx(ctx, tx, organizationID, stepID, policy)
+		if err != nil {
+			return nil, "", err
+		}
+		return minted, "", nil
+	}
+	derived, err := deriveIdempotencyDeadlineTx(ctx, tx, organizationID, stepID, *policy.IdempotencyWindowMs)
+	if err != nil {
+		return nil, "", err
+	}
+	if derived == nil {
+		return nil, "IDEMPOTENCY_WINDOW_UNKNOWN", nil
+	}
+	return derived, "", nil
+}
+
 func insertReconciliationCaseTx(ctx context.Context, tx storage.Tx, organizationID, environmentID, stepID string, attemptID *string, reason string, evidence map[string]any) error {
 	encoded, err := json.Marshal(evidence)
 	if err != nil {
@@ -241,6 +290,39 @@ func routeStepToReconciliationTx(ctx context.Context, tx storage.Tx, organizatio
 	return appendRunEvent(ctx, tx, organizationID, runID, "STEP_WAITING", map[string]any{
 		"stepId": stepID, "nodeId": nodeID, "reason": "RECONCILIATION", "holdReason": reason,
 	})
+}
+
+// deriveIdempotencyDeadlineTx reconstructs the original first-claim + window
+// deadline for a legacy step that has attempt history but no persisted
+// idempotency_valid_until, and backfills it (only where still NULL).
+// It returns (nil, nil) when no attempt history exists. It never mints a
+// fresh now+window deadline.
+func deriveIdempotencyDeadlineTx(ctx context.Context, tx storage.Tx, organizationID, stepID string, windowMs int64) (*time.Time, error) {
+	var firstClaim time.Time
+	if err := tx.QueryRow(ctx, `SELECT created_at FROM task_attempts
+		WHERE step_id=$1::uuid AND organization_id=$2::uuid
+		ORDER BY attempt_number ASC LIMIT 1`, stepID, organizationID).Scan(&firstClaim); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	derived := firstClaim.Add(time.Duration(windowMs) * time.Millisecond)
+	var stored time.Time
+	if err := tx.QueryRow(ctx, `UPDATE run_steps SET idempotency_valid_until=$1, updated_at=clock_timestamp()
+		WHERE id=$2::uuid AND organization_id=$3::uuid AND idempotency_valid_until IS NULL
+		RETURNING idempotency_valid_until`, derived, stepID, organizationID).Scan(&stored); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A concurrent backfill won the race; re-read the authoritative value.
+			if err := tx.QueryRow(ctx, `SELECT idempotency_valid_until FROM run_steps
+				WHERE id=$1::uuid AND organization_id=$2::uuid`, stepID, organizationID).Scan(&stored); err != nil {
+				return nil, err
+			}
+			return &stored, nil
+		}
+		return nil, err
+	}
+	return &stored, nil
 }
 
 // scheduleRetryOrHoldTx persists a retry intent (WAITING/RETRY_BACKOFF +
@@ -281,6 +363,11 @@ func scheduleRetryOrHoldTx(ctx context.Context, tx storage.Tx, organizationID, e
 	if IsNonRetryableCode(errorCode) {
 		return "fail", errorCode, nil
 	}
+	// Absent/invalid recovery policy fails closed: malformed persisted
+	// manifests must never become permission to repeat customer work.
+	if !IsValidRecoveryPolicy(policy.Recovery) {
+		return "fail", "INVALID_RECOVERY_POLICY", nil
+	}
 	// Reconcile policy with ambiguous outcome => hold, never blind retry.
 	if RequiresReconciliation(policy.Recovery, effectStatus) {
 		evidence := map[string]any{
@@ -300,18 +387,41 @@ func scheduleRetryOrHoldTx(ctx context.Context, tx storage.Tx, organizationID, e
 	if !HasRetryBudget(nextAttemptNumber, policy.MaxAttempts) {
 		return "fail", "MAX_ATTEMPTS_EXCEEDED", nil
 	}
-	// Idempotent window admission: never extend; insufficient => hold.
-	if strings.ToLower(strings.TrimSpace(policy.Recovery)) == "idempotent" && policy.IdempotencyWindowMs != nil {
-		if validUntil == nil {
-			// Defensive: first-claim should have set this. If missing (e.g. rows
-			// created before M2), initialize now without extending later retries.
-			var set time.Time
-			if err := tx.QueryRow(ctx, `UPDATE run_steps SET idempotency_valid_until=
-				clock_timestamp()+($1::bigint*INTERVAL '1 millisecond'), updated_at=clock_timestamp()
-				WHERE id=$2::uuid AND organization_id=$3::uuid AND idempotency_valid_until IS NULL
-				RETURNING idempotency_valid_until`, *policy.IdempotencyWindowMs, stepID, organizationID).Scan(&set); err == nil {
-				validUntil = &set
+	// Idempotent window admission: the deadline is first-claim + window and is
+	// never extended or reset by retry, restart, or migration compatibility.
+	// Insufficient window => hold, never blind retry.
+	if strings.ToLower(strings.TrimSpace(policy.Recovery)) == "idempotent" {
+		if policy.IdempotencyWindowMs == nil {
+			// No declared dedup bound: a retry cannot be proven covered.
+			evidence := map[string]any{
+				"operationId": stableOperationID(environmentIDForOp, runID, nodeID),
+				"attemptId":   failedAttemptID, "errorCode": errorCode,
 			}
+			if err := routeStepToReconciliationTx(ctx, tx, organizationID, environmentID, runID, stepID, nodeID, &failedAttemptID, "IDEMPOTENCY_WINDOW_UNKNOWN", evidence); err != nil {
+				return "", "", err
+			}
+			return "hold", "", nil
+		}
+		if validUntil == nil {
+			// Legacy/migrated row without a persisted first-claim deadline.
+			// Derive the ORIGINAL deadline from the earliest persisted attempt
+			// (first claim time + window). Never mint now+window here.
+			derived, err := deriveIdempotencyDeadlineTx(ctx, tx, organizationID, stepID, *policy.IdempotencyWindowMs)
+			if err != nil {
+				return "", "", err
+			}
+			if derived == nil {
+				// No authoritative history to derive from: fail closed.
+				evidence := map[string]any{
+					"operationId": stableOperationID(environmentIDForOp, runID, nodeID),
+					"attemptId":   failedAttemptID, "errorCode": errorCode,
+				}
+				if err := routeStepToReconciliationTx(ctx, tx, organizationID, environmentID, runID, stepID, nodeID, &failedAttemptID, "IDEMPOTENCY_WINDOW_UNKNOWN", evidence); err != nil {
+					return "", "", err
+				}
+				return "hold", "", nil
+			}
+			validUntil = derived
 		}
 		if validUntil != nil && InsufficientIdempotencyWindow(dbNow, *validUntil, policy.TimeoutMs) {
 			evidence := map[string]any{
@@ -691,9 +801,23 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				timeoutMs = policy.TimeoutMs
 			}
 			// First-claim idempotency expiry: set once, never extend (Blueprint §14.1).
-			validUntil, err := ensureIdempotencyWindowTx(ctx, tx, session.OrganizationID, match.stepID, policy)
+			// Legacy steps that already have attempts but no persisted deadline
+			// resolve the ORIGINAL first-claim deadline instead of minting
+			// now+window; unresolvable steps hold without creating an attempt.
+			validUntil, holdReason, err := claimIdempotencyAdmissionTx(ctx, tx, session.OrganizationID, match.stepID, policy)
 			if err != nil {
 				return err
+			}
+			if holdReason != "" {
+				evidence := map[string]any{
+					"operationId": stableOperationID(session.EnvironmentID, match.runID, match.nodeID),
+					"timeoutMs":   timeoutMs,
+				}
+				if err := routeStepToReconciliationTx(ctx, tx, session.OrganizationID, environmentID, match.runID, match.stepID, match.nodeID, nil, holdReason, evidence); err != nil {
+					return err
+				}
+				reconciledRuns = append(reconciledRuns, match.runID)
+				continue
 			}
 			if validUntil != nil && InsufficientIdempotencyWindow(dbNow, *validUntil, timeoutMs) {
 				// Insufficient window routes to reconciliation; no attempt is

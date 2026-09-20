@@ -47,6 +47,12 @@ type RetryPolicy struct {
 
 // NormalizeRetryPolicy clamps raw manifest values to the canonical defaults
 // and limits. maxAttempts is clamped to [1,10] with default 3.
+//
+// Recovery policy is NEVER defaulted: Deadbolt requires explicit
+// safe/idempotent/reconcile semantics, so an absent/invalid value is
+// preserved as-is and the engine must fail closed (no automatic retry).
+// Manifest/schema validation should reject such deployments first; this is
+// the execution-domain backstop against malformed persisted manifests.
 func NormalizeRetryPolicy(maxAttempts int, initialDelayMs, maxDelayMs, timeoutMs int64, recovery string, idempotencyWindowMs *int64) RetryPolicy {
 	if maxAttempts <= 0 {
 		maxAttempts = DefaultMaxAttempts
@@ -73,9 +79,6 @@ func NormalizeRetryPolicy(maxAttempts int, initialDelayMs, maxDelayMs, timeoutMs
 	}
 	if timeoutMs <= 0 {
 		timeoutMs = DefaultAttemptTimeoutMs
-	}
-	if recovery == "" {
-		recovery = "safe"
 	}
 	return RetryPolicy{
 		MaxAttempts:         maxAttempts,
@@ -181,6 +184,11 @@ func ParseRetryAfter(value string, now time.Time) (delayMs int64, ok bool) {
 		if secs < 0 {
 			return 0, false
 		}
+		if secs > math.MaxInt64/1000 {
+			// Saturate instead of overflowing: downstream capping turns this
+			// into maxDelayMs, never into a negative/immediate retry.
+			return math.MaxInt64, true
+		}
 		return secs * 1000, true
 	}
 	// HTTP-date: try common IMF/RFC850/asctime layouts.
@@ -204,6 +212,18 @@ func ParseRetryAfter(value string, now time.Time) (delayMs int64, ok bool) {
 		}
 	}
 	return 0, false
+}
+
+// IsValidRecoveryPolicy reports whether a recovery mode is an explicit
+// Deadbolt contract value. Absent/invalid policy must fail closed: it is
+// never reinterpreted as permission to automatically repeat customer work.
+func IsValidRecoveryPolicy(recovery string) bool {
+	switch strings.ToLower(strings.TrimSpace(recovery)) {
+	case "safe", "idempotent", "reconcile":
+		return true
+	default:
+		return false
+	}
 }
 
 // NonRetryableCodes are deterministic contract failures that must never

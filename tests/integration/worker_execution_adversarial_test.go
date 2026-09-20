@@ -241,7 +241,7 @@ func enrollExecutionWorker(t *testing.T, tc *tenantTestContext, server *httptest
 
 func seedExecutionDeployment(t *testing.T, tc *tenantTestContext, orgID, envID, digest string) string {
 	t.Helper()
-	manifest := `{"targetArchitecture":"amd64","secretNames":["API_TOKEN"],"tasks":[{"name":"task-a","entrypoint":"tasks/a.js","timeoutMs":45000}],"workflows":[{"name":"workflow-a","nodes":[{"id":"node-a","task":"task-a"}]}]}`
+	manifest := `{"targetArchitecture":"amd64","secretNames":["API_TOKEN"],"tasks":[{"name":"task-a","entrypoint":"tasks/a.js","recovery":"safe","timeoutMs":45000}],"workflows":[{"name":"workflow-a","nodes":[{"id":"node-a","task":"task-a"}]}]}`
 	var deploymentID string
 	err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `INSERT INTO deployments
