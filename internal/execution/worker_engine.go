@@ -74,13 +74,14 @@ type deploymentManifest struct {
 	TargetArchitecture string   `json:"targetArchitecture"`
 	SecretNames        []string `json:"secretNames"`
 	Tasks              []struct {
-		Name         string `json:"name"`
-		Entrypoint   string `json:"entrypoint"`
-		Recovery     string `json:"recovery"`
-		TimeoutMs    int64  `json:"timeoutMs"`
-		InputSchema  any    `json:"inputSchema"`
-		OutputSchema any    `json:"outputSchema"`
-		Retry        struct {
+		Name                string `json:"name"`
+		Entrypoint          string `json:"entrypoint"`
+		Recovery            string `json:"recovery"`
+		TimeoutMs           int64  `json:"timeoutMs"`
+		InputSchema         any    `json:"inputSchema"`
+		OutputSchema        any    `json:"outputSchema"`
+		IdempotencyWindowMs *int64 `json:"idempotencyWindowMs"`
+		Retry               struct {
 			MaxAttempts    int   `json:"maxAttempts"`
 			InitialDelayMs int64 `json:"initialDelayMs"`
 			MaxDelayMs     int64 `json:"maxDelayMs"`
@@ -89,7 +90,7 @@ type deploymentManifest struct {
 	Workflows []workflowManifest `json:"workflows"`
 }
 
-func (m deploymentManifest) taskRecoveryPolicy(workflowName, nodeID string) (string, int) {
+func (m deploymentManifest) taskRetryPolicy(workflowName, nodeID string) RetryPolicy {
 	taskName := nodeID
 	for _, wf := range m.Workflows {
 		if wf.Name == workflowName {
@@ -104,18 +105,15 @@ func (m deploymentManifest) taskRecoveryPolicy(workflowName, nodeID string) (str
 	}
 	for _, task := range m.Tasks {
 		if task.Name == taskName {
-			policy := task.Recovery
-			if policy == "" {
-				policy = "safe"
-			}
-			maxAttempts := task.Retry.MaxAttempts
-			if maxAttempts <= 0 {
-				maxAttempts = 3
-			}
-			return policy, maxAttempts
+			return NormalizeRetryPolicy(task.Retry.MaxAttempts, task.Retry.InitialDelayMs, task.Retry.MaxDelayMs, task.TimeoutMs, task.Recovery, task.IdempotencyWindowMs)
 		}
 	}
-	return "safe", 3
+	return NormalizeRetryPolicy(0, 0, 0, 0, "safe", nil)
+}
+
+func (m deploymentManifest) taskRecoveryPolicy(workflowName, nodeID string) (string, int) {
+	p := m.taskRetryPolicy(workflowName, nodeID)
+	return p.Recovery, p.MaxAttempts
 }
 
 func (m deploymentManifest) taskPolicy(workflowName, nodeID string) (string, int64) {
@@ -187,6 +185,374 @@ func targetArchitecture(os, architecture string) string {
 	}
 }
 
+// ensureIdempotencyWindowTx sets run_steps.idempotency_valid_until on first
+// claim (first-claim + window) and never extends it afterwards.
+// Returns the authoritative valid_until (nil when policy has no window).
+func ensureIdempotencyWindowTx(ctx context.Context, tx storage.Tx, organizationID, stepID string, policy RetryPolicy) (*time.Time, error) {
+	if strings.ToLower(strings.TrimSpace(policy.Recovery)) != "idempotent" || policy.IdempotencyWindowMs == nil {
+		return nil, nil
+	}
+	windowMs := *policy.IdempotencyWindowMs
+	var validUntil *time.Time
+	if err := tx.QueryRow(ctx, `SELECT idempotency_valid_until FROM run_steps
+		WHERE id=$1::uuid AND organization_id=$2::uuid`, stepID, organizationID).Scan(&validUntil); err != nil {
+		return nil, err
+	}
+	if validUntil != nil {
+		return validUntil, nil
+	}
+	var set time.Time
+	if err := tx.QueryRow(ctx, `UPDATE run_steps SET idempotency_valid_until=
+		clock_timestamp()+($1::bigint*INTERVAL '1 millisecond'), updated_at=clock_timestamp()
+		WHERE id=$2::uuid AND organization_id=$3::uuid AND idempotency_valid_until IS NULL
+		RETURNING idempotency_valid_until`, windowMs, stepID, organizationID).Scan(&set); err != nil {
+		return nil, err
+	}
+	return &set, nil
+}
+
+func insertReconciliationCaseTx(ctx context.Context, tx storage.Tx, organizationID, environmentID, stepID string, attemptID *string, reason string, evidence map[string]any) error {
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO reconciliation_cases
+		(organization_id, environment_id, step_id, attempt_id, reason, evidence, status)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,$6::jsonb,'OPEN')`,
+		organizationID, environmentID, stepID, attemptID, reason, string(encoded))
+	return err
+}
+
+// routeStepToReconciliationTx moves a step/run into WAITING/RECONCILIATION with
+// an OPEN reconciliation case. It never creates an attempt and never extends
+// the idempotency window.
+func routeStepToReconciliationTx(ctx context.Context, tx storage.Tx, organizationID, environmentID, runID, stepID, nodeID string, attemptID *string, reason string, evidence map[string]any) error {
+	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='WAITING', wait_reason='RECONCILIATION', updated_at=clock_timestamp()
+		WHERE id=$1::uuid AND organization_id=$2::uuid`, stepID, organizationID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status='WAITING', reason_code='RECONCILIATION', updated_at=clock_timestamp()
+		WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING','WAITING')`, runID, organizationID); err != nil {
+		return err
+	}
+	if err := insertReconciliationCaseTx(ctx, tx, organizationID, environmentID, stepID, attemptID, reason, evidence); err != nil {
+		return err
+	}
+	return appendRunEvent(ctx, tx, organizationID, runID, "STEP_WAITING", map[string]any{
+		"stepId": stepID, "nodeId": nodeID, "reason": "RECONCILIATION", "holdReason": reason,
+	})
+}
+
+// scheduleRetryOrHoldTx persists a retry intent (WAITING/RETRY_BACKOFF +
+// PENDING timer with a once-chosen due_at) or routes to reconciliation /
+// terminal failure when guards forbid retry. It returns "retry", "hold", or
+// "fail". The caller has already closed the failed attempt and deleted its
+// lease; this function owns step/run/timer/case transitions atomically.
+func scheduleRetryOrHoldTx(ctx context.Context, tx storage.Tx, organizationID, environmentID, runID, stepID, nodeID, failedAttemptID string, failedAttemptNumber int, policy RetryPolicy, errorCode string, retryable bool, effectStatus string, retryAfterRaw string, runStatus, runReason string, runDeadline *time.Time, environmentIDForOp string) (string, string, error) {
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return "", "", err
+	}
+	// Lock run and step in canonical order (run -> step) before timer work.
+	var lockedRunStatus, lockedRunReason string
+	var lockedRunDeadline *time.Time
+	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,''), deadline_at FROM runs
+		WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, runID, organizationID).Scan(&lockedRunStatus, &lockedRunReason, &lockedRunDeadline); err != nil {
+		return "", "", err
+	}
+	var nextAttemptNumber int
+	var currentWaitReason *string
+	var validUntil *time.Time
+	if err := tx.QueryRow(ctx, `SELECT next_attempt_number, wait_reason, idempotency_valid_until FROM run_steps
+		WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, stepID, organizationID).Scan(&nextAttemptNumber, &currentWaitReason, &validUntil); err != nil {
+		return "", "", err
+	}
+
+	// Terminal states never reopen (INV-09). If the run already terminalized
+	// (e.g. sibling fail-fast), do not schedule.
+	switch lockedRunStatus {
+	case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+		return "fail", lockedRunStatus, nil
+	}
+	if !CanScheduleRetry(lockedRunStatus, lockedRunReason) {
+		return "fail", errorCode, nil
+	}
+	// Deterministic terminal failures never consume budget.
+	if IsNonRetryableCode(errorCode) {
+		return "fail", errorCode, nil
+	}
+	// Reconcile policy with ambiguous outcome => hold, never blind retry.
+	if RequiresReconciliation(policy.Recovery, effectStatus) {
+		evidence := map[string]any{
+			"operationId": stableOperationID(environmentIDForOp, runID, nodeID),
+			"attemptId":   failedAttemptID, "errorCode": errorCode, "effectStatus": effectStatus,
+		}
+		if err := routeStepToReconciliationTx(ctx, tx, organizationID, environmentID, runID, stepID, nodeID, &failedAttemptID, "AMBIGUOUS_OUTCOME", evidence); err != nil {
+			return "", "", err
+		}
+		return "hold", "", nil
+	}
+	// Worker-declared non-retryable (and not ambiguous-hold) => fail.
+	if !retryable {
+		return "fail", errorCode, nil
+	}
+	// Budget includes the first attempt.
+	if !HasRetryBudget(nextAttemptNumber, policy.MaxAttempts) {
+		return "fail", "MAX_ATTEMPTS_EXCEEDED", nil
+	}
+	// Idempotent window admission: never extend; insufficient => hold.
+	if strings.ToLower(strings.TrimSpace(policy.Recovery)) == "idempotent" && policy.IdempotencyWindowMs != nil {
+		if validUntil == nil {
+			// Defensive: first-claim should have set this. If missing (e.g. rows
+			// created before M2), initialize now without extending later retries.
+			var set time.Time
+			if err := tx.QueryRow(ctx, `UPDATE run_steps SET idempotency_valid_until=
+				clock_timestamp()+($1::bigint*INTERVAL '1 millisecond'), updated_at=clock_timestamp()
+				WHERE id=$2::uuid AND organization_id=$3::uuid AND idempotency_valid_until IS NULL
+				RETURNING idempotency_valid_until`, *policy.IdempotencyWindowMs, stepID, organizationID).Scan(&set); err == nil {
+				validUntil = &set
+			}
+		}
+		if validUntil != nil && InsufficientIdempotencyWindow(dbNow, *validUntil, policy.TimeoutMs) {
+			evidence := map[string]any{
+				"operationId": stableOperationID(environmentIDForOp, runID, nodeID),
+				"attemptId":   failedAttemptID, "errorCode": errorCode,
+				"idempotencyValidUntil": validUntil.UTC().Format(time.RFC3339Nano),
+			}
+			if err := routeStepToReconciliationTx(ctx, tx, organizationID, environmentID, runID, stepID, nodeID, &failedAttemptID, "IDEMPOTENCY_WINDOW_INSUFFICIENT", evidence); err != nil {
+				return "", "", err
+			}
+			return "hold", "", nil
+		}
+	}
+
+	// Compute once-chosen due_at with full jitter + capped Retry-After.
+	var retryAfterMs *int64
+	if strings.TrimSpace(retryAfterRaw) != "" {
+		if ms, ok := ParseRetryAfter(retryAfterRaw, dbNow); ok {
+			retryAfterMs = &ms
+		}
+	}
+	delayMs := ComputeRetryDelayMs(failedAttemptNumber, policy.InitialDelayMs, policy.MaxDelayMs, SampleJitter(), retryAfterMs)
+	dueAt := dbNow.Add(time.Duration(delayMs) * time.Millisecond)
+
+	// Run deadline guard: not enough time left => fail, never schedule.
+	deadlineRef := runDeadline
+	if deadlineRef == nil {
+		deadlineRef = lockedRunDeadline
+	}
+	if InsufficientRunDeadline(dueAt, policy.TimeoutMs, deadlineRef) {
+		return "fail", "RUN_DEADLINE_EXCEEDED", nil
+	}
+
+	operationID := stableOperationID(environmentIDForOp, runID, nodeID)
+	// Persist durable timer first; partial unique index guarantees one PENDING
+	// timer per (org, kind, reference=step). Duplicate schedule is idempotent.
+	var timerID string
+	err := tx.QueryRow(ctx, `INSERT INTO timers
+		(organization_id, environment_id, kind, reference_id, run_id, step_id, attempt_number, operation_id, reason, due_at, state)
+		VALUES ($1::uuid,$2::uuid,'RETRY_BACKOFF',$3::uuid,$4::uuid,$3::uuid,$5,$6,$7,$8,'PENDING')
+		ON CONFLICT DO NOTHING
+		RETURNING id::text`,
+		organizationID, environmentID, stepID, runID, nextAttemptNumber, operationID, errorCode, dueAt).Scan(&timerID)
+	if err != nil {
+		// ON CONFLICT DO NOTHING with RETURNING yields NoRows when the pending
+		// timer already exists: restart-safe idempotency, do not redraw.
+		if errors.Is(err, pgx.ErrNoRows) {
+			var existingDue time.Time
+			if qErr := tx.QueryRow(ctx, `SELECT due_at FROM timers
+				WHERE organization_id=$1::uuid AND kind='RETRY_BACKOFF' AND reference_id=$2::uuid AND state='PENDING'`,
+				organizationID, stepID).Scan(&existingDue); qErr == nil {
+				dueAt = existingDue
+			}
+		} else {
+			return "", "", err
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='WAITING', wait_reason='RETRY_BACKOFF',
+		eligible_at=$1, updated_at=clock_timestamp()
+		WHERE id=$2::uuid AND organization_id=$3::uuid`, dueAt, stepID, organizationID); err != nil {
+		return "", "", err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status='WAITING', reason_code='RETRY_BACKOFF', updated_at=clock_timestamp()
+		WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING')`, runID, organizationID); err != nil {
+		return "", "", err
+	}
+	if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_WAITING", map[string]any{
+		"stepId": stepID, "nodeId": nodeID, "reason": "RETRY_BACKOFF",
+		"dueAt": dueAt.UTC().Format(time.RFC3339Nano), "attemptNumber": nextAttemptNumber,
+		"operationId": operationID,
+	}); err != nil {
+		return "", "", err
+	}
+	return "retry", "", nil
+}
+
+func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID, stepID, reasonCode string) error {
+	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED', wait_reason=$1, updated_at=clock_timestamp()
+		WHERE id=$2::uuid AND organization_id=$3::uuid`, reasonCode, stepID, organizationID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code=$1, updated_at=clock_timestamp()
+		WHERE id=$2::uuid AND organization_id=$3::uuid`, reasonCode, runID, organizationID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
+		WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`, runID, organizationID); err != nil {
+		return err
+	}
+	return appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
+		"status": "FAILED", "reason": reasonCode, "stepId": stepID,
+	})
+}
+
+// FireDueRetryTimers fires due RETRY_BACKOFF timers: due firing creates READY,
+// claim alone creates the next attempt. Duplicate firing is safe: the
+// Timer FIRED transition is conditional on PENDING and the step transition on
+// WAITING/RETRY_BACKOFF, so only one firer wins. Guard failures (paused, hold,
+// cancelling, terminal) keep the timer PENDING with its original due_at.
+func (e *WorkerEngine) FireDueRetryTimers(ctx context.Context, organizationID string) (int, error) {
+	var fired int
+	var affected []string
+	err := e.pool.WithTenantTx(ctx, organizationID, func(ctx context.Context, tx storage.Tx) error {
+		n, runs, err := fireDueRetryTimersTx(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		fired = n
+		affected = runs
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if e.hub != nil {
+		for _, rID := range affected {
+			e.hub.Publish(rID)
+		}
+	}
+	return fired, nil
+}
+
+type retryTimerCandidate struct {
+	timerID   string
+	stepID    string
+	runID     string
+	dueAt     time.Time
+	nodeID    string
+	runStatus string
+	runReason string
+}
+
+func fireDueRetryTimersTx(ctx context.Context, tx storage.Tx, organizationID string) (int, []string, error) {
+	// Candidate scan without locks; ownership is granted only after acquiring
+	// run -> step -> timer locks in order and revalidating under those locks.
+	rows, err := tx.Query(ctx, `SELECT t.id::text, t.step_id::text, t.run_id::text, t.due_at,
+			rs.node_id, r.status, COALESCE(r.reason_code,'')
+		FROM timers t
+		JOIN runs r ON r.id=t.run_id AND r.organization_id=t.organization_id
+		JOIN run_steps rs ON rs.id=t.step_id AND rs.organization_id=t.organization_id
+		WHERE t.organization_id=$1::uuid AND t.kind='RETRY_BACKOFF' AND t.state='PENDING'
+			AND t.due_at <= clock_timestamp()
+		ORDER BY t.due_at, t.id
+		LIMIT 50`, organizationID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("query due retry timers: %w", err)
+	}
+	candidates := make([]retryTimerCandidate, 0)
+	for rows.Next() {
+		var c retryTimerCandidate
+		if err := rows.Scan(&c.timerID, &c.stepID, &c.runID, &c.dueAt, &c.nodeID, &c.runStatus, &c.runReason); err != nil {
+			rows.Close()
+			return 0, nil, err
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, nil, err
+	}
+	rows.Close()
+	if len(candidates) == 0 {
+		return 0, nil, nil
+	}
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return 0, nil, err
+	}
+	fired := 0
+	affectedMap := make(map[string]struct{})
+	for _, c := range candidates {
+		// Lock order: run -> step -> timer (Blueprint §11.2).
+		var runStatus, runReason string
+		if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,'') FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.runID, organizationID).Scan(&runStatus, &runReason); err != nil {
+			continue
+		}
+		var stepState, waitReason string
+		var eligibleAt *time.Time
+		if err := tx.QueryRow(ctx, `SELECT state, COALESCE(wait_reason,''), eligible_at FROM run_steps
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.stepID, organizationID).Scan(&stepState, &waitReason, &eligibleAt); err != nil {
+			continue
+		}
+		var timerState string
+		var timerDue time.Time
+		if err := tx.QueryRow(ctx, `SELECT state, due_at FROM timers
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.timerID, organizationID).Scan(&timerState, &timerDue); err != nil {
+			continue
+		}
+		// Revalidate under locks: timer must still be pending and due.
+		if timerState != "PENDING" || timerDue.After(dbNow) {
+			continue
+		}
+		if stepState != "WAITING" || waitReason != "RETRY_BACKOFF" {
+			continue
+		}
+		if !CanFireRetry(runStatus, runReason) {
+			// Guard holds: keep waiting with original due_at (no reset).
+			continue
+		}
+		// Conditional fire: only one scheduler wins.
+		tag, err := tx.Exec(ctx, `UPDATE timers SET state='FIRED', fired_at=clock_timestamp(), updated_at=clock_timestamp()
+			WHERE id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, c.timerID, organizationID)
+		if err != nil {
+			return 0, nil, err
+		}
+		if tag.RowsAffected() == 0 {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY', wait_reason=NULL,
+			eligible_at=$1, updated_at=clock_timestamp()
+			WHERE id=$2::uuid AND organization_id=$3::uuid AND state='WAITING' AND wait_reason='RETRY_BACKOFF'`,
+			timerDue, c.stepID, organizationID); err != nil {
+			return 0, nil, err
+		}
+		// Release run from retry wait; preserve started/never-started distinction.
+		if _, err := tx.Exec(ctx, `UPDATE runs SET status=CASE
+				WHEN EXISTS (SELECT 1 FROM task_attempts ta JOIN run_steps rst ON rst.id=ta.step_id WHERE rst.run_id=$1::uuid AND ta.started_at IS NOT NULL) THEN 'RUNNING'
+				ELSE 'QUEUED'
+			END, reason_code=NULL, updated_at=clock_timestamp()
+			WHERE id=$1::uuid AND organization_id=$2::uuid AND status='WAITING' AND reason_code='RETRY_BACKOFF'`,
+			c.runID, organizationID); err != nil {
+			return 0, nil, err
+		}
+		if err := appendRunEvent(ctx, tx, organizationID, c.runID, "STEP_READY", map[string]any{
+			"stepId": c.stepID, "nodeId": c.nodeID, "reason": "RETRY_DUE",
+			"dueAt": timerDue.UTC().Format(time.RFC3339Nano),
+		}); err != nil {
+			return 0, nil, err
+		}
+		fired++
+		affectedMap[c.runID] = struct{}{}
+	}
+	affected := make([]string, 0, len(affectedMap))
+	for rID := range affectedMap {
+		affected = append(affected, rID)
+	}
+	return fired, affected, nil
+}
+
 type claimMatch struct {
 	stepID       string
 	runID        string
@@ -245,6 +611,15 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 
 		// Reconcile expired leases and unstarted claims before evaluating capacity and ready steps
 		if _, runs, err := e.reconcileExpiredLeasesTx(ctx, tx, session.OrganizationID); err != nil {
+			return err
+		} else {
+			reconciledRuns = append(reconciledRuns, runs...)
+		}
+
+		// Fire due retry timers in the same admission transaction so a poll
+		// observes newly READY retries without an extra round-trip. Firing is
+		// idempotent and preserves the original due_at across restarts.
+		if _, runs, err := fireDueRetryTimersTx(ctx, tx, session.OrganizationID); err != nil {
 			return err
 		} else {
 			reconciledRuns = append(reconciledRuns, runs...)
@@ -310,6 +685,30 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				return fmt.Errorf("decode deployment manifest: %w", err)
 			}
 			entrypoint, timeoutMs := manifest.taskPolicy(match.workflowName, match.nodeID)
+			policy := manifest.taskRetryPolicy(match.workflowName, match.nodeID)
+			// Prefer normalized timeout for window/deadline guards.
+			if policy.TimeoutMs > 0 {
+				timeoutMs = policy.TimeoutMs
+			}
+			// First-claim idempotency expiry: set once, never extend (Blueprint §14.1).
+			validUntil, err := ensureIdempotencyWindowTx(ctx, tx, session.OrganizationID, match.stepID, policy)
+			if err != nil {
+				return err
+			}
+			if validUntil != nil && InsufficientIdempotencyWindow(dbNow, *validUntil, timeoutMs) {
+				// Insufficient window routes to reconciliation; no attempt is
+				// created and no budget is spent (Blueprint §14.1).
+				evidence := map[string]any{
+					"operationId":           stableOperationID(session.EnvironmentID, match.runID, match.nodeID),
+					"timeoutMs":             timeoutMs,
+					"idempotencyValidUntil": validUntil.UTC().Format(time.RFC3339Nano),
+				}
+				if err := routeStepToReconciliationTx(ctx, tx, session.OrganizationID, environmentID, match.runID, match.stepID, match.nodeID, nil, "IDEMPOTENCY_WINDOW_INSUFFICIENT", evidence); err != nil {
+					return err
+				}
+				reconciledRuns = append(reconciledRuns, match.runID)
+				continue
+			}
 			assignmentInput := match.input
 			var targetNode *workflowNode
 			for _, wf := range manifest.Workflows {
@@ -636,13 +1035,18 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		var epoch int64
 		var storedDigest *string
 		var attemptDeadline *time.Time
-		err := tx.QueryRow(ctx, `SELECT r.id::text,rs.id::text,rs.node_id,a.status,a.epoch,a.session_id::text,a.outcome_digest,a.deadline_at,d.manifest,r.workflow_name
+		var attemptNumber int
+		var runEnvID, runStatus, runReason string
+		var runDeadlineVal *time.Time
+		err := tx.QueryRow(ctx, `SELECT r.id::text,rs.id::text,rs.node_id,a.status,a.epoch,a.session_id::text,a.outcome_digest,a.deadline_at,d.manifest,r.workflow_name,
+			a.attempt_number,r.environment_id::text,r.status,COALESCE(r.reason_code,''),r.deadline_at
 			FROM runs r JOIN run_steps rs ON rs.run_id=r.id AND rs.organization_id=r.organization_id
 			JOIN task_attempts a ON a.step_id=rs.id AND a.organization_id=rs.organization_id
 			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid
 			FOR UPDATE OF r,rs,a`, req.AttemptID, session.OrganizationID).Scan(
-			&runID, &stepID, &nodeID, &status, &epoch, &ownerSession, &storedDigest, &attemptDeadline, &manifestBytes, &workflowName)
+			&runID, &stepID, &nodeID, &status, &epoch, &ownerSession, &storedDigest, &attemptDeadline, &manifestBytes, &workflowName,
+			&attemptNumber, &runEnvID, &runStatus, &runReason, &runDeadlineVal)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return worker.ErrAttemptNotFound
@@ -908,24 +1312,62 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 				}
 			}
 		} else {
-			// Step failed or cancelled: fail run, cancel remaining nonterminal steps
-			errorCode := "TASK_FAILED"
-			if req.Error != nil && req.Error.Code != "" {
-				errorCode = req.Error.Code
-			}
-			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code=$1,updated_at=clock_timestamp()
-				WHERE id=$2::uuid AND organization_id=$3::uuid`, errorCode, runID, session.OrganizationID); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED',updated_at=clock_timestamp()
-				WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`,
-				runID, session.OrganizationID); err != nil {
-				return err
-			}
-			if err := appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{
-				"status": "FAILED", "reason": errorCode, "stepId": stepID,
-			}); err != nil {
-				return err
+			if req.Outcome == "CANCELLED" {
+				// Cancelled attempts never retry; preserve terminal semantics.
+				errorCode := "TASK_CANCELLED"
+				if req.Error != nil && req.Error.Code != "" {
+					errorCode = req.Error.Code
+				}
+				if err := failRunForStepTx(ctx, tx, session.OrganizationID, runID, stepID, errorCode); err != nil {
+					return err
+				}
+			} else {
+				// FAILED/TIMED_OUT: policy-based retry intent with durable timer,
+				// budget/deadline/hold guards, and idempotency-window admission.
+				// Blueprint §14-15: safe/idempotent/definitive NOT_APPLIED may
+				// retry; reconcile UNKNOWN and insufficient windows hold.
+				var manifest deploymentManifest
+				if len(manifestBytes) > 0 {
+					_ = json.Unmarshal(manifestBytes, &manifest)
+				}
+				policy := manifest.taskRetryPolicy(workflowName, nodeID)
+				errorCode := "TASK_FAILED"
+				retryable := true
+				effectStatus := "UNKNOWN"
+				retryAfterRaw := ""
+				if req.Error != nil {
+					if req.Error.Code != "" {
+						errorCode = req.Error.Code
+					}
+					retryable = req.Error.Retryable
+					if req.Error.EffectStatus != "" {
+						effectStatus = req.Error.EffectStatus
+					}
+					retryAfterRaw = req.Error.RetryAfter
+				} else if req.Outcome == "TIMED_OUT" {
+					errorCode = "ATTEMPT_TIMED_OUT"
+					retryable = true
+					effectStatus = "UNKNOWN"
+				}
+				envForTimer := runEnvID
+				if envForTimer == "" {
+					envForTimer = session.EnvironmentID
+				}
+				decision, failCode, err := scheduleRetryOrHoldTx(ctx, tx, session.OrganizationID, envForTimer, runID, stepID, nodeID, req.AttemptID, attemptNumber, policy, errorCode, retryable, effectStatus, retryAfterRaw, runStatus, runReason, runDeadlineVal, session.EnvironmentID)
+				if err != nil {
+					return err
+				}
+				if decision == "retry" || decision == "hold" {
+					// Durable intent persisted; run/step now WAITING with timer or hold.
+					// No further fail-fast; attempts are created only by claim.
+				} else {
+					if failCode == "" {
+						failCode = errorCode
+					}
+					if err := failRunForStepTx(ctx, tx, session.OrganizationID, runID, stepID, failCode); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		if e.beforeCompleteCommit != nil {
@@ -1049,6 +1491,8 @@ type expiredAttemptCandidate struct {
 	manifestBytes        []byte
 	runStatus            string
 	runDeadlineAt        *time.Time
+	environmentID        string
+	attemptNumber        int
 }
 
 // ReconcileExpiredLeases checks for expired leases and unstarted claims across the
@@ -1064,6 +1508,12 @@ func (e *WorkerEngine) ReconcileExpiredLeases(ctx context.Context, organizationI
 		}
 		totalReclaimed = reclaimed
 		affectedRuns = runs
+		fired, firedRuns, err := fireDueRetryTimersTx(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		totalReclaimed += fired
+		affectedRuns = append(affectedRuns, firedRuns...)
 		return nil
 	})
 	if err != nil {
@@ -1082,7 +1532,8 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			r.id::text, rs.id::text, a.id::text, a.status, a.epoch, a.started_at,
 			a.claim_start_deadline_at, a.deadline_at, l.expires_at,
 			rs.next_attempt_number, rs.current_epoch, rs.node_id,
-			r.workflow_name, d.manifest, r.status, r.deadline_at
+			r.workflow_name, d.manifest, r.status, r.deadline_at,
+			r.environment_id::text, a.attempt_number
 		FROM runs r
 		JOIN run_steps rs ON rs.run_id=r.id AND rs.organization_id=r.organization_id
 		JOIN task_attempts a ON a.step_id=rs.id AND a.organization_id=rs.organization_id
@@ -1112,6 +1563,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			&c.claimStartDeadlineAt, &c.attemptDeadlineAt, &c.leaseExpiresAt,
 			&c.nextAttemptNumber, &c.currentEpoch, &c.nodeID,
 			&c.workflowName, &c.manifestBytes, &c.runStatus, &c.runDeadlineAt,
+			&c.environmentID, &c.attemptNumber,
 		); err != nil {
 			rows.Close()
 			return 0, nil, fmt.Errorf("scan expired attempt candidate: %w", err)
@@ -1194,7 +1646,8 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 		if len(c.manifestBytes) > 0 {
 			_ = json.Unmarshal(c.manifestBytes, &manifest)
 		}
-		policy, maxAttempts := manifest.taskRecoveryPolicy(c.workflowName, c.nodeID)
+		fullPolicy := manifest.taskRetryPolicy(c.workflowName, c.nodeID)
+		policy := fullPolicy.Recovery
 
 		// 1. Overall run deadline exceeded
 		if c.runDeadlineAt != nil && !dbNow.Before(*c.runDeadlineAt) {
@@ -1243,49 +1696,36 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 				return 0, nil, err
 			}
 
-			// Unstarted claims never executed any side effects; safe to retry if attempt budget remains
-			if c.nextAttemptNumber <= maxAttempts {
-				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid AND state IN ('RUNNING','WAITING')`, c.stepID, organizationID); err != nil {
+			// Unstarted claims never executed side effects (NOT_APPLIED): schedule a
+			// durable backoff timer instead of immediate READY so restart never
+			// redraws jitter or resets the timer (Blueprint §15.1, F-09).
+			{
+				var m deploymentManifest
+				if len(c.manifestBytes) > 0 {
+					_ = json.Unmarshal(c.manifestBytes, &m)
+				}
+				pol := m.taskRetryPolicy(c.workflowName, c.nodeID)
+				envForTimer := c.environmentID
+				decision, failCode, err := scheduleRetryOrHoldTx(ctx, tx, organizationID, envForTimer, c.runID, c.stepID, c.nodeID, c.attemptID, c.attemptNumber, pol, "START_DEADLINE_EXCEEDED", true, "NOT_APPLIED", "", c.runStatus, "", c.runDeadlineAt, envForTimer)
+				if err != nil {
 					return 0, nil, err
 				}
-				// Normalize parent run if it was WAITING with RECOVERY_HANDOFF
-				if _, err := tx.Exec(ctx, `UPDATE runs SET status=CASE
-					WHEN EXISTS (SELECT 1 FROM task_attempts ta JOIN run_steps rst ON rst.id=ta.step_id WHERE rst.run_id=$1::uuid AND ta.started_at IS NOT NULL) THEN 'RUNNING'
-					ELSE 'QUEUED'
-				END, reason_code=NULL, updated_at=clock_timestamp()
-				WHERE id=$1::uuid AND organization_id=$2::uuid AND status='WAITING' AND reason_code='RECOVERY_HANDOFF'`, c.runID, organizationID); err != nil {
-					return 0, nil, err
+				if decision == "retry" || decision == "hold" {
+					continue
 				}
-				if err := appendRunEvent(ctx, tx, organizationID, c.runID, "STEP_READY", map[string]any{
-					"stepId": c.stepID, "nodeId": c.nodeID, "reason": "CLAIM_EXPIRED_REQUEUED",
-				}); err != nil {
-					return 0, nil, err
+				if failCode == "" {
+					failCode = "START_DEADLINE_EXCEEDED"
 				}
-			} else {
-				// Budget exhausted
-				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED', wait_reason='MAX_ATTEMPTS_EXCEEDED', updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid`, c.stepID, organizationID); err != nil {
-					return 0, nil, err
-				}
-				if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='START_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid`, c.runID, organizationID); err != nil {
-					return 0, nil, err
-				}
-				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
-					WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`, c.runID, organizationID); err != nil {
-					return 0, nil, err
-				}
-				if err := appendRunEvent(ctx, tx, organizationID, c.runID, "RUN_FAILED", map[string]any{
-					"status": "FAILED", "reason": "START_DEADLINE_EXCEEDED", "stepId": c.stepID,
-				}); err != nil {
+				if err := failRunForStepTx(ctx, tx, organizationID, c.runID, c.stepID, failCode); err != nil {
 					return 0, nil, err
 				}
 			}
 			continue
 		}
 
-		// 3. Running attempt (started_at != nil): either attempt deadline exceeded or lease expired
+		// 3. Running attempt (started_at != nil): either attempt deadline exceeded or lease expired.
+		// Durable retry uses a persisted backoff timer (Blueprint §15.1, F-09);
+		// ambiguous reconcile outcomes and insufficient idempotent windows hold.
 		isTimeout := c.attemptDeadlineAt != nil && !dbNow.Before(*c.attemptDeadlineAt)
 		outcome := "LOST"
 		reasonCode := "LEASE_EXPIRED"
@@ -1295,7 +1735,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			outcome = "TIMED_OUT"
 			reasonCode = "ATTEMPT_TIMED_OUT"
 			message = "Attempt execution deadline exceeded"
-			retryable = false
+			retryable = true
 		}
 
 		if _, err := tx.Exec(ctx, `UPDATE task_attempts SET status=$1, completed_at=clock_timestamp(),
@@ -1312,55 +1752,19 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			return 0, nil, err
 		}
 
-		if policy == "reconcile" {
-			if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='WAITING', wait_reason='RECONCILIATION', updated_at=clock_timestamp()
-				WHERE id=$1::uuid AND organization_id=$2::uuid`, c.stepID, organizationID); err != nil {
+		{
+			envForTimer := c.environmentID
+			decision, failCode, err := scheduleRetryOrHoldTx(ctx, tx, organizationID, envForTimer, c.runID, c.stepID, c.nodeID, c.attemptID, c.attemptNumber, fullPolicy, reasonCode, retryable, "UNKNOWN", "", c.runStatus, "", c.runDeadlineAt, envForTimer)
+			if err != nil {
 				return 0, nil, err
 			}
-			if _, err := tx.Exec(ctx, `UPDATE runs SET status='WAITING', reason_code='RECONCILIATION', updated_at=clock_timestamp()
-				WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING')`, c.runID, organizationID); err != nil {
-				return 0, nil, err
-			}
-			if err := appendRunEvent(ctx, tx, organizationID, c.runID, "STEP_WAITING", map[string]any{
-				"stepId": c.stepID, "nodeId": c.nodeID, "reason": "RECONCILIATION",
-			}); err != nil {
-				return 0, nil, err
-			}
-		} else {
-			if c.nextAttemptNumber <= maxAttempts {
-				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid AND state IN ('RUNNING','WAITING')`, c.stepID, organizationID); err != nil {
-					return 0, nil, err
-				}
-				// Normalize parent run if it was WAITING with RECOVERY_HANDOFF
-				if _, err := tx.Exec(ctx, `UPDATE runs SET status=CASE
-					WHEN EXISTS (SELECT 1 FROM task_attempts ta JOIN run_steps rst ON rst.id=ta.step_id WHERE rst.run_id=$1::uuid AND ta.started_at IS NOT NULL) THEN 'RUNNING'
-					ELSE 'QUEUED'
-				END, reason_code=NULL, updated_at=clock_timestamp()
-				WHERE id=$1::uuid AND organization_id=$2::uuid AND status='WAITING' AND reason_code='RECOVERY_HANDOFF'`, c.runID, organizationID); err != nil {
-					return 0, nil, err
-				}
-				if err := appendRunEvent(ctx, tx, organizationID, c.runID, "STEP_READY", map[string]any{
-					"stepId": c.stepID, "nodeId": c.nodeID, "reason": "LEASE_EXPIRED_REQUEUED",
-				}); err != nil {
-					return 0, nil, err
-				}
+			if decision == "retry" || decision == "hold" {
+				// Timer or hold persisted; firing creates READY, claim creates attempt.
 			} else {
-				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED', wait_reason='MAX_ATTEMPTS_EXCEEDED', updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid`, c.stepID, organizationID); err != nil {
-					return 0, nil, err
+				if failCode == "" {
+					failCode = reasonCode
 				}
-				if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code=$1, updated_at=clock_timestamp()
-					WHERE id=$2::uuid AND organization_id=$3::uuid`, reasonCode, c.runID, organizationID); err != nil {
-					return 0, nil, err
-				}
-				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
-					WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`, c.runID, organizationID); err != nil {
-					return 0, nil, err
-				}
-				if err := appendRunEvent(ctx, tx, organizationID, c.runID, "RUN_FAILED", map[string]any{
-					"status": "FAILED", "reason": reasonCode, "stepId": c.stepID,
-				}); err != nil {
+				if err := failRunForStepTx(ctx, tx, organizationID, c.runID, c.stepID, failCode); err != nil {
 					return 0, nil, err
 				}
 			}
