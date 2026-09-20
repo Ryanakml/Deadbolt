@@ -1792,7 +1792,12 @@ func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID st
 			FROM runs r
 			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 			WHERE r.organization_id=$1::uuid AND r.status IN ('QUEUED','RUNNING')
-			ORDER BY r.updated_at, r.id
+				AND EXISTS (
+					SELECT 1 FROM run_steps blocked
+					WHERE blocked.run_id=r.id AND blocked.organization_id=r.organization_id
+						AND blocked.state='BLOCKED'
+				)
+			ORDER BY r.reconciliation_checked_at NULLS FIRST, r.id
 			LIMIT 50
 			FOR UPDATE OF r SKIP LOCKED`, organizationID)
 		if err != nil {
@@ -1887,6 +1892,14 @@ func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID st
 				repaired++
 				steps[node.ID] = readyStep{id: step.id, state: "READY"}
 				affectedRuns = append(affectedRuns, runID)
+			}
+			// A run with unmet dependencies must yield its place to the next
+			// bounded batch. This observation does not alter workflow state and
+			// intentionally has no execution event; any actual transition above
+			// still uses appendRunEvent and its outbox intent.
+			if _, err := tx.Exec(ctx, `UPDATE runs SET reconciliation_checked_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID); err != nil {
+				return fmt.Errorf("record reconciliation observation for run %s: %w", runID, err)
 			}
 		}
 		return nil

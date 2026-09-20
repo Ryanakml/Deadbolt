@@ -283,6 +283,7 @@ func run() error {
 	outboxMetrics := outbox.NewMetrics(pool)
 	if reconciler != nil {
 		outboxMetrics.SetSchedulerHeartbeat(reconciler.Ticker())
+		outboxMetrics.SetSchedulerSlowSweepStatus(reconciler.SlowSweepInFlight)
 	}
 	// Outbox sweeps cross tenant boundaries and therefore use the dedicated
 	// system connection. The runtime role is intentionally tenant-scoped and

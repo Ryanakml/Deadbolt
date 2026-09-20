@@ -55,3 +55,17 @@ func TestMetricsDispatcherAndSchedulerHeartbeatsAreIndependent(t *testing.T) {
 		t.Fatalf("scheduler heartbeat changed when only dispatcher swept: before=%d after=%d", schedulerBefore, schedulerAfter)
 	}
 }
+
+func TestMetricsExposeSlowSweepInFlightSeparatelyFromFastLoopLag(t *testing.T) {
+	m := NewMetrics(nil)
+	var inFlight atomic.Bool
+	inFlight.Store(true)
+	m.SetSchedulerSlowSweepStatus(inFlight.Load)
+	if got := metricValue(t, m.FormatPrometheus(), "deadbolt_scheduler_slow_sweep_in_flight"); got != 1 {
+		t.Fatalf("slow sweep status = %d, want 1", got)
+	}
+	inFlight.Store(false)
+	if got := metricValue(t, m.FormatPrometheus(), "deadbolt_scheduler_slow_sweep_in_flight"); got != 0 {
+		t.Fatalf("slow sweep status = %d, want 0", got)
+	}
+}

@@ -17,6 +17,7 @@ type Metrics struct {
 	failuresTotal    atomic.Int64
 	lastDispatchTime atomic.Int64
 	schedulerTime    *atomic.Int64
+	slowSweepActive  func() bool
 	taskLogDrops     func() int64
 	oldestPendingAge atomic.Int64 // in seconds
 	pendingCount     atomic.Int64
@@ -34,6 +35,16 @@ func NewMetrics(pool *pgxpool.Pool) *Metrics {
 func (m *Metrics) SetSchedulerHeartbeat(heartbeat *atomic.Int64) {
 	if m != nil {
 		m.schedulerTime = heartbeat
+	}
+}
+
+// SetSchedulerSlowSweepStatus exposes whether bounded slow maintenance is
+// currently in flight. It complements the fast-loop lag gauge: a stuck graph
+// repair must be visible without making the execution-fencing heartbeat look
+// stale.
+func (m *Metrics) SetSchedulerSlowSweepStatus(status func() bool) {
+	if m != nil {
+		m.slowSweepActive = status
 	}
 }
 
@@ -142,6 +153,10 @@ func (m *Metrics) FormatPrometheus() string {
 	if m.taskLogDrops != nil {
 		taskLogDrops = m.taskLogDrops()
 	}
+	var slowSweepInFlight int
+	if m.slowSweepActive != nil && m.slowSweepActive() {
+		slowSweepInFlight = 1
+	}
 
 	return fmt.Sprintf(`# HELP deadbolt_outbox_published_total Total number of outbox events published to NATS JetStream.
 # TYPE deadbolt_outbox_published_total counter
@@ -167,6 +182,10 @@ deadbolt_outbox_dispatcher_loop_lag_seconds %d
 # TYPE deadbolt_scheduler_loop_lag_seconds gauge
 deadbolt_scheduler_loop_lag_seconds %d
 
+# HELP deadbolt_scheduler_slow_sweep_in_flight Whether five-second graph and retention maintenance is currently running.
+# TYPE deadbolt_scheduler_slow_sweep_in_flight gauge
+deadbolt_scheduler_slow_sweep_in_flight %d
+
 # HELP deadbolt_task_logs_dropped_total Total number of newly dropped task diagnostic log records.
 # TYPE deadbolt_task_logs_dropped_total counter
 deadbolt_task_logs_dropped_total %d
@@ -177,6 +196,7 @@ deadbolt_task_logs_dropped_total %d
 		m.pendingCount.Load(),
 		dispatchLag,
 		schedulerLag,
+		slowSweepInFlight,
 		taskLogDrops,
 	)
 }

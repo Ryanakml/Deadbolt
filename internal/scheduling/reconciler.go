@@ -2,6 +2,7 @@ package scheduling
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync/atomic"
@@ -21,6 +22,8 @@ type Reconciler struct {
 	logger          *log.Logger
 	tenantSweep     func(context.Context, string) error
 	slowTenantSweep func(context.Context, string) error
+	slowInterval    time.Duration
+	slowRunning     atomic.Bool
 }
 
 // SetTenantSweep adds bounded per-tenant maintenance to the existing
@@ -44,12 +47,23 @@ func (r *Reconciler) SetSlowTenantSweep(hook func(context.Context, string) error
 
 // NewReconciler creates a scheduler reconciler wired to the database pool.
 func NewReconciler(pool *pgxpool.Pool, sweepInterval time.Duration, logger *log.Logger) *Reconciler {
+	return NewReconcilerWithIntervals(pool, sweepInterval, 5*time.Second, logger)
+}
+
+// NewReconcilerWithIntervals exposes the slow-pass cadence for deterministic
+// tests. Production callers use NewReconciler and retain the five-second
+// blueprint default.
+func NewReconcilerWithIntervals(pool *pgxpool.Pool, sweepInterval, slowInterval time.Duration, logger *log.Logger) *Reconciler {
 	if logger == nil {
 		logger = log.Default()
+	}
+	if slowInterval <= 0 {
+		slowInterval = 5 * time.Second
 	}
 	return &Reconciler{
 		pool:          pool,
 		sweepInterval: sweepInterval,
+		slowInterval:  slowInterval,
 		ticker:        &atomic.Int64{},
 		wakeup:        make(chan struct{}, 1),
 		logger:        logger,
@@ -74,18 +88,25 @@ func (r *Reconciler) Ticker() *atomic.Int64 {
 	return r.ticker
 }
 
+// SlowSweepInFlight reports whether bounded five-second maintenance is still
+// running. Operators can distinguish a slow maintenance pass from stale fast
+// fencing via the scheduler heartbeat.
+func (r *Reconciler) SlowSweepInFlight() bool {
+	return r != nil && r.slowRunning.Load()
+}
+
 // Sweep executes an authoritative sweep iteration against the database.
 // The heartbeat is updated ONLY when the query succeeds.
 func (r *Reconciler) Sweep(ctx context.Context) error {
-	return r.sweep(ctx, r.tenantSweep)
+	return r.sweep(ctx, r.tenantSweep, true)
 }
 
 // SlowSweep performs the bounded five-second graph/outbox maintenance pass.
 func (r *Reconciler) SlowSweep(ctx context.Context) error {
-	return r.sweep(ctx, r.slowTenantSweep)
+	return r.sweep(ctx, r.slowTenantSweep, false)
 }
 
-func (r *Reconciler) sweep(ctx context.Context, hook func(context.Context, string) error) error {
+func (r *Reconciler) sweep(ctx context.Context, hook func(context.Context, string) error, heartbeat bool) error {
 	if r.pool == nil {
 		return fmt.Errorf("scheduler sweep failed: database connection pool is nil")
 	}
@@ -102,8 +123,11 @@ func (r *Reconciler) sweep(ctx context.Context, hook func(context.Context, strin
 		}
 	}
 
-	// Update heartbeat only after successful database enumeration
-	r.ticker.Store(time.Now().UnixNano())
+	// Only the fast ownership/deadline pass advances readiness. A successful
+	// slow maintenance pass must not hide a stalled fencing loop.
+	if heartbeat {
+		r.ticker.Store(time.Now().UnixNano())
+	}
 	r.logger.Printf("[SCHEDULER] Reconciliation sweep successful across %d tenant(s)", len(tenants))
 	return nil
 }
@@ -125,7 +149,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	slowTicker := time.NewTicker(5 * time.Second)
+	slowTicker := time.NewTicker(r.slowInterval)
 	defer slowTicker.Stop()
 
 	for {
@@ -146,9 +170,16 @@ func (r *Reconciler) Run(ctx context.Context) error {
 				ticker.Reset(interval)
 			}
 		case <-slowTicker.C:
-			if err := r.SlowSweep(ctx); err != nil {
-				r.logger.Printf("[SCHEDULER] Slow sweep failed: %v", err)
+			if !r.slowRunning.CompareAndSwap(false, true) {
+				r.logger.Printf("[SCHEDULER] Slow sweep still running; coalescing tick")
+				continue
 			}
+			go func() {
+				defer r.slowRunning.Store(false)
+				if err := r.SlowSweep(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					r.logger.Printf("[SCHEDULER] Slow sweep failed: %v", err)
+				}
+			}()
 		}
 	}
 }

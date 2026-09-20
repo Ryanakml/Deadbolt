@@ -21,6 +21,8 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/scheduling"
+	"github.com/Ryanakml/Deadbolt/internal/storage"
+	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -759,6 +761,83 @@ func TestTruthfulSchedulerHealth(t *testing.T) {
 	}
 	if brokenReconciler.Ticker().Load() != 0 {
 		t.Fatalf("expected ticker to remain 0 on failed sweep")
+	}
+}
+
+// TestSlowSweepDoesNotBlockFastFencing proves that a stuck five-second
+// maintenance pass is visible but cannot delay the one-second ownership and
+// deadline loop. It uses the real scheduler tenant-discovery database path.
+func TestSlowSweepDoesNotBlockFastFencing(t *testing.T) {
+	db, runtimePool, systemURL := setupTestDB(t)
+	defer db.Close()
+	defer runtimePool.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	systemPool, err := pgxpool.New(ctx, systemURL)
+	if err != nil {
+		t.Fatalf("connect system pool: %v", err)
+	}
+	defer systemPool.Close()
+
+	service := tenant.NewService(storage.NewPool(runtimePool))
+	owner, _ := tenant.NewUUID()
+	org, err := service.CreateOrganization(ctx, owner, "slow-sweep-isolation")
+	if err != nil {
+		t.Fatalf("create organization: %v", err)
+	}
+	project, err := service.CreateProject(ctx, org.ID, "scheduler")
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := service.CreateEnvironment(ctx, org.ID, project.ID, tenant.EnvStaging, 1); err != nil {
+		t.Fatalf("create environment: %v", err)
+	}
+
+	reconciler := scheduling.NewReconcilerWithIntervals(systemPool, 10*time.Millisecond, 20*time.Millisecond, nil)
+	var fastPasses atomic.Int64
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	reconciler.SetTenantSweep(func(context.Context, string) error {
+		fastPasses.Add(1)
+		return nil
+	})
+	reconciler.SetSlowTenantSweep(func(context.Context, string) error {
+		select {
+		case <-slowStarted:
+		default:
+			close(slowStarted)
+		}
+		<-releaseSlow
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() { done <- reconciler.Run(ctx) }()
+	select {
+	case <-slowStarted:
+	case <-time.After(time.Second):
+		t.Fatal("slow sweep did not start")
+	}
+	if !reconciler.SlowSweepInFlight() {
+		t.Fatal("slow sweep must report inflight while blocked")
+	}
+	before := fastPasses.Load()
+	time.Sleep(100 * time.Millisecond)
+	if fastPasses.Load() <= before {
+		t.Fatal("slow maintenance blocked fast ownership/deadline fencing")
+	}
+	if reconciler.Ticker().Load() == 0 {
+		t.Fatal("fast fencing heartbeat was not observable during slow maintenance")
+	}
+	close(releaseSlow)
+	cancel()
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("reconciler returned %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconciler did not stop")
 	}
 }
 
