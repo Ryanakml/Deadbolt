@@ -6,7 +6,7 @@ import { DashboardApiClient, isUnauthorized, isConflict, newIdempotencyKey, } fr
 import { createEnvironmentSelection, formatEnvironmentLabel, getSelectedEnvironmentId, selectEnvironment, setSelectionCatalog, setSelectionOrganization, } from "./api.js";
 import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
-import { shouldShowWorkerWait, terminalStepEmptyText, openCaseForStep, reconciliationHoldText, RESOLVE_ACTIONS, } from "./inspector.js";
+import { shouldShowWorkerWait, terminalStepEmptyText, openCaseForStep, reconciliationHoldText, terminationBannerText, RESOLVE_ACTIONS, } from "./inspector.js";
 import { clearStreamErrorOnLive, createStreamErrorBanner, markGlobalError, markStreamError, } from "./stream.js";
 // DOM Bootstrap for browser runtime
 if (typeof document !== "undefined") {
@@ -505,8 +505,16 @@ function initDashboard() {
           <div class="run-badges">
             <span class="badge status-${snap.status.toLowerCase()}">${snap.status}</span>
             <span id="stream-freshness-badge" class="badge freshness-badge freshness-${currentStreamFreshness.toLowerCase()}">${currentStreamFreshness}</span>
+            ${snap.status === "QUEUED" || snap.status === "RUNNING" || snap.status === "WAITING" ? `<button id="cancel-run-btn" class="danger-btn">Cancel run</button>` : ""}
           </div>
         </div>
+
+        ${(() => {
+                const banner = terminationBannerText(snap.status, snap.terminationConfirmed);
+                return banner
+                    ? `<div class="termination-banner" role="status">${escapeHtml(banner)}</div>`
+                    : "";
+            })()}
 
         <div class="meta-grid">
           <div class="meta-item"><label>Revision</label><div>${snap.revision}</div></div>
@@ -556,6 +564,14 @@ function initDashboard() {
       `;
             // Re-apply current transport freshness
             renderFreshness(currentStreamFreshness);
+            // Wire durable cancellation. The backend stays authoritative:
+            // expectedRevision is captured at open time and 409s refresh in-dialog.
+            const cancelBtn = container.querySelector("#cancel-run-btn");
+            if (cancelBtn) {
+                cancelBtn.addEventListener("click", (e) => {
+                    openCancelDialog(api, snap, e.currentTarget);
+                });
+            }
             // Wire audited resolution dialogs. The backend stays authoritative:
             // expectedRevision is captured at open time and 409s refresh in-dialog.
             container.querySelectorAll(".resolve-link").forEach((btn) => {
@@ -857,6 +873,76 @@ function initDashboard() {
     }
     function closeResolveDialog() {
         document.getElementById("resolve-dialog-overlay")?.remove();
+    }
+    // openCancelDialog confirms durable cancellation. Cancelling stops
+    // platform execution and revokes worker ownership; it never rolls back
+    // external side effects already performed.
+    function openCancelDialog(api, snap, invoker) {
+        closeCancelDialog();
+        const overlay = document.createElement("div");
+        overlay.className = "dialog-overlay";
+        overlay.id = "cancel-dialog-overlay";
+        overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="cancel-dialog-title">
+        <h3 id="cancel-dialog-title">Cancel run — ${escapeHtml(snap.workflowName)}</h3>
+        <p class="text-muted">This revokes worker ownership and stops nonterminal work immediately.
+        Already-succeeded steps are preserved. External effects already performed are
+        <strong>not</strong> rolled back — verify provider state afterwards.</p>
+        <div class="hold-meta">Run revision ${snap.revision}</div>
+        <div id="cancel-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="cancel-dismiss">Keep running</button>
+          <button id="cancel-confirm">Confirm cancel</button>
+        </div>
+      </div>
+    `;
+        document.body.appendChild(overlay);
+        // One command identity for this decision, reused if the submit is
+        // ambiguously delivered.
+        const idempotencyKey = newIdempotencyKey();
+        const errorBox = overlay.querySelector("#cancel-error");
+        const confirmBtn = overlay.querySelector("#cancel-confirm");
+        const close = () => {
+            closeCancelDialog();
+            invoker?.focus();
+        };
+        overlay.querySelector("#cancel-dismiss").addEventListener("click", close);
+        overlay.addEventListener("keydown", (e) => {
+            if (e.key === "Escape")
+                close();
+        });
+        overlay.addEventListener("mousedown", (e) => {
+            if (e.target === overlay)
+                close();
+        });
+        confirmBtn.focus();
+        confirmBtn.addEventListener("click", () => {
+            confirmBtn.setAttribute("disabled", "true");
+            api
+                .cancelRun(snap.id, snap.revision, idempotencyKey)
+                .then(() => {
+                close();
+                void activeInspector
+                    ?.fetchSnapshot()
+                    .catch((err) => renderError(err instanceof Error ? err : new Error(String(err))));
+            })
+                .catch((err) => {
+                confirmBtn.removeAttribute("disabled");
+                if (isConflict(err)) {
+                    errorBox.textContent =
+                        "This run changed since you opened it (409). The latest state was reloaded — review it before acting.";
+                    errorBox.style.display = "block";
+                    void activeInspector?.fetchSnapshot().catch(() => undefined);
+                    return;
+                }
+                errorBox.textContent =
+                    err instanceof Error ? err.message : String(err);
+                errorBox.style.display = "block";
+            });
+        });
+    }
+    function closeCancelDialog() {
+        document.getElementById("cancel-dialog-overlay")?.remove();
     }
 }
 //# sourceMappingURL=index.js.map

@@ -237,3 +237,21 @@ func TestScheduleAndFireGuards(t *testing.T) {
 		t.Fatalf("hold/paused/terminal must keep waiting")
 	}
 }
+
+func TestNormalizeAttemptTimeoutDefaultAndMax(t *testing.T) {
+	if got := NormalizeRetryPolicy(3, 1000, 30000, 0, "safe", nil).TimeoutMs; got != DefaultAttemptTimeoutMs {
+		t.Fatalf("unset timeout should default to 5m, got %d", got)
+	}
+	if got := NormalizeRetryPolicy(3, 1000, 30000, 2*MaxAttemptTimeoutMs, "safe", nil).TimeoutMs; got != MaxAttemptTimeoutMs {
+		t.Fatalf("timeout above 1h must clamp to %d, got %d", MaxAttemptTimeoutMs, got)
+	}
+	if MaxAttemptTimeoutMs != 3600000 {
+		t.Fatalf("attempt max must be exactly 1h in ms, got %d", MaxAttemptTimeoutMs)
+	}
+	if RunLifetimeMs != int64(24*60*60*1000) {
+		t.Fatalf("MVP run lifetime must be exactly 24h in ms, got %d", RunLifetimeMs)
+	}
+	if CancelGraceMs != 10000 {
+		t.Fatalf("cancel grace must be exactly 10s in ms, got %d", CancelGraceMs)
+	}
+}

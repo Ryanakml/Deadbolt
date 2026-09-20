@@ -329,6 +329,10 @@ func (h *HTTPHandler) HandleStopAck(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
 			return
 		}
+		if errors.Is(err, ErrStaleOwnership) {
+			h.writeError(w, r, http.StatusConflict, "STALE_OWNERSHIP", err.Error(), false)
+			return
+		}
 		h.writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error(), true)
 		return
 	}

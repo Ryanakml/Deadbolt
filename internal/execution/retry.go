@@ -29,6 +29,16 @@ const (
 	DefaultInitialDelayMs   = 1000
 	DefaultMaxDelayMs       = 30000
 	DefaultAttemptTimeoutMs = 300000
+	// MaxAttemptTimeoutMs is the execution backstop for the attempt deadline
+	// (Blueprint §15.2: default 5m, maximum 1h). Registration validation
+	// enforces the same bound; the engine clamps persisted outliers.
+	MaxAttemptTimeoutMs = 3600000
+	// RunLifetimeMs is the MVP run-deadline default and maximum: 24 hours
+	// from create-run acceptance (Blueprint §15.2).
+	RunLifetimeMs = int64(24 * 60 * 60 * 1000)
+	// CancelGraceMs bounds cancellation settlement: CANCELLING settles to
+	// CANCELLED after all stop ACKs or when this grace expires (§15.2).
+	CancelGraceMs = int64(10 * 1000)
 
 	// ClaimStartBudgetMs mirrors worker.ClaimStartDeadline (5s) to avoid an
 	// import cycle with internal/worker. Keep in sync; covered by unit test.
@@ -79,6 +89,9 @@ func NormalizeRetryPolicy(maxAttempts int, initialDelayMs, maxDelayMs, timeoutMs
 	}
 	if timeoutMs <= 0 {
 		timeoutMs = DefaultAttemptTimeoutMs
+	}
+	if timeoutMs > MaxAttemptTimeoutMs {
+		timeoutMs = MaxAttemptTimeoutMs
 	}
 	return RetryPolicy{
 		MaxAttempts:         maxAttempts,

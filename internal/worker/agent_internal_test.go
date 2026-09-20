@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -268,5 +269,81 @@ func TestHeartbeatTransientErrorsRemainLeaseSafetyErrors(t *testing.T) {
 	}
 	if got := heartbeats.Load(); got < 2 {
 		t.Fatalf("expected transient retry behavior, got %d calls", got)
+	}
+}
+
+func TestStopAckReportsUnconfirmedWhenGroupSurvives(t *testing.T) {
+	var mu sync.Mutex
+	var stopAcks []StopAckRequestDTO
+	acked := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/worker/v1/heartbeat":
+			_ = json.NewEncoder(w).Encode(HeartbeatResponseDTO{
+				ProtocolVersion: ProtocolVersion,
+				RequestID:       "hb",
+				Stops:           []StopCommandDTO{{AttemptID: "attempt", OwnershipEpoch: 1, Reason: "CANCEL_REQUESTED", GraceTimeoutMs: 10000}},
+			})
+		case "/worker/v1/stop-ack":
+			var ack StopAckRequestDTO
+			_ = json.NewDecoder(r.Body).Decode(&ack)
+			mu.Lock()
+			stopAcks = append(stopAcks, ack)
+			mu.Unlock()
+			select {
+			case acked <- struct{}{}:
+			default:
+			}
+			_ = json.NewEncoder(w).Encode(AckResponseDTO{ProtocolVersion: ProtocolVersion, RequestID: ack.RequestID, Accepted: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	agent, err := NewAgent(AgentConfig{ControlPlaneURL: server.URL, HeartbeatInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.supervisor.GracePeriod = 100 * time.Millisecond
+	agent.workerID, agent.sessionID, agent.sessionTok = "worker", "session", "token"
+	agent.expiresAt = time.Now().Add(time.Hour)
+	// Spawn without reaping: after SIGTERM+SIGKILL the child persists as an
+	// unreaped zombie, so the group cannot be confirmed dead and the ACK
+	// must report ProcessStopped=false rather than an assumed true.
+	cmd := exec.Command("sleep", "30")
+	configureProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	agent.runningAttempts["attempt"] = &activeAttempt{attemptID: "attempt", epoch: 1, pid: cmd.Process.Pid, cancel: func() {}}
+	hbDone := make(chan struct{})
+	go func() {
+		agent.heartbeatLoop(context.Background(), "attempt", 1, NewLeaseTracker(time.Now().Add(time.Minute), 0, 0), hbDone)
+		close(hbDone)
+	}()
+	select {
+	case <-acked:
+	case <-time.After(8 * time.Second):
+		t.Fatal("stop ACK was never posted")
+	}
+	select {
+	case <-hbDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat loop did not exit after the stop")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(stopAcks) != 1 {
+		t.Fatalf("expected exactly one stop ACK, got %d", len(stopAcks))
+	}
+	if stopAcks[0].ProcessStopped {
+		t.Fatalf("unconfirmable termination must ACK ProcessStopped=false: %+v", stopAcks[0])
+	}
+	if stopAcks[0].AttemptID != "attempt" || stopAcks[0].OwnershipEpoch != 1 {
+		t.Fatalf("ACK must carry the stopped attempt identity: %+v", stopAcks[0])
 	}
 }

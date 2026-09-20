@@ -22,6 +22,11 @@ type RunDTO struct {
 	Revision       int64               `json:"revision"`
 	CreatedAt      string              `json:"createdAt"`
 	DeadlineAt     *string             `json:"deadlineAt,omitempty"`
+	// TerminationConfirmed reports stop settlement for CANCELLED runs:
+	// true when every stop was acknowledged (or no stops were needed),
+	// false when the grace expired with stops unacknowledged. Nil while
+	// the run is not settled. It never claims external rollback.
+	TerminationConfirmed *bool `json:"terminationConfirmed,omitempty"`
 }
 
 type RunStepDTO struct {

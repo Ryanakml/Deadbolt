@@ -249,20 +249,21 @@ func (s *Service) CreateRun(
 			}
 		}
 
-		// 4. Create Run
+		// 4. Create Run with the MVP lifetime default: 24h from acceptance.
 		var runID string
 		var createdAt time.Time
 		var deadlineAt *time.Time
 		runQuery := `INSERT INTO runs (
 			organization_id, environment_id, deployment_id, workflow_name,
 			idempotency_key, status, revision, input, last_event_sequence,
-			created_at, updated_at
+			deadline_at, created_at, updated_at
 		) VALUES (
 			$1::uuid, $2::uuid, $3::uuid, $4,
 			$5, 'QUEUED', 1, $6::jsonb, 1,
+			clock_timestamp()+($7::bigint*INTERVAL '1 millisecond'),
 			clock_timestamp(), clock_timestamp()
 		) RETURNING id::text, created_at, deadline_at`
-		if err := tx.QueryRow(ctx, runQuery, orgID, envID, deploymentID, workflowName, idempotencyKey, canonicalInput).
+		if err := tx.QueryRow(ctx, runQuery, orgID, envID, deploymentID, workflowName, idempotencyKey, canonicalInput, RunLifetimeMs).
 			Scan(&runID, &createdAt, &deadlineAt); err != nil {
 			return fmt.Errorf("insert run: %w", err)
 		}
@@ -1201,14 +1202,14 @@ func queryRunDTO(ctx context.Context, tx storage.Tx, orgID, runID string) (*RunD
 	var deadlineAt *time.Time
 	query := `SELECT r.id::text, r.organization_id::text, e.project_id::text, r.environment_id::text,
 		r.workflow_name, r.deployment_id::text, r.status, r.reason_code, r.revision,
-		r.created_at, r.deadline_at
+		r.created_at, r.deadline_at, r.termination_confirmed
 		FROM runs r
 		JOIN environments e ON e.id = r.environment_id AND e.organization_id = r.organization_id
 		WHERE r.id = $1::uuid AND r.organization_id = $2::uuid`
 	err := tx.QueryRow(ctx, query, runID, orgID).Scan(
 		&run.ID, &run.OrganizationID, &run.ProjectID, &run.EnvironmentID,
 		&run.WorkflowName, &run.DeploymentID, &statusStr, &run.ReasonCode, &run.Revision,
-		&createdAt, &deadlineAt,
+		&createdAt, &deadlineAt, &run.TerminationConfirmed,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

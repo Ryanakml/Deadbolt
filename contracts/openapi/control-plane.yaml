@@ -452,7 +452,7 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
+      x-implemented: true
       x-required-capability: runs:control
       requestBody:
         required: true
@@ -2291,6 +2291,9 @@ components:
         deadlineAt:
           type: string
           format: date-time
+        terminationConfirmed:
+          type: boolean
+          description: Stop settlement for cancelled runs. Null while not settled.
       required:
         - id
         - workflowName

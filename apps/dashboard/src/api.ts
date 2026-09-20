@@ -339,6 +339,35 @@ export class DashboardApiClient {
     return res.json() as Promise<ResolveReconciliationResponse>;
   }
 
+  // cancelRun requests durable cancellation. The caller binds the revision
+  // read from the snapshot; a 409 means the run changed and the dialog must
+  // refresh instead of retrying blindly. Cancelling never rolls back
+  // external side effects already performed.
+  public async cancelRun(
+    runId: string,
+    expectedRevision: number,
+    idempotencyKey?: string,
+  ): Promise<Run> {
+    const res = await apiFetch(
+      `${this.baseUrl}/v1/runs/${encodeURIComponent(runId)}/cancel`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": readCsrfToken(),
+          "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+        },
+        body: JSON.stringify({ expectedRevision }),
+      },
+    );
+    if (!res.ok) {
+      throw new Error(
+        `Failed to cancel run (HTTP ${res.status}): ${res.statusText}`,
+      );
+    }
+    return res.json() as Promise<Run>;
+  }
+
   // listProjects discovers the active organization's projects through the
   // existing public tenant API using the BFF session cookie.
   public async listProjects(): Promise<ProjectSummary[]> {

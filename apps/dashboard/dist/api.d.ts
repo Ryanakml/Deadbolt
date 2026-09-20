@@ -68,6 +68,7 @@ export declare class DashboardApiClient {
     getRunEvents(runId: string, cursor?: number, limit?: number): Promise<RunEventsResponse>;
     getRunLogs(runId: string, stepId?: string, attemptId?: string, cursor?: string, limit?: number): Promise<TaskLogsResponse>;
     resolveReconciliationCase(caseId: string, body: ResolveReconciliationRequest, idempotencyKey?: string): Promise<ResolveReconciliationResponse>;
+    cancelRun(runId: string, expectedRevision: number, idempotencyKey?: string): Promise<Run>;
     listProjects(): Promise<ProjectSummary[]>;
     listProjectEnvironments(projectId: string): Promise<EnvironmentSummary[]>;
     loadEnvironmentCatalog(): Promise<CatalogEnvironment[]>;

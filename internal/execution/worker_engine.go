@@ -146,6 +146,9 @@ func (m deploymentManifest) taskPolicy(workflowName, nodeID string) (string, int
 			if timeout <= 0 {
 				timeout = defaultAttemptTimeout.Milliseconds()
 			}
+			if timeout > MaxAttemptTimeoutMs {
+				timeout = MaxAttemptTimeoutMs
+			}
 			return task.Entrypoint, timeout
 		}
 	}
@@ -521,7 +524,7 @@ func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID,
 	}
 	// Holds mooted by run failure close with the deciding actor (or NULL for
 	// system terminalization) so no OPEN case survives a terminal run.
-	if err := closeOpenCasesAsFailTx(ctx, tx, organizationID, runID, actorID, reasonCode); err != nil {
+	if err := closeOpenCasesTx(ctx, tx, organizationID, runID, actorID, reasonCode, "FAIL"); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code=$1, updated_at=clock_timestamp()
@@ -530,6 +533,11 @@ func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID,
 	}
 	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
 		WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`, runID, organizationID); err != nil {
+		return err
+	}
+	// Pending timers die with the run so a later firing cannot resurrect it.
+	if _, err := tx.Exec(ctx, `UPDATE timers SET state='CANCELLED', updated_at=clock_timestamp()
+		WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, runID, organizationID); err != nil {
 		return err
 	}
 	return appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
@@ -616,8 +624,9 @@ func fireDueRetryTimersTx(ctx context.Context, tx storage.Tx, organizationID str
 	for _, c := range candidates {
 		// Lock order: run -> step -> timer (Blueprint §11.2).
 		var runStatus, runReason string
-		if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,'') FROM runs
-			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.runID, organizationID).Scan(&runStatus, &runReason); err != nil {
+		var runDeadline *time.Time
+		if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,''), deadline_at FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.runID, organizationID).Scan(&runStatus, &runReason, &runDeadline); err != nil {
 			continue
 		}
 		var stepState, waitReason string
@@ -641,6 +650,11 @@ func fireDueRetryTimersTx(ctx context.Context, tx storage.Tx, organizationID str
 		}
 		if !CanFireRetry(runStatus, runReason) {
 			// Guard holds: keep waiting with original due_at (no reset).
+			continue
+		}
+		if runDeadline != nil && !dbNow.Before(*runDeadline) {
+			// Run deadline passed while parked: never resurrect. The
+			// overdue sweep terminalizes the run; the timer stays pending.
 			continue
 		}
 		// Conditional fire: only one scheduler wins.
@@ -1390,6 +1404,12 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 			// engine decision after schema validation. A deterministic validation
 			// failure must still ACK an identical authorized delivery.
 			if storedDigest != nil && *storedDigest == req.ResultDigest {
+				// Cancel-first rejects even identical results: revoking
+				// ownership ends the identity, so there is nothing to ACK
+				// against (Blueprint §15.4, F-12).
+				if status == "CANCELLED" && (runStatus == "CANCELLING" || runStatus == "CANCELLED") {
+					return worker.ErrStaleOwnership
+				}
 				return nil
 			}
 			return worker.ErrResultConflict
@@ -1563,10 +1583,49 @@ func (e *WorkerEngine) StopAck(ctx context.Context, session *worker.WorkerSessio
 		return nil, worker.ErrUnauthorized
 	}
 	err := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
+		// Resolve the run without locks first; the ordered locks below
+		// follow run → attempt (Blueprint §11.2).
+		var runID string
+		if err := tx.QueryRow(ctx, `SELECT rs.run_id::text FROM run_steps rs
+			JOIN task_attempts a ON a.step_id=rs.id AND a.organization_id=rs.organization_id
+			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid`,
+			req.AttemptID, session.OrganizationID).Scan(&runID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, runID, session.OrganizationID); err != nil {
+			return err
+		}
+		// Fence the ACK to the attempt's original session and epoch:
+		// cancellation revokes the lease, but stop confirmation stays bound
+		// to the worker/session/epoch that owned the physical process.
+		// Session and epoch are immutable after claim, so this read cannot
+		// race ownership changes.
+		var ownerSession string
+		var ownerEpoch int64
+		if err := tx.QueryRow(ctx, `SELECT session_id::text, epoch FROM task_attempts
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`,
+			req.AttemptID, session.OrganizationID).Scan(&ownerSession, &ownerEpoch); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if ownerSession != session.SessionID || ownerEpoch != req.OwnershipEpoch {
+			return worker.ErrStaleOwnership
+		}
 		_, err := tx.Exec(ctx, `UPDATE stop_commands SET acked_at=COALESCE(acked_at,clock_timestamp()),
 			termination_confirmed_at=CASE WHEN $1 THEN clock_timestamp() ELSE termination_confirmed_at END
 			WHERE attempt_id=$2::uuid AND organization_id=$3::uuid`,
 			req.ProcessStopped, req.AttemptID, session.OrganizationID)
+		if err != nil {
+			return err
+		}
+		// An ACK may complete grace settlement; the sweeper covers the rest.
+		_, err = settleCancellingRunTx(ctx, tx, session.OrganizationID, runID)
 		return err
 	})
 	if err != nil {
@@ -1684,12 +1743,20 @@ func (e *WorkerEngine) ReconcileExpiredLeases(ctx context.Context, organizationI
 		affectedRuns = append(affectedRuns, firedRuns...)
 		// The run deadline stays active while held: terminalize overdue held
 		// runs that have no live work left to settle them.
-		overdue, overdueRuns, err := failOverdueHeldRunsTx(ctx, tx, organizationID)
+		overdue, overdueRuns, err := failOverdueRunsTx(ctx, tx, organizationID)
 		if err != nil {
 			return err
 		}
 		totalReclaimed += overdue
 		affectedRuns = append(affectedRuns, overdueRuns...)
+		// Durable grace settlement: CANCELLING runs settle once stops are
+		// acknowledged or past grace, surviving control-plane restarts.
+		settled, settledRuns, err := settleCancellingRunsTx(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		totalReclaimed += settled
+		affectedRuns = append(affectedRuns, settledRuns...)
 		return nil
 	})
 	if err != nil {

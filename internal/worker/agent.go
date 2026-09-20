@@ -623,7 +623,13 @@ func (a *Agent) heartbeatLoop(ctx context.Context, attemptID string, epoch int64
 					att := a.runningAttempts[attemptID]
 					a.mu.RUnlock()
 					if att != nil && att.pid > 0 {
-						_ = a.supervisor.TerminateProcessGroup(att.pid)
+						// Report the observed outcome, never an assumed one:
+						// a surviving process group must ACK ProcessStopped=false.
+						stopRes := a.supervisor.TerminateProcessGroup(att.pid)
+						stopped := stopRes != nil && stopRes.Stopped
+						if !stopped {
+							a.cfg.Logger.Printf("Stop unconfirmed for attempt %s (pid %d still alive)", attemptID, att.pid)
+						}
 						stopAck := &StopAckRequestDTO{
 							ProtocolVersion: ProtocolVersion,
 							RequestID:       fmt.Sprintf("req_stopack_%d", time.Now().UnixNano()),
@@ -631,7 +637,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context, attemptID string, epoch int64
 							SessionID:       a.sessionID,
 							AttemptID:       attemptID,
 							OwnershipEpoch:  epoch,
-							ProcessStopped:  true,
+							ProcessStopped:  stopped,
 						}
 						if _, err := a.stopAck(ctx, stopAck); errors.Is(err, ErrWorkerRevoked) {
 							a.handleWorkerRevoked()
