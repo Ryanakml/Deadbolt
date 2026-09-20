@@ -104,8 +104,10 @@ func (e *WorkerEngine) cancelRunTx(
 	type liveAttempt struct {
 		attemptID string
 		stepID    string
+		started   bool
 	}
-	rows, err := tx.Query(ctx, `SELECT a.id::text, rs.id::text
+	rows, err := tx.Query(ctx, `SELECT a.id::text, rs.id::text,
+			(a.status='RUNNING' OR a.started_at IS NOT NULL)
 		FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
 		WHERE rs.run_id=$1::uuid AND a.organization_id=$2::uuid
 			AND a.status IN ('CLAIMED','RUNNING')
@@ -117,7 +119,7 @@ func (e *WorkerEngine) cancelRunTx(
 	live := make([]liveAttempt, 0)
 	for rows.Next() {
 		var la liveAttempt
-		if err := rows.Scan(&la.attemptID, &la.stepID); err != nil {
+		if err := rows.Scan(&la.attemptID, &la.stepID, &la.started); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -136,9 +138,16 @@ func (e *WorkerEngine) cancelRunTx(
 	graceUntil := dbNow.Add(time.Duration(CancelGraceMs) * time.Millisecond)
 
 	for _, la := range live {
+		// Cancellation proves nothing about external effects of an attempt
+		// that already started: only a demonstrably unstarted claim may
+		// record NOT_APPLIED. Process termination is not rollback evidence.
+		effectStatus := "NOT_APPLIED"
+		if la.started {
+			effectStatus = "UNKNOWN"
+		}
 		if _, err := tx.Exec(ctx, `UPDATE task_attempts SET status='CANCELLED', completed_at=clock_timestamp(),
-			error=jsonb_build_object('code','CANCEL_REQUESTED','message','Run cancellation requested','retryable',false,'effectStatus','NOT_APPLIED')
-			WHERE id=$1::uuid AND organization_id=$2::uuid`, la.attemptID, orgID); err != nil {
+			error=jsonb_build_object('code','CANCEL_REQUESTED','message','Run cancellation requested','retryable',false,'effectStatus',$1::text)
+			WHERE id=$2::uuid AND organization_id=$3::uuid`, effectStatus, la.attemptID, orgID); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM task_leases WHERE step_id=$1::uuid AND organization_id=$2::uuid`, la.stepID, orgID); err != nil {
@@ -253,7 +262,19 @@ func settleCancellingRunTx(ctx context.Context, tx storage.Tx, orgID, runID stri
 		runID, orgID).Scan(&unacked); err != nil {
 		return false, err
 	}
-	confirmed := unacked == 0
+	// Confirmation is durable process-stop proof, not mere acknowledgement:
+	// an ACK with ProcessStopped=false leaves termination_confirmed_at NULL
+	// and settles the run as unconfirmed.
+	var unconfirmed int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM stop_commands sc
+		JOIN task_attempts a ON a.id=sc.attempt_id AND a.organization_id=sc.organization_id
+		JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
+		WHERE rs.run_id=$1::uuid AND sc.organization_id=$2::uuid
+			AND sc.termination_confirmed_at IS NULL`,
+		runID, orgID).Scan(&unconfirmed); err != nil {
+		return false, err
+	}
+	confirmed := unconfirmed == 0
 	if _, err := tx.Exec(ctx, `UPDATE runs SET status='CANCELLED', termination_confirmed=$1,
 		updated_at=clock_timestamp() WHERE id=$2::uuid AND organization_id=$3::uuid`,
 		confirmed, runID, orgID); err != nil {

@@ -702,3 +702,165 @@ func TestCreateRunDefaultsDeadline24h(t *testing.T) {
 		t.Fatalf("deadline must be ~24h after acceptance, got %s", dt)
 	}
 }
+
+// TestCancelNegativeAckSettlesUnconfirmed proves finding 1: a Stop ACK that
+// reports ProcessStopped=false settles the run as CANCELLED with
+// termination_confirmed=false, and later ACKs never flip it back to true.
+func TestCancelNegativeAckSettlesUnconfirmed(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "cancel-negack")
+	const digest = "bundle-cancel-negack-20"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, safeManifest(3, 1000, 30000))
+	runID, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	advertiseDigest(t, tc, orgID, session.SessionID, digest)
+
+	a1 := claimExecution(t, server, session, digest, "cancel-negack-claim")
+	startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "cancel-negack")
+	if status, _ := cancelRunHTTP(t, server, token, orgID, runID, runRevision(t, tc, orgID, runID), ""); status != http.StatusOK {
+		t.Fatalf("cancel expected 200, got %d", status)
+	}
+	ack := func(stopped bool, suffix string) int {
+		var resp worker.AckResponseDTO
+		return postWorkerJSON(t, server, "/worker/v1/stop-ack", session.SessionToken, worker.StopAckRequestDTO{
+			ProtocolVersion: worker.ProtocolVersion, RequestID: "negack-" + suffix,
+			WorkerID: session.WorkerID, SessionID: session.SessionID,
+			AttemptID: a1.AttemptID, OwnershipEpoch: a1.OwnershipEpoch, ProcessStopped: stopped,
+		}, &resp)
+	}
+	if status := ack(false, "1"); status != http.StatusOK {
+		t.Fatalf("negative ACK must be accepted, got %d", status)
+	}
+	readFlag := func() (string, *bool) {
+		var runStatus string
+		var confirmed *bool
+		if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT status, termination_confirmed FROM runs WHERE id=$1::uuid`, runID).Scan(&runStatus, &confirmed)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return runStatus, confirmed
+	}
+	if runStatus, confirmed := readFlag(); runStatus != "CANCELLED" || confirmed == nil || *confirmed {
+		t.Fatalf("negative ACK must settle unconfirmed, got %s/%v", runStatus, confirmed)
+	}
+	// A later ACK never flips the settled flag without authority to do so:
+	// terminal rows stay immutable.
+	if status := ack(true, "2"); status != http.StatusOK {
+		t.Fatalf("late ACK must still be accepted, got %d", status)
+	}
+	if runStatus, confirmed := readFlag(); runStatus != "CANCELLED" || confirmed == nil || *confirmed {
+		t.Fatalf("settled flag must never flip to true, got %s/%v", runStatus, confirmed)
+	}
+}
+
+// TestStopAckFencedToSessionAndEpoch proves finding 3: a stale epoch or a
+// foreign session cannot acknowledge the stop; the original session+epoch
+// still can even though cancellation revoked the lease.
+func TestStopAckFencedToSessionAndEpoch(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "stopack-fence-a")
+	foreign, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "stopack-fence-b")
+	const digest = "bundle-stopack-fence-20"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, safeManifest(3, 1000, 30000))
+	runID, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	advertiseDigest(t, tc, orgID, session.SessionID, digest)
+	advertiseDigest(t, tc, orgID, foreign.SessionID, digest)
+
+	a1 := claimExecution(t, server, session, digest, "stopack-fence-claim")
+	startNode(t, server, session, a1.AttemptID, a1.OwnershipEpoch)
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "stopack-fence")
+	if status, _ := cancelRunHTTP(t, server, token, orgID, runID, runRevision(t, tc, orgID, runID), ""); status != http.StatusOK {
+		t.Fatalf("cancel expected 200, got %d", status)
+	}
+	ackAs := func(sess *testWorkerSession, epoch int64, suffix string) int {
+		var resp worker.AckResponseDTO
+		return postWorkerJSON(t, server, "/worker/v1/stop-ack", sess.SessionToken, worker.StopAckRequestDTO{
+			ProtocolVersion: worker.ProtocolVersion, RequestID: "fence-" + suffix,
+			WorkerID: sess.WorkerID, SessionID: sess.SessionID,
+			AttemptID: a1.AttemptID, OwnershipEpoch: epoch, ProcessStopped: true,
+		}, &resp)
+	}
+	unacked := func() *time.Time {
+		var acked *time.Time
+		if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT acked_at FROM stop_commands WHERE attempt_id=$1::uuid`, a1.AttemptID).Scan(&acked)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return acked
+	}
+	// Stale epoch from the owning session is rejected and touches nothing.
+	if status := ackAs(session, a1.OwnershipEpoch+99, "stale-epoch"); status != http.StatusConflict {
+		t.Fatalf("stale-epoch ACK must be 409, got %d", status)
+	}
+	if unacked() != nil {
+		t.Fatalf("stale-epoch ACK must not modify the stop command")
+	}
+	// A foreign valid session is rejected and touches nothing.
+	if status := ackAs(foreign, a1.OwnershipEpoch, "foreign"); status != http.StatusConflict {
+		t.Fatalf("foreign-session ACK must be 409, got %d", status)
+	}
+	if unacked() != nil {
+		t.Fatalf("foreign-session ACK must not modify the stop command")
+	}
+	// The original session+epoch is still accepted after lease revocation.
+	if status := ackAs(session, a1.OwnershipEpoch, "original"); status != http.StatusOK {
+		t.Fatalf("original ACK must be accepted, got %d", status)
+	}
+	if unacked() == nil {
+		t.Fatalf("original ACK must record the acknowledgement")
+	}
+}
+
+// TestCancelEffectStatusByStartState proves finding 4: cancelling a RUNNING
+// attempt records UNKNOWN (cancellation proves nothing about side effects),
+// while an unstarted CLAIMED attempt records NOT_APPLIED.
+func TestCancelEffectStatusByStartState(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "cancel-effect")
+	const digest = "bundle-cancel-effect-20"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, safeManifest(3, 1000, 30000))
+	advertiseDigest(t, tc, orgID, session.SessionID, digest)
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "cancel-effect")
+
+	effectOf := func(attemptID string) string {
+		var raw []byte
+		if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT error FROM task_attempts WHERE id=$1::uuid`, attemptID).Scan(&raw)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var envelope map[string]any
+		_ = json.Unmarshal(raw, &envelope)
+		effect, _ := envelope["effectStatus"].(string)
+		return effect
+	}
+
+	// Started attempt first.
+	runRunning, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	running := claimExecution(t, server, session, digest, "effect-running-claim")
+	startNode(t, server, session, running.AttemptID, running.OwnershipEpoch)
+	if status, _ := cancelRunHTTP(t, server, token, orgID, runRunning, runRevision(t, tc, orgID, runRunning), "effect-running"); status != http.StatusOK {
+		t.Fatalf("cancel expected 200, got %d", status)
+	}
+	if got := effectOf(running.AttemptID); got != "UNKNOWN" {
+		t.Fatalf("started attempt must record UNKNOWN, got %q", got)
+	}
+
+	// Unstarted claim second (separate run; the worker still has a slot).
+	runClaimed, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	unstarted := claimExecution(t, server, session, digest, "effect-claimed-claim")
+	if status, _ := cancelRunHTTP(t, server, token, orgID, runClaimed, runRevision(t, tc, orgID, runClaimed), "effect-claimed"); status != http.StatusOK {
+		t.Fatalf("cancel expected 200, got %d", status)
+	}
+	if got := effectOf(unstarted.AttemptID); got != "NOT_APPLIED" {
+		t.Fatalf("unstarted claim must record NOT_APPLIED, got %q", got)
+	}
+}

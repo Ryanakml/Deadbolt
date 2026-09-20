@@ -1583,13 +1583,8 @@ func (e *WorkerEngine) StopAck(ctx context.Context, session *worker.WorkerSessio
 		return nil, worker.ErrUnauthorized
 	}
 	err := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE stop_commands SET acked_at=COALESCE(acked_at,clock_timestamp()),
-			termination_confirmed_at=CASE WHEN $1 THEN clock_timestamp() ELSE termination_confirmed_at END
-			WHERE attempt_id=$2::uuid AND organization_id=$3::uuid`,
-			req.ProcessStopped, req.AttemptID, session.OrganizationID)
-		if err != nil {
-			return err
-		}
+		// Resolve the run without locks first; the ordered locks below
+		// follow run → attempt (Blueprint §11.2).
 		var runID string
 		if err := tx.QueryRow(ctx, `SELECT rs.run_id::text FROM run_steps rs
 			JOIN task_attempts a ON a.step_id=rs.id AND a.organization_id=rs.organization_id
@@ -1598,6 +1593,35 @@ func (e *WorkerEngine) StopAck(ctx context.Context, session *worker.WorkerSessio
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, runID, session.OrganizationID); err != nil {
+			return err
+		}
+		// Fence the ACK to the attempt's original session and epoch:
+		// cancellation revokes the lease, but stop confirmation stays bound
+		// to the worker/session/epoch that owned the physical process.
+		// Session and epoch are immutable after claim, so this read cannot
+		// race ownership changes.
+		var ownerSession string
+		var ownerEpoch int64
+		if err := tx.QueryRow(ctx, `SELECT session_id::text, epoch FROM task_attempts
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`,
+			req.AttemptID, session.OrganizationID).Scan(&ownerSession, &ownerEpoch); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if ownerSession != session.SessionID || ownerEpoch != req.OwnershipEpoch {
+			return worker.ErrStaleOwnership
+		}
+		_, err := tx.Exec(ctx, `UPDATE stop_commands SET acked_at=COALESCE(acked_at,clock_timestamp()),
+			termination_confirmed_at=CASE WHEN $1 THEN clock_timestamp() ELSE termination_confirmed_at END
+			WHERE attempt_id=$2::uuid AND organization_id=$3::uuid`,
+			req.ProcessStopped, req.AttemptID, session.OrganizationID)
+		if err != nil {
 			return err
 		}
 		// An ACK may complete grace settlement; the sweeper covers the rest.
