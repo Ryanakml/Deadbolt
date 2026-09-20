@@ -17,6 +17,53 @@ export function terminalStepEmptyText(stepStatus) {
     }
     return "No attempt executed.";
 }
+// openCaseForStep returns the OPEN reconciliation hold for a step, if any.
+// A step shows at most one actionable hold; resolved history stays visible
+// through the event timeline instead.
+export function openCaseForStep(snapshot, stepId) {
+    const cases = snapshot.reconciliationCases ?? [];
+    for (const c of cases) {
+        if (c.stepId === stepId && c.status === "OPEN") {
+            return c;
+        }
+    }
+    return null;
+}
+// reconciliationHoldText explains an unknown-outcome hold without claiming
+// the side effect is safe to repeat. The provider may already have received
+// the operation, so the only safe actions are the audited resolutions.
+export function reconciliationHoldText(reason) {
+    switch (reason) {
+        case "AMBIGUOUS_OUTCOME":
+            return "Outcome unknown — the provider may already have received the operation. Check the external reference, then confirm the outcome.";
+        case "IDEMPOTENCY_WINDOW_INSUFFICIENT":
+            return "Outcome unknown and the provider deduplication window cannot cover another attempt. Check the external reference, then confirm the outcome.";
+        case "IDEMPOTENCY_WINDOW_UNKNOWN":
+            return "Outcome unknown and no deduplication window is on record. Check the external reference, then confirm the outcome.";
+        default:
+            return "Outcome unknown — the provider may already have received the operation. Check the external reference, then confirm the outcome.";
+    }
+}
+export const RESOLVE_ACTIONS = [
+    {
+        action: "confirm_succeeded",
+        label: "Confirm succeeded",
+        hint: "The side effect happened. Submit the schema-valid result plus the evidence reference.",
+        needsResult: true,
+    },
+    {
+        action: "confirm_not_executed_retry",
+        label: "Confirm not executed — retry",
+        hint: "Declare the effect did not occur. A retry is scheduled within the remaining budget.",
+        needsResult: false,
+    },
+    {
+        action: "fail_run",
+        label: "Fail run",
+        hint: "Stop the workflow with a visible reason.",
+        needsResult: false,
+    },
+];
 export class RunInspector {
     snapshot = null;
     streamClient = null;
@@ -294,6 +341,24 @@ export class RunInspector {
                         }
                     }
                 }
+                break;
+            case "step.waiting":
+                if (typeof payload.stepId === "string") {
+                    const s = this.snapshot.steps.find((st) => st.id === payload.stepId);
+                    if (s) {
+                        s.status = "WAITING";
+                    }
+                }
+                break;
+            case "run.waiting":
+                this.snapshot.status = "WAITING";
+                if (typeof payload.reason === "string") {
+                    this.snapshot.reasonCode = payload.reason;
+                }
+                break;
+            case "run.resumed":
+                // The server moved the run out of a hold; converge on authority.
+                void this.fetchSnapshot().catch(() => undefined);
                 break;
             case "step.succeeded":
                 if (typeof payload.stepId === "string") {

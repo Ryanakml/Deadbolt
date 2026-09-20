@@ -17,10 +17,17 @@ import (
 type HTTPHandler struct {
 	service *Service
 	tenants *tenant.Service
+	engine  *WorkerEngine
 }
 
 func NewHTTPHandler(s *Service, tenants *tenant.Service) *HTTPHandler {
 	return &HTTPHandler{service: s, tenants: tenants}
+}
+
+// SetWorkerEngine attaches the execution authority for reconciliation
+// resolution. Kept as a setter so existing constructors are untouched.
+func (h *HTTPHandler) SetWorkerEngine(e *WorkerEngine) {
+	h.engine = e
 }
 
 func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
@@ -582,4 +589,88 @@ func errJSON(w http.ResponseWriter, r *http.Request, s int, c, m string) {
 		"details":   map[string]any{},
 		"retryable": s >= 500,
 	})
+}
+
+func (h *HTTPHandler) ResolveCase(w http.ResponseWriter, r *http.Request) {
+	caller, ok := tenant.CallerFromContext(r.Context())
+	if !ok {
+		errJSON(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
+	// Machine keys can never hold runs:reconcile (Blueprint §24.2); reject
+	// explicitly so the denial is auditable at this boundary too.
+	if caller.Type == tenant.IdentityTypeMachine {
+		errJSON(w, r, http.StatusForbidden, "MACHINE_FORBIDDEN", "Machine keys cannot resolve reconciliation cases")
+		return
+	}
+	if h.engine == nil {
+		errJSON(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+		return
+	}
+
+	caseID := r.PathValue("id")
+	if caseID == "" {
+		errJSON(w, r, http.StatusBadRequest, "INVALID_CASE_ID", "Reconciliation case ID is required")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		errJSON(w, r, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "Request body exceeds transport limit")
+		return
+	}
+	parsed, err := contracts.ParseJSON(raw)
+	if err != nil {
+		errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
+		return
+	}
+	canonical, _ := json.Marshal(parsed)
+	var req ResolveReconciliationRequest
+	dec := json.NewDecoder(bytes.NewReader(canonical))
+	if err := dec.Decode(&req); err != nil {
+		errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Invalid request body")
+		return
+	}
+
+	resp, err := h.engine.ResolveReconciliationCase(
+		r.Context(), caller.OrganizationID, caseID, req, auditFromCaller(caller, r),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrCaseNotFound):
+			errJSON(w, r, http.StatusNotFound, "CASE_NOT_FOUND", "Reconciliation case not found")
+		case errors.Is(err, ErrCaseResolved):
+			errJSON(w, r, http.StatusConflict, "CASE_RESOLVED", "Reconciliation case is already resolved; refresh before acting")
+		case errors.Is(err, ErrRevisionConflict):
+			errJSON(w, r, http.StatusConflict, "REVISION_CONFLICT", "Case changed since it was read; refresh before acting")
+		case errors.Is(err, ErrRunTerminal):
+			errJSON(w, r, http.StatusConflict, "RUN_TERMINAL", "Run is already terminal")
+		case errors.Is(err, ErrBudgetExhausted):
+			errJSON(w, r, http.StatusConflict, "BUDGET_EXHAUSTED", "No retry attempts remain; fail or rerun instead")
+		case errors.Is(err, ErrWindowInsufficient):
+			errJSON(w, r, http.StatusConflict, "INSUFFICIENT_WINDOW", "Idempotency window cannot cover another attempt")
+		case errors.Is(err, ErrRunDeadlineExceeded):
+			errJSON(w, r, http.StatusConflict, "RUN_DEADLINE_EXCEEDED", "Run deadline has passed")
+		case errors.Is(err, ErrInvalidRecovery):
+			errJSON(w, r, http.StatusConflict, "INVALID_RECOVERY_POLICY", "Task recovery policy is absent or invalid")
+		case errors.Is(err, tenant.ErrIdempotencyConflict):
+			errJSON(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency key already used with different request content")
+		case errors.Is(err, ErrInvalidAction), errors.Is(err, ErrMissingEvidence), errors.Is(err, ErrMissingResult), errors.Is(err, ErrMissingReason), errors.Is(err, ErrReasonTooLong):
+			errJSON(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		case errors.Is(err, ErrResultSchema):
+			errJSON(w, r, http.StatusUnprocessableEntity, "RESULT_SCHEMA_VIOLATION", "Result does not conform to task output schema")
+		case errors.Is(err, ErrResultTooLarge):
+			errJSON(w, r, http.StatusRequestEntityTooLarge, "RESULT_TOO_LARGE", "Resolution result exceeds 256 KiB")
+		case errors.Is(err, ErrMachineForbidden):
+			errJSON(w, r, http.StatusForbidden, "MACHINE_FORBIDDEN", "Machine keys cannot resolve reconciliation cases")
+		case errors.Is(err, tenant.ErrAuditRequired):
+			errJSON(w, r, http.StatusUnauthorized, "AUDIT_REQUIRED", "Audit context is required")
+		default:
+			errJSON(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }

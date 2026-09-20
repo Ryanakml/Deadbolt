@@ -1,6 +1,15 @@
-import { RunSnapshot, RunEvent, RunEventsResponse, StepStatus, TaskLogsResponse, StreamFreshness } from "./types.js";
+import { RunSnapshot, RunEvent, RunEventsResponse, StepStatus, TaskLogsResponse, StreamFreshness, ReconciliationCase, ResolveAction } from "./types.js";
 export declare function shouldShowWorkerWait(stepStatus: StepStatus, waitingReason: string | null | undefined, activeCompatibleWorkers: number | undefined): boolean;
 export declare function terminalStepEmptyText(stepStatus: StepStatus): string;
+export declare function openCaseForStep(snapshot: RunSnapshot, stepId: string): ReconciliationCase | null;
+export declare function reconciliationHoldText(reason: string | null | undefined): string;
+export interface ResolveActionOption {
+    action: ResolveAction;
+    label: string;
+    hint: string;
+    needsResult: boolean;
+}
+export declare const RESOLVE_ACTIONS: ResolveActionOption[];
 export interface InspectorListener {
     onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
     onFreshnessChanged?: (freshness: StreamFreshness) => void;

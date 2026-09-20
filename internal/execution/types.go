@@ -25,11 +25,12 @@ type RunDTO struct {
 }
 
 type RunStepDTO struct {
-	ID           string               `json:"id"`
-	NodeID       string               `json:"nodeId"`
-	Status       contracts.StepStatus `json:"status"`
-	CurrentEpoch int64                `json:"currentEpoch"`
-	Attempts     []AttemptSummaryDTO  `json:"attempts"`
+	ID               string               `json:"id"`
+	NodeID           string               `json:"nodeId"`
+	Status           contracts.StepStatus `json:"status"`
+	CurrentEpoch     int64                `json:"currentEpoch"`
+	CompletionSource *string              `json:"completionSource,omitempty"`
+	Attempts         []AttemptSummaryDTO  `json:"attempts"`
 }
 
 type AttemptSummaryDTO struct {
@@ -45,12 +46,30 @@ type AttemptSummaryDTO struct {
 
 type RunSnapshotDTO struct {
 	RunDTO
-	LastEventSequence       int64        `json:"lastEventSequence"`
-	Steps                   []RunStepDTO `json:"steps"`
-	Output                  any          `json:"output,omitempty"`
-	Error                   any          `json:"error,omitempty"`
-	WaitingReason           *string      `json:"waitingReason,omitempty"`
-	ActiveCompatibleWorkers int          `json:"activeCompatibleWorkers"`
+	LastEventSequence       int64                   `json:"lastEventSequence"`
+	Steps                   []RunStepDTO            `json:"steps"`
+	ReconciliationCases     []ReconciliationCaseDTO `json:"reconciliationCases"`
+	Output                  any                     `json:"output,omitempty"`
+	Error                   any                     `json:"error,omitempty"`
+	WaitingReason           *string                 `json:"waitingReason,omitempty"`
+	ActiveCompatibleWorkers int                     `json:"activeCompatibleWorkers"`
+}
+
+// ReconciliationCaseDTO is one unknown-outcome hold. Evidence carries the
+// external reference the resolver checked; it must be a reference string,
+// never secret material.
+type ReconciliationCaseDTO struct {
+	ID         string  `json:"id"`
+	StepID     string  `json:"stepId"`
+	AttemptID  *string `json:"attemptId,omitempty"`
+	Reason     string  `json:"reason"`
+	Evidence   any     `json:"evidence,omitempty"`
+	Status     string  `json:"status"`
+	Resolution *string `json:"resolution,omitempty"`
+	ActorID    *string `json:"actorId,omitempty"`
+	Revision   int64   `json:"revision"`
+	ResolvedAt *string `json:"resolvedAt,omitempty"`
+	CreatedAt  string  `json:"createdAt"`
 }
 
 type RunListResponseDTO struct {

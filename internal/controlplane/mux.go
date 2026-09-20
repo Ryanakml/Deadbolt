@@ -65,6 +65,7 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		if workerEngine == nil {
 			workerEngine = execution.NewWorkerEngine(storagePool, eventHub)
 		}
+		workerEngine.SetCommands(tenantService)
 		workerSvc := worker.NewService(storagePool, deploymentSvc, workerEngine)
 		outboxMetrics.SetTaskLogDroppedCounter(workerSvc.DroppedLogsCount)
 		workerHandler := worker.NewHTTPHandler(workerSvc, tenantService)
@@ -72,6 +73,7 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 
 		executionSvc := execution.NewService(storagePool, tenantService, eventHub)
 		executionHandler := execution.NewHTTPHandler(executionSvc, tenantService)
+		executionHandler.SetWorkerEngine(workerEngine)
 		mux.Handle("POST /api/v1/workflows/{name}/runs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsCreate, executionHandler.CreateRun))))
 		mux.Handle("POST /v1/workflows/{name}/runs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsCreate, executionHandler.CreateRun))))
 		mux.Handle("GET /api/v1/runs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.ListRuns))))
@@ -84,6 +86,8 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("GET /v1/runs/{id}/stream", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsRead, executionHandler.StreamRunEvents))))
 		mux.Handle("GET /api/v1/runs/{id}/logs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapPayloadRead, executionHandler.GetRunLogs))))
 		mux.Handle("GET /v1/runs/{id}/logs", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapPayloadRead, executionHandler.GetRunLogs))))
+		mux.Handle("POST /api/v1/reconciliation-cases/{id}/resolve", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsReconcile, executionHandler.ResolveCase))))
+		mux.Handle("POST /v1/reconciliation-cases/{id}/resolve", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsReconcile, executionHandler.ResolveCase))))
 
 		mux.Handle("GET /api/v1/workers", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersRead, executionHandler.ListWorkers))))
 		mux.Handle("GET /v1/workers", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersRead, executionHandler.ListWorkers))))

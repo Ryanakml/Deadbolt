@@ -12,6 +12,7 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
+	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 	"github.com/jackc/pgx/v5"
 )
@@ -24,6 +25,7 @@ const defaultAttemptTimeout = 5 * time.Minute
 type WorkerEngine struct {
 	pool                 *storage.Pool
 	hub                  *EventHub
+	commands             *tenant.Service
 	beforeCompleteCommit func() error
 	afterCompleteCommit  func() error
 }
@@ -38,6 +40,13 @@ func NewWorkerEngine(pool *storage.Pool, hub ...*EventHub) *WorkerEngine {
 
 func (e *WorkerEngine) SetHub(hub *EventHub) {
 	e.hub = hub
+}
+
+// SetCommands attaches the canonical tenant command service so mutations
+// record idempotent command outcomes atomically with state transitions.
+// Engines without it (unit-style construction) execute bare transactions.
+func (e *WorkerEngine) SetCommands(commands *tenant.Service) {
+	e.commands = commands
 }
 
 // SetBeforeCompleteCommitHookForTest injects a deterministic failure after all
@@ -272,16 +281,22 @@ func insertReconciliationCaseTx(ctx context.Context, tx storage.Tx, organization
 	return err
 }
 
-// routeStepToReconciliationTx moves a step/run into WAITING/RECONCILIATION with
+// routeStepToReconciliationTx moves a step into WAITING/RECONCILIATION with
 // an OPEN reconciliation case. It never creates an attempt and never extends
-// the idempotency window.
+// the idempotency window. The run parks in WAITING/RECONCILIATION only once
+// sibling attempts drain; while siblings are still active the run stays
+// RUNNING and the hold is enforced by the run-wide claim guard instead.
 func routeStepToReconciliationTx(ctx context.Context, tx storage.Tx, organizationID, environmentID, runID, stepID, nodeID string, attemptID *string, reason string, evidence map[string]any) error {
 	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='WAITING', wait_reason='RECONCILIATION', updated_at=clock_timestamp()
 		WHERE id=$1::uuid AND organization_id=$2::uuid`, stepID, organizationID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE runs SET status='WAITING', reason_code='RECONCILIATION', updated_at=clock_timestamp()
-		WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING','WAITING')`, runID, organizationID); err != nil {
+		WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING','WAITING')
+		AND NOT EXISTS (SELECT 1 FROM task_attempts a
+			JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
+			WHERE rs.run_id=$1::uuid AND a.organization_id=$2::uuid
+				AND a.status IN ('CLAIMED','RUNNING'))`, runID, organizationID); err != nil {
 		return err
 	}
 	if err := insertReconciliationCaseTx(ctx, tx, organizationID, environmentID, stepID, attemptID, reason, evidence); err != nil {
@@ -499,9 +514,14 @@ func scheduleRetryOrHoldTx(ctx context.Context, tx storage.Tx, organizationID, e
 	return "retry", "", nil
 }
 
-func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID, stepID, reasonCode string) error {
+func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID, stepID, reasonCode string, actorID *string) error {
 	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED', wait_reason=$1, updated_at=clock_timestamp()
 		WHERE id=$2::uuid AND organization_id=$3::uuid`, reasonCode, stepID, organizationID); err != nil {
+		return err
+	}
+	// Holds mooted by run failure close with the deciding actor (or NULL for
+	// system terminalization) so no OPEN case survives a terminal run.
+	if err := closeOpenCasesAsFailTx(ctx, tx, organizationID, runID, actorID, reasonCode); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code=$1, updated_at=clock_timestamp()
@@ -760,6 +780,12 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
 				AND r.status IN ('QUEUED','RUNNING')
 				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
+				-- Run-wide reconciliation hold: a run with any OPEN case admits
+				-- no new claims even while siblings are still draining.
+				AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
+					JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
+					WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
+						AND rc.organization_id=$2::uuid AND rc.status='OPEN')
 			ORDER BY rs.eligible_at, rs.id
 			LIMIT $4
 			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, environmentID, claimLimit)
@@ -1135,6 +1161,184 @@ func terminalAttempt(status string) bool {
 	}
 }
 
+// advanceAfterStepSuccessTx unblocks dependency-satisfied steps and
+// terminalizes the run when every node is terminal. It is shared by worker
+// completion and audited reconciliation success so downstream scheduling
+// cannot diverge between the two paths.
+func advanceAfterStepSuccessTx(ctx context.Context, tx storage.Tx, organizationID, runID string, defaultOutput any) error {
+	var manifestBytes []byte
+	var workflowName string
+	var rawRunInput []byte
+	if err := tx.QueryRow(ctx, `SELECT d.manifest, r.workflow_name, r.input
+		FROM runs r JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+		WHERE r.id=$1::uuid AND r.organization_id=$2::uuid`, runID, organizationID).Scan(&manifestBytes, &workflowName, &rawRunInput); err != nil {
+		return err
+	}
+	var manifest deploymentManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return fmt.Errorf("decode manifest: %w", err)
+	}
+	var targetWorkflow *workflowManifest
+	for i := range manifest.Workflows {
+		if manifest.Workflows[i].Name == workflowName {
+			targetWorkflow = &manifest.Workflows[i]
+			break
+		}
+	}
+	var runInput any
+	if len(rawRunInput) > 0 {
+		_ = json.Unmarshal(rawRunInput, &runInput)
+	}
+
+	type stepData struct {
+		id     string
+		nodeID string
+		state  string
+		output any
+	}
+	stepRows, err := tx.Query(ctx, `SELECT id::text, node_id, state, output
+		FROM run_steps WHERE run_id=$1::uuid AND organization_id=$2::uuid
+		FOR UPDATE`, runID, organizationID)
+	if err != nil {
+		return err
+	}
+	stepsByNode := make(map[string]*stepData)
+	outputsMap := make(map[string]any)
+	for stepRows.Next() {
+		var s stepData
+		var rawOut []byte
+		if err := stepRows.Scan(&s.id, &s.nodeID, &s.state, &rawOut); err != nil {
+			stepRows.Close()
+			return err
+		}
+		if len(rawOut) > 0 && string(rawOut) != "null" {
+			_ = json.Unmarshal(rawOut, &s.output)
+			outputsMap[s.nodeID] = s.output
+		}
+		stepsByNode[s.nodeID] = &s
+	}
+	stepRows.Close()
+
+	if targetWorkflow != nil {
+		// Advance BLOCKED steps whose dependencies in 'after' are all SUCCEEDED
+		for _, node := range targetWorkflow.Nodes {
+			st, ok := stepsByNode[node.ID]
+			if !ok || st.state != "BLOCKED" {
+				continue
+			}
+			allDepsMet := true
+			for _, depID := range node.After {
+				depStep, depExists := stepsByNode[depID]
+				if !depExists || (depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED") {
+					allDepsMet = false
+					break
+				}
+			}
+			if allDepsMet {
+				// Evaluate input mapping if present
+				if node.Input != nil {
+					mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
+					inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
+					if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
+						// Non-retryable mapping error per Blueprint §10.4 & §14.2
+						if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED',wait_reason='INPUT_MAPPING_ERROR',updated_at=clock_timestamp()
+							WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, organizationID); uErr != nil {
+							return uErr
+						}
+						if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='INPUT_MAPPING_ERROR',updated_at=clock_timestamp()
+							WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID); uErr != nil {
+							return uErr
+						}
+						if err := appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
+							"reason": "INPUT_MAPPING_ERROR", "nodeId": node.ID,
+						}); err != nil {
+							return err
+						}
+						return nil
+					}
+				}
+				// Unblock to READY
+				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY',wait_reason=NULL,eligible_at=clock_timestamp(),updated_at=clock_timestamp()
+					WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, organizationID); err != nil {
+					return err
+				}
+				st.state = "READY"
+				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", map[string]any{
+					"stepId": st.id, "nodeId": node.ID,
+				}); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Check if all nodes are terminal
+		allTerminal := true
+		allSucceeded := true
+		for _, node := range targetWorkflow.Nodes {
+			st, ok := stepsByNode[node.ID]
+			if !ok || (st.state != "SUCCEEDED" && st.state != "SKIPPED" && st.state != "FAILED" && st.state != "CANCELLED") {
+				allTerminal = false
+				break
+			}
+			if st.state != "SUCCEEDED" && st.state != "SKIPPED" {
+				allSucceeded = false
+			}
+		}
+
+		if allTerminal {
+			if allSucceeded {
+				var finalOutput any = defaultOutput
+				if targetWorkflow.Output != nil {
+					mappedOut, outErr := contracts.MapInput(targetWorkflow.Output, runInput, outputsMap)
+					if outErr != nil {
+						// Output mapping error -> fail run
+						if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='OUTPUT_MAPPING_ERROR',updated_at=clock_timestamp()
+							WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID); uErr != nil {
+							return uErr
+						}
+						return appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
+							"reason": "OUTPUT_MAPPING_ERROR",
+						})
+					}
+					finalOutput = mappedOut
+				}
+				if targetWorkflow.OutputSchema != nil && contracts.ValidatePayload(targetWorkflow.OutputSchema, finalOutput) != nil {
+					if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='OUTPUT_SCHEMA_VIOLATION',updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID); err != nil {
+						return err
+					}
+					return appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{"reason": "OUTPUT_SCHEMA_VIOLATION"})
+				}
+				finalJSON, err := contracts.CanonicalizeGeneric(finalOutput)
+				if err != nil || len(finalJSON) > worker.MaxInlinePayloadBytes {
+					return worker.ErrPayloadTooLarge
+				}
+				if _, err := tx.Exec(ctx, `UPDATE runs SET status='SUCCEEDED',output=$1::jsonb,reason_code=NULL,updated_at=clock_timestamp()
+					WHERE id=$2::uuid AND organization_id=$3::uuid`, string(finalJSON), runID, organizationID); err != nil {
+					return err
+				}
+				if err := appendRunEvent(ctx, tx, organizationID, runID, "RUN_COMPLETED", map[string]any{
+					"status": "SUCCEEDED",
+				}); err != nil {
+					return err
+				}
+			} else {
+				if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='STEP_FAILED',updated_at=clock_timestamp()
+					WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID); err != nil {
+					return err
+				}
+				if err := appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
+					"status": "FAILED",
+				}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessionContext, req *worker.CompleteRequestDTO) (*worker.CompleteResponseDTO, error) {
 	if req.WorkerID != session.WorkerID || req.SessionID != session.SessionID {
 		return nil, worker.ErrUnauthorized
@@ -1266,174 +1470,8 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		}
 
 		if req.Outcome == "SUCCEEDED" {
-			var manifestBytes []byte
-			var workflowName string
-			var rawRunInput []byte
-			if err := tx.QueryRow(ctx, `SELECT d.manifest, r.workflow_name, r.input
-				FROM runs r JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-				WHERE r.id=$1::uuid AND r.organization_id=$2::uuid`, runID, session.OrganizationID).Scan(&manifestBytes, &workflowName, &rawRunInput); err != nil {
+			if err := advanceAfterStepSuccessTx(ctx, tx, session.OrganizationID, runID, req.Output); err != nil {
 				return err
-			}
-			var manifest deploymentManifest
-			if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-				return fmt.Errorf("decode manifest: %w", err)
-			}
-			var targetWorkflow *workflowManifest
-			for i := range manifest.Workflows {
-				if manifest.Workflows[i].Name == workflowName {
-					targetWorkflow = &manifest.Workflows[i]
-					break
-				}
-			}
-			var runInput any
-			if len(rawRunInput) > 0 {
-				_ = json.Unmarshal(rawRunInput, &runInput)
-			}
-
-			type stepData struct {
-				id     string
-				nodeID string
-				state  string
-				output any
-			}
-			stepRows, err := tx.Query(ctx, `SELECT id::text, node_id, state, output
-				FROM run_steps WHERE run_id=$1::uuid AND organization_id=$2::uuid
-				FOR UPDATE`, runID, session.OrganizationID)
-			if err != nil {
-				return err
-			}
-			stepsByNode := make(map[string]*stepData)
-			outputsMap := make(map[string]any)
-			for stepRows.Next() {
-				var s stepData
-				var rawOut []byte
-				if err := stepRows.Scan(&s.id, &s.nodeID, &s.state, &rawOut); err != nil {
-					stepRows.Close()
-					return err
-				}
-				if len(rawOut) > 0 && string(rawOut) != "null" {
-					_ = json.Unmarshal(rawOut, &s.output)
-					outputsMap[s.nodeID] = s.output
-				}
-				stepsByNode[s.nodeID] = &s
-			}
-			stepRows.Close()
-
-			if targetWorkflow != nil {
-				// Advance BLOCKED steps whose dependencies in 'after' are all SUCCEEDED
-				for _, node := range targetWorkflow.Nodes {
-					st, ok := stepsByNode[node.ID]
-					if !ok || st.state != "BLOCKED" {
-						continue
-					}
-					allDepsMet := true
-					for _, depID := range node.After {
-						depStep, depExists := stepsByNode[depID]
-						if !depExists || (depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED") {
-							allDepsMet = false
-							break
-						}
-					}
-					if allDepsMet {
-						// Evaluate input mapping if present
-						if node.Input != nil {
-							mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
-							inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
-							if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
-								// Non-retryable mapping error per Blueprint §10.4 & §14.2
-								if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED',wait_reason='INPUT_MAPPING_ERROR',updated_at=clock_timestamp()
-									WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, session.OrganizationID); uErr != nil {
-									return uErr
-								}
-								if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='INPUT_MAPPING_ERROR',updated_at=clock_timestamp()
-									WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, session.OrganizationID); uErr != nil {
-									return uErr
-								}
-								if err := appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{
-									"reason": "INPUT_MAPPING_ERROR", "nodeId": node.ID,
-								}); err != nil {
-									return err
-								}
-								return nil
-							}
-						}
-						// Unblock to READY
-						if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY',wait_reason=NULL,eligible_at=clock_timestamp(),updated_at=clock_timestamp()
-							WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, session.OrganizationID); err != nil {
-							return err
-						}
-						st.state = "READY"
-						if err := appendRunEvent(ctx, tx, session.OrganizationID, runID, "STEP_READY", map[string]any{
-							"stepId": st.id, "nodeId": node.ID,
-						}); err != nil {
-							return err
-						}
-					}
-				}
-
-				// Check if all nodes are terminal
-				allTerminal := true
-				allSucceeded := true
-				for _, node := range targetWorkflow.Nodes {
-					st, ok := stepsByNode[node.ID]
-					if !ok || (st.state != "SUCCEEDED" && st.state != "SKIPPED" && st.state != "FAILED" && st.state != "CANCELLED") {
-						allTerminal = false
-						break
-					}
-					if st.state != "SUCCEEDED" && st.state != "SKIPPED" {
-						allSucceeded = false
-					}
-				}
-
-				if allTerminal {
-					if allSucceeded {
-						var finalOutput any = req.Output
-						if targetWorkflow.Output != nil {
-							mappedOut, outErr := contracts.MapInput(targetWorkflow.Output, runInput, outputsMap)
-							if outErr != nil {
-								// Output mapping error -> fail run
-								if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='OUTPUT_MAPPING_ERROR',updated_at=clock_timestamp()
-									WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, session.OrganizationID); uErr != nil {
-									return uErr
-								}
-								return appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{
-									"reason": "OUTPUT_MAPPING_ERROR",
-								})
-							}
-							finalOutput = mappedOut
-						}
-						if targetWorkflow.OutputSchema != nil && contracts.ValidatePayload(targetWorkflow.OutputSchema, finalOutput) != nil {
-							if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='OUTPUT_SCHEMA_VIOLATION',updated_at=clock_timestamp()
-								WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, session.OrganizationID); err != nil {
-								return err
-							}
-							return appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{"reason": "OUTPUT_SCHEMA_VIOLATION"})
-						}
-						finalJSON, err := contracts.CanonicalizeGeneric(finalOutput)
-						if err != nil || len(finalJSON) > worker.MaxInlinePayloadBytes {
-							return worker.ErrPayloadTooLarge
-						}
-						if _, err := tx.Exec(ctx, `UPDATE runs SET status='SUCCEEDED',output=$1::jsonb,reason_code=NULL,updated_at=clock_timestamp()
-							WHERE id=$2::uuid AND organization_id=$3::uuid`, string(finalJSON), runID, session.OrganizationID); err != nil {
-							return err
-						}
-						if err := appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_COMPLETED", map[string]any{
-							"status": "SUCCEEDED",
-						}); err != nil {
-							return err
-						}
-					} else {
-						if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='STEP_FAILED',updated_at=clock_timestamp()
-							WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, session.OrganizationID); err != nil {
-							return err
-						}
-						if err := appendRunEvent(ctx, tx, session.OrganizationID, runID, "RUN_FAILED", map[string]any{
-							"status": "FAILED",
-						}); err != nil {
-							return err
-						}
-					}
-				}
 			}
 		} else {
 			if req.Outcome == "CANCELLED" {
@@ -1442,7 +1480,7 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 				if req.Error != nil && req.Error.Code != "" {
 					errorCode = req.Error.Code
 				}
-				if err := failRunForStepTx(ctx, tx, session.OrganizationID, runID, stepID, errorCode); err != nil {
+				if err := failRunForStepTx(ctx, tx, session.OrganizationID, runID, stepID, errorCode, nil); err != nil {
 					return err
 				}
 			} else {
@@ -1488,11 +1526,17 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 					if failCode == "" {
 						failCode = errorCode
 					}
-					if err := failRunForStepTx(ctx, tx, session.OrganizationID, runID, stepID, failCode); err != nil {
+					if err := failRunForStepTx(ctx, tx, session.OrganizationID, runID, stepID, failCode, nil); err != nil {
 						return err
 					}
 				}
 			}
+		}
+		// Park the run in WAITING/RECONCILIATION once sibling attempts drain
+		// while a hold is open. Terminal runs and runs with live work are
+		// left untouched.
+		if err := settleHoldAfterCompletionTx(ctx, tx, session.OrganizationID, runID); err != nil {
+			return err
 		}
 		if e.beforeCompleteCommit != nil {
 			return e.beforeCompleteCommit()
@@ -1638,6 +1682,14 @@ func (e *WorkerEngine) ReconcileExpiredLeases(ctx context.Context, organizationI
 		}
 		totalReclaimed += fired
 		affectedRuns = append(affectedRuns, firedRuns...)
+		// The run deadline stays active while held: terminalize overdue held
+		// runs that have no live work left to settle them.
+		overdue, overdueRuns, err := failOverdueHeldRunsTx(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		totalReclaimed += overdue
+		affectedRuns = append(affectedRuns, overdueRuns...)
 		return nil
 	})
 	if err != nil {
@@ -1840,7 +1892,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 				if failCode == "" {
 					failCode = "START_DEADLINE_EXCEEDED"
 				}
-				if err := failRunForStepTx(ctx, tx, organizationID, c.runID, c.stepID, failCode); err != nil {
+				if err := failRunForStepTx(ctx, tx, organizationID, c.runID, c.stepID, failCode, nil); err != nil {
 					return 0, nil, err
 				}
 			}
@@ -1888,7 +1940,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 				if failCode == "" {
 					failCode = reasonCode
 				}
-				if err := failRunForStepTx(ctx, tx, organizationID, c.runID, c.stepID, failCode); err != nil {
+				if err := failRunForStepTx(ctx, tx, organizationID, c.runID, c.stepID, failCode, nil); err != nil {
 					return 0, nil, err
 				}
 			}

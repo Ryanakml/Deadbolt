@@ -43,6 +43,7 @@ export interface RunStep {
   nodeId: string;
   status: StepStatus;
   currentEpoch: number;
+  completionSource?: string | null;
   attempts: TaskAttempt[];
 }
 
@@ -63,10 +64,44 @@ export interface Run {
 export interface RunSnapshot extends Run {
   lastEventSequence: number;
   steps: RunStep[];
+  reconciliationCases?: ReconciliationCase[];
   output?: unknown;
   error?: unknown;
   waitingReason?: string | null;
   activeCompatibleWorkers?: number;
+}
+
+export interface ReconciliationCase {
+  id: string;
+  stepId: string;
+  attemptId?: string | null;
+  reason: string;
+  evidence?: unknown;
+  status: "OPEN" | "RESOLVED";
+  resolution?: string | null;
+  actorId?: string | null;
+  revision: number;
+  resolvedAt?: string | null;
+  createdAt: string;
+}
+
+export type ResolveAction =
+  | "confirm_succeeded"
+  | "confirm_not_executed_retry"
+  | "fail_run";
+
+export interface ResolveReconciliationRequest {
+  action: ResolveAction;
+  evidence: string;
+  reason: string;
+  result?: unknown;
+  expectedRevision: number;
+}
+
+export interface ResolveReconciliationResponse {
+  caseId: string;
+  resolved: boolean;
+  revision: number;
 }
 
 export interface Worker {
