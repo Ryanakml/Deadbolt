@@ -330,28 +330,57 @@ func TestResolveConcurrentSingleWinner(t *testing.T) {
 
 	type outcome struct {
 		status int
-		body   map[string]any
+		code   string
+		fatal  string
 	}
 	results := make(chan outcome, 2)
 	start := make(chan struct{})
 	for _, tok := range []string{tokenA, tokenB} {
 		go func(tok string) {
+			// No t.* calls inside goroutines: report outcomes through the
+			// channel so the race detector stays quiet.
+			var o outcome
+			defer func() { results <- o }()
 			<-start
-			s, b := resolveCaseHTTP(t, server, tok, orgID, caseID, map[string]any{
+			raw, _ := json.Marshal(map[string]any{
 				"action": "fail_run", "evidence": "race", "expectedRevision": rev,
 			})
-			results <- outcome{s, b}
+			atomic.AddInt64(&resolveKeySeq, 1)
+			req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/reconciliation-cases/"+caseID+"/resolve", bytes.NewReader(raw))
+			if err != nil {
+				o.fatal = err.Error()
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+tok)
+			req.Header.Set("X-Organization-ID", orgID)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", fmt.Sprintf("resolve-race-%d", atomic.AddInt64(&resolveKeySeq, 1)))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				o.fatal = err.Error()
+				return
+			}
+			defer resp.Body.Close()
+			var parsed map[string]any
+			_ = json.NewDecoder(resp.Body).Decode(&parsed)
+			o.status = resp.StatusCode
+			if code, _ := parsed["code"].(string); code != "" {
+				o.code = code
+			}
 		}(tok)
 	}
 	close(start)
 	first := <-results
 	second := <-results
+	if first.fatal != "" || second.fatal != "" {
+		t.Fatalf("concurrent resolve transport failed: %q %q", first.fatal, second.fatal)
+	}
 	codes := map[int]int{}
 	for _, o := range []outcome{first, second} {
 		codes[o.status]++
 	}
 	if codes[http.StatusOK] != 1 || codes[http.StatusConflict] != 1 {
-		t.Fatalf("expected one 200 and one 409, got %v / %v", first, second)
+		t.Fatalf("expected one 200 and one 409, got %+v / %+v", first, second)
 	}
 }
 
