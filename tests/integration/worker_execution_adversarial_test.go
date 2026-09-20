@@ -1004,13 +1004,13 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 	}
 
 	// 3. Worker Engine ReconcileExpiredLeases runs (as reconciler would)
-	var preTransitionLostEvents, preTransitionReadyEvents, preTransitionOutbox int
+	var preTransitionLostEvents, preTransitionWaitingEvents, preTransitionOutbox int
 	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_LOST'),
-			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_READY'),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_WAITING'),
 			(SELECT count(*) FROM outbox_events WHERE subject='execution.state_changed' AND payload->>'runId'=$1::text)`, runID).
-			Scan(&preTransitionLostEvents, &preTransitionReadyEvents, &preTransitionOutbox)
+			Scan(&preTransitionLostEvents, &preTransitionWaitingEvents, &preTransitionOutbox)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1023,37 +1023,48 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 		t.Fatalf("expected 1 reclaimed attempt, got %d", reclaimed)
 	}
 
-	// 4. Verify Attempt 1 marked LOST with LEASE_EXPIRED and step requeued to READY
-	var attempt1Status, attempt1Error, stepState string
+	// 4. Verify Attempt 1 marked LOST with LEASE_EXPIRED and step parked in
+	// WAITING/RETRY_BACKOFF with a persisted PENDING timer (M2 #18: durable
+	// backoff replaces immediate READY; firing creates READY).
+	var attempt1Status, attempt1Error, stepState, waitReason string
 	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
-		return tx.QueryRow(ctx, `SELECT a.status, COALESCE(a.error->>'code', ''), rs.state
+		return tx.QueryRow(ctx, `SELECT a.status, COALESCE(a.error->>'code', ''), rs.state, COALESCE(rs.wait_reason,'')
 			FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id
-			WHERE a.id=$1::uuid`, assignmentA.AttemptID).Scan(&attempt1Status, &attempt1Error, &stepState)
+			WHERE a.id=$1::uuid`, assignmentA.AttemptID).Scan(&attempt1Status, &attempt1Error, &stepState, &waitReason)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if attempt1Status != "LOST" || attempt1Error != "LEASE_EXPIRED" || stepState != "READY" {
-		t.Fatalf("unexpected state after lease expiry: attemptStatus=%s error=%s stepState=%s", attempt1Status, attempt1Error, stepState)
+	if attempt1Status != "LOST" || attempt1Error != "LEASE_EXPIRED" || stepState != "WAITING" || waitReason != "RETRY_BACKOFF" {
+		t.Fatalf("unexpected state after lease expiry: attemptStatus=%s error=%s stepState=%s wait=%s", attempt1Status, attempt1Error, stepState, waitReason)
+	}
+	var pendingTimers int
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM timers WHERE step_id=$1::uuid AND state='PENDING' AND kind='RETRY_BACKOFF'`, stepID).Scan(&pendingTimers)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if pendingTimers != 1 {
+		t.Fatalf("expected one pending retry timer, got %d", pendingTimers)
 	}
 
 	// A second sweep must be a no-op. Lease expiry is an authoritative state
 	// transition, not a notification that can be emitted again on every sweep.
-	var lostEvents, readyEvents, stateChangedOutbox int
+	var lostEvents, waitingEvents, stateChangedOutbox int
 	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_LOST'),
-			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_READY'),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_WAITING'),
 			(SELECT count(*) FROM outbox_events WHERE subject='execution.state_changed' AND payload->>'runId'=$1::text)`, runID).
-			Scan(&lostEvents, &readyEvents, &stateChangedOutbox)
+			Scan(&lostEvents, &waitingEvents, &stateChangedOutbox)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if lostEvents != preTransitionLostEvents+1 || readyEvents != preTransitionReadyEvents+1 || stateChangedOutbox != preTransitionOutbox+2 {
+	if lostEvents != preTransitionLostEvents+1 || waitingEvents != preTransitionWaitingEvents+1 || stateChangedOutbox != preTransitionOutbox+2 {
 		t.Fatalf("lease expiry did not record the required durable effects: before=%d/%d/%d after=%d/%d/%d",
-			preTransitionLostEvents, preTransitionReadyEvents, preTransitionOutbox, lostEvents, readyEvents, stateChangedOutbox)
+			preTransitionLostEvents, preTransitionWaitingEvents, preTransitionOutbox, lostEvents, waitingEvents, stateChangedOutbox)
 	}
 
-	preSweepLostEvents, preSweepReadyEvents, preSweepOutbox := lostEvents, readyEvents, stateChangedOutbox
+	preSweepLostEvents, preSweepWaitingEvents, preSweepOutbox := lostEvents, waitingEvents, stateChangedOutbox
 	reclaimed, err = engine.ReconcileExpiredLeases(context.Background(), orgID)
 	if err != nil {
 		t.Fatalf("second ReconcileExpiredLeases failed: %v", err)
@@ -1064,18 +1075,28 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='TASK_LOST'),
-			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_READY'),
+			(SELECT count(*) FROM run_events WHERE run_id=$1::uuid AND event_type='STEP_WAITING'),
 			(SELECT count(*) FROM outbox_events WHERE subject='execution.state_changed' AND payload->>'runId'=$1::text)`, runID).
-			Scan(&lostEvents, &readyEvents, &stateChangedOutbox)
+			Scan(&lostEvents, &waitingEvents, &stateChangedOutbox)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if lostEvents != preSweepLostEvents || readyEvents != preSweepReadyEvents || stateChangedOutbox != preSweepOutbox {
+	if lostEvents != preSweepLostEvents || waitingEvents != preSweepWaitingEvents || stateChangedOutbox != preSweepOutbox {
 		t.Fatalf("lease expiry was not idempotent: before=%d/%d/%d after=%d/%d/%d",
-			preSweepLostEvents, preSweepReadyEvents, preSweepOutbox, lostEvents, readyEvents, stateChangedOutbox)
+			preSweepLostEvents, preSweepWaitingEvents, preSweepOutbox, lostEvents, waitingEvents, stateChangedOutbox)
 	}
 
-	// 5. Worker B claims the recovered step
+	// 5. Fire the due retry timer (M2 #18): due firing creates READY, then
+	// Worker B claims the recovered step. Make the timer due deterministically.
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE timers SET due_at=clock_timestamp()-INTERVAL '1 second' WHERE step_id=$1::uuid AND state='PENDING'`, stepID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fired, err := engine.FireDueRetryTimers(context.Background(), orgID); err != nil || fired != 1 {
+		t.Fatalf("expected retry timer to fire once, got %d err %v", fired, err)
+	}
 	assignmentB := claimExecution(t, server, workerB, digest, "poll-running-b")
 	if assignmentB.AttemptID == assignmentA.AttemptID || assignmentB.OwnershipEpoch <= assignmentA.OwnershipEpoch {
 		t.Fatalf("expected replacement attempt with higher epoch, got attempt=%s epoch=%d", assignmentB.AttemptID, assignmentB.OwnershipEpoch)
