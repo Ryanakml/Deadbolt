@@ -44,6 +44,9 @@ export async function apiFetch(input, init = {}) {
 export function isUnauthorized(err) {
     return err instanceof Error && err.message.includes("HTTP 401");
 }
+export function isConflict(err) {
+    return err instanceof Error && err.message.includes("HTTP 409");
+}
 // readCsrfToken reads the SPA-readable CSRF bootstrap cookie without ever
 // touching the HttpOnly session value. Both hosted (__Host-) and local
 // (non-secure) cookie names are accepted.
@@ -154,6 +157,24 @@ export class DashboardApiClient {
         const res = await apiFetch(`${this.baseUrl}/v1/runs/${encodeURIComponent(runId)}/logs${q}`);
         if (!res.ok) {
             throw new Error(`Failed to get run logs (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
+    // resolveReconciliationCase submits one audited human decision for an
+    // unknown-outcome hold. The caller binds the expectedRevision read from
+    // the snapshot; a 409 means the case changed and the dialog must refresh
+    // instead of retrying blindly.
+    async resolveReconciliationCase(caseId, body) {
+        const res = await apiFetch(`${this.baseUrl}/v1/reconciliation-cases/${encodeURIComponent(caseId)}/resolve`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+            },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to resolve case (HTTP ${res.status}): ${res.statusText}`);
         }
         return res.json();
     }

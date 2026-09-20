@@ -414,7 +414,7 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			_ = json.Unmarshal(rawError, &runError)
 		}
 
-		rows, err := tx.Query(ctx, `SELECT id::text, node_id, state, current_epoch
+		rows, err := tx.Query(ctx, `SELECT id::text, node_id, state, current_epoch, completion_source
 			FROM run_steps
 			WHERE run_id = $1::uuid AND organization_id = $2::uuid
 			ORDER BY created_at ASC, id ASC`, runID, orgID)
@@ -427,7 +427,7 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 		for rows.Next() {
 			var st RunStepDTO
 			var stateStr string
-			if err := rows.Scan(&st.ID, &st.NodeID, &stateStr, &st.CurrentEpoch); err != nil {
+			if err := rows.Scan(&st.ID, &st.NodeID, &stateStr, &st.CurrentEpoch, &st.CompletionSource); err != nil {
 				return err
 			}
 			st.Status = contracts.StepStatus(stateStr)
@@ -535,6 +535,48 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			}
 		}
 
+		reconciliationCases := make([]ReconciliationCaseDTO, 0)
+		if len(steps) > 0 {
+			stepIDs := make([]string, len(steps))
+			for i, st := range steps {
+				stepIDs[i] = st.ID
+			}
+			caseRows, err := tx.Query(ctx, `
+				SELECT id::text, step_id::text, attempt_id::text, reason, evidence,
+					status, resolution, actor_id::text, revision, resolved_at, created_at
+				FROM reconciliation_cases
+				WHERE organization_id = $1::uuid AND step_id = ANY($2::uuid[])
+				ORDER BY created_at ASC, id ASC
+			`, orgID, stepIDs)
+			if err != nil {
+				return fmt.Errorf("query reconciliation cases: %w", err)
+			}
+			for caseRows.Next() {
+				var c ReconciliationCaseDTO
+				var rawEvidence []byte
+				var resolvedAt *time.Time
+				var createdAt time.Time
+				if err := caseRows.Scan(&c.ID, &c.StepID, &c.AttemptID, &c.Reason, &rawEvidence,
+					&c.Status, &c.Resolution, &c.ActorID, &c.Revision, &resolvedAt, &createdAt); err != nil {
+					caseRows.Close()
+					return err
+				}
+				if len(rawEvidence) > 0 && string(rawEvidence) != "null" {
+					_ = json.Unmarshal(rawEvidence, &c.Evidence)
+				}
+				if resolvedAt != nil {
+					s := resolvedAt.UTC().Format(time.RFC3339Nano)
+					c.ResolvedAt = &s
+				}
+				c.CreatedAt = createdAt.UTC().Format(time.RFC3339Nano)
+				reconciliationCases = append(reconciliationCases, c)
+			}
+			caseRows.Close()
+			if err := caseRows.Err(); err != nil {
+				return err
+			}
+		}
+
 		if run.Status == contracts.RunStatusFAILED && runError == nil {
 			if run.ReasonCode != nil {
 				runError = map[string]any{
@@ -560,6 +602,7 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			RunDTO:                  *run,
 			LastEventSequence:       lastEventSeq,
 			Steps:                   steps,
+			ReconciliationCases:     reconciliationCases,
 			Output:                  output,
 			Error:                   runError,
 			WaitingReason:           waitingReason,

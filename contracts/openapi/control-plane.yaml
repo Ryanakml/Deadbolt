@@ -655,7 +655,7 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
+      x-implemented: true
       x-required-capability: runs:reconcile
       security:
         - BrowserSession: []
@@ -2302,12 +2302,50 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/RunStep"
+            reconciliationCases:
+              type: array
+              items:
+                $ref: "#/components/schemas/ReconciliationCase"
             output: {}
             error:
               $ref: "#/components/schemas/ErrorEnvelope"
           required:
             - lastEventSequence
             - steps
+    ReconciliationCase:
+      type: object
+      properties:
+        id:
+          type: string
+        stepId:
+          type: string
+        attemptId:
+          type: string
+        reason:
+          type: string
+        evidence: {}
+        status:
+          type: string
+          enum:
+            - OPEN
+            - RESOLVED
+        resolution:
+          type: string
+        actorId:
+          type: string
+        revision:
+          type: integer
+        resolvedAt:
+          type: string
+        createdAt:
+          type: string
+      required:
+        - id
+        - stepId
+        - reason
+        - status
+        - revision
+        - createdAt
     RunStep:
       type: object
       properties:
@@ -2319,6 +2357,8 @@ components:
           $ref: "#/components/schemas/StepStatus"
         currentEpoch:
           type: integer
+        completionSource:
+          type: string
         attempts:
           type: array
           items:

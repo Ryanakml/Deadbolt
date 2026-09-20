@@ -4,6 +4,8 @@ import {
   RunSnapshot,
   RunEventsResponse,
   TaskLogsResponse,
+  ResolveReconciliationRequest,
+  ResolveReconciliationResponse,
 } from "./types.js";
 
 export interface ListRunsResponse {
@@ -133,6 +135,10 @@ export async function apiFetch(
 
 export function isUnauthorized(err: unknown): boolean {
   return err instanceof Error && err.message.includes("HTTP 401");
+}
+
+export function isConflict(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("HTTP 409");
 }
 
 // readCsrfToken reads the SPA-readable CSRF bootstrap cookie without ever
@@ -289,6 +295,33 @@ export class DashboardApiClient {
       );
     }
     return res.json() as Promise<TaskLogsResponse>;
+  }
+
+  // resolveReconciliationCase submits one audited human decision for an
+  // unknown-outcome hold. The caller binds the expectedRevision read from
+  // the snapshot; a 409 means the case changed and the dialog must refresh
+  // instead of retrying blindly.
+  public async resolveReconciliationCase(
+    caseId: string,
+    body: ResolveReconciliationRequest,
+  ): Promise<ResolveReconciliationResponse> {
+    const res = await apiFetch(
+      `${this.baseUrl}/v1/reconciliation-cases/${encodeURIComponent(caseId)}/resolve`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": readCsrfToken(),
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!res.ok) {
+      throw new Error(
+        `Failed to resolve case (HTTP ${res.status}): ${res.statusText}`,
+      );
+    }
+    return res.json() as Promise<ResolveReconciliationResponse>;
   }
 
   // listProjects discovers the active organization's projects through the

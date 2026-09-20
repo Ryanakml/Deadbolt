@@ -2,11 +2,11 @@ export * from "./types.js";
 export * from "./stream.js";
 export * from "./inspector.js";
 export * from "./api.js";
-import { DashboardApiClient, isUnauthorized } from "./api.js";
+import { DashboardApiClient, isUnauthorized, isConflict } from "./api.js";
 import { createEnvironmentSelection, formatEnvironmentLabel, getSelectedEnvironmentId, selectEnvironment, setSelectionCatalog, setSelectionOrganization, } from "./api.js";
 import { resolveOrgState } from "./auth.js";
 import { RunInspector } from "./inspector.js";
-import { shouldShowWorkerWait, terminalStepEmptyText } from "./inspector.js";
+import { shouldShowWorkerWait, terminalStepEmptyText, openCaseForStep, reconciliationHoldText, RESOLVE_ACTIONS, } from "./inspector.js";
 import { clearStreamErrorOnLive, createStreamErrorBanner, markGlobalError, markStreamError, } from "./stream.js";
 // DOM Bootstrap for browser runtime
 if (typeof document !== "undefined") {
@@ -465,12 +465,30 @@ function initDashboard() {
                     st.status === "SUCCEEDED") {
                     noAttemptsHtml = `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(st.status))}</div>`;
                 }
+                // Unknown-outcome hold: the provider may already have received the
+                // operation. Only audited resolutions are offered, never blind retry.
+                let holdHtml = "";
+                const openCase = openCaseForStep(snap, st.id);
+                if (st.status === "WAITING" && openCase) {
+                    const evidenceRef = evidenceReference(openCase);
+                    holdHtml = `
+              <div class="hold-banner" role="status">
+                <strong>Waiting for reconciliation.</strong>
+                <div class="recovery-hint">${escapeHtml(reconciliationHoldText(openCase.reason))}</div>
+                ${evidenceRef ? `<div class="hold-evidence">Reference: <code>${escapeHtml(evidenceRef)}</code></div>` : ""}
+                <div class="hold-meta">Case <code>${escapeHtml(openCase.id.slice(0, 8))}…</code> · revision ${openCase.revision}</div>
+                <button class="resolve-link" data-case-id="${escapeHtml(openCase.id)}" data-revision="${openCase.revision}" data-step-id="${escapeHtml(st.id)}">Resolve</button>
+              </div>
+            `;
+                }
                 return `
           <div class="step-card" data-step-id="${st.id}">
             <div class="step-header">
               <h4>${escapeHtml(st.nodeId)}</h4>
               <span class="badge status-${st.status.toLowerCase()}">${st.status}</span>
+              ${st.completionSource ? `<span class="badge source-${st.completionSource.toLowerCase()}">${escapeHtml(st.completionSource)}</span>` : ""}
             </div>
+            ${holdHtml}
             <div class="attempts-container">
               ${attemptsHtml || noAttemptsHtml}
             </div>
@@ -538,6 +556,19 @@ function initDashboard() {
       `;
             // Re-apply current transport freshness
             renderFreshness(currentStreamFreshness);
+            // Wire audited resolution dialogs. The backend stays authoritative:
+            // expectedRevision is captured at open time and 409s refresh in-dialog.
+            container.querySelectorAll(".resolve-link").forEach((btn) => {
+                btn.addEventListener("click", (e) => {
+                    const el = e.currentTarget;
+                    const caseId = el.getAttribute("data-case-id");
+                    const stepId = el.getAttribute("data-step-id");
+                    const revision = Number(el.getAttribute("data-revision"));
+                    if (caseId && stepId && Number.isFinite(revision)) {
+                        openResolveDialog(api, snap, stepId, caseId, revision, el);
+                    }
+                });
+            });
             // Re-render cached events and logs if activeInspector already has them
             if (activeInspector) {
                 const evs = activeInspector.getEvents();
@@ -678,6 +709,138 @@ function initDashboard() {
         const div = document.createElement("div");
         div.textContent = str;
         return div.innerHTML;
+    }
+    // evidenceReference surfaces the hold's recorded reference (operation ID
+    // or provider reference) without ever implying the outcome is known.
+    function evidenceReference(c) {
+        const ev = c.evidence;
+        if (ev && typeof ev === "object") {
+            for (const key of ["reference", "operationId", "externalRef"]) {
+                if (typeof ev[key] === "string" && ev[key].length > 0) {
+                    return ev[key];
+                }
+            }
+        }
+        return "";
+    }
+    // openResolveDialog offers only the three audited resolutions for an
+    // unknown outcome. There is deliberately no blind "retry anyway": retries
+    // go through confirm_not_executed_retry within budget, and every decision
+    // binds the revision read at open time.
+    function openResolveDialog(api, snap, stepId, caseId, revision, invoker) {
+        closeResolveDialog();
+        const step = snap.steps.find((s) => s.id === stepId);
+        const overlay = document.createElement("div");
+        overlay.className = "dialog-overlay";
+        overlay.id = "resolve-dialog-overlay";
+        const optionsHtml = RESOLVE_ACTIONS.map((opt, i) => `
+        <label class="resolve-option">
+          <input type="radio" name="resolve-action" value="${opt.action}" ${i === 0 ? "checked" : ""} />
+          <span><strong>${escapeHtml(opt.label)}</strong><br />
+          <span class="text-muted">${escapeHtml(opt.hint)}</span></span>
+        </label>
+      `).join("");
+        overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="resolve-dialog-title">
+        <h3 id="resolve-dialog-title">Resolve unknown outcome — ${escapeHtml(step?.nodeId ?? stepId)}</h3>
+        <p class="text-muted">The provider may already have received this operation. Your decision is audited with your identity.</p>
+        <fieldset>
+          <legend>Decision</legend>
+          ${optionsHtml}
+        </fieldset>
+        <label>Evidence reference (required)
+          <input id="resolve-evidence" type="text" placeholder="e.g. provider payment ID, message ID" autocomplete="off" />
+        </label>
+        <label id="resolve-result-label" style="display:none">Result JSON (required for confirm succeeded)
+          <textarea id="resolve-result" rows="4" placeholder='{"key": "value"}'></textarea>
+        </label>
+        <div id="resolve-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="resolve-cancel">Cancel</button>
+          <button id="resolve-submit">Submit decision</button>
+        </div>
+      </div>
+    `;
+        document.body.appendChild(overlay);
+        const errorBox = overlay.querySelector("#resolve-error");
+        const evidenceInput = overlay.querySelector("#resolve-evidence");
+        const resultLabel = overlay.querySelector("#resolve-result-label");
+        const resultInput = overlay.querySelector("#resolve-result");
+        const submitBtn = overlay.querySelector("#resolve-submit");
+        const showError = (msg) => {
+            errorBox.textContent = msg;
+            errorBox.style.display = "block";
+        };
+        const syncResultVisibility = () => {
+            const checked = overlay.querySelector('input[name="resolve-action"]:checked');
+            resultLabel.style.display =
+                checked?.value === "confirm_succeeded" ? "block" : "none";
+        };
+        overlay
+            .querySelectorAll('input[name="resolve-action"]')
+            .forEach((r) => r.addEventListener("change", syncResultVisibility));
+        syncResultVisibility();
+        const close = () => {
+            closeResolveDialog();
+            invoker?.focus();
+        };
+        overlay.querySelector("#resolve-cancel").addEventListener("click", close);
+        overlay.addEventListener("keydown", (e) => {
+            if (e.key === "Escape")
+                close();
+        });
+        overlay.addEventListener("mousedown", (e) => {
+            if (e.target === overlay)
+                close();
+        });
+        evidenceInput.focus();
+        submitBtn.addEventListener("click", () => {
+            const checked = overlay.querySelector('input[name="resolve-action"]:checked');
+            const action = (checked?.value ?? "confirm_succeeded");
+            const evidence = evidenceInput.value.trim();
+            if (!evidence) {
+                showError("Evidence reference is required.");
+                return;
+            }
+            let result;
+            if (action === "confirm_succeeded") {
+                if (!resultInput.value.trim()) {
+                    showError("Result JSON is required to confirm success.");
+                    return;
+                }
+                try {
+                    result = JSON.parse(resultInput.value);
+                }
+                catch {
+                    showError("Result must be valid JSON.");
+                    return;
+                }
+            }
+            submitBtn.setAttribute("disabled", "true");
+            const body = { action, evidence, expectedRevision: revision };
+            if (action === "confirm_succeeded")
+                body.result = result;
+            api
+                .resolveReconciliationCase(caseId, body)
+                .then(() => {
+                close();
+                void activeInspector
+                    ?.fetchSnapshot()
+                    .catch((err) => renderError(err instanceof Error ? err : new Error(String(err))));
+            })
+                .catch((err) => {
+                submitBtn.removeAttribute("disabled");
+                if (isConflict(err)) {
+                    showError("This case changed since you opened it (409). The latest state was reloaded — review it before acting.");
+                    void activeInspector?.fetchSnapshot().catch(() => undefined);
+                    return;
+                }
+                showError(err instanceof Error ? err.message : String(err));
+            });
+        });
+    }
+    function closeResolveDialog() {
+        document.getElementById("resolve-dialog-overlay")?.remove();
     }
 }
 //# sourceMappingURL=index.js.map
