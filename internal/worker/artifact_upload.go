@@ -101,6 +101,10 @@ func (a *Agent) publishArtifactViaControlPlane(ctx context.Context, assignment A
 	}
 	digest := sha256.Sum256(data)
 	sha := hex.EncodeToString(digest[:])
+	// Stable command identities: retries of the same logical publication reuse
+	// the same Idempotency-Key so the control plane replays instead of
+	// minting a second row or charging quota twice. Never time/random based.
+	createKey := fmt.Sprintf("artifact-create:%s:%s:%d", assignment.AttemptID, sha, len(data))
 	createBody, _ := json.Marshal(map[string]any{
 		"runId": assignment.RunID, "attemptId": assignment.AttemptID,
 		"ownershipEpoch": assignment.OwnershipEpoch,
@@ -110,7 +114,7 @@ func (a *Agent) publishArtifactViaControlPlane(ctx context.Context, assignment A
 		ID        string `json:"id"`
 		UploadURL string `json:"uploadUrl"`
 	}
-	if err := a.postArtifactJSON(ctx, "/v1/artifacts", createBody, &created); err != nil {
+	if err := a.postArtifactJSON(ctx, "/v1/artifacts", createBody, &created, createKey); err != nil {
 		return "", &ArtifactPublishError{Code: "UPLOAD_FAILED", Retryable: true, Err: err}
 	}
 	if created.ID == "" || created.UploadURL == "" {
@@ -139,7 +143,8 @@ func (a *Agent) publishArtifactViaControlPlane(ctx context.Context, assignment A
 		ID     string `json:"id"`
 		Status string `json:"status"`
 	}
-	if err := a.postArtifactJSON(ctx, "/v1/artifacts/"+created.ID+"/finalize", finalizeBody, &finalized); err != nil {
+	finalizeKey := fmt.Sprintf("artifact-finalize:%s:%s", created.ID, assignment.AttemptID)
+	if err := a.postArtifactJSON(ctx, "/v1/artifacts/"+created.ID+"/finalize", finalizeBody, &finalized, finalizeKey); err != nil {
 		return "", &ArtifactPublishError{Code: "UPLOAD_FAILED", Retryable: true, Err: err}
 	}
 	if finalized.Status != "READY" {
@@ -167,13 +172,16 @@ func (a *Agent) maybePublishArtifact(ctx context.Context, assignment AssignmentD
 	return id, true, nil
 }
 
-func (a *Agent) postArtifactJSON(ctx context.Context, path string, body []byte, resBody any) error {
+func (a *Agent) postArtifactJSON(ctx context.Context, path string, body []byte, resBody any, idempotencyKey ...string) error {
 	u := a.baseURL.ResolveReference(&url.URL{Path: path})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if len(idempotencyKey) > 0 && strings.TrimSpace(idempotencyKey[0]) != "" {
+		req.Header.Set("Idempotency-Key", strings.TrimSpace(idempotencyKey[0]))
+	}
 	if a.sessionTok != "" {
 		req.Header.Set("Authorization", "Bearer "+a.sessionTok)
 	}

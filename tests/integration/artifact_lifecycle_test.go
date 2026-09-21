@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -97,11 +98,21 @@ func claimStartedArtifactAttempt(t *testing.T, tc *tenantTestContext, server *ht
 
 func postArtifactJSON(t *testing.T, server *httptest.Server, token, path string, body map[string]any) (int, map[string]any) {
 	t.Helper()
+	return postArtifactJSONWithKey(t, server, token, path, body, "")
+}
+
+func postArtifactJSONWithKey(t *testing.T, server *httptest.Server, token, path string, body map[string]any, idemKey string) (int, map[string]any) {
+	t.Helper()
 	raw, _ := json.Marshal(body)
 	req, _ := http.NewRequest(http.MethodPost, server.URL+path, bytes.NewReader(raw))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Idempotency-Key", "artifact-test-"+path)
+	if idemKey == "" {
+		// Unique per call so independent reservations never collide on the
+		// durable command identity; idempotency tests pass explicit keys.
+		idemKey = fmt.Sprintf("artifact-test-%s-%d", path, time.Now().UnixNano())
+	}
+	req.Header.Set("Idempotency-Key", idemKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("artifact request failed: %v", err)
