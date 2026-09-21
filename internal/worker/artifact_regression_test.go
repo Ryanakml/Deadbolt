@@ -178,9 +178,9 @@ func TestMissingSecretNeverLaunchesHandler(t *testing.T) {
 	defer server.Close()
 	u, _ := url.Parse(server.URL)
 	agent, err := NewAgent(AgentConfig{
-		ControlPlaneURL: server.URL,
+		ControlPlaneURL:    server.URL,
 		OnTaskProcessStart: func() { launched.Add(1) },
-		HTTPClient:        server.Client(),
+		HTTPClient:         server.Client(),
 	})
 	if err != nil {
 		t.Fatal(err)

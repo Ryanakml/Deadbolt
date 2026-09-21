@@ -590,7 +590,7 @@ func TestPublishFailureReportsFailedUnknownAndHoldsReconcile(t *testing.T) {
 		WorkerID: session.WorkerID, SessionID: session.SessionID,
 		AttemptID: a.AttemptID, OwnershipEpoch: a.OwnershipEpoch,
 		Outcome: "FAILED",
-		Error: &worker.TaskErrorDTO{Code: "UPLOAD_FAILED", Message: "boom", Retryable: true, EffectStatus: "UNKNOWN"},
+		Error:   &worker.TaskErrorDTO{Code: "UPLOAD_FAILED", Message: "boom", Retryable: true, EffectStatus: "UNKNOWN"},
 	}
 	completion.ResultDigest, _ = worker.CanonicalCompletionDigest(&completion)
 	var resp worker.CompleteResponseDTO
@@ -750,9 +750,9 @@ func TestSchedulerFastSlowSplitPreserved(t *testing.T) {
 // --- Claim provider isolation ---
 
 type blockingArtifactStore struct {
-	inner    artifacts.ObjectStore
-	entered  chan string
-	release  chan struct{}
+	inner       artifacts.ObjectStore
+	entered     chan string
+	release     chan struct{}
 	releaseOnce sync.Once
 }
 
@@ -1052,4 +1052,3 @@ func TestCompleteVsGCRaceNoDanglingReference(t *testing.T) {
 		}
 	}
 }
-

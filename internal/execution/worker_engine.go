@@ -722,14 +722,14 @@ type claimMatch struct {
 // commits (no authoritative Claim transaction open); TX B revalidates before
 // claiming so stale snapshots are never claimed.
 type pendingClaim struct {
-	match          claimMatch
+	match           claimMatch
 	assignmentInput any
-	refs           []string
-	manifest       deploymentManifest
-	entrypoint     string
-	timeoutMs      int64
-	policy         RetryPolicy
-	verified       bool
+	refs            []string
+	manifest        deploymentManifest
+	entrypoint      string
+	timeoutMs       int64
+	policy          RetryPolicy
+	verified        bool
 }
 
 func equalRefSets(a, b []string) bool {
@@ -901,7 +901,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			}
 			pending = append(pending, pendingClaim{
 				match: m, assignmentInput: assignmentInput,
-				refs: artifacts.CollectArtifactRefs(assignmentInput),
+				refs:     artifacts.CollectArtifactRefs(assignmentInput),
 				manifest: manifest, entrypoint: entrypoint,
 				timeoutMs: timeoutMs, policy: policy,
 			})
