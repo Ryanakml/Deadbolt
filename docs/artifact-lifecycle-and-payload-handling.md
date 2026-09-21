@@ -85,7 +85,7 @@ reserve → PENDING_UPLOAD → PUT bytes → finalize → READY → download
 
 ## 5. Migration and rollout
 
-- Additive migrations only (`00020_artifact_attempt_binding.sql` binds
+- Additive migrations only (`00022_artifact_attempt_binding.sql` binds
   uploads to owning attempts; earlier `artifacts` schema stands).
   No backfill; binary rollback does not roll the database back.
 - No topology changes: the same control-plane binary serves the new

@@ -1227,7 +1227,8 @@ func (e *WorkerEngine) artifactsReady(ctx context.Context, orgID string, ids []s
 	if err := e.artifacts.VerifyReferences(ctx, orgID, ids); err != nil {
 		if errors.Is(err, artifacts.ErrArtifactNotFound) ||
 			errors.Is(err, artifacts.ErrObjectNotFound) ||
-			errors.Is(err, artifacts.ErrSizeMismatch) {
+			errors.Is(err, artifacts.ErrSizeMismatch) ||
+			errors.Is(err, artifacts.ErrChecksumMismatch) {
 			return false, nil
 		}
 		return false, err
@@ -1526,12 +1527,12 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 					req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Result carries both inline output and an artifact reference", Retryable: false, EffectStatus: "NOT_APPLIED"}
 				} else if e.artifacts == nil {
 					return fmt.Errorf("artifact association unavailable")
-				} else if _, aerr := e.artifacts.LookupForCompletion(
-					ctx, session.OrganizationID, stepID, req.AttemptID, req.OwnershipEpoch, req.ArtifactID); aerr != nil {
+				} else if _, aerr := e.artifacts.LookupForCompletionTx(
+					ctx, tx, session.OrganizationID, stepID, req.AttemptID, req.OwnershipEpoch, req.ArtifactID); aerr != nil {
 					req.Outcome = "FAILED"
 					req.Output = nil
 					req.ArtifactID = ""
-					req.Error = &worker.TaskErrorDTO{Code: artifactFailureCode(aerr), Message: "Artifact result cannot be associated", Retryable: false, EffectStatus: "NOT_APPLIED"}
+					req.Error = &worker.TaskErrorDTO{Code: artifactFailureCode(aerr), Message: "Artifact result cannot be associated", Retryable: false, EffectStatus: "UNKNOWN"}
 				} else {
 					req.Output = map[string]any{artifacts.ArtifactRefKey: req.ArtifactID}
 					artifactResult = true

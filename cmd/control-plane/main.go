@@ -19,8 +19,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/artifacts"
+	"github.com/Ryanakml/Deadbolt/internal/auth"
 	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
@@ -271,7 +271,6 @@ func run() error {
 						return err
 					}
 				}
-<<<<<<< HEAD
 				return nil
 			})
 			reconciler.SetSlowTenantSweep(func(ctx context.Context, orgID string) error {

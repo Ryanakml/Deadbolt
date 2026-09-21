@@ -443,10 +443,12 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 			Outcome:         "FAILED",
 			ResultDigest:    hex.EncodeToString(digest[:]),
 			Error: &TaskErrorDTO{
-				Code:         "MISSING_REQUIRED_SECRET",
-				Message:      secretErr.Error(),
-				Retryable:    false,
-				EffectStatus: "NOT_APPLIED",
+				Code:      "MISSING_REQUIRED_SECRET",
+				Message:   secretErr.Error(),
+				Retryable: false,
+				// The handler already returned success. Publication failure is
+				// infrastructure uncertainty, not proof that user work was absent.
+				EffectStatus: "UNKNOWN",
 			},
 		}
 		preflight.ResultDigest, _ = CanonicalCompletionDigest(preflight)
@@ -518,10 +520,12 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 				code, retryable = pub.Code, pub.Retryable
 			}
 			compReq.Error = &TaskErrorDTO{
-				Code:         code,
-				Message:      pubErr.Error(),
-				Retryable:    retryable,
-				EffectStatus: "NOT_APPLIED",
+				Code:      code,
+				Message:   pubErr.Error(),
+				Retryable: retryable,
+				// The user handler has already completed; failure to publish its
+				// result is ambiguous and must follow recovery policy.
+				EffectStatus: "UNKNOWN",
 			}
 		} else if handled {
 			compReq.ArtifactID = artifactID

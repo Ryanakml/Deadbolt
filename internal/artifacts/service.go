@@ -23,7 +23,7 @@ import (
 //   - Upload URLs are single-object presigned PUTs valid for 5 minutes.
 //   - Finalize verifies size and SHA-256 before any result may reference the
 //     artifact. S3 upload is never inside a DB transaction.
-//   - PENDING_UPLOAD → READY → (DELETED), or PENDING_UPLOAD → EXPIRED.
+//   - PENDING_UPLOAD → READY → DELETING → DELETED, or PENDING_UPLOAD → EXPIRED.
 //     Unreferenced uploads are collected after a 24h grace period;
 //     artifacts referenced by run outputs are retained.
 
@@ -161,17 +161,30 @@ func (s *Service) Reserve(
 	}
 	sha = strings.ToLower(strings.TrimSpace(sha))
 
+	// Presigning is provider I/O. Do it before opening the authoritative
+	// transaction; an unused URL cannot mutate durable state.
+	key, err := randomStorageKey(expectedEnv, runID)
+	if err != nil {
+		return nil, "", time.Time{}, err
+	}
+	uploadURL, expiresAt, err := s.store.PresignPut(ctx, key, "application/octet-stream", PresignPutTTL)
+	if err != nil {
+		return nil, "", time.Time{}, err
+	}
 	var out *Artifact
-	var uploadURL string
-	var expiresAt time.Time
-	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		var attemptEpoch int64
 		var attemptStatus, stepID, attemptRun, environmentID string
 		var attemptSession *string
 		err := tx.QueryRow(ctx, `SELECT a.epoch, a.status, a.step_id::text, rs.run_id::text, rs.environment_id::text,
 				a.session_id::text
 			FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
-			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid`,
+			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+			JOIN task_leases l ON l.attempt_id=a.id AND l.organization_id=a.organization_id
+			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid
+			AND clock_timestamp() < l.expires_at AND clock_timestamp() < a.deadline_at
+			AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
+			FOR UPDATE OF a, l`,
 			attemptID, orgID).Scan(&attemptEpoch, &attemptStatus, &stepID, &attemptRun, &environmentID, &attemptSession)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -206,10 +219,6 @@ func (s *Service) Reserve(
 		if reserved+sizeBytes > EnvStorageQuotaBytes {
 			return ErrQuotaExceeded
 		}
-		key, err := randomStorageKey(environmentID, runID)
-		if err != nil {
-			return err
-		}
 		var a Artifact
 		var created time.Time
 		err = tx.QueryRow(ctx, `INSERT INTO artifacts
@@ -225,8 +234,7 @@ func (s *Service) Reserve(
 		a.EnvironmentID = environmentID
 		a.AttemptID = &attemptID
 		out = &a
-		uploadURL, expiresAt, err = s.store.PresignPut(ctx, key, "application/octet-stream", PresignPutTTL)
-		return err
+		return nil
 	})
 	if err != nil {
 		return nil, "", time.Time{}, err
@@ -243,7 +251,9 @@ func (s *Service) Finalize(
 	if s.store == nil {
 		return nil, ErrStoreUnavailable
 	}
-	var out *Artifact
+	// Snapshot the immutable reservation and ownership first, commit, then do
+	// provider I/O. The second transaction below revalidates all authority.
+	var snapshot Artifact
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		var a Artifact
 		var attemptRef *string
@@ -254,7 +264,13 @@ func (s *Service) Finalize(
 				a.storage_key, a.size_bytes, a.sha256_hash, a.status, a.expires_at, a.created_at,
 				ta.epoch, ta.status, ta.session_id::text, a.environment_id::text
 			FROM artifacts a JOIN task_attempts ta ON ta.id=a.attempt_id AND ta.organization_id=a.organization_id
-			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid FOR UPDATE OF a`,
+			JOIN run_steps rs ON rs.id=ta.step_id AND rs.organization_id=ta.organization_id
+			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+			JOIN task_leases l ON l.attempt_id=ta.id AND l.organization_id=ta.organization_id
+			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid
+			AND clock_timestamp() < l.expires_at AND clock_timestamp() < ta.deadline_at
+			AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
+			FOR UPDATE OF a, ta, l`,
 			artifactID, orgID).Scan(
 			&a.ID, &a.RunID, &a.StepID, &attemptRef, &a.StorageKey, &a.SizeBytes, &a.SHA256,
 			&a.Status, &a.ExpiresAt, &a.CreatedAt, &attemptEpoch, &attemptStatus, &attemptSession, &a.EnvironmentID)
@@ -282,36 +298,66 @@ func (s *Service) Finalize(
 		if !validSHA(sha) || strings.ToLower(strings.TrimSpace(sha)) != a.SHA256 {
 			return ErrReservationMismatch
 		}
-		size, err := s.store.Stat(ctx, a.StorageKey)
+		snapshot = a
+		snapshot.AttemptID = attemptRef
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	size, err := s.store.Stat(ctx, snapshot.StorageKey)
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			return nil, ErrObjectNotFound
+		}
+		return nil, err
+	}
+	if size != snapshot.SizeBytes {
+		return nil, ErrSizeMismatch
+	}
+	body, err := s.store.Fetch(ctx, snapshot.StorageKey)
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.New()
+	streamed, copyErr := io.Copy(h, body)
+	_ = body.Close()
+	if copyErr != nil {
+		return nil, copyErr
+	}
+	if streamed != snapshot.SizeBytes || hex.EncodeToString(h.Sum(nil)) != snapshot.SHA256 {
+		return nil, ErrChecksumMismatch
+	}
+	var out *Artifact
+	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var status string
+		var currentSHA string
+		var currentAttempt *string
+		var currentEpoch int64
+		var currentSession *string
+		var currentEnv string
+		err := tx.QueryRow(ctx, `SELECT a.status,a.sha256_hash,a.attempt_id::text,ta.epoch,ta.session_id::text,a.environment_id::text
+			FROM artifacts a JOIN task_attempts ta ON ta.id=a.attempt_id AND ta.organization_id=a.organization_id
+			JOIN run_steps rs ON rs.id=ta.step_id AND rs.organization_id=ta.organization_id
+			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+			JOIN task_leases l ON l.attempt_id=ta.id AND l.organization_id=ta.organization_id
+			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid AND clock_timestamp()<l.expires_at
+			AND clock_timestamp()<ta.deadline_at AND (r.deadline_at IS NULL OR clock_timestamp()<r.deadline_at)
+			FOR UPDATE OF a,ta,l`, artifactID, orgID).Scan(&status, &currentSHA, &currentAttempt, &currentEpoch, &currentSession, &currentEnv)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotOwned
+		}
 		if err != nil {
-			if errors.Is(err, ErrObjectNotFound) {
-				return ErrObjectNotFound
-			}
 			return err
 		}
-		if size != a.SizeBytes {
-			return ErrSizeMismatch
+		if status != "PENDING_UPLOAD" || currentAttempt == nil || *currentAttempt != attemptID || currentEpoch != epoch || currentSHA != snapshot.SHA256 || (sessionID != nil && (currentSession == nil || *currentSession != *sessionID)) || (expectedEnv != "" && currentEnv != expectedEnv) {
+			return ErrNotOwned
 		}
-		body, err := s.store.Fetch(ctx, a.StorageKey)
-		if err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE artifacts SET status='READY' WHERE id=$1::uuid AND organization_id=$2::uuid`, artifactID, orgID); err != nil {
 			return err
 		}
-		h := sha256.New()
-		streamed, err := io.Copy(h, body)
-		body.Close()
-		if err != nil {
-			return err
-		}
-		if streamed != a.SizeBytes || hex.EncodeToString(h.Sum(nil)) != a.SHA256 {
-			return ErrChecksumMismatch
-		}
-		if _, err := tx.Exec(ctx, `UPDATE artifacts SET status='READY'
-			WHERE id=$1::uuid AND organization_id=$2::uuid`, artifactID, orgID); err != nil {
-			return err
-		}
-		a.Status = "READY"
-		a.AttemptID = attemptRef
-		out = &a
+		snapshot.Status = "READY"
+		out = &snapshot
 		return nil
 	})
 	if err != nil {
@@ -358,7 +404,8 @@ func (s *Service) DownloadURL(
 // CollectGarbage deletes one bounded batch of safe orphans: unfinalized
 // uploads past the 24h grace, and finalized artifacts past grace that no run
 // output references. Referenced artifacts (including all active-run outputs)
-// are retained. Object deletion is best-effort; row transitions commit.
+// are retained. DELETING is durable: provider work happens only after that
+// transition commits, and failures leave the row retryable on the next pass.
 func (s *Service) CollectGarbage(ctx context.Context, orgID string, batchSize int, now time.Time) (int, error) {
 	if batchSize <= 0 {
 		batchSize = 50
@@ -366,7 +413,7 @@ func (s *Service) CollectGarbage(ctx context.Context, orgID string, batchSize in
 	type victim struct {
 		id, key, status string
 	}
-	var collected int
+	var victims []victim
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT id::text, storage_key, status FROM artifacts
 			WHERE organization_id=$1::uuid AND (
@@ -382,7 +429,7 @@ func (s *Service) CollectGarbage(ctx context.Context, orgID string, batchSize in
 		if err != nil {
 			return err
 		}
-		victims := make([]victim, 0)
+		victims = make([]victim, 0)
 		for rows.Next() {
 			var v victim
 			if err := rows.Scan(&v.id, &v.key, &v.status); err != nil {
@@ -397,24 +444,51 @@ func (s *Service) CollectGarbage(ctx context.Context, orgID string, batchSize in
 		}
 		rows.Close()
 		for _, v := range victims {
-			// Best effort: a missing object is already the desired end state.
-			if s.store != nil {
-				_ = s.store.Delete(ctx, v.key)
+			// Pending uploads use their specified terminal EXPIRED state. They
+			// remain candidates for best-effort object cleanup on later sweeps.
+			next := "DELETING"
+			if v.status == "PENDING_UPLOAD" {
+				next = "EXPIRED"
 			}
-			next := "EXPIRED"
-			if v.status == "READY" {
-				next = "DELETED"
-			}
-			if _, err := tx.Exec(ctx, `UPDATE artifacts SET status=$1
-				WHERE id=$2::uuid AND organization_id=$3::uuid`, next, v.id, orgID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE artifacts SET status=$1 WHERE id=$2::uuid AND organization_id=$3::uuid AND status=$4`, next, v.id, orgID, v.status); err != nil {
 				return err
 			}
-			collected++
+		}
+		// Also resume a previous process that crashed after its DELETING commit.
+		rows, err = tx.Query(ctx, `SELECT id::text,storage_key,status FROM artifacts WHERE organization_id=$1::uuid AND status IN ('DELETING','EXPIRED') ORDER BY created_at,id LIMIT $2 FOR UPDATE SKIP LOCKED`, orgID, batchSize)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var v victim
+			if err := rows.Scan(&v.id, &v.key, &v.status); err != nil {
+				return err
+			}
+			victims = append(victims, v)
 		}
 		return nil
 	})
 	if err != nil {
 		return 0, err
+	}
+	collected := 0
+	for _, v := range victims {
+		if s.store == nil {
+			continue
+		}
+		if err := s.store.Delete(ctx, v.key); err != nil && !errors.Is(err, ErrObjectNotFound) {
+			continue
+		}
+		// A second short transaction proves the durable delete after the object
+		// store confirms it; no provider call can hold a DB lock.
+		if err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE artifacts SET status='DELETED' WHERE id=$1::uuid AND organization_id=$2::uuid AND status='DELETING'`, v.id, orgID)
+			return err
+		}); err != nil {
+			return collected, err
+		}
+		collected++
 	}
 	return collected, nil
 }
@@ -461,6 +535,34 @@ func (s *Service) LookupForCompletion(
 	return &a, nil
 }
 
+// LookupForCompletionTx is the completion variant: its artifact row lock is
+// held by the same transaction that commits the step output. GC selects with
+// SKIP LOCKED, so it cannot terminalize an artifact between validation and
+// association.
+func (s *Service) LookupForCompletionTx(ctx context.Context, tx storage.Tx, orgID, stepID, attemptID string, epoch int64, artifactID string) (*Artifact, error) {
+	var a Artifact
+	var attemptRef *string
+	var attemptEpoch int64
+	var attemptStatus string
+	err := tx.QueryRow(ctx, `SELECT a.id::text,a.run_id::text,a.step_id::text,a.attempt_id::text,a.storage_key,a.size_bytes,a.sha256_hash,a.status,a.expires_at,a.created_at,ta.epoch,ta.status
+		FROM artifacts a JOIN task_attempts ta ON ta.id=a.attempt_id AND ta.organization_id=a.organization_id
+		WHERE a.id=$1::uuid AND a.organization_id=$2::uuid FOR UPDATE OF a`, artifactID, orgID).Scan(&a.ID, &a.RunID, &a.StepID, &attemptRef, &a.StorageKey, &a.SizeBytes, &a.SHA256, &a.Status, &a.ExpiresAt, &a.CreatedAt, &attemptEpoch, &attemptStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrArtifactNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if a.Status != "READY" {
+		return nil, ErrArtifactNotReady
+	}
+	if a.StepID != stepID || attemptRef == nil || *attemptRef != attemptID || attemptEpoch != epoch || (attemptStatus != "RUNNING" && attemptStatus != "CLAIMED") {
+		return nil, ErrNotOwned
+	}
+	a.AttemptID = attemptRef
+	return &a, nil
+}
+
 // ReadyArtifactIDsTx is the transaction-scoped variant used by engine
 // admission paths that already hold locks.
 func (s *Service) ReadyArtifactIDsTx(ctx context.Context, tx storage.Tx, orgID string, ids []string) (map[string]bool, error) {
@@ -494,12 +596,12 @@ func (s *Service) VerifyReferences(ctx context.Context, orgID string, ids []stri
 		return nil
 	}
 	type ref struct {
-		id, key string
-		size    int64
+		id, key, sha string
+		size         int64
 	}
 	refs := make([]ref, 0, len(ids))
 	err := s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT id::text, storage_key, size_bytes FROM artifacts
+		rows, err := tx.Query(ctx, `SELECT id::text, storage_key, size_bytes, sha256_hash FROM artifacts
 			WHERE organization_id=$1::uuid AND id = ANY($2::uuid[]) AND status='READY'`,
 			orgID, ids)
 		if err != nil {
@@ -508,7 +610,7 @@ func (s *Service) VerifyReferences(ctx context.Context, orgID string, ids []stri
 		defer rows.Close()
 		for rows.Next() {
 			var r ref
-			if err := rows.Scan(&r.id, &r.key, &r.size); err != nil {
+			if err := rows.Scan(&r.id, &r.key, &r.size, &r.sha); err != nil {
 				return err
 			}
 			refs = append(refs, r)
@@ -534,6 +636,19 @@ func (s *Service) VerifyReferences(ctx context.Context, orgID string, ids []stri
 		}
 		if size != r.size {
 			return ErrSizeMismatch
+		}
+		body, err := s.store.Fetch(ctx, r.key)
+		if err != nil {
+			return err
+		}
+		h := sha256.New()
+		n, copyErr := io.Copy(h, body)
+		_ = body.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if n != r.size || hex.EncodeToString(h.Sum(nil)) != r.sha {
+			return ErrChecksumMismatch
 		}
 	}
 	return nil
