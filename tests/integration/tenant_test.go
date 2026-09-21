@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -29,12 +30,14 @@ type tenantTestContext struct {
 	sessionStore *auth.SessionStore
 	authCfg      auth.Config
 	runtimePool  *pgxpool.Pool
+	database     *sql.DB
+	systemURL    string
 	cleanup      func()
 }
 
 func setupTenantContext(t *testing.T) *tenantTestContext {
 	t.Helper()
-	db, runtimePool, _ := setupTestDB(t)
+	db, runtimePool, systemURL := setupTestDB(t)
 
 	pool := storage.NewPool(runtimePool)
 	service := tenant.NewService(pool)
@@ -60,6 +63,8 @@ func setupTenantContext(t *testing.T) *tenantTestContext {
 		sessionStore: sessionStore,
 		authCfg:      authCfg,
 		runtimePool:  runtimePool,
+		database:     db,
+		systemURL:    systemURL,
 		cleanup:      cleanup,
 	}
 }
@@ -1722,8 +1727,8 @@ func TestControlPlaneProductionMuxWiring(t *testing.T) {
 	defer tc.cleanup()
 
 	// Assert schema migration version matches expected
-	if migrator.LatestSchemaVersion != 19 {
-		t.Fatalf("expected migrator.LatestSchemaVersion to be 19, got %d", migrator.LatestSchemaVersion)
+	if migrator.LatestSchemaVersion != 21 {
+		t.Fatalf("expected migrator.LatestSchemaVersion to be 21, got %d", migrator.LatestSchemaVersion)
 	}
 
 	ctx := context.Background()

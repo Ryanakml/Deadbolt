@@ -257,6 +257,14 @@ func run() error {
 						return err
 					}
 				}
+				return nil
+			})
+			reconciler.SetSlowTenantSweep(func(ctx context.Context, orgID string) error {
+				if workerEngine != nil {
+					if _, err := workerEngine.ReconcileReadyWork(ctx, orgID); err != nil {
+						return err
+					}
+				}
 				_, err := retentionService.PruneExpiredTaskLogs(ctx, orgID, 1000)
 				return err
 			})
@@ -275,6 +283,7 @@ func run() error {
 	outboxMetrics := outbox.NewMetrics(pool)
 	if reconciler != nil {
 		outboxMetrics.SetSchedulerHeartbeat(reconciler.Ticker())
+		outboxMetrics.SetSchedulerSlowSweepStatus(reconciler.SlowSweepInFlight)
 	}
 	// Outbox sweeps cross tenant boundaries and therefore use the dedicated
 	// system connection. The runtime role is intentionally tenant-scoped and

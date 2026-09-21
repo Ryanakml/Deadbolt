@@ -1770,6 +1770,151 @@ func (e *WorkerEngine) ReconcileExpiredLeases(ctx context.Context, organizationI
 	return totalReclaimed, nil
 }
 
+// ReconcileReadyWork repairs the durable graph after a completion-to-wakeup
+// gap (for example, a broker loss or scheduler restart). It deliberately uses
+// the same transaction boundary as normal execution: a state transition is
+// accompanied by its history event and outbox intent through appendRunEvent.
+// The operation is idempotent because only BLOCKED steps are eligible and the
+// run/step locks serialize competing workers.
+func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID string) (int, error) {
+	if e == nil || e.pool == nil {
+		return 0, fmt.Errorf("ready-work reconciliation requires a database pool")
+	}
+	var repaired int
+	var affectedRuns []string
+	err := e.pool.WithTenantTx(ctx, organizationID, func(ctx context.Context, tx storage.Tx) error {
+		type readyWorkCandidate struct {
+			runID, workflowName string
+			manifestBytes       []byte
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT r.id::text, r.workflow_name, d.manifest
+			FROM runs r
+			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+			WHERE r.organization_id=$1::uuid AND r.status IN ('QUEUED','RUNNING')
+				AND EXISTS (
+					SELECT 1 FROM run_steps blocked
+					WHERE blocked.run_id=r.id AND blocked.organization_id=r.organization_id
+						AND blocked.state='BLOCKED'
+				)
+			ORDER BY r.reconciliation_checked_at NULLS FIRST, r.id
+			LIMIT 50
+			FOR UPDATE OF r SKIP LOCKED`, organizationID)
+		if err != nil {
+			return fmt.Errorf("query ready-work candidates: %w", err)
+		}
+		candidates := make([]readyWorkCandidate, 0, 50)
+		for rows.Next() {
+			var runID, workflowName string
+			var manifestBytes []byte
+			if err := rows.Scan(&runID, &workflowName, &manifestBytes); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan ready-work candidate: %w", err)
+			}
+			candidates = append(candidates, readyWorkCandidate{runID: runID, workflowName: workflowName, manifestBytes: manifestBytes})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+
+		for _, candidate := range candidates {
+			runID := candidate.runID
+			workflowName := candidate.workflowName
+			manifestBytes := candidate.manifestBytes
+			var manifest deploymentManifest
+			if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+				return fmt.Errorf("decode deployment manifest for run %s: %w", runID, err)
+			}
+			var workflow *workflowManifest
+			for i := range manifest.Workflows {
+				if manifest.Workflows[i].Name == workflowName {
+					workflow = &manifest.Workflows[i]
+					break
+				}
+			}
+			if workflow == nil {
+				continue
+			}
+
+			stepRows, err := tx.Query(ctx, `SELECT id::text, node_id, state FROM run_steps
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid ORDER BY id FOR UPDATE`, runID, organizationID)
+			if err != nil {
+				return fmt.Errorf("query steps for run %s: %w", runID, err)
+			}
+			type readyStep struct{ id, state string }
+			steps := make(map[string]readyStep, len(workflow.Nodes))
+			for stepRows.Next() {
+				var id, nodeID, state string
+				if err := stepRows.Scan(&id, &nodeID, &state); err != nil {
+					stepRows.Close()
+					return err
+				}
+				steps[nodeID] = readyStep{id: id, state: state}
+			}
+			if err := stepRows.Err(); err != nil {
+				stepRows.Close()
+				return err
+			}
+			stepRows.Close()
+
+			for _, node := range workflow.Nodes {
+				step, ok := steps[node.ID]
+				if !ok || step.state != "BLOCKED" {
+					continue
+				}
+				depsReady := true
+				for _, dependency := range node.After {
+					dep, exists := steps[dependency]
+					if !exists || (dep.state != "SUCCEEDED" && dep.state != "SKIPPED") {
+						depsReady = false
+						break
+					}
+				}
+				if !depsReady {
+					continue
+				}
+				result, err := tx.Exec(ctx, `UPDATE run_steps
+					SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
+					WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, step.id, organizationID)
+				if err != nil {
+					return fmt.Errorf("repair blocked step %s: %w", step.id, err)
+				}
+				if result.RowsAffected() == 0 {
+					continue
+				}
+				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", map[string]any{
+					"stepId": step.id, "nodeId": node.ID, "reason": "RECONCILIATION",
+				}); err != nil {
+					return fmt.Errorf("record repaired step %s: %w", step.id, err)
+				}
+				repaired++
+				steps[node.ID] = readyStep{id: step.id, state: "READY"}
+				affectedRuns = append(affectedRuns, runID)
+			}
+			// A run with unmet dependencies must yield its place to the next
+			// bounded batch. This observation does not alter workflow state and
+			// intentionally has no execution event; any actual transition above
+			// still uses appendRunEvent and its outbox intent.
+			if _, err := tx.Exec(ctx, `UPDATE runs SET reconciliation_checked_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID); err != nil {
+				return fmt.Errorf("record reconciliation observation for run %s: %w", runID, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if e.hub != nil {
+		for _, runID := range affectedRuns {
+			e.hub.Publish(runID)
+		}
+	}
+	return repaired, nil
+}
+
 func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.Tx, organizationID string) (int, []string, error) {
 	rows, err := tx.Query(ctx, `SELECT
 			r.id::text, rs.id::text, a.id::text, a.status, a.epoch, a.started_at,
