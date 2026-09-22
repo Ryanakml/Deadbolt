@@ -805,7 +805,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
 			WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
 				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
-				AND r.status IN ('QUEUED','RUNNING')
+				AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
 				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
 				AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
 					JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
@@ -951,6 +951,9 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			WHERE environment_id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, session.EnvironmentID, session.OrganizationID).Scan(&environmentID, &maxConcurrency); err != nil {
 			return err
 		}
+		if maxConcurrency > 10 {
+			maxConcurrency = 10
+		}
 
 		// Reconcile expired leases and unstarted claims before evaluating capacity and ready steps
 		if _, runs, err := e.reconcileExpiredLeasesTx(ctx, tx, session.OrganizationID); err != nil {
@@ -980,6 +983,21 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			claimLimit = remaining
 		}
 		if claimLimit <= 0 {
+			// Keep accepted work queued with an explicit durable reason. The
+			// candidate query above includes this state, so capacity becoming
+			// available is enough to resume claiming without a separate queue.
+			if _, err := tx.Exec(ctx, `UPDATE runs r
+				SET status='WAITING', reason_code='QUOTA_WAIT', updated_at=clock_timestamp()
+				WHERE r.organization_id=$1::uuid AND r.environment_id=$2::uuid
+				  AND r.status IN ('QUEUED','RUNNING')
+				  AND EXISTS (
+					SELECT 1 FROM run_steps rs
+					WHERE rs.run_id=r.id AND rs.organization_id=r.organization_id
+					  AND rs.environment_id=r.environment_id AND rs.state='READY'
+					  AND rs.eligible_at <= clock_timestamp()
+				  )`, session.OrganizationID, environmentID); err != nil {
+				return err
+			}
 			return nil
 		}
 
@@ -1224,6 +1242,12 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				TargetArchitecture: targetArchitecture(manifest.TargetOS, manifest.TargetArchitecture), SecretNames: manifest.SecretNames,
 				TargetOS: manifest.TargetOS,
 			})
+			if _, err := tx.Exec(ctx, `UPDATE runs
+				SET status='RUNNING', reason_code=NULL, updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND reason_code='QUOTA_WAIT'`,
+				match.runID, session.OrganizationID); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -2552,8 +2576,26 @@ func appendRunEvent(ctx context.Context, tx storage.Tx, organizationID, runID, e
 		return err
 	}
 	var sequence int64
-	if err := tx.QueryRow(ctx, `UPDATE runs SET last_event_sequence=last_event_sequence+1,updated_at=clock_timestamp()
-		WHERE id=$1::uuid AND organization_id=$2::uuid RETURNING last_event_sequence`, runID, organizationID).Scan(&sequence); err != nil {
+	// Reserve the final history slot for a terminal event. This keeps a noisy
+	// run from exhausting its event budget before the control plane can record
+	// the terminal outcome. The run transition that hit the limit is rolled
+	// back by the caller, so no correctness event is silently dropped.
+	terminal := eventType == "RUN_COMPLETED" || eventType == "RUN_FAILED" || eventType == "RUN_CANCELLED"
+	whereBudget := "last_event_sequence < $3"
+	if terminal {
+		whereBudget = "last_event_sequence < $3 OR (last_event_sequence = $3 AND $4)"
+	}
+	query := fmt.Sprintf(`UPDATE runs SET last_event_sequence=last_event_sequence+1,updated_at=clock_timestamp()
+		WHERE id=$1::uuid AND organization_id=$2::uuid AND (%s)
+		RETURNING last_event_sequence`, whereBudget)
+	args := []any{runID, organizationID, int64(maxRunEvents - 1)}
+	if terminal {
+		args = append(args, terminal)
+	}
+	if err := tx.QueryRow(ctx, query, args...).Scan(&sequence); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrHistoryLimitExceeded
+		}
 		return err
 	}
 	var eventID string

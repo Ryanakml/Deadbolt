@@ -112,6 +112,11 @@ func (h *HTTPHandler) HandleEnroll(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.EnrollWorker(r.Context(), &req)
 	if err != nil {
+		if errors.Is(err, ErrSessionQuotaExceeded) {
+			w.Header().Set("Retry-After", "60")
+			h.writeError(w, r, http.StatusTooManyRequests, "SESSION_QUOTA_EXCEEDED", "Environment has reached the worker session limit", false)
+			return
+		}
 		if errors.Is(err, ErrChallengeExpired) {
 			h.writeError(w, r, http.StatusBadRequest, "CHALLENGE_EXPIRED", err.Error(), false)
 			return
@@ -142,6 +147,11 @@ func (h *HTTPHandler) HandleSession(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.service.CreateSession(r.Context(), &req)
 	if err != nil {
+		if errors.Is(err, ErrSessionQuotaExceeded) {
+			w.Header().Set("Retry-After", "60")
+			h.writeError(w, r, http.StatusTooManyRequests, "SESSION_QUOTA_EXCEEDED", "Environment has reached the worker session limit", false)
+			return
+		}
 		if errors.Is(err, ErrChallengeExpired) {
 			h.writeError(w, r, http.StatusBadRequest, "CHALLENGE_EXPIRED", err.Error(), false)
 			return

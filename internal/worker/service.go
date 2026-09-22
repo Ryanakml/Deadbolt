@@ -168,6 +168,12 @@ func (s *Service) EnrollWorker(ctx context.Context, req *EnrollRequestDTO) (*Ses
 	var sessionExpiresAt time.Time
 
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := lockEnvironmentAdmission(ctx, tx, orgID, envID); err != nil {
+			return err
+		}
+		if err := enforceWorkerSessionQuota(ctx, tx, orgID, envID); err != nil {
+			return err
+		}
 		// Insert worker
 		workerQuery := `INSERT INTO workers (organization_id, environment_id, public_key, pool_name, status, last_seen_at)
 		                VALUES ($1::uuid, $2::uuid, $3, $4, 'ACTIVE', clock_timestamp())
@@ -260,6 +266,11 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 	var sessionExpiresAt time.Time
 
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		// Admission is locked before fencing attempts/sessions so reconnects
+		// cannot race the per-environment worker-session cap.
+		if err := lockEnvironmentAdmission(ctx, tx, orgID, envID); err != nil {
+			return err
+		}
 		if fencer, ok := s.engine.(SessionFencer); ok && fencer != nil {
 			if err := fencer.FenceWorkerSessions(ctx, tx, orgID, req.WorkerID, "RECONNECT"); err != nil {
 				return fmt.Errorf("fence reconnecting worker: %w", err)
@@ -271,6 +282,9 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 		                        WHERE worker_id = $1::uuid AND organization_id = $2::uuid AND revoked_at IS NULL`, req.WorkerID, orgID)
 		if err != nil {
 			return fmt.Errorf("revoke old worker sessions: %w", err)
+		}
+		if err := enforceWorkerSessionQuota(ctx, tx, orgID, envID); err != nil {
+			return err
 		}
 
 		// Create fresh session
@@ -307,6 +321,31 @@ func (s *Service) CreateSession(ctx context.Context, req *SessionRequestDTO) (*S
 		SessionToken:    rawSessionToken,
 		ExpiresAt:       sessionExpiresAt.UTC().Format(time.RFC3339),
 	}, nil
+}
+
+func lockEnvironmentAdmission(ctx context.Context, tx storage.Tx, orgID, envID string) error {
+	var lockedID string
+	if err := tx.QueryRow(ctx, `SELECT environment_id::text
+		FROM environment_admissions
+		WHERE environment_id=$1::uuid AND organization_id=$2::uuid
+		FOR UPDATE`, envID, orgID).Scan(&lockedID); err != nil {
+		return fmt.Errorf("lock environment admission: %w", err)
+	}
+	return nil
+}
+
+func enforceWorkerSessionQuota(ctx context.Context, tx storage.Tx, orgID, envID string) error {
+	var active int
+	if err := tx.QueryRow(ctx, `SELECT count(*)
+		FROM worker_sessions
+		WHERE organization_id=$1::uuid AND environment_id=$2::uuid
+		  AND revoked_at IS NULL AND expires_at > clock_timestamp()`, orgID, envID).Scan(&active); err != nil {
+		return fmt.Errorf("count active worker sessions: %w", err)
+	}
+	if active >= MaxWorkerSessions {
+		return ErrSessionQuotaExceeded
+	}
+	return nil
 }
 
 // AuthenticateSession verifies a Bearer session token against database records.
