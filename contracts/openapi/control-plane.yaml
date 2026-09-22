@@ -1409,7 +1409,7 @@ paths:
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
       x-required-capability: artifacts:write
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response
@@ -1486,7 +1486,7 @@ paths:
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
       x-required-capability: artifacts:write
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response
@@ -1548,7 +1548,7 @@ paths:
           required: true
           schema: *a1
       x-required-capability: payload:read
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response

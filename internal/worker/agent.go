@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,6 +73,10 @@ type Agent struct {
 	stopPoll        chan struct{}
 	stopOnce        sync.Once
 	slotsChan       chan struct{}
+	// PublishArtifactFn publishes result bytes through the scoped artifact
+	// APIs. Nil preserves the control-plane implementation; tests inject a
+	// stub to assert completion substitution without network.
+	PublishArtifactFn func(ctx context.Context, assignment AssignmentDTO, data []byte, contentType string) (string, error)
 }
 
 func NewAgent(cfg AgentConfig) (*Agent, error) {
@@ -428,24 +430,7 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 	secretEnv, secretErr := resolveTaskSecrets(assignment.SecretNames)
 	if secretErr != nil {
 		a.cfg.Logger.Printf("Refusing attempt %s: %v", assignment.AttemptID, secretErr)
-		digest := sha256.Sum256([]byte(secretErr.Error()))
-		preflight := &CompleteRequestDTO{
-			ProtocolVersion: ProtocolVersion,
-			RequestID:       fmt.Sprintf("req_comp_preflight_%d", time.Now().UnixNano()),
-			WorkerID:        a.workerID,
-			SessionID:       a.sessionID,
-			AttemptID:       assignment.AttemptID,
-			OwnershipEpoch:  assignment.OwnershipEpoch,
-			Outcome:         "FAILED",
-			ResultDigest:    hex.EncodeToString(digest[:]),
-			Error: &TaskErrorDTO{
-				Code:         "MISSING_REQUIRED_SECRET",
-				Message:      secretErr.Error(),
-				Retryable:    false,
-				EffectStatus: "NOT_APPLIED",
-			},
-		}
-		preflight.ResultDigest, _ = CanonicalCompletionDigest(preflight)
+		preflight := buildMissingSecretPreflight(assignment, a.workerID, a.sessionID, secretErr)
 		_, _ = a.completeWithRetry(attCtx, preflight)
 		return
 	}
@@ -491,39 +476,16 @@ func (a *Agent) executeAssignment(parentCtx context.Context, assignment Assignme
 		}
 	}
 
-	// 6. Complete request
-	outcome := "SUCCEEDED"
-	if execErr != nil || completion == nil || completion.Status == "FAILED" {
-		outcome = "FAILED"
+	// 6. Complete request via the canonical assembler so post-handler
+	// publication failures report FAILED+UNKNOWN without a dangling
+	// SUCCEEDED+Error combination.
+	var publishID string
+	var publishHandled bool
+	var publishErr error
+	if completion != nil && execErr == nil && completion.Status != "FAILED" {
+		publishID, publishHandled, publishErr = a.maybePublishArtifact(attCtx, assignment, completion.Output)
 	}
-
-	compReq := &CompleteRequestDTO{
-		ProtocolVersion: ProtocolVersion,
-		RequestID:       fmt.Sprintf("req_comp_%d", time.Now().UnixNano()),
-		WorkerID:        a.workerID,
-		SessionID:       a.sessionID,
-		AttemptID:       assignment.AttemptID,
-		OwnershipEpoch:  assignment.OwnershipEpoch,
-		Outcome:         outcome,
-	}
-	if outcome == "SUCCEEDED" && completion != nil {
-		compReq.Output = completion.Output
-	} else if completion != nil && completion.Error != nil {
-		compReq.Error = &TaskErrorDTO{
-			Code:         completion.Error.Code,
-			Message:      completion.Error.Message,
-			Retryable:    completion.Error.Retryable,
-			Details:      completion.Error.Details,
-			EffectStatus: "NOT_APPLIED",
-		}
-	} else if execErr != nil {
-		compReq.Error = &TaskErrorDTO{
-			Code:         "WORKER_PREFLIGHT_FAILED",
-			Message:      execErr.Error(),
-			Retryable:    false,
-			EffectStatus: "NOT_APPLIED",
-		}
-	}
+	compReq := assembleCompleteRequest(assignment, a.workerID, a.sessionID, completion, execErr, publishID, publishHandled, publishErr)
 	resDigest, digestErr := CanonicalCompletionDigest(compReq)
 	if digestErr != nil {
 		return
@@ -545,6 +507,90 @@ func resolveTaskSecrets(names []string) (map[string]string, error) {
 		}
 	}
 	return values, nil
+}
+
+// buildMissingSecretPreflight reports a pre-handler refusal: customer code
+// never ran, so the effect is NOT_APPLIED and no runner is launched.
+func buildMissingSecretPreflight(assignment AssignmentDTO, workerID, sessionID string, secretErr error) *CompleteRequestDTO {
+	preflight := &CompleteRequestDTO{
+		ProtocolVersion: ProtocolVersion,
+		RequestID:       fmt.Sprintf("req_comp_preflight_%d", time.Now().UnixNano()),
+		WorkerID:        workerID,
+		SessionID:       sessionID,
+		AttemptID:       assignment.AttemptID,
+		OwnershipEpoch:  assignment.OwnershipEpoch,
+		Outcome:         "FAILED",
+		Error: &TaskErrorDTO{
+			Code:      "MISSING_REQUIRED_SECRET",
+			Message:   secretErr.Error(),
+			Retryable: false,
+			// resolveTaskSecrets runs before TaskInput creation and the
+			// runner: customer code has not executed, so no handler side
+			// effect is possible.
+			EffectStatus: "NOT_APPLIED",
+		},
+	}
+	preflight.ResultDigest, _ = CanonicalCompletionDigest(preflight)
+	return preflight
+}
+
+// assembleCompleteRequest builds the control-plane completion after the
+// handler ran. A post-handler publication failure is ambiguous (UNKNOWN) and
+// must report Outcome FAILED with no artifact reference or inline output.
+// The contradictory SUCCEEDED+Error combination is never constructed.
+func assembleCompleteRequest(assignment AssignmentDTO, workerID, sessionID string, completion *TaskCompletion, execErr error, publishID string, publishHandled bool, publishErr error) *CompleteRequestDTO {
+	outcome := "SUCCEEDED"
+	if execErr != nil || completion == nil || completion.Status == "FAILED" {
+		outcome = "FAILED"
+	}
+	compReq := &CompleteRequestDTO{
+		ProtocolVersion: ProtocolVersion,
+		RequestID:       fmt.Sprintf("req_comp_%d", time.Now().UnixNano()),
+		WorkerID:        workerID,
+		SessionID:       sessionID,
+		AttemptID:       assignment.AttemptID,
+		OwnershipEpoch:  assignment.OwnershipEpoch,
+		Outcome:         outcome,
+	}
+	if outcome == "SUCCEEDED" && completion != nil {
+		if publishErr != nil {
+			compReq.Outcome = "FAILED"
+			compReq.ArtifactID = ""
+			compReq.Output = nil
+			code, retryable := "UPLOAD_FAILED", true
+			if pub, ok := publishErr.(*ArtifactPublishError); ok {
+				code, retryable = pub.Code, pub.Retryable
+			}
+			compReq.Error = &TaskErrorDTO{
+				Code:      code,
+				Message:   publishErr.Error(),
+				Retryable: retryable,
+				// The user handler has already completed; failure to publish its
+				// result is ambiguous and must follow recovery policy.
+				EffectStatus: "UNKNOWN",
+			}
+		} else if publishHandled {
+			compReq.ArtifactID = publishID
+		} else {
+			compReq.Output = completion.Output
+		}
+	} else if completion != nil && completion.Error != nil {
+		compReq.Error = &TaskErrorDTO{
+			Code:         completion.Error.Code,
+			Message:      completion.Error.Message,
+			Retryable:    completion.Error.Retryable,
+			Details:      completion.Error.Details,
+			EffectStatus: "NOT_APPLIED",
+		}
+	} else if execErr != nil {
+		compReq.Error = &TaskErrorDTO{
+			Code:         "WORKER_PREFLIGHT_FAILED",
+			Message:      execErr.Error(),
+			Retryable:    false,
+			EffectStatus: "NOT_APPLIED",
+		}
+	}
+	return compReq
 }
 
 func (a *Agent) startWithRetry(ctx context.Context, req *StartRequestDTO) (*StartResponseDTO, error) {

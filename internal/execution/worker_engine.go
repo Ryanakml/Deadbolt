@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ryanakml/Deadbolt/internal/artifacts"
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -26,6 +27,7 @@ type WorkerEngine struct {
 	pool                 *storage.Pool
 	hub                  *EventHub
 	commands             *tenant.Service
+	artifacts            *artifacts.Service
 	beforeCompleteCommit func() error
 	afterCompleteCommit  func() error
 }
@@ -47,6 +49,13 @@ func (e *WorkerEngine) SetHub(hub *EventHub) {
 // Engines without it (unit-style construction) execute bare transactions.
 func (e *WorkerEngine) SetCommands(commands *tenant.Service) {
 	e.commands = commands
+}
+
+// SetArtifacts attaches the scoped artifact service for result association
+// and consumer integrity admission. Engines without it fail artifact paths
+// closed.
+func (e *WorkerEngine) SetArtifacts(svc *artifacts.Service) {
+	e.artifacts = svc
 }
 
 // SetBeforeCompleteCommitHookForTest injects a deterministic failure after all
@@ -708,6 +717,71 @@ type claimMatch struct {
 	runDeadline  *time.Time
 }
 
+// pendingClaim snapshots one candidate plus its immutable artifact
+// requirements while TX A holds locks. Provider verification runs after TX A
+// commits (no authoritative Claim transaction open); TX B revalidates before
+// claiming so stale snapshots are never claimed.
+type pendingClaim struct {
+	match           claimMatch
+	assignmentInput any
+	refs            []string
+	manifest        deploymentManifest
+	entrypoint      string
+	timeoutMs       int64
+	policy          RetryPolicy
+	verified        bool
+}
+
+func equalRefSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, id := range a {
+		counts[id]++
+	}
+	for _, id := range b {
+		counts[id]--
+		if counts[id] < 0 {
+			return false
+		}
+	}
+	for _, c := range counts {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *WorkerEngine) verifyPendingClaimsOutsideTx(ctx context.Context, orgID string, pending []pendingClaim) error {
+	for i := range pending {
+		if len(pending[i].refs) == 0 {
+			pending[i].verified = true
+			continue
+		}
+		if e.artifacts == nil {
+			pending[i].verified = false
+			continue
+		}
+		err := e.artifacts.VerifyReferences(ctx, orgID, pending[i].refs)
+		if err == nil {
+			pending[i].verified = true
+			continue
+		}
+		if errors.Is(err, artifacts.ErrArtifactNotFound) ||
+			errors.Is(err, artifacts.ErrArtifactNotReady) ||
+			errors.Is(err, artifacts.ErrObjectNotFound) ||
+			errors.Is(err, artifacts.ErrSizeMismatch) ||
+			errors.Is(err, artifacts.ErrChecksumMismatch) {
+			pending[i].verified = false
+			continue
+		}
+		return err
+	}
+	return nil
+}
+
 func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionContext, req *worker.PollRequestDTO) (*worker.PollResponseDTO, error) {
 	if req.WorkerID != session.WorkerID || req.SessionID != session.SessionID {
 		return nil, worker.ErrUnauthorized
@@ -717,6 +791,131 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 		return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
 	}
 	var reconciledRuns []string
+
+	// TX A snapshots candidates plus immutable artifact requirements and
+	// commits before any provider I/O. No authoritative Claim transaction
+	// remains open while S3 HEAD/GET/hash runs below.
+	var pending []pendingClaim
+	snapshotErr := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
+				d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at
+			FROM run_steps rs
+			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+			JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
+			WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
+				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
+				AND r.status IN ('QUEUED','RUNNING')
+				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
+				AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
+					JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
+					WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
+						AND rc.organization_id=$2::uuid AND rc.status='OPEN')
+			ORDER BY rs.eligible_at, rs.id
+			LIMIT $4
+			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots)
+		if err != nil {
+			return fmt.Errorf("snapshot claim candidates: %w", err)
+		}
+		var matches []claimMatch
+		for rows.Next() {
+			var m claimMatch
+			var inputJSON []byte
+			if err := rows.Scan(&m.stepID, &m.runID, &m.nodeID, &inputJSON, &m.bundle, &m.manifest, &m.workflowName, &m.runDeadline); err != nil {
+				rows.Close()
+				return err
+			}
+			if len(inputJSON) > 0 {
+				if err := json.Unmarshal(inputJSON, &m.input); err != nil {
+					rows.Close()
+					return fmt.Errorf("decode run input: %w", err)
+				}
+			}
+			matches = append(matches, m)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, m := range matches {
+			var manifest deploymentManifest
+			if err := json.Unmarshal(m.manifest, &manifest); err != nil {
+				return fmt.Errorf("decode deployment manifest: %w", err)
+			}
+			entrypoint, timeoutMs := manifest.taskPolicy(m.workflowName, m.nodeID)
+			policy := manifest.taskRetryPolicy(m.workflowName, m.nodeID)
+			if policy.TimeoutMs > 0 {
+				timeoutMs = policy.TimeoutMs
+			}
+			assignmentInput := m.input
+			var targetNode *workflowNode
+			for _, wf := range manifest.Workflows {
+				if wf.Name != m.workflowName {
+					continue
+				}
+				for i := range wf.Nodes {
+					if wf.Nodes[i].ID == m.nodeID {
+						targetNode = &wf.Nodes[i]
+						break
+					}
+				}
+				break
+			}
+			if targetNode != nil && targetNode.Input != nil {
+				outRows, err := tx.Query(ctx, `SELECT node_id, output FROM run_steps
+					WHERE run_id=$1::uuid AND organization_id=$2::uuid AND output IS NOT NULL`,
+					m.runID, session.OrganizationID)
+				if err != nil {
+					return fmt.Errorf("snapshot mapped outputs: %w", err)
+				}
+				outputsMap := make(map[string]any)
+				for outRows.Next() {
+					var nodeID string
+					var rawOutput []byte
+					if err := outRows.Scan(&nodeID, &rawOutput); err != nil {
+						outRows.Close()
+						return err
+					}
+					var output any
+					if err := json.Unmarshal(rawOutput, &output); err != nil {
+						outRows.Close()
+						return fmt.Errorf("decode mapped step output: %w", err)
+					}
+					outputsMap[nodeID] = output
+				}
+				if err := outRows.Err(); err != nil {
+					outRows.Close()
+					return err
+				}
+				outRows.Close()
+				mapped, err := contracts.MapInput(targetNode.Input, m.input, outputsMap)
+				if err != nil {
+					return fmt.Errorf("map task input: %w", err)
+				}
+				inputSchema, _ := manifest.taskSchemas(m.workflowName, m.nodeID)
+				if inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil {
+					return fmt.Errorf("map task input: %w", ErrSchemaViolation)
+				}
+				assignmentInput = mapped
+			}
+			pending = append(pending, pendingClaim{
+				match: m, assignmentInput: assignmentInput,
+				refs:     artifacts.CollectArtifactRefs(assignmentInput),
+				manifest: manifest, entrypoint: entrypoint,
+				timeoutMs: timeoutMs, policy: policy,
+			})
+		}
+		return nil
+	})
+	if snapshotErr != nil {
+		return nil, snapshotErr
+	}
+	// Provider verification with no authoritative Claim DB transaction open.
+	// A slow or blocked object store must not stall execution coordination.
+	if err := e.verifyPendingClaimsOutsideTx(ctx, session.OrganizationID, pending); err != nil {
+		return nil, err
+	}
 
 	err := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
 		var workerStatus string
@@ -784,52 +983,15 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			return nil
 		}
 
-		rows, err := tx.Query(ctx, `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
-				d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at
-			FROM run_steps rs
-			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
-			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-			JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
-			WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
-				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
-				AND r.status IN ('QUEUED','RUNNING')
-				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
-				-- Run-wide reconciliation hold: a run with any OPEN case admits
-				-- no new claims even while siblings are still draining.
-				AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
-					JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
-					WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
-						AND rc.organization_id=$2::uuid AND rc.status='OPEN')
-			ORDER BY rs.eligible_at, rs.id
-			LIMIT $4
-			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, environmentID, claimLimit)
-		if err != nil {
-			return fmt.Errorf("lock claim candidates: %w", err)
+		// TX B reuses TX A snapshots and never runs provider I/O. Candidates
+		// that became READY after the snapshot wait for the next poll so the
+		// authoritative claim never waits for S3 while holding locks.
+		if len(pending) > claimLimit {
+			pending = pending[:claimLimit]
 		}
 
-		matches := make([]claimMatch, 0, claimLimit)
-		for rows.Next() {
-			var match claimMatch
-			var inputJSON []byte
-			if err := rows.Scan(&match.stepID, &match.runID, &match.nodeID, &inputJSON, &match.bundle, &match.manifest, &match.workflowName, &match.runDeadline); err != nil {
-				rows.Close()
-				return err
-			}
-			if len(inputJSON) > 0 {
-				if err := json.Unmarshal(inputJSON, &match.input); err != nil {
-					rows.Close()
-					return fmt.Errorf("decode run input: %w", err)
-				}
-			}
-			matches = append(matches, match)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		rows.Close()
-
-		for _, match := range matches {
+		for _, pc := range pending {
+			match := pc.match
 			var manifest deploymentManifest
 			if err := json.Unmarshal(match.manifest, &manifest); err != nil {
 				return fmt.Errorf("decode deployment manifest: %w", err)
@@ -925,6 +1087,90 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				assignmentInput = mapped
 			}
 
+			// TX B revalidation: the snapshot's artifact requirements must still
+			// apply. Mapping is recomputed under canonical locks; a drift
+			// means the pre-verification is stale, so this candidate waits for
+			// the next poll instead of claiming stale data.
+			currentRefs := artifacts.CollectArtifactRefs(assignmentInput)
+			if !equalRefSets(currentRefs, pc.refs) {
+				continue
+			}
+			// Consumer integrity admission uses the provider verification that
+			// ran after TX A committed (no Claim transaction open). Here we
+			// only revalidate durable DB state and never touch S3.
+			if len(currentRefs) > 0 {
+				if !pc.verified {
+					missing := currentRefs
+					if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED',wait_reason='ARTIFACT_UNAVAILABLE',updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid AND state='READY'`, match.stepID, session.OrganizationID); uErr != nil {
+						return uErr
+					}
+					// Only terminalize the run when this candidate still owns
+					// the READY slot; a concurrent claim winner keeps its work.
+					var failed bool
+					if err := tx.QueryRow(ctx, `SELECT state='FAILED' FROM run_steps WHERE id=$1::uuid AND organization_id=$2::uuid`, match.stepID, session.OrganizationID).Scan(&failed); err == nil && failed {
+						if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='ARTIFACT_UNAVAILABLE',updated_at=clock_timestamp()
+							WHERE id=$1::uuid AND organization_id=$2::uuid`, match.runID, session.OrganizationID); uErr != nil {
+							return uErr
+						}
+						if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED',updated_at=clock_timestamp()
+							WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`,
+							match.runID, session.OrganizationID); uErr != nil {
+							return uErr
+						}
+						if err := appendRunEvent(ctx, tx, session.OrganizationID, match.runID, "RUN_FAILED", map[string]any{
+							"reason": "ARTIFACT_UNAVAILABLE", "nodeId": match.nodeID, "artifactIds": missing,
+						}); err != nil {
+							return err
+						}
+					}
+					continue
+				}
+				// Verified outside, but the DB rows must still be READY under
+				// this transaction's locks; otherwise the association would
+				// dangle.
+				ready := map[string]bool{}
+				if e.artifacts != nil {
+					got, err := e.artifacts.ReadyArtifactIDsTx(ctx, tx, session.OrganizationID, currentRefs)
+					if err != nil {
+						return err
+					}
+					ready = got
+				}
+				allReady := len(currentRefs) > 0
+				for _, id := range currentRefs {
+					if !ready[id] {
+						allReady = false
+						break
+					}
+				}
+				if !allReady {
+					missing := currentRefs
+					if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED',wait_reason='ARTIFACT_UNAVAILABLE',updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid AND state='READY'`, match.stepID, session.OrganizationID); uErr != nil {
+						return uErr
+					}
+					var failed bool
+					if err := tx.QueryRow(ctx, `SELECT state='FAILED' FROM run_steps WHERE id=$1::uuid AND organization_id=$2::uuid`, match.stepID, session.OrganizationID).Scan(&failed); err == nil && failed {
+						if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='ARTIFACT_UNAVAILABLE',updated_at=clock_timestamp()
+							WHERE id=$1::uuid AND organization_id=$2::uuid`, match.runID, session.OrganizationID); uErr != nil {
+							return uErr
+						}
+						if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED',updated_at=clock_timestamp()
+							WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`,
+							match.runID, session.OrganizationID); uErr != nil {
+							return uErr
+						}
+						if err := appendRunEvent(ctx, tx, session.OrganizationID, match.runID, "RUN_FAILED", map[string]any{
+							"reason": "ARTIFACT_UNAVAILABLE", "nodeId": match.nodeID, "artifactIds": missing,
+						}); err != nil {
+							return err
+						}
+					}
+					continue
+				}
+			}
+
 			var epoch int64
 			var attemptNumber int
 			if err := tx.QueryRow(ctx, `UPDATE run_steps
@@ -932,6 +1178,11 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 					next_attempt_number=next_attempt_number+1, updated_at=clock_timestamp()
 				WHERE id=$1::uuid AND organization_id=$2::uuid AND state='READY'
 				RETURNING current_epoch, next_attempt_number-1`, match.stepID, session.OrganizationID).Scan(&epoch, &attemptNumber); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					// Lost the race after the snapshot: another worker
+					// claimed first. Skip without failing the run.
+					continue
+				}
 				return err
 			}
 
@@ -1172,6 +1423,40 @@ func terminalAttempt(status string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// artifactsReady enforces consumer integrity: referenced artifacts must be
+// READY with intact objects. Integrity absences fail closed as unverified;
+// transport failures propagate. A missing service fails closed.
+func (e *WorkerEngine) artifactsReady(ctx context.Context, orgID string, ids []string) (bool, error) {
+	if e.artifacts == nil {
+		return false, nil
+	}
+	if err := e.artifacts.VerifyReferences(ctx, orgID, ids); err != nil {
+		if errors.Is(err, artifacts.ErrArtifactNotFound) ||
+			errors.Is(err, artifacts.ErrObjectNotFound) ||
+			errors.Is(err, artifacts.ErrSizeMismatch) ||
+			errors.Is(err, artifacts.ErrChecksumMismatch) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// artifactFailureCode maps association failures to terminal codes. Every
+// mapping is a deterministic failure: the producer is never silently rerun.
+func artifactFailureCode(err error) string {
+	switch {
+	case errors.Is(err, artifacts.ErrArtifactNotFound):
+		return "ARTIFACT_NOT_FOUND"
+	case errors.Is(err, artifacts.ErrArtifactNotReady):
+		return "ARTIFACT_NOT_READY"
+	case errors.Is(err, artifacts.ErrNotOwned):
+		return "ARTIFACT_NOT_OWNED"
+	default:
+		return "ARTIFACT_UNAVAILABLE"
 	}
 }
 
@@ -1437,15 +1722,42 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		// Contract/schema failures are deterministic terminal failures, never retryable
 		// successes with a bad payload.
 		if req.Outcome == "SUCCEEDED" {
-			var manifest deploymentManifest
-			if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-				return fmt.Errorf("decode manifest: %w", err)
+			artifactResult := false
+			if req.ArtifactID != "" {
+				// Large results travel as typed references: the artifact must
+				// be READY and bound to this attempt by current ownership.
+				// Anything else fails closed without touching run state.
+				// Artifact bytes are opaque to the control plane, so the
+				// reference bypasses output-schema validation.
+				if req.Output != nil {
+					req.Outcome = "FAILED"
+					req.Output = nil
+					req.ArtifactID = ""
+					req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Result carries both inline output and an artifact reference", Retryable: false, EffectStatus: "NOT_APPLIED"}
+				} else if e.artifacts == nil {
+					return fmt.Errorf("artifact association unavailable")
+				} else if _, aerr := e.artifacts.LookupForCompletionTx(
+					ctx, tx, session.OrganizationID, stepID, req.AttemptID, req.OwnershipEpoch, req.ArtifactID); aerr != nil {
+					req.Outcome = "FAILED"
+					req.Output = nil
+					req.ArtifactID = ""
+					req.Error = &worker.TaskErrorDTO{Code: artifactFailureCode(aerr), Message: "Artifact result cannot be associated", Retryable: false, EffectStatus: "UNKNOWN"}
+				} else {
+					req.Output = map[string]any{artifacts.ArtifactRefKey: req.ArtifactID}
+					artifactResult = true
+				}
 			}
-			_, outputSchema := manifest.taskSchemas(workflowName, nodeID)
-			if outputSchema != nil && contracts.ValidatePayload(outputSchema, req.Output) != nil {
-				req.Outcome = "FAILED"
-				req.Output = nil
-				req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Task output does not conform to output schema", Retryable: false, EffectStatus: "NOT_APPLIED"}
+			if req.Outcome == "SUCCEEDED" && !artifactResult {
+				var manifest deploymentManifest
+				if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+					return fmt.Errorf("decode manifest: %w", err)
+				}
+				_, outputSchema := manifest.taskSchemas(workflowName, nodeID)
+				if outputSchema != nil && contracts.ValidatePayload(outputSchema, req.Output) != nil {
+					req.Outcome = "FAILED"
+					req.Output = nil
+					req.Error = &worker.TaskErrorDTO{Code: "OUTPUT_SCHEMA_VIOLATION", Message: "Task output does not conform to output schema", Retryable: false, EffectStatus: "NOT_APPLIED"}
+				}
 			}
 		}
 

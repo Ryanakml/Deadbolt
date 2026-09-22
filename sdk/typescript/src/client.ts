@@ -322,4 +322,72 @@ export class DeadboltClient {
       return res.data;
     },
   };
+
+  readonly artifacts = {
+    /**
+     * Reserves an upload for one attempt: enforces caps/quota, binds live
+     * ownership, and returns the artifact id plus a single-object PUT URL.
+     */
+    create: async (options: {
+      runId: string;
+      attemptId: string;
+      ownershipEpoch: number;
+      sizeBytes: number;
+      sha256: string;
+      idempotencyKey: string;
+    }): Promise<{ id: string; uploadUrl: string; expiresAt: string }> => {
+      const res = await this.request<{
+        id: string;
+        uploadUrl: string;
+        expiresAt: string;
+      }>(
+        "POST",
+        "/v1/artifacts",
+        { "Idempotency-Key": options.idempotencyKey },
+        {
+          runId: options.runId,
+          attemptId: options.attemptId,
+          ownershipEpoch: options.ownershipEpoch,
+          sizeBytes: options.sizeBytes,
+          sha256: options.sha256,
+        },
+      );
+      return res.data;
+    },
+    /**
+     * Finalizes an upload after verifying size and SHA-256 server-side.
+     */
+    finalize: async (options: {
+      id: string;
+      attemptId: string;
+      ownershipEpoch: number;
+      sha256: string;
+      idempotencyKey: string;
+    }): Promise<{ id: string; status: string }> => {
+      const res = await this.request<{ id: string; status: string }>(
+        "POST",
+        `/v1/artifacts/${encodeURIComponent(options.id)}/finalize`,
+        { "Idempotency-Key": options.idempotencyKey },
+        {
+          attemptId: options.attemptId,
+          ownershipEpoch: options.ownershipEpoch,
+          sha256: options.sha256,
+        },
+      );
+      return res.data;
+    },
+    /**
+     * Mints a short-lived attachment download URL for a READY artifact.
+     */
+    downloadUrl: async (
+      id: string,
+    ): Promise<{ id: string; downloadUrl: string; expiresAt: string }> => {
+      const res = await this.request<{
+        id: string;
+        downloadUrl: string;
+        expiresAt: string;
+      }>("GET", `/v1/artifacts/${encodeURIComponent(id)}`);
+      return res.data;
+    },
+  };
 }

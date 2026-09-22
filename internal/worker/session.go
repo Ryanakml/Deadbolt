@@ -50,6 +50,16 @@ type WorkerSessionContext struct {
 	ExpiresAt      time.Time
 }
 
+// SessionTokenPrefix marks worker session bearer tokens, distinguishing
+// them from tenant API keys and human CLI sessions for auth dispatch.
+const SessionTokenPrefix = "dbs_"
+
+// IsSessionTokenFormat reports whether raw (without the Bearer scheme) has
+// worker session token shape. It performs no cryptographic verification.
+func IsSessionTokenFormat(raw string) bool {
+	return strings.HasPrefix(strings.TrimSpace(raw), SessionTokenPrefix)
+}
+
 // GenerateSessionToken produces a 32-byte cryptographically secure session token
 // and its SHA-256 hash.
 func GenerateSessionToken() (rawToken string, tokenHash string, err error) {

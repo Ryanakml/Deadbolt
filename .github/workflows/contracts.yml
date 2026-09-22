@@ -31,11 +31,32 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres?sslmode=disable
       DATABASE_URL: postgres://postgres@localhost:5432/postgres?sslmode=disable
+      DEADBOLT_ARTIFACTS_S3_ENDPOINT: 127.0.0.1:9002
+      DEADBOLT_ARTIFACTS_S3_BUCKET: deadbolt-artifacts-test
+      DEADBOLT_ARTIFACTS_S3_ACCESS_KEY: miniotest
+      DEADBOLT_ARTIFACTS_S3_SECRET_KEY: miniotest123
+      DEADBOLT_ARTIFACTS_S3_REGION: us-east-1
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
           fetch-depth: 0
+      # Real S3-compatible storage for artifact tests. A service container
+      # cannot supply MinIO's required server command, and port 9000 is
+      # reserved for the Compose smoke profile, so MinIO runs detached here.
+      - name: Start MinIO for artifact tests
+        run: |
+          docker run -d --name deadbolt-ci-minio -p 127.0.0.1:9002:9000 \
+            -e MINIO_ROOT_USER=miniotest -e MINIO_ROOT_PASSWORD=miniotest123 \
+            quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:9002/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is live"
+              break
+            fi
+            sleep 2
+          done
+          curl -fs http://127.0.0.1:9002/minio/health/live
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: 10.24.0
@@ -128,6 +149,13 @@ jobs:
           # Test stop and start preserves volume persistence
           docker compose -f deploy/compose/docker-compose.yml --profile core stop
           docker compose -f deploy/compose/docker-compose.yml --profile core start
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
+              echo "Local compose control plane restarted!"
+              break
+            fi
+            sleep 2
+          done
           curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1 || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
           # Explicit clean teardown
           docker compose -f deploy/compose/docker-compose.yml --profile core down -v

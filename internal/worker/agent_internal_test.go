@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -345,5 +346,50 @@ func TestStopAckReportsUnconfirmedWhenGroupSurvives(t *testing.T) {
 	}
 	if stopAcks[0].AttemptID != "attempt" || stopAcks[0].OwnershipEpoch != 1 {
 		t.Fatalf("ACK must carry the stopped attempt identity: %+v", stopAcks[0])
+	}
+}
+
+func TestMaybePublishArtifactDecision(t *testing.T) {
+	agent, err := NewAgent(AgentConfig{ControlPlaneURL: "http://127.0.0.1:9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var published []byte
+	agent.PublishArtifactFn = func(_ context.Context, _ AssignmentDTO, data []byte, _ string) (string, error) {
+		published = data
+		return "artifact-1", nil
+	}
+	asg := AssignmentDTO{RunID: "r", StepID: "s", AttemptID: "a", OwnershipEpoch: 1}
+
+	// Small inline output passes through untouched.
+	id, handled, err := agent.maybePublishArtifact(context.Background(), asg, map[string]any{"ok": true})
+	if err != nil || handled || id != "" {
+		t.Fatalf("small output must pass through: %q %v %v", id, handled, err)
+	}
+	// Explicit marker uploads even when small.
+	marker := map[string]any{ArtifactUploadMarkerKey: map[string]any{
+		"data": base64.StdEncoding.EncodeToString([]byte("bytes")), "contentType": "text/plain",
+	}}
+	id, handled, err = agent.maybePublishArtifact(context.Background(), asg, marker)
+	if err != nil || !handled || id != "artifact-1" || string(published) != "bytes" {
+		t.Fatalf("marker must publish: %q %v %v", id, handled, err)
+	}
+	// Oversize canonical output spills automatically.
+	big := map[string]any{"blob": strings.Repeat("x", InlineResultLimitBytes+1)}
+	id, handled, err = agent.maybePublishArtifact(context.Background(), asg, big)
+	if err != nil || !handled || id != "artifact-1" {
+		t.Fatalf("oversize output must spill: %q %v %v", id, handled, err)
+	}
+	// Over-limit bytes fail closed before any network use.
+	huge := make([]byte, MaxArtifactUploadBytes+1)
+	_, _, err = agent.maybePublishArtifact(context.Background(), asg,
+		map[string]any{ArtifactUploadMarkerKey: map[string]any{
+			"data": base64.StdEncoding.EncodeToString(huge), "contentType": "text/plain",
+		}})
+	if err == nil {
+		t.Fatalf("over-limit upload must fail")
+	}
+	if pub, ok := err.(*ArtifactPublishError); !ok || pub.Code != "ARTIFACT_TOO_LARGE" || pub.Retryable {
+		t.Fatalf("over-limit must be non-retryable ARTIFACT_TOO_LARGE, got %+v", err)
 	}
 }
