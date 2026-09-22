@@ -167,6 +167,31 @@ func (s *Service) ReserveTx(
 	if err != nil {
 		return nil, "", time.Time{}, err
 	}
+	// Derive the environment without taking an attempt lock. The blueprint's
+	// lock order starts with the environment admission row; the authoritative
+	// attempt/lease lock is acquired only after that row is held.
+	var candidateEnvironmentID string
+	err = tx.QueryRow(ctx, `SELECT rs.environment_id::text
+		FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
+		WHERE a.id=$1::uuid AND a.organization_id=$2::uuid`, attemptID, orgID).Scan(&candidateEnvironmentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", time.Time{}, ErrNotOwned
+		}
+		return nil, "", time.Time{}, err
+	}
+	if expectedEnv != "" && candidateEnvironmentID != expectedEnv {
+		return nil, "", time.Time{}, ErrNotOwned
+	}
+	var lockedEnvironmentID string
+	if err := tx.QueryRow(ctx, `SELECT environment_id::text FROM environment_admissions
+		WHERE environment_id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, candidateEnvironmentID, orgID).Scan(&lockedEnvironmentID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", time.Time{}, ErrNotOwned
+		}
+		return nil, "", time.Time{}, err
+	}
+
 	var attemptEpoch int64
 	var attemptStatus, stepID, attemptRun, environmentID string
 	var attemptSession *string
@@ -259,10 +284,34 @@ func (s *Service) Reserve(
 	}
 	var out *Artifact
 	err = s.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		// Lock the environment admission row before the attempt/lease rows. This
+		// serializes quota admission and follows the engine-wide lock order.
+		var candidateEnvironmentID string
+		err := tx.QueryRow(ctx, `SELECT rs.environment_id::text
+			FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
+			WHERE a.id=$1::uuid AND a.organization_id=$2::uuid`, attemptID, orgID).Scan(&candidateEnvironmentID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotOwned
+			}
+			return err
+		}
+		if expectedEnv != "" && candidateEnvironmentID != expectedEnv {
+			return ErrNotOwned
+		}
+		var lockedEnvironmentID string
+		if err := tx.QueryRow(ctx, `SELECT environment_id::text FROM environment_admissions
+			WHERE environment_id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, candidateEnvironmentID, orgID).Scan(&lockedEnvironmentID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotOwned
+			}
+			return err
+		}
+
 		var attemptEpoch int64
 		var attemptStatus, stepID, attemptRun, environmentID string
 		var attemptSession *string
-		err := tx.QueryRow(ctx, `SELECT a.epoch, a.status, a.step_id::text, rs.run_id::text, rs.environment_id::text,
+		err = tx.QueryRow(ctx, `SELECT a.epoch, a.status, a.step_id::text, rs.run_id::text, rs.environment_id::text,
 				a.session_id::text
 			FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
 			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id

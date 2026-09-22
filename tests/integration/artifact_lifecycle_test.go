@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -332,6 +333,81 @@ func TestArtifactCapsQuotaAndShape(t *testing.T) {
 	})
 	if status != 429 || body["code"] != "STORAGE_QUOTA_EXCEEDED" {
 		t.Fatalf("exhausted quota must be 429, got %d (%v)", status, body)
+	}
+}
+
+// TestArtifactQuotaAdmissionIsSerialized proves that concurrent reservations
+// cannot both pass the read/check followed by insert race at the quota edge.
+func TestArtifactQuotaAdmissionIsSerialized(t *testing.T) {
+	tc, server, orgID, envID, _, _ := setupArtifactSuite(t, "quota-race")
+	defer tc.cleanup()
+	defer server.Close()
+
+	const digest = "bundle-artifact-quota-race-22"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, artifactManifest())
+	first, firstIDs := claimStartedArtifactAttempt(t, tc, server, orgID, envID, digest, deploymentID, "quota-race-a")
+	second, secondIDs := claimStartedArtifactAttempt(t, tc, server, orgID, envID, digest, deploymentID, "quota-race-b")
+
+	// Leave exactly 100 bytes available. Two concurrent 100-byte reservations
+	// must result in one success and one quota rejection.
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO artifacts
+			(organization_id, environment_id, run_id, step_id, storage_key, size_bytes, sha256_hash, status)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'quota-race-filler', $5, $6, 'READY')`,
+			orgID, envID, firstIDs.runID, firstIDs.stepID, int64((1<<30)-100), sha256Hex([]byte("filler")))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		status int
+		body   map[string]any
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	reserve := func(session *testWorkerSession, ids artifactIDs, key string) {
+		defer wg.Done()
+		status, body := postArtifactJSONWithKey(t, server, session.SessionToken, "/v1/artifacts", map[string]any{
+			"runId": ids.runID, "attemptId": ids.attemptID, "ownershipEpoch": ids.epoch,
+			"sizeBytes": 100, "sha256": sha256Hex(bytes.Repeat([]byte("q"), 100)),
+		}, key)
+		results <- result{status: status, body: body}
+	}
+	wg.Add(2)
+	go reserve(first, firstIDs, "artifact-quota-race-a")
+	go reserve(second, secondIDs, "artifact-quota-race-b")
+	wg.Wait()
+	close(results)
+
+	successes, rejected := 0, 0
+	for got := range results {
+		switch got.status {
+		case http.StatusOK:
+			successes++
+		case http.StatusTooManyRequests:
+			if got.body["code"] != "STORAGE_QUOTA_EXCEEDED" {
+				t.Fatalf("quota loser returned unexpected body: %v", got.body)
+			}
+			rejected++
+		default:
+			t.Fatalf("concurrent reserve returned unexpected status %d (%v)", got.status, got.body)
+		}
+	}
+	if successes != 1 || rejected != 1 {
+		t.Fatalf("quota race results: successes=%d rejected=%d", successes, rejected)
+	}
+
+	var total int64
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts
+			WHERE organization_id=$1::uuid AND environment_id=$2::uuid
+			AND status IN ('PENDING_UPLOAD','READY')`, orgID, envID).Scan(&total)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if total > artifacts.EnvStorageQuotaBytes {
+		t.Fatalf("committed reservation total exceeded quota: %d", total)
 	}
 }
 
