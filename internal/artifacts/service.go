@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -89,8 +90,13 @@ func CollectArtifactRefs(v any) []string {
 		}
 		switch t := n.(type) {
 		case map[string]any:
-			for _, x := range t {
-				walk(x)
+			keys := make([]string, 0, len(t))
+			for key := range t {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				walk(t[key])
 			}
 		case []any:
 			for _, x := range t {
