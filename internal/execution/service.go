@@ -37,7 +37,6 @@ const (
 	maxInlinePayloadBytes = worker.MaxInlinePayloadBytes
 	maxWorkflowNodes      = 50
 	maxNonterminalRuns    = 100
-	createRunBurstLimit   = 10
 	maxRunEvents          = 10000
 )
 
@@ -220,6 +219,23 @@ func (s *Service) CreateRun(
 			FOR UPDATE`, envID, orgID).Scan(&admissionEnvironmentID); err != nil {
 			return fmt.Errorf("lock environment admission: %w", err)
 		}
+		var availableCreateTokens float64
+		if err := tx.QueryRow(ctx, `UPDATE environment_admissions
+			SET create_rate_tokens = LEAST(10::double precision,
+				create_rate_tokens + EXTRACT(EPOCH FROM (clock_timestamp() - create_rate_updated_at)) * 5),
+				create_rate_updated_at = clock_timestamp(), updated_at = clock_timestamp()
+			WHERE environment_id = $1::uuid AND organization_id = $2::uuid
+			RETURNING create_rate_tokens`, envID, orgID).Scan(&availableCreateTokens); err != nil {
+			return fmt.Errorf("refill create-run rate bucket: %w", err)
+		}
+		if availableCreateTokens < 1 {
+			return ErrCreateRateLimited
+		}
+		if _, err := tx.Exec(ctx, `UPDATE environment_admissions
+			SET create_rate_tokens = create_rate_tokens - 1, updated_at = clock_timestamp()
+			WHERE environment_id = $1::uuid AND organization_id = $2::uuid`, envID, orgID); err != nil {
+			return fmt.Errorf("debit create-run rate bucket: %w", err)
+		}
 		var nonterminalRuns int
 		if err := tx.QueryRow(ctx, `SELECT count(*)
 			FROM runs
@@ -230,17 +246,6 @@ func (s *Service) CreateRun(
 		if nonterminalRuns >= maxNonterminalRuns {
 			return ErrRunQuotaExceeded
 		}
-		var recentCreates int
-		if err := tx.QueryRow(ctx, `SELECT count(*)
-			FROM runs
-			WHERE environment_id = $1::uuid AND organization_id = $2::uuid
-			  AND created_at >= clock_timestamp() - INTERVAL '1 second'`, envID, orgID).Scan(&recentCreates); err != nil {
-			return fmt.Errorf("count recent run creates: %w", err)
-		}
-		if recentCreates >= createRunBurstLimit {
-			return ErrCreateRateLimited
-		}
-
 		// 3. Resolve deployment once
 		var deploymentID string
 		var manifestJSON []byte

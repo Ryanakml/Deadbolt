@@ -803,7 +803,10 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
 			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 			JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
+			JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
+			JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
 			WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
+				AND candidate_w.pool_name=$5
 				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
 				AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
 				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
@@ -813,7 +816,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 						AND rc.organization_id=$2::uuid AND rc.status='OPEN')
 			ORDER BY rs.eligible_at, rs.id
 			LIMIT $4
-			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots)
+			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, session.PoolName)
 		if err != nil {
 			return fmt.Errorf("snapshot claim candidates: %w", err)
 		}
@@ -978,8 +981,28 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				AND clock_timestamp() < l.expires_at`, environmentID, session.OrganizationID).Scan(&activeLeases); err != nil {
 			return err
 		}
+		// The MVP worker/task boundary is two concurrent assignments per
+		// session. The worker may advertise fewer free slots, but cannot raise
+		// the server-side cap by sending an arbitrary value.
 		claimLimit := req.AvailableSlots
+		if claimLimit > worker.DefaultSlots {
+			claimLimit = worker.DefaultSlots
+		}
 		if remaining := maxConcurrency - activeLeases; remaining < claimLimit {
+			claimLimit = remaining
+		}
+		var poolActiveLeases int
+		if err := tx.QueryRow(ctx, `SELECT count(*)
+			FROM task_leases l
+			JOIN run_steps rs ON rs.id=l.step_id AND rs.organization_id=l.organization_id
+			JOIN worker_sessions leased_ws ON leased_ws.id=l.session_id
+			JOIN workers leased_w ON leased_w.id=leased_ws.worker_id
+			WHERE rs.environment_id=$1::uuid AND rs.organization_id=$2::uuid
+			  AND leased_w.pool_name=$3 AND clock_timestamp() < l.expires_at`,
+			environmentID, session.OrganizationID, session.PoolName).Scan(&poolActiveLeases); err != nil {
+			return err
+		}
+		if remaining := maxConcurrency - poolActiveLeases; remaining < claimLimit {
 			claimLimit = remaining
 		}
 		if claimLimit <= 0 {
@@ -2594,7 +2617,44 @@ func appendRunEvent(ctx context.Context, tx storage.Tx, organizationID, runID, e
 	}
 	if err := tx.QueryRow(ctx, query, args...).Scan(&sequence); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrHistoryLimitExceeded
+			if terminal {
+				return ErrHistoryLimitExceeded
+			}
+			// The final event slot is reserved for a terminal failure. Once a
+			// nonterminal transition reaches the reserved boundary, atomically
+			// stop scheduling and write the terminal event instead of dropping
+			// correctness history or leaving the run nonterminal forever.
+			var terminalSequence int64
+			if err := tx.QueryRow(ctx, `UPDATE runs
+				SET status='FAILED', reason_code='HISTORY_LIMIT_EXCEEDED',
+					last_event_sequence=last_event_sequence+1, updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED')
+				  AND last_event_sequence=$3
+				RETURNING last_event_sequence`, runID, organizationID, int64(maxRunEvents-1)).Scan(&terminalSequence); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrHistoryLimitExceeded
+				}
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE run_steps
+				SET state='CANCELLED', updated_at=clock_timestamp()
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid
+				  AND state IN ('BLOCKED','READY','WAITING')`, runID, organizationID); err != nil {
+				return err
+			}
+			var eventID string
+			if err := tx.QueryRow(ctx, `INSERT INTO run_events
+				(organization_id,run_id,sequence,event_type,payload)
+				VALUES ($1::uuid,$2::uuid,$3,'RUN_FAILED',jsonb_build_object(
+					'reason','HISTORY_LIMIT_EXCEEDED')) RETURNING id::text`,
+				organizationID, runID, terminalSequence).Scan(&eventID); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO outbox_events (organization_id,event_id,subject,payload)
+				VALUES ($1::uuid,$2::uuid,'execution.state_changed',jsonb_build_object(
+					'runId',$3::text,'sequence',$4::bigint,'eventType','RUN_FAILED'))`,
+				organizationID, eventID, runID, terminalSequence)
+			return err
 		}
 		return err
 	}
