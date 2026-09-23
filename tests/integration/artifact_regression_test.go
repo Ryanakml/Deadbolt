@@ -656,9 +656,9 @@ func resolveForTest(names []string) (map[string]string, error) {
 	return values, nil
 }
 
-// --- Migration 21→22 ---
+// --- Migration 21→23 ---
 
-func TestMigrationFreshAnd21To22(t *testing.T) {
+func TestMigrationFreshAnd21To23(t *testing.T) {
 	db, runtimePool, _ := setupTestDB(t)
 	defer db.Close()
 	defer runtimePool.Close()
@@ -668,10 +668,10 @@ func TestMigrationFreshAnd21To22(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 22 {
-		t.Fatalf("fresh DB must be 22, got %d", v)
+	if v != 23 {
+		t.Fatalf("fresh DB must be 23, got %d", v)
 	}
-	// Existing schema 21 → apply 22 → healthy.
+	// Existing schema 21 → apply 23 → healthy.
 	if err := runner.DownTo(ctx, 21); err != nil {
 		t.Fatalf("down to 21: %v", err)
 	}
@@ -679,10 +679,10 @@ func TestMigrationFreshAnd21To22(t *testing.T) {
 		t.Fatalf("down version=%d want 21", v)
 	}
 	if err := runner.Up(ctx); err != nil {
-		t.Fatalf("up to 22: %v", err)
+		t.Fatalf("up to 23: %v", err)
 	}
-	if v, _ := runner.Version(ctx); v != 22 {
-		t.Fatalf("up version=%d want 22", v)
+	if v, _ := runner.Version(ctx); v != 23 {
+		t.Fatalf("up version=%d want 23", v)
 	}
 	// Required artifact columns/indexes exist.
 	pool := runtimePool

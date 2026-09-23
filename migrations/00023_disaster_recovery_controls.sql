@@ -1,6 +1,14 @@
 -- +goose Up
 -- M2 Disaster recovery controls, incidents, and deletion ledger review hooks (Blueprint §18.3, §27.3 & Issue #24).
 
+-- 0. Create-run rate bucket (Issue #23 admission caps, duplicated here so
+-- PR74 is self-contained: service.go debits this bucket on every CreateRun.
+-- IF NOT EXISTS keeps this idempotent when #23's 00023 migration also lands).
+ALTER TABLE environment_admissions
+    ADD COLUMN IF NOT EXISTS create_rate_tokens DOUBLE PRECISION NOT NULL DEFAULT 10
+        CHECK (create_rate_tokens >= 0 AND create_rate_tokens <= 10),
+    ADD COLUMN IF NOT EXISTS create_rate_updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp();
+
 -- 1. System Recovery Controls (System-level admission, dispatch, and recovery mode state)
 CREATE TABLE IF NOT EXISTS system_recovery_controls (
     id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -122,6 +130,9 @@ END $$;
 -- +goose StatementEnd
 
 -- +goose Down
+ALTER TABLE environment_admissions
+    DROP COLUMN IF EXISTS create_rate_updated_at,
+    DROP COLUMN IF EXISTS create_rate_tokens;
 DROP TABLE IF EXISTS deletion_ledger CASCADE;
 DROP TABLE IF EXISTS disaster_recovery_incidents CASCADE;
 DROP TABLE IF EXISTS system_recovery_controls CASCADE;

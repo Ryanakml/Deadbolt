@@ -804,6 +804,10 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 	// TX A snapshots candidates plus immutable artifact requirements and
 	// commits before any provider I/O. No authoritative Claim transaction
 	// remains open while S3 HEAD/GET/hash runs below.
+	effectivePool := session.PoolName
+	if effectivePool == "" {
+		effectivePool = "default"
+	}
 	var pending []pendingClaim
 	snapshotErr := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
@@ -815,7 +819,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
 			JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
 			WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
-				AND candidate_w.pool_name=$5
+				AND (candidate_w.pool_name=$5 OR $5 = '' OR candidate_w.pool_name='default')
 				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
 				AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
 				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
@@ -825,7 +829,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 						AND rc.organization_id=$2::uuid AND rc.status='OPEN')
 			ORDER BY rs.eligible_at, rs.id
 			LIMIT $4
-			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, session.PoolName)
+			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, effectivePool)
 		if err != nil {
 			return fmt.Errorf("snapshot claim candidates: %w", err)
 		}
@@ -1008,7 +1012,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			JOIN workers leased_w ON leased_w.id=leased_ws.worker_id
 			WHERE rs.environment_id=$1::uuid AND rs.organization_id=$2::uuid
 			  AND leased_w.pool_name=$3 AND clock_timestamp() < l.expires_at`,
-			environmentID, session.OrganizationID, session.PoolName).Scan(&poolActiveLeases); err != nil {
+			environmentID, session.OrganizationID, effectivePool).Scan(&poolActiveLeases); err != nil {
 			return err
 		}
 		if remaining := maxConcurrency - poolActiveLeases; remaining < claimLimit {
