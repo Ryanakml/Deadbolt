@@ -1628,60 +1628,61 @@ func advanceAfterStepSuccessTx(ctx context.Context, tx storage.Tx, organizationI
 		for changed := true; changed; {
 			changed = false
 			for _, node := range targetWorkflow.Nodes {
-			st, ok := stepsByNode[node.ID]
-			if !ok || st.state != "BLOCKED" {
-				continue
-			}
-			allDepsMet := true
-			dependencySkipped := false
-			for _, depID := range node.After {
-				depStep, depExists := stepsByNode[depID]
-				if !depExists {
-					allDepsMet = false
-					break
+				st, ok := stepsByNode[node.ID]
+				if !ok || st.state != "BLOCKED" {
+					continue
 				}
-				if depStep.state == "SKIPPED" {
-					dependencySkipped = true
+				allDepsMet := true
+				dependencySkipped := false
+				for _, depID := range node.After {
+					depStep, depExists := stepsByNode[depID]
+					if !depExists {
+						allDepsMet = false
+						break
+					}
+					if depStep.state == "SKIPPED" {
+						dependencySkipped = true
+					}
+					if depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED" {
+						allDepsMet = false
+					}
 				}
-				if depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED" {
-					allDepsMet = false
-				}
-			}
-			if allDepsMet {
-				if dependencySkipped {
-					if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED',wait_reason='DEPENDENCY_SKIPPED',updated_at=clock_timestamp()
+				if allDepsMet {
+					if dependencySkipped {
+						if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED',wait_reason='DEPENDENCY_SKIPPED',updated_at=clock_timestamp()
 						WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, st.id, organizationID); err != nil {
+							return err
+						}
+						st.state = "SKIPPED"
+						changed = true
+						if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
+							"stepId": st.id, "nodeId": node.ID, "reason": "DEPENDENCY_SKIPPED",
+						}); err != nil {
+							return err
+						}
+						continue
+					}
+					// Evaluate input mapping if present
+					if node.Input != nil {
+						mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
+						inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
+						if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
+							// Non-retryable mapping error per Blueprint §10.4 & §14.2
+							return failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INPUT_MAPPING_ERROR", nil)
+						}
+					}
+					// Unblock to READY
+					if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY',wait_reason=NULL,eligible_at=clock_timestamp(),updated_at=clock_timestamp()
+					WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, organizationID); err != nil {
 						return err
 					}
-				st.state = "SKIPPED"
+					st.state = "READY"
 					changed = true
-					if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
-						"stepId": st.id, "nodeId": node.ID, "reason": "DEPENDENCY_SKIPPED",
+					if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", map[string]any{
+						"stepId": st.id, "nodeId": node.ID,
 					}); err != nil {
 						return err
 					}
-					continue
-				}
-				// Evaluate input mapping if present
-				if node.Input != nil {
-					mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
-					inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
-					if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
-						// Non-retryable mapping error per Blueprint §10.4 & §14.2
-						return failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INPUT_MAPPING_ERROR", nil)
-					}
-				}
-				// Unblock to READY
-				if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY',wait_reason=NULL,eligible_at=clock_timestamp(),updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, organizationID); err != nil {
-					return err
-				}
-				st.state = "READY"
-				changed = true
-				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", map[string]any{
-					"stepId": st.id, "nodeId": node.ID,
-				}); err != nil {
-					return err
 				}
 			}
 		}
