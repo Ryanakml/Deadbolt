@@ -78,6 +78,7 @@ END $$;
 ALTER TABLE deletion_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deletion_ledger FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS tenant_isolation_deletion_ledger ON deletion_ledger;
 CREATE POLICY tenant_isolation_deletion_ledger ON deletion_ledger
     FOR ALL
     USING (organization_id = app.current_organization_id())
