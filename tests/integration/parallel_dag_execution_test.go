@@ -1330,6 +1330,17 @@ func TestParallelFailFast_RealAgent(t *testing.T) {
 	if stops == 0 {
 		t.Fatalf("stop command must persist for the live sibling attempt")
 	}
+	// Stop delivery is asynchronous via Agent heartbeat: the SIBLING_FAILED
+	// row commits atomically with fail-fast, but the Agent acks on its next
+	// heartbeat after its lease join misses (synthetic LEASE_NOT_FOUND stop).
+	ackDeadline := time.Now().Add(25 * time.Second)
+	for stopAcked == 0 && time.Now().Before(ackDeadline) {
+		time.Sleep(200 * time.Millisecond)
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT count(*) FROM stop_commands sc JOIN task_attempts a ON a.id=sc.attempt_id
+				JOIN run_steps rs ON rs.id=a.step_id WHERE rs.run_id=$1::uuid AND rs.node_id='e' AND sc.acked_at IS NOT NULL`, run.ID).Scan(&stopAcked)
+		})
+	}
 	if stopAcked == 0 {
 		t.Fatalf("stop command must reach the Agent (acked), logs=%s", agentLogs.String())
 	}
