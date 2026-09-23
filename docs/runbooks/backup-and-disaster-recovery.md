@@ -154,39 +154,49 @@ stateDiagram-v2
 ```
 
 ### Step 1: Read-Only First Mode Activation
+
 Immediately upon database restoration, system controls are set to `READ_ONLY`:
+
 - API returns `503 Service Unavailable` with `ADMISSION_DISABLED` for new run submissions (`POST /v1/workflows/{workflowName}/runs`).
 - Worker polling (`POST /v1/tasks/claim`) returns empty assignments.
 - Cron / scheduled workflows are paused.
 - Pre-disaster worker leases are cleared to prevent stale workers from executing in-flight steps.
 
 ### Step 2: Disaster Incident & Uncertainty Window Recording
+
 Call `POST /v1/system/recovery/prepare` (or executed via `scripts/restore-staging-db.sh --disaster-recovery`):
+
 - Records `recovery_point` ($T_{recovery}$) and `incident_at` ($T_{incident}$) in `disaster_recovery_incidents`.
 - Binds uncertainty window $[T_{recovery}, T_{incident}]$.
 - Reconciles any edge-accepted requests missing from database snapshots:
   > **RPO Gap Disclaimer**:
   > _"no claim of zero RPO: requests accepted during the uncertainty window cannot be reconstructed from database alone"_
-  All such request IDs are logged in `rpo_gap_request_ids` for upstream notification.
+  > All such request IDs are logged in `rpo_gap_request_ids` for upstream notification.
 
 ### Step 3: Disaster Reconciliation Hold Verification
+
 - All nonterminal runs (`QUEUED`, `RUNNING`, `WAITING`, `PAUSING`, `PAUSED`, `CANCELLING`) transition to `WAITING` status with hold reason `RECONCILIATION`.
 - `reconciliation_cases` are created with `reason = 'DISASTER_RECOVERY_HOLD'` and state details including the uncertainty window.
 - Terminal runs (`SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`) remain untouched (INV-09).
 - Existing human operator sessions are revoked (`revocation_reason = 'DISASTER_RECOVERY_RESET'`); operators must log in freshly after recovery.
 
 ### Step 4: External Side-Effect Review Checklist (Operator)
+
 Before any execution resumes, operators must reconcile external side effects that may have completed during the uncertainty window (see Section 6).
 
 ### Step 5: Automated Integrity Verification & Audit Trail
+
 Execute `POST /v1/system/recovery/verify`:
+
 - Verifies database schema version matches `LatestSchemaVersion` (Migration 23+).
 - Checks pending deletion ledger count (`app.count_pending_deletions()`) preserving M5 GDPR/deletion hooks.
 - Verifies all active steps remain safely on hold.
 - Confirms audit trail is intact and captures recovery verification evidence.
 
 ### Step 6: Gradual Resumption
+
 Execute `POST /v1/system/recovery/resume`:
+
 - System transitions `READ_ONLY` $\to$ `RESUMING` $\to$ `ACTIVE`.
 - Allows selective tenant-by-tenant resumption (`target_tenants`) or batched activation to avoid thundering herds.
 - Admission, dispatch, and schedules are re-enabled only after all holds are cleared or explicitly deferred.
@@ -201,6 +211,7 @@ When restoring a database to an older snapshot ($T_{recovery}$), the external wo
 
 1. **Identify Open Disaster Holds**:
    Query open reconciliation cases:
+
    ```bash
    curl -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
      "https://deadbolt.internal/v1/reconciliation/cases?status=OPEN&reason=DISASTER_RECOVERY_HOLD"
@@ -293,4 +304,3 @@ The disaster recovery and reconciliation workflow was validated end-to-end via a
 - Staging currently operates on a single EC2 host without active cross-AZ failover.
 - In the event of catastrophic AWS AZ failure, RTO is dependent on provisioning a new instance in an alternate AZ and executing the PITR procedure outlined in Section 4.
 - Production architecture will utilize managed multi-AZ PostgreSQL (Aurora or RDS) and decoupled ECS/EKS task runner services.
-
