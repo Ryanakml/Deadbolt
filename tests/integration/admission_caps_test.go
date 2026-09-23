@@ -125,6 +125,19 @@ func TestCreateRunTokenBucketRefillAndAdmission429(t *testing.T) {
 			t.Fatalf("refilled request %d status=%d, want 202", i, status)
 		}
 	}
+
+	// Pin the bucket to exactly 0 tokens (and reset the timestamp to now) so that any
+	// wall-clock time that elapsed during the 5 sequential requests above does not partially
+	// refill the bucket before we test the 6th request on slow CI runners.
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE environment_admissions
+			SET create_rate_tokens=0, create_rate_updated_at=clock_timestamp()
+			WHERE environment_id=$1::uuid AND organization_id=$2::uuid`, envID, orgID)
+		return err
+	}); err != nil {
+		t.Fatalf("pin bucket after refill: %v", err)
+	}
+
 	if status := create("refilled-exceeded-6"); status != http.StatusTooManyRequests {
 		t.Fatalf("6th request after 1s refill status=%d, want 429", status)
 	}
