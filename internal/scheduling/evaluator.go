@@ -105,9 +105,14 @@ func isRepeatedUTCOccurrence(utcTime time.Time, loc *time.Location) bool {
 }
 
 // CoalesceMissedResult holds the outcome of evaluating downtime misfire according to Blueprint §17 coalesce-one.
+// Bounded-memory contract: CoalesceMissed never materializes the full missed backlog.
+// It preserves only the latest missed occurrence, total missed count, skipped count,
+// and next future occurrence. MissedOccurrences is always nil in the production path;
+// tests requiring the full list must use EnumerateMissedBounded with an explicit bound.
 type CoalesceMissedResult struct {
 	CoalescedOccurrence *time.Time
 	SkippedCount        int
+	MissedCount         int
 	MissedOccurrences   []time.Time
 	NextFuture          time.Time
 }
@@ -116,6 +121,8 @@ type CoalesceMissedResult struct {
 // according to the coalesce-one misfire policy (Blueprint §17):
 // "setelah downtime buat maksimal satu run untuk occurrence terbaru yang terlewat,
 // simpan jumlah occurrence yang dilewati, lalu hitung next future occurrence."
+// It uses O(1) memory regardless of downtime length: only the latest missed occurrence
+// and integer counters are retained.
 func (s *ScheduleSpec) CoalesceMissed(lastOccurrence time.Time, now time.Time) (*CoalesceMissedResult, error) {
 	if lastOccurrence.IsZero() {
 		// First evaluation ever; evaluate next occurrence from now
@@ -126,12 +133,14 @@ func (s *ScheduleSpec) CoalesceMissed(lastOccurrence time.Time, now time.Time) (
 		return &CoalesceMissedResult{
 			CoalescedOccurrence: nil,
 			SkippedCount:        0,
+			MissedCount:         0,
 			MissedOccurrences:   nil,
 			NextFuture:          next,
 		}, nil
 	}
 
-	var missed []time.Time
+	var latest time.Time
+	missedCount := 0
 	cursor := lastOccurrence
 
 	for {
@@ -142,7 +151,8 @@ func (s *ScheduleSpec) CoalesceMissed(lastOccurrence time.Time, now time.Time) (
 		if next.After(now) {
 			break
 		}
-		missed = append(missed, next)
+		latest = next
+		missedCount++
 		cursor = next
 	}
 
@@ -152,24 +162,47 @@ func (s *ScheduleSpec) CoalesceMissed(lastOccurrence time.Time, now time.Time) (
 	}
 
 	res := &CoalesceMissedResult{
-		MissedOccurrences: missed,
+		MissedCount:       missedCount,
+		MissedOccurrences: nil,
 		NextFuture:        nextFuture,
 	}
 
-	if len(missed) == 0 {
+	if missedCount == 0 {
 		res.CoalescedOccurrence = nil
 		res.SkippedCount = 0
-	} else if len(missed) == 1 {
-		latest := missed[0]
-		res.CoalescedOccurrence = &latest
-		res.SkippedCount = 0
 	} else {
-		latest := missed[len(missed)-1]
-		res.CoalescedOccurrence = &latest
-		res.SkippedCount = len(missed) - 1
+		latestCopy := latest
+		res.CoalescedOccurrence = &latestCopy
+		res.SkippedCount = missedCount - 1
 	}
 
 	return res, nil
+}
+
+// EnumerateMissedBounded is a deliberately bounded test helper that materializes the full
+// missed occurrence list only when the total does not exceed max. It returns an error when
+// the backlog exceeds max, preventing accidental unbounded allocation in tests.
+func (s *ScheduleSpec) EnumerateMissedBounded(lastOccurrence time.Time, now time.Time, max int) ([]time.Time, error) {
+	if max <= 0 {
+		return nil, fmt.Errorf("max must be positive, got %d", max)
+	}
+	var out []time.Time
+	cursor := lastOccurrence
+	for {
+		next, err := s.NextOccurrence(cursor)
+		if err != nil {
+			return nil, err
+		}
+		if next.After(now) {
+			break
+		}
+		if len(out)+1 > max {
+			return nil, fmt.Errorf("missed backlog exceeds bound %d", max)
+		}
+		out = append(out, next)
+		cursor = next
+	}
+	return out, nil
 }
 
 // EvaluateOverlap determines whether a scheduled occurrence should start or be skipped

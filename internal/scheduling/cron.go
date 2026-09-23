@@ -9,16 +9,16 @@ import (
 
 // ScheduleSpec encapsulates a parsed 5-field cron expression and IANA timezone (Blueprint §17).
 type ScheduleSpec struct {
-	RawCron   string
-	Timezone  string
-	Location  *time.Location
-	Minutes   fieldMatcher
-	Hours     fieldMatcher
-	Days      fieldMatcher
-	Months    fieldMatcher
-	Weekdays  fieldMatcher
-	domStar   bool
-	dowStar   bool
+	RawCron  string
+	Timezone string
+	Location *time.Location
+	Minutes  fieldMatcher
+	Hours    fieldMatcher
+	Days     fieldMatcher
+	Months   fieldMatcher
+	Weekdays fieldMatcher
+	domStar  bool
+	dowStar  bool
 }
 
 type fieldMatcher map[int]bool

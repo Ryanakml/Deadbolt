@@ -19,22 +19,28 @@ Spike SP-05 evaluates 5-field cron parsing, IANA timezone resolution, and schedu
 
 ---
 
-## 2. Candidates and Evaluation Decision
+## 2. Pinned Candidates Actually Executed and Evidence-Based Decision
 
-| Candidate                                             | Strategy & Evaluation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Decision                                                                                                                                                    |
-| :---------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Candidate A: Naive Cron / Go `time.Date` Defaults** | Iterates calendar dates and constructs `time.Date(year, month, day, hour, min, ..., loc)`. Standard libraries and default cron runners (e.g. uninspected `robfig/cron/v3` or `gorhill/cronexpr`) rely directly on runtime date normalization. In `tests/spikes/sp05/candidate_test.go`: on 2026-03-08 in `America/New_York`, missing wall time 02:30 is normalized to 01:30 (or shifted to 03:30) rather than skipped, firing an invalid execution. On fall-back, uninspected iterators fire both UTC occurrences or violate monotonicity. On downtime, standard runners queue every missed execution, causing thundering herd backlogs. | **REJECTED.** Violates Blueprint §17 DST rules, misfire policy, and overlap limits. No uninspected library defaults may be inherited without policy guards. |
-| **Candidate B: Deadbolt Strict §17 Schedule Engine**  | Strict 5-field parser (`internal/scheduling/cron.go`) + DST-safe monotonic evaluator (`internal/scheduling/evaluator.go`). Specifically validates wall time existence (`isValidWallTime`) to skip spring-forward gaps, inspects historical transition windows (`isRepeatedUTCOccurrence`) to strictly select the first UTC occurrence during fall back, enforces `coalesce-one` downtime calculation with exact `skipped_count`, and checks nonterminal run states for `skip-overlap`.                                                                                                                                                   | **SELECTED.** Fully satisfies Blueprint §17 invariants and passes all controlled-clock golden fixtures.                                                     |
+All three candidates below were executed against the shared fixtures in `contracts/fixtures/schedules.json` via `tests/spikes/sp05/candidate_test.go` using location-aware input (`ref.In(loc)`). No claim below is made about a library that was not executed.
+
+| Candidate                               | Exact version (go.mod)                                                                                                                                                 | Observed results (location-aware `Next`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Decision                                                                                                                                            |
+| :-------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **robfig/cron/v3**                      | `github.com/robfig/cron/v3 v3.0.1` (parser `Minute\|Hour\|Dom\|Month\|Dow`)                                                                                            | NY gap `30 2 * * *` ref `2026-03-07T07:30:00Z` => `2026-03-09T06:30:00Z` PASS. London gap `30 1 * * *` ref `2026-03-28T01:30:00Z` => `2026-03-30T00:30:00Z` PASS. Lord Howe `15 2 * * *` ref `2026-10-03T15:00:00Z` => `2026-10-04T15:15:00Z` PASS. NY fold `30 1 * * *` ref `2026-11-01T04:00:00Z` => first `2026-11-01T05:30:00Z` PASS, second `2026-11-01T06:30:00Z` FAIL (emits duplicate UTC occurrence; expected `2026-11-02T06:30:00Z`). London fold ref `2026-10-25T00:00:00Z` => first `2026-10-25T00:30:00Z` PASS, second `2026-10-25T01:30:00Z` FAIL (duplicate same day; expected `2026-10-26T01:30:00Z`). Hourly downtime (last `10:00Z`, now `14:30Z`) naive `Next` iteration queues 4 runs (`11:00,12:00,13:00,14:00`) — backlog flood without `coalesce-one`. | **REJECTED unguarded.** Passes gaps but violates §17 fold rule (emits both UTC occurrences) and has no `coalesce-one`/`skip-overlap` policy.        |
+| **gorhill/cronexpr**                    | `github.com/gorhill/cronexpr v0.0.0-20180427100037-88b0669f7d75` (`cronexpr.Parse` / `Next`)                                                                           | NY gap => `2026-03-08T06:30:00Z` (`01:30 EST` gap day) FAIL (expected `2026-03-09T06:30:00Z`). London gap => `2026-03-29T01:30:00Z` FAIL (expected `2026-03-30T00:30:00Z`). Lord Howe => `2026-10-03T15:45:00Z` FAIL (expected `2026-10-04T15:15:00Z`). NY fold => first `2026-11-01T05:30:00Z` PASS, second `2026-11-02T06:30:00Z` PASS. London fold => first `2026-10-25T01:30:00Z` FAIL (selects second UTC occurrence; expected `2026-10-25T00:30:00Z`). Hourly downtime naive iteration queues 4 runs — same backlog flood.                                                                                                                                                                                                                                              | **REJECTED unguarded.** Passes NY fold but violates §17 gap rule and London first-occurrence rule, and has no `coalesce-one`/`skip-overlap` policy. |
+| **Deadbolt Strict §17 Schedule Engine** | `internal/scheduling` (this repo: `cron.go` parser + `evaluator.go` with `isValidWallTime` / `isRepeatedUTCOccurrence` / bounded `CoalesceMissed` / `EvaluateOverlap`) | All gap fixtures PASS (NY `2026-03-09T06:30:00Z`, London `2026-03-30T00:30:00Z`, Lord Howe `2026-10-04T15:15:00Z`). All fold fixtures PASS (NY first `05:30Z` then `2026-11-02T06:30:00Z`; London first `00:30Z` then `2026-10-26T01:30:00Z`). Downtime `10:00Z→14:30Z` => `MissedCount=4`, latest `14:00Z`, `SkippedCount=3`, next `15:00Z` with `MissedOccurrences=nil` (O(1) memory). Overlap and revision fixtures PASS.                                                                                                                                                                                                                                                                                                                                                  | **SELECTED.** Only candidate satisfying both DST gap and fold invariants plus `coalesce-one` / `skip-overlap` with bounded memory.                  |
+
+Neither pinned library satisfies §17 alone: `robfig/cron/v3 v3.0.1` passes gaps but fails folds; `gorhill/cronexpr v0.0.0-20180427100037-88b0669f7d75` passes NY fold but fails gaps and London first-occurrence. The Deadbolt evaluator is therefore selected, with third-party cron use (if ever) requiring explicit §17 policy guards.
 
 ---
 
 ## 3. Toolchain and Environment Setup
 
-- **Host Architecture:** darwin/arm64 (macOS 15 / Darwin 25.1.0)
-- **Go Toolchain:** `go version go1.27.1 darwin/arm64`
+- **Host Architecture:** darwin/arm64 (macOS 15 / Darwin 25.1.0 locally); CI: ubuntu-24.04 (amd64/arm64)
+- **Go Toolchain:** `go version go1.27.1 darwin/arm64` (CI: `1.27.1` via `actions/setup-go@v6`)
 - **Node / Runtime:** Node `v24.21.0`, pnpm `10.24.0`
-- **Zoneinfo Database:** System IANA tzdata at `/usr/share/zoneinfo` (`America/New_York`, `Europe/London`, `Australia/Lord_Howe`, `UTC`)
-- **Database Engine:** PostgreSQL 14/16 with Goose migration runner (`LatestSchemaVersion = 25`)
+- **Zoneinfo Database:** System IANA tzdata at `/usr/share/zoneinfo` → `/var/db/timezone/zoneinfo`, active `+VERSION 2026c` (default snapshot `2025b`); fixtures cover `America/New_York`, `Europe/London`, `Australia/Lord_Howe`, `UTC`. CI uses the ubuntu-24.04 system tzdata via `time.LoadLocation`.
+- **Pinned cron modules:** `github.com/robfig/cron/v3 v3.0.1` (2020-01-04), `github.com/gorhill/cronexpr v0.0.0-20180427100037-88b0669f7d75` (2018-04-27) per `go.mod` / `go.sum` (`go list -m` verified)
+- **Database Engine:** PostgreSQL 14.19 locally (Homebrew); CI `postgres:16-alpine` service with Goose migration runner (`LatestSchemaVersion = 25`, migration `00025_recurring_schedules_contract.sql`)
 
 ---
 
@@ -55,7 +61,7 @@ The shared fixture corpus defines 14 deterministic scenarios across multiple tim
 11. `misfire_coalesce_zero_missed_on_schedule`: Evaluation before due time yields 0 missed occurrences.
 12. `overlap_policy_skip_when_previous_nonterminal`: Active `RUNNING` previous run skips next occurrence with `SKIPPED_OVERLAP`.
 13. `overlap_policy_start_when_previous_terminal`: `SUCCEEDED` previous run starts next occurrence normally.
-14. `schedule_revision_changes_future_only`: Schedule update increments revision from 1 to 2; past occurrences retain revision 1 key while future occurrences evaluate under revision 2.
+14. `schedule_revision_changes_future_only`: Schedule update increments revision from 1 to 2; pre-edit occurrence derives from `InitialCron` (`0 10 * * *` => `2026-05-01T10:00:00Z` under revision 1) and post-boundary occurrence derives from `UpdatedCron` (`0 15 * * *` after `2026-05-01T12:00:00Z` => `2026-05-01T15:00:00Z` under revision 2); past key remains pinned.
 
 ---
 
@@ -67,43 +73,49 @@ The shared fixture corpus defines 14 deterministic scenarios across multiple tim
 go test -v ./internal/scheduling
 ```
 
-**Result:**
+**Result (Go 1.27.1, tzdata 2026c):**
 
-- 14/14 fixture contract test cases passed.
-- 10 invalid cron/timezone error cases passed.
+- 14/14 fixture contract test cases passed (`TestScheduleFixturesContract`, including strengthened revision transition that evaluates `InitialCron` pre-edit, `UpdatedCron` post-boundary, stale-cron negative, and pinned-key stability).
+- 10 invalid cron/timezone error cases passed (`TestCronParseErrors`).
+- `TestCoalesceMissed_BoundedMemory_HighFrequencyLongDowntime` passed: per-minute schedule over 30-day downtime yields `MissedCount=43200`, `SkippedCount=43199`, latest `2026-01-31T00:00:00Z`, next `2026-01-31T00:01:00Z` with `MissedOccurrences=nil`; bounded helper rejects the backlog with `max=1000`.
 
-### 5.2 Spike Candidate Comparison and Concurrency (`INV-10`)
+### 5.2 Spike Candidate Comparison (`INV-10` unit helper only)
 
 ```sh
 go test -v ./tests/spikes/sp05
 ```
 
-**Result:**
+**Result (pinned modules executed, tzdata 2026c):**
 
-- `TestCandidateComparison_DSTGap`: Candidate A (naive library default) failed §17 by firing on gap day with shifted hour (01:30). Candidate B (Deadbolt §17 evaluator) passed by skipping 2026-03-08 and scheduling 2026-03-09 02:30 EDT.
-- `TestCandidateComparison_DSTFold`: Candidate B passed by selecting first UTC occurrence (05:30 UTC) and skipping duplicate UTC occurrence (06:30 UTC).
-- `TestCandidateComparison_MisfireDowntime`: Candidate B passed by coalescing 4 missed runs into latest occurrence with `skipped_count = 3`.
-- `TestConcurrentDuplicateEvaluators_INV10`: 10 concurrent racing evaluators resulted in exactly 1 committed logical action on unique occurrence key `(schedule_id, revision, scheduled_at_utc)`.
+- `TestPinnedCandidateVersions_Record`: logs `github.com/robfig/cron/v3 v3.0.1` and `github.com/gorhill/cronexpr v0.0.0-20180427100037-88b0669f7d75`.
+- `TestCandidateComparison_DSTGap_NY`: Deadbolt PASS (`2026-03-09T06:30:00Z`); robfig PASS (`2026-03-09T06:30:00Z`); cronexpr FAIL (`2026-03-08T06:30:00Z`, fires gap-day `01:30 EST`).
+- `TestCandidateComparison_DSTGap_London`: Deadbolt PASS (`2026-03-30T00:30:00Z`); robfig PASS; cronexpr FAIL (`2026-03-29T01:30:00Z`).
+- `TestCandidateComparison_DSTFold_NY`: Deadbolt PASS (first `05:30Z`, subsequent `2026-11-02T06:30:00Z`); robfig FAIL (second `2026-11-01T06:30:00Z` duplicate); cronexpr PASS.
+- `TestCandidateComparison_DSTFold_London`: Deadbolt PASS (first `00:30Z`, subsequent `2026-10-26T01:30:00Z`); robfig FAIL (second `2026-10-25T01:30:00Z` duplicate); cronexpr FAIL (first `2026-10-25T01:30:00Z`, wrong UTC occurrence).
+- `TestCandidateComparison_LordHowe`: Deadbolt PASS (`2026-10-04T15:15:00Z`); robfig PASS; cronexpr FAIL (`2026-10-03T15:45:00Z`).
+- `TestCandidateComparison_MisfireDowntime`: robfig naive queues 4 runs, cronexpr naive queues 4 runs (backlog flood); Deadbolt `CoalesceMissed` yields `MissedCount=4`, latest `14:00Z`, `SkippedCount=3`, next `15:00Z` with `MissedOccurrences=nil`.
+- `TestOccurrenceKeyCanonicalIdentity_FormatHelper`: deterministic formatting verified; notes authoritative concurrency proof lives in §5.3 (not a mutex/map claim).
 
-### 5.3 PostgreSQL Schema and RLS Integration
+### 5.3 PostgreSQL Schema, Concurrency, and RLS Integration
 
 ```sh
 go test -v ./tests/integration -run 'TestSchedule'
 ```
 
-**Result:**
+**Result (PostgreSQL 14.19 local; CI 16-alpine; `LatestSchemaVersion = 25`):**
 
-- Migration `00025_recurring_schedules_contract.sql` successfully applied (`LatestSchemaVersion = 25`).
-- Unique constraint `(schedule_id, occurrence_key)` prevented duplicate insertions.
-- `SKIPPED_OVERLAP` and `SKIPPED_MISFIRE` with `skipped_count` persisted and queryable.
-- RLS verified: foreign tenant queries return 0 rows.
+- Migration `00025_recurring_schedules_contract.sql` applied: `uq_deployments_org_env_id`, `fk_schedules_pinned_deployment`, and `uq_schedule_occurrences_canonical_identity ON schedule_occurrences (schedule_id, revision, due_at)` present.
+- `TestScheduleSchemaAndPolicies`, `TestScheduleOverlapAndMisfireAccounting`, `TestScheduleTenantIsolation` passed (policies, `SKIPPED_OVERLAP`/`SKIPPED_MISFIRE` with `skipped_count`, RLS 0-row isolation).
+- `TestScheduleCanonicalIdentity_UniqueConstraint` passed: same `(schedule_id, revision, due_at)` with distinct `occurrence_key` strings rejected with `duplicate key value violates unique constraint "uq_schedule_occurrences_canonical_identity"`.
+- `TestScheduleConcurrentDuplicateEvaluatorsINV10_Postgres` passed: 10 duplicate evaluators raced on separate transactions/connections with distinct `occurrence_key` values for the same `(schedule_id, 1, 2026-05-01T12:00:00Z)`; exactly 1 committed and 9 rejected with `duplicate key value`; final `count(*)=1`.
+- `TestScheduleDeploymentIntegrity_Negative` passed: valid same-org/same-env pin accepted; nonexistent UUID, cross-tenant deployment, and cross-environment deployment each rejected with `fk_schedules_pinned_deployment` foreign-key violation.
 
 ---
 
 ## 6. Delivery Boundary Status
 
-- **M4 Blocker Decision:** **UNBLOCKED.** Recurring schedule engine candidate selected and verified against §17 fixtures.
-- **Implemented:** 5-field cron parser, timezone validator, DST gap/fold handlers, coalesce-one misfire evaluator, skip-overlap evaluator, occurrence key formatting, migration `00025`, and integration tests.
-- **Automated Tests:** All unit, spike, and integration tests passed locally.
-- **Hosted CI:** Pending PR submission.
+- **M4 Blocker Decision:** **UNBLOCKED for selection only.** Recurring schedule engine candidate selected and verified against §17 fixtures. No M4 recurring-schedule runtime execution is started in this spike.
+- **Implemented:** 5-field cron parser, timezone validator, DST gap/fold handlers, bounded `coalesce-one` misfire evaluator (`MissedCount`/`SkippedCount`/`NextFuture`, `MissedOccurrences=nil`) with `EnumerateMissedBounded` test helper, `skip-overlap` evaluator, occurrence key formatting, migration `00025` (canonical unique index + pinned-deployment FK + composite uniqueness), and integration tests (PG race, canonical uniqueness, deployment negatives).
+- **Automated Tests:** All unit, spike (real pinned candidates), and integration (real PostgreSQL concurrency) tests passed locally; exact-head CI validation required (see PR checks).
+- **Hosted CI:** Pending PR submission (exact-head run).
 - **Deployed:** No (documentation and spike contract verification).
