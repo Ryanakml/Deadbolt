@@ -670,12 +670,13 @@ func TestMigrationFreshAnd21To23(t *testing.T) {
 	defer runtimePool.Close()
 	ctx := context.Background()
 	runner := migrator.NewRunner(db, "../../migrations")
+	defer func() { _ = runner.Up(ctx) }()
 	v, err := runner.Version(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 23 {
-		t.Fatalf("fresh DB must be 23, got %d", v)
+	if v != migrator.LatestSchemaVersion {
+		t.Fatalf("fresh DB must be %d, got %d", migrator.LatestSchemaVersion, v)
 	}
 	// Existing schema 21 → apply 23 → healthy.
 	if err := runner.DownTo(ctx, 21); err != nil {
@@ -684,7 +685,7 @@ func TestMigrationFreshAnd21To23(t *testing.T) {
 	if v, _ := runner.Version(ctx); v != 21 {
 		t.Fatalf("down version=%d want 21", v)
 	}
-	if err := runner.Up(ctx); err != nil {
+	if err := runner.UpTo(ctx, 23); err != nil {
 		t.Fatalf("up to 23: %v", err)
 	}
 	if v, _ := runner.Version(ctx); v != 23 {

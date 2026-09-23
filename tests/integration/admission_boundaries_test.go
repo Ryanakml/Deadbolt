@@ -392,10 +392,11 @@ func TestMigration22To23(t *testing.T) {
 	if err := runner.DownTo(ctx, 22); err != nil {
 		t.Fatalf("down to 22: %v", err)
 	}
+	defer func() { _ = runner.Up(ctx) }()
 	if v, _ := runner.Version(ctx); v != 22 {
 		t.Fatalf("down version=%d, want 22", v)
 	}
-	if err := runner.Up(ctx); err != nil {
+	if err := runner.UpTo(ctx, 23); err != nil {
 		t.Fatalf("up to 23: %v", err)
 	}
 	if v, _ := runner.Version(ctx); v != 23 {

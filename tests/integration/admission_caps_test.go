@@ -143,7 +143,18 @@ func TestCreateRunTokenBucketRefillAndAdmission429(t *testing.T) {
 	}
 
 	// 5. Concurrency: Reset bucket to full (10 tokens). Fire 15 concurrent requests.
-	// Exactly 10 must succeed (202) and 5 must be rate limited (429).
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make([]int, 15)
+	for i := 0; i < 15; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx] = create(fmt.Sprintf("concurrent-rate-%d", idx))
+		}(i)
+	}
+
 	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE environment_admissions
 			SET create_rate_tokens=10, create_rate_updated_at=clock_timestamp()
@@ -152,16 +163,7 @@ func TestCreateRunTokenBucketRefillAndAdmission429(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("reset bucket for concurrency: %v", err)
 	}
-
-	var wg sync.WaitGroup
-	results := make([]int, 15)
-	for i := 0; i < 15; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			results[idx] = create(fmt.Sprintf("concurrent-rate-%d", idx))
-		}(i)
-	}
+	close(start)
 	wg.Wait()
 
 	acceptedCount := 0
