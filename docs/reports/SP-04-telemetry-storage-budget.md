@@ -53,13 +53,13 @@ psql "$TEST_DATABASE_URL-or-local-deadbolt_integration_test" \
 ### 3.2 Storage (measured in `deadbolt_integration_test` after the runs above)
 
 - `task_logs`: 259 rows, 368 kB total relation (96 kB heap; remainder TOAST
-  + indexes). Raw message bytes 50 kB; average stored row 198 bytes; max
-  message length 16,384 (cap enforced at the application layer).
+  - indexes). Raw message bytes 50 kB; average stored row 198 bytes; max
+    message length 16,384 (cap enforced at the application layer).
 - Honesty note: test filler (`'F' x 16 KiB`) is highly compressible, so
   TOAST shrinks it far below 16 KiB on disk. Incompressible (e.g. encrypted
   or high-entropy) payloads would store near full size; see projections.
 - Indexes (6): primary + `attempt_id_sequence` + `lookup/step/attempt/
-  retention`, 16–56 kB each at this volume.
+retention`, 16–56 kB each at this volume.
 - `task_log_drop_receipts`: 6 rows, 32 kB.
 
 ### 3.3 Query latency (measured, same database)

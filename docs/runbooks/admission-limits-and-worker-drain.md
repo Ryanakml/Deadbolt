@@ -6,19 +6,19 @@ as-built behavior with pointers to code and regression tests.
 
 ## 1. MVP limits
 
-| Dimension | Limit | Enforced at |
-|---|---|---|
-| Nodes per workflow | 50 | Contract validation at register (`NODE_COUNT_EXCEEDED`); service defense in depth at run creation (`WORKFLOW_TOO_LARGE`, HTTP 422) |
-| Running/claimed attempts (live leases) per env | 10 | Claim boundary under the environment admission lock; server ceiling 10 even if `max_concurrency` is configured higher |
-| Nonterminal runs per env | 100 | Run creation (`RUN_QUOTA_EXCEEDED`, HTTP 429 + `Retry-After: 60`); terminal runs do not count |
-| Create-run rate per env | 5/sec, burst 10 | Token bucket under the environment admission lock (`CREATE_RUN_RATE_LIMITED`, HTTP 429 + `Retry-After: 1`) |
-| Worker sessions per env | 10 | Enrollment and session creation under the admission lock (`SESSION_QUOTA_EXCEEDED`, HTTP 429 + `Retry-After: 60`) |
-| Worker slots per session | 2 (`DefaultSlots`) | Claim clamps advertised slots down to 2; a worker can never raise the cap |
-| Inline JSON payload | 256 KiB | Request validation (`PAYLOAD_TOO_LARGE`) |
-| Task logs | 16 KiB/line, 1 MiB/attempt | Ingest drops over-budget lines with `DroppedCount` + `BudgetExhausted`; `deadbolt_task_logs_dropped_total` metric; drop receipts persisted |
-| Log retention | 7 days | `PruneExpiredTaskLogs` batch (limit 1000) on the scheduler slow sweep; expired reads return an explicit expired marker, never silent absence |
-| Attempts per task | default 3, max 10 | Retry policy |
-| Events per run | 10,000, final slot reserved | Non-terminal append at 9,999 rejected `HISTORY_LIMIT_EXCEEDED`; terminal `RUN_FAILED` commits as event 10,000 exactly once |
+| Dimension                                      | Limit                       | Enforced at                                                                                                                                  |
+| ---------------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Nodes per workflow                             | 50                          | Contract validation at register (`NODE_COUNT_EXCEEDED`); service defense in depth at run creation (`WORKFLOW_TOO_LARGE`, HTTP 422)           |
+| Running/claimed attempts (live leases) per env | 10                          | Claim boundary under the environment admission lock; server ceiling 10 even if `max_concurrency` is configured higher                        |
+| Nonterminal runs per env                       | 100                         | Run creation (`RUN_QUOTA_EXCEEDED`, HTTP 429 + `Retry-After: 60`); terminal runs do not count                                                |
+| Create-run rate per env                        | 5/sec, burst 10             | Token bucket under the environment admission lock (`CREATE_RUN_RATE_LIMITED`, HTTP 429 + `Retry-After: 1`)                                   |
+| Worker sessions per env                        | 10                          | Enrollment and session creation under the admission lock (`SESSION_QUOTA_EXCEEDED`, HTTP 429 + `Retry-After: 60`)                            |
+| Worker slots per session                       | 2 (`DefaultSlots`)          | Claim clamps advertised slots down to 2; a worker can never raise the cap                                                                    |
+| Inline JSON payload                            | 256 KiB                     | Request validation (`PAYLOAD_TOO_LARGE`)                                                                                                     |
+| Task logs                                      | 16 KiB/line, 1 MiB/attempt  | Ingest drops over-budget lines with `DroppedCount` + `BudgetExhausted`; `deadbolt_task_logs_dropped_total` metric; drop receipts persisted   |
+| Log retention                                  | 7 days                      | `PruneExpiredTaskLogs` batch (limit 1000) on the scheduler slow sweep; expired reads return an explicit expired marker, never silent absence |
+| Attempts per task                              | default 3, max 10           | Retry policy                                                                                                                                 |
+| Events per run                                 | 10,000, final slot reserved | Non-terminal append at 9,999 rejected `HISTORY_LIMIT_EXCEEDED`; terminal `RUN_FAILED` commits as event 10,000 exactly once                   |
 
 ## 2. Admission behavior (429 + Retry-After)
 

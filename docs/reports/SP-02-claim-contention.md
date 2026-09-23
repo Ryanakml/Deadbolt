@@ -146,6 +146,7 @@ pnpm check:parity
 - **Automated Tests:** All 8 integration tests and 2 SP-02 contention benchmark suites pass cleanly with Go race detector (`-race`).
 - **CI Hardening:** GitHub Actions workflow (`.github/workflows/contracts.yml`) equipped with PostgreSQL 16 service container and `TEST_DATABASE_URL` configuration.
 - **INV-06 Traceability:** Schema provides persistence tables (`run_events`, `outbox_events`, `task_attempts`, `task_leases`); runtime atomic commit orchestration scheduled for M1 execution engine.
+
 ---
 
 ## 8. M2 remeasurement (Issue #23)
