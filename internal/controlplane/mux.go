@@ -14,6 +14,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/outbox"
+	"github.com/Ryanakml/Deadbolt/internal/recovery"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
@@ -137,6 +138,22 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("POST /v1/workers/{workerId}/revoke", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleRevokeWorker))))
 		mux.Handle("POST /api/v1/workers/{workerId}/drain", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleDrainWorker))))
 		mux.Handle("POST /v1/workers/{workerId}/drain", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleDrainWorker))))
+
+		recoveryMgr := recovery.NewManager(storagePool)
+		recoveryHandler := recovery.NewHTTPHandler(recoveryMgr, tenantService)
+		recoveryRoute := func(pattern, capability string, handle http.HandlerFunc) {
+			mux.Handle(pattern, tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(capability, handle))))
+		}
+		recoveryRoute("GET /api/v1/system/recovery", tenant.CapRunsRead, recoveryHandler.GetRecovery)
+		recoveryRoute("GET /v1/system/recovery", tenant.CapRunsRead, recoveryHandler.GetRecovery)
+		recoveryRoute("POST /api/v1/system/recovery/prepare", tenant.CapRunsControl, recoveryHandler.PrepareRecovery)
+		recoveryRoute("POST /v1/system/recovery/prepare", tenant.CapRunsControl, recoveryHandler.PrepareRecovery)
+		recoveryRoute("POST /api/v1/system/recovery/verify", tenant.CapRunsControl, recoveryHandler.VerifyIntegrity)
+		recoveryRoute("POST /v1/system/recovery/verify", tenant.CapRunsControl, recoveryHandler.VerifyIntegrity)
+		recoveryRoute("POST /api/v1/system/recovery/rpo-gap", tenant.CapRunsControl, recoveryHandler.ReconcileRPOGap)
+		recoveryRoute("POST /v1/system/recovery/rpo-gap", tenant.CapRunsControl, recoveryHandler.ReconcileRPOGap)
+		recoveryRoute("POST /api/v1/system/recovery/resume", tenant.CapRunsControl, recoveryHandler.Resume)
+		recoveryRoute("POST /v1/system/recovery/resume", tenant.CapRunsControl, recoveryHandler.Resume)
 
 		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
 		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)

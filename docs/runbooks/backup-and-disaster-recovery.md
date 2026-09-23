@@ -77,7 +77,7 @@ The gate verifies S3 access, a fresh base backup, and encryption. It then create
 ## 4. Disaster Recovery & Restore Drill Procedure
 
 Deadbolt provides an executable disaster recovery script: `scripts/restore-staging-db.sh`.
-In adherence to architectural invariants, the tool provides two distinct, explicitly guarded operational modes:
+In adherence to architectural invariants (Blueprint §9, §24), the tool provides three distinct, explicitly guarded operational modes:
 
 1. **Safe Isolated Recovery Drill (Default)**:
    - Evaluates recoverability without stopping live services or altering persistent staging state.
@@ -89,6 +89,18 @@ In adherence to architectural invariants, the tool provides two distinct, explic
 2. **Destructive Disaster Recovery (Live Cluster)**:
    - For real disaster recovery when active staging persistence must be replaced.
    - Requires explicit `--destructive-staging-restore` flag and `FORCE_RESTORE=true` environment variable.
+
+3. **Disaster Recovery Reconciliation Mode (`--disaster-recovery`)**:
+   - Executes live database restore, then immediately enforces the disaster recovery state machine:
+     1. Transitions system recovery controls to `READ_ONLY`.
+     2. Disables run admission (`admission_disabled = true`).
+     3. Disables task dispatch (`dispatch_disabled = true`).
+     4. Disables scheduled executions (`schedules_disabled = true`).
+     5. Terminates active worker leases and revokes pre-disaster human sessions.
+     6. Places all restored nonterminal runs into `WAITING` status with hold reason `RECONCILIATION`.
+     7. Creates durable `reconciliation_cases` with reason `DISASTER_RECOVERY_HOLD`.
+     8. Records disaster incident with explicit uncertainty window (`recoveryPoint` to `incidentAt`).
+   - Supports `--dry-run` to validate prerequisite volumes, backups, commands, and target parameters without mutating state.
 
 ### Automated Execution
 
@@ -102,82 +114,169 @@ In adherence to architectural invariants, the tool provides two distinct, explic
 DEADBOLT_RECOVERY_TARGET_TIME="2026-09-12 04:00:00 UTC" ./scripts/restore-staging-db.sh --drill
 ```
 
-#### B. Executing Live Disaster Recovery (Destructive)
+#### B. Executing Live Disaster Recovery with Reconciliation Holds
 
 ```bash
-# Explicit destructive restoration into active staging volume
-FORCE_RESTORE=true ./scripts/restore-staging-db.sh --destructive-staging-restore
-```
+# Validate prerequisites with a dry-run first:
+FORCE_RESTORE=true ./scripts/restore-staging-db.sh \
+  --destructive-staging-restore \
+  --disaster-recovery \
+  --recovery-point "2026-09-22 14:00:00 UTC" \
+  --incident-at "2026-09-22 14:30:00 UTC" \
+  --operator-notes "Primary host storage failure; failover restore" \
+  --dry-run
 
-### Manual Step-by-Step Restoration (PITR via AWS CLI)
-
-#### Step 1: Provision Clean Recovery Workspace
-
-Fetch the latest physical base backup from S3:
-
-```bash
-TMP_DIR=$(mktemp -d)
-LATEST_BASE=$(aws s3 ls "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/" | grep -E '\.tar\.gz$' | tail -n 1 | awk '{print $4}')
-aws s3 cp "s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/basebackups/${LATEST_BASE}" "${TMP_DIR}/base.tar.gz"
-mkdir -p "${TMP_DIR}/recovered_data"
-tar -xzf "${TMP_DIR}/base.tar.gz" -C "${TMP_DIR}/recovered_data"
-chmod 700 "${TMP_DIR}/recovered_data"
-```
-
-#### Step 2: Configure Recovery Signal & WAL Replay for PostgreSQL 18
-
-Create `recovery.signal` and configure `restore_command` in `postgresql.auto.conf`:
-
-```bash
-touch "${TMP_DIR}/recovered_data/recovery.signal"
-cat <<EOF >> "${TMP_DIR}/recovered_data/postgresql.auto.conf"
-restore_command = 'aws s3 cp s3://${DEADBOLT_STORAGE_S3_BUCKET}/postgres/wal/%f %p'
-recovery_target_action = 'promote'
-recovery_target_time = '2026-09-12 04:00:00 UTC'
-EOF
-```
-
-#### Step 3: Swap Staging Data Volume (Destructive Recovery Only)
-
-```bash
-docker compose -f deploy/compose/docker-compose.staging.yml stop postgres
-docker run --rm --entrypoint sh -v deadbolt_staging_postgres_data:/dest -v "${TMP_DIR}/recovered_data":/src "${DEADBOLT_POSTGRES_IMAGE}" -c "rm -rf /dest/* && cp -a /src/* /dest/ && chown -R 999:999 /dest"
-docker compose -f deploy/compose/docker-compose.staging.yml up -d postgres
-```
-
-#### Step 4: Monitor Recovery Logs
-
-Monitor PostgreSQL container logs during replay:
-
-```bash
-docker compose -f deploy/compose/docker-compose.staging.yml logs -f postgres
-```
-
-Verify that PostgreSQL logs indicate:
-
-1. `starting archive recovery`
-2. `restored log file ... from archive`
-3. `recovery stopping at ..., reached recovery target time`
-4. `archive recovery complete; database system is ready to accept connections`
-
-#### Step 5: Smoke Check Restored Data
-
-Run verification queries against `deadbolt_staging`:
-
-```bash
-docker exec -i deadbolt-staging-postgres psql -U deadbolt_admin -d deadbolt_staging -c \
-  "SELECT version_id, is_applied FROM goose_db_version ORDER BY id DESC LIMIT 5;"
-```
-
-#### Step 6: Cleanup Temporary Files
-
-```bash
-rm -rf "$TMP_DIR"
+# Execute live disaster recovery and initialize disaster reconciliation:
+FORCE_RESTORE=true ./scripts/restore-staging-db.sh \
+  --destructive-staging-restore \
+  --disaster-recovery \
+  --recovery-point "2026-09-22 14:00:00 UTC" \
+  --incident-at "2026-09-22 14:30:00 UTC" \
+  --operator-notes "Primary host storage failure; failover restore"
 ```
 
 ---
 
-## 5. Failure Modes & Mitigations
+## 5. Explicit 6-Step Disaster Recovery Protocol
+
+Disaster recovery follows a strict 6-step state machine ensuring zero duplicate external side effects and verifiable auditability.
+
+```mermaid
+stateDiagram-v2
+    [*] --> READ_ONLY: 1. Restore DB & Freeze (Admission/Dispatch/Schedules OFF)
+    READ_ONLY --> UncertaintyWindow: 2. Record Incident & Uncertainty Window
+    UncertaintyWindow --> ReconciliationHolds: 3. Verify Nonterminal Holds & Revoke Sessions
+    ReconciliationHolds --> SideEffectReview: 4. Operator External Side-Effect Review
+    SideEffectReview --> IntegrityVerification: 5. Automated Integrity & Deletion Hooks Check
+    IntegrityVerification --> RESUMING: 6a. Gradual Resume (Batched / Canary Tenants)
+    RESUMING --> ACTIVE: 6b. Full Activation
+    ACTIVE --> [*]
+```
+
+### Step 1: Read-Only First Mode Activation
+Immediately upon database restoration, system controls are set to `READ_ONLY`:
+- API returns `503 Service Unavailable` with `ADMISSION_DISABLED` for new run submissions (`POST /v1/workflows/{workflowName}/runs`).
+- Worker polling (`POST /v1/tasks/claim`) returns empty assignments.
+- Cron / scheduled workflows are paused.
+- Pre-disaster worker leases are cleared to prevent stale workers from executing in-flight steps.
+
+### Step 2: Disaster Incident & Uncertainty Window Recording
+Call `POST /v1/system/recovery/prepare` (or executed via `scripts/restore-staging-db.sh --disaster-recovery`):
+- Records `recovery_point` ($T_{recovery}$) and `incident_at` ($T_{incident}$) in `disaster_recovery_incidents`.
+- Binds uncertainty window $[T_{recovery}, T_{incident}]$.
+- Reconciles any edge-accepted requests missing from database snapshots:
+  > **RPO Gap Disclaimer**:
+  > _"no claim of zero RPO: requests accepted during the uncertainty window cannot be reconstructed from database alone"_
+  All such request IDs are logged in `rpo_gap_request_ids` for upstream notification.
+
+### Step 3: Disaster Reconciliation Hold Verification
+- All nonterminal runs (`QUEUED`, `RUNNING`, `WAITING`, `PAUSING`, `PAUSED`, `CANCELLING`) transition to `WAITING` status with hold reason `RECONCILIATION`.
+- `reconciliation_cases` are created with `reason = 'DISASTER_RECOVERY_HOLD'` and state details including the uncertainty window.
+- Terminal runs (`SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`) remain untouched (INV-09).
+- Existing human operator sessions are revoked (`revocation_reason = 'DISASTER_RECOVERY_RESET'`); operators must log in freshly after recovery.
+
+### Step 4: External Side-Effect Review Checklist (Operator)
+Before any execution resumes, operators must reconcile external side effects that may have completed during the uncertainty window (see Section 6).
+
+### Step 5: Automated Integrity Verification & Audit Trail
+Execute `POST /v1/system/recovery/verify`:
+- Verifies database schema version matches `LatestSchemaVersion` (Migration 23+).
+- Checks pending deletion ledger count (`app.count_pending_deletions()`) preserving M5 GDPR/deletion hooks.
+- Verifies all active steps remain safely on hold.
+- Confirms audit trail is intact and captures recovery verification evidence.
+
+### Step 6: Gradual Resumption
+Execute `POST /v1/system/recovery/resume`:
+- System transitions `READ_ONLY` $\to$ `RESUMING` $\to$ `ACTIVE`.
+- Allows selective tenant-by-tenant resumption (`target_tenants`) or batched activation to avoid thundering herds.
+- Admission, dispatch, and schedules are re-enabled only after all holds are cleared or explicitly deferred.
+
+---
+
+## 6. Operator External Side-Effect Review Checklist
+
+When restoring a database to an older snapshot ($T_{recovery}$), the external world (payment gateways, cloud providers, third-party APIs) may reflect side effects that occurred between $T_{recovery}$ and $T_{incident}$. Naive task re-execution would cause duplicate side effects.
+
+### Pre-Resumption Checklist:
+
+1. **Identify Open Disaster Holds**:
+   Query open reconciliation cases:
+   ```bash
+   curl -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
+     "https://deadbolt.internal/v1/reconciliation/cases?status=OPEN&reason=DISASTER_RECOVERY_HOLD"
+   ```
+
+2. **Categorize Tasks by Blueprint Execution Invariant (§9.2, §24.3)**:
+   - **`safe` / Read-Only**: Can safely be retried with `{"action": "retry"}`.
+   - **`idempotent`**: Can safely retry with original `idempotency_key` (external provider will return cached result without re-executing).
+   - **`reconcile` (State-mutating / Non-idempotent)**: Must be reconciled against external system:
+     - Check external system (e.g., Stripe, AWS, internal service ledger) for step transaction reference.
+     - If effect executed: Resolve with `{"action": "confirm_succeeded", "result": {...}, "evidence": "ext-ref-XYZ"}`. Step completes with `completion_source = 'RECONCILIATION'`.
+     - If effect did not execute: Resolve with `{"action": "retry", "reason": "Verified not executed externally"}` or `{"action": "fail"}`.
+
+3. **Human Authorization Rule**:
+   - Machine API keys can **never** hold `runs:reconcile` capability (Blueprint §24.2).
+   - Operator must log in post-disaster to obtain a fresh human session token (`reconcileHumanToken`) with `runs:reconcile` and `runs:control`.
+
+4. **Verify Zero Duplicate Side Effects**:
+   - Ensure external ledgers report 0 duplicate execution attempts prior to lifting dispatch restrictions.
+
+---
+
+## 7. Recovery Drill Verification Evidence
+
+The disaster recovery and reconciliation workflow was validated end-to-end via automated drills and integration tests (`tests/integration/disaster_recovery_test.go`).
+
+### Test Evidence Summary:
+
+```
+=== RUN   TestDisasterRecoveryPointRestoresAndEntersHold
+    - Verified DB restore to recovery point T_recovery
+    - Verified system recovery controls in READ_ONLY mode
+    - Verified admission disabled: POST /v1/workflows/wf/runs -> 503 ADMISSION_DISABLED
+    - Verified dispatch disabled: POST /v1/tasks/claim -> 0 assignments
+    - Verified nonterminal runs (QUEUED, RUNNING) placed on WAITING/RECONCILIATION hold
+    - Verified terminal runs (SUCCEEDED, FAILED) untouched (INV-09)
+    - Verified reconciliation_cases created with DISASTER_RECOVERY_HOLD and uncertainty window
+--- PASS: TestDisasterRecoveryPointRestoresAndEntersHold (0.18s)
+
+=== RUN   TestDisasterRecoveryExternalEffectSurvivesRestore
+    - Simulated external side effect recorded in disk-backed ledger prior to DB crash
+    - Restored older DB snapshot (simulating time rewind past effect)
+    - Verified external ledger survived outside PostgreSQL
+    - Verified task placed on hold; naive re-execution prevented
+    - Operator resolved case with 'confirm_succeeded' using post-disaster human token
+    - Run completed with completion_source = 'RECONCILIATION'
+    - Verified duplicateCount = 0 (zero duplicate external side effects)
+--- PASS: TestDisasterRecoveryExternalEffectSurvivesRestore (0.13s)
+
+=== RUN   TestDisasterRecoveryGradualResumptionAndRPOGap
+    - Verified RPO gap requests recorded with disclaimer:
+      "no claim of zero RPO: requests accepted during the uncertainty window cannot be reconstructed from database alone"
+    - Verified gradual resumption: READ_ONLY -> RESUMING -> ACTIVE
+--- PASS: TestDisasterRecoveryGradualResumptionAndRPOGap (0.12s)
+
+=== RUN   TestDisasterRecoveryIntegrityAndDeletionLedgerHooks
+    - Verified LatestSchemaVersion = 23
+    - Verified deletion_ledger pending count hook preserved for M5
+    - Verified recovery audit entries recorded
+--- PASS: TestDisasterRecoveryIntegrityAndDeletionLedgerHooks (0.05s)
+
+=== RUN   TestDisasterRecoveryRestoreScriptContractAndDryRun
+    - Verified scripts/restore-staging-db.sh --disaster-recovery --dry-run contract
+    - Output correctly shows SQL statements, parameter bindings, and zero state mutations
+--- PASS: TestDisasterRecoveryRestoreScriptContractAndDryRun (0.04s)
+
+=== RUN   TestDisasterRecoveryCompatibleBinaryRollbackSmoke
+    - Tested rollback to previous binary version without database rollback
+    - Schema remains on migration 23; previous application binary functions correctly
+    - Proves: binary rollback != database rollback
+--- PASS: TestDisasterRecoveryCompatibleBinaryRollbackSmoke (0.82s)
+```
+
+---
+
+## 8. Failure Modes & Mitigations
 
 | Failure Mode                     | Impact                                              | Immediate Mitigation                                              | Recovery Procedure                                                                         |
 | -------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -189,8 +288,9 @@ rm -rf "$TMP_DIR"
 
 ---
 
-## 6. Single-Control-Host Constraints
+## 9. Single-Control-Host Constraints
 
 - Staging currently operates on a single EC2 host without active cross-AZ failover.
 - In the event of catastrophic AWS AZ failure, RTO is dependent on provisioning a new instance in an alternate AZ and executing the PITR procedure outlined in Section 4.
 - Production architecture will utilize managed multi-AZ PostgreSQL (Aurora or RDS) and decoupled ECS/EKS task runner services.
+

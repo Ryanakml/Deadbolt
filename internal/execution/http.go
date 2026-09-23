@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
+	"github.com/Ryanakml/Deadbolt/internal/recovery"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 )
 
@@ -90,6 +91,10 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, tenant.ErrAuditRequired) {
 			errJSON(w, r, http.StatusUnauthorized, "AUDIT_REQUIRED", "Audit context is required")
+			return
+		}
+		if errors.Is(err, recovery.ErrAdmissionDisabled) {
+			errJSON(w, r, http.StatusServiceUnavailable, "ADMISSION_DISABLED", "System is in disaster recovery read-only mode; run admission is disabled")
 			return
 		}
 		if errors.Is(err, ErrMissingIdempotencyKey) {

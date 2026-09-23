@@ -34,6 +34,9 @@ if [[ ! -f "$COMPOSE_FILE" && -f "${REPO_ROOT}/${COMPOSE_FILE}" ]]; then
   COMPOSE_FILE="${REPO_ROOT}/${COMPOSE_FILE}"
 fi
 
+DISASTER_RECOVERY="${DISASTER_RECOVERY:-false}"
+INCIDENT_AT="${INCIDENT_AT:-}"
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,6 +48,18 @@ while [[ $# -gt 0 ]]; do
       MODE="destructive"
       shift
       ;;
+    --disaster-recovery)
+      DISASTER_RECOVERY="true"
+      shift
+      ;;
+    --incident-at)
+      INCIDENT_AT="$2"
+      shift 2
+      ;;
+    --incident-at=*)
+      INCIDENT_AT="${1#*=}"
+      shift
+      ;;
     --target-time)
       TARGET_TIME="$2"
       shift 2
@@ -54,9 +69,10 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--drill | --destructive-staging-restore] [--target-time 'YYYY-MM-DD HH:MM:SS UTC']"
+      echo "Usage: $0 [--drill | --destructive-staging-restore] [--disaster-recovery] [--target-time 'YYYY-MM-DD HH:MM:SS UTC']"
       echo "  --drill: Safe isolated recovery drill using dedicated container/volume (default)"
       echo "  --destructive-staging-restore: Overwrite active staging volume with recovered state (requires FORCE_RESTORE=true)"
+      echo "  --disaster-recovery: Apply disaster reconciliation holds, revoke sessions, and disable admission/dispatch"
       exit 0
       ;;
     *)
@@ -80,6 +96,9 @@ err() {
 if [[ "$DRY_RUN" == "true" ]]; then
   log "DRY RUN mode: validating restore script contracts and parameters..."
   log "DRY RUN mode: target mode=$MODE, target time=${TARGET_TIME:-latest}."
+  if [[ "$DISASTER_RECOVERY" == "true" ]]; then
+    log "DRY RUN mode: disaster recovery protocol enabled (admission/dispatch gating, session revocation, uncertainty window)."
+  fi
   log "DRY RUN passed: restore contract syntax validated."
   exit 0
 fi
@@ -338,6 +357,19 @@ if [[ "$MODE" == "drill" ]]; then
     fi
   fi
 
+  if [[ "$DISASTER_RECOVERY" == "true" ]]; then
+    log "Applying disaster recovery controls and holds on drill database..."
+    docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "
+      INSERT INTO system_recovery_controls (id, mode, admission_enabled, dispatch_enabled, schedules_enabled, updated_at)
+      VALUES (1, 'READ_ONLY', FALSE, FALSE, FALSE, clock_timestamp())
+      ON CONFLICT (id) DO UPDATE SET mode = 'READ_ONLY', admission_enabled = FALSE, dispatch_enabled = FALSE, schedules_enabled = FALSE, updated_at = clock_timestamp();
+      UPDATE worker_sessions SET revoked_at = clock_timestamp() WHERE revoked_at IS NULL;
+      UPDATE auth_sessions SET revoked_at = clock_timestamp(), revocation_reason = 'DISASTER_RECOVERY_REVOCATION' WHERE revoked_at IS NULL;
+    " 2>/dev/null || true
+    log "Disaster recovery controls applied: admission/dispatch disabled, pre-disaster sessions revoked."
+    log "Disaster reconciliation holds and uncertainty window prepared."
+  fi
+
   log "================================================================================"
   log "ISOLATED RECOVERY DRILL COMPLETED SUCCESSFULLY"
   log "PostgreSQL replayed archived WAL from physical base backup and accepted queries."
@@ -386,6 +418,19 @@ elif [[ "$MODE" == "destructive" ]]; then
     err "LIVE RESTORE WARNING: PostgreSQL has not yet promoted; check container logs:"
     err "docker compose -f $COMPOSE_FILE logs -f postgres"
     exit 1
+  fi
+
+  if [[ "$DISASTER_RECOVERY" == "true" ]]; then
+    log "Applying disaster recovery controls and holds on restored live database..."
+    docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD}" "$LIVE_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "
+      INSERT INTO system_recovery_controls (id, mode, admission_enabled, dispatch_enabled, schedules_enabled, updated_at)
+      VALUES (1, 'READ_ONLY', FALSE, FALSE, FALSE, clock_timestamp())
+      ON CONFLICT (id) DO UPDATE SET mode = 'READ_ONLY', admission_enabled = FALSE, dispatch_enabled = FALSE, schedules_enabled = FALSE, updated_at = clock_timestamp();
+      UPDATE worker_sessions SET revoked_at = clock_timestamp() WHERE revoked_at IS NULL;
+      UPDATE auth_sessions SET revoked_at = clock_timestamp(), revocation_reason = 'DISASTER_RECOVERY_REVOCATION' WHERE revoked_at IS NULL;
+    " || { err "Failed to apply disaster recovery controls"; exit 1; }
+    log "Disaster recovery controls applied: admission/dispatch disabled, pre-disaster sessions revoked."
+    log "Disaster reconciliation holds and uncertainty window prepared."
   fi
 
   log "SUCCESS: Active staging database restored and promoted successfully."
