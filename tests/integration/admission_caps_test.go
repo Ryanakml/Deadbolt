@@ -69,6 +69,20 @@ func TestCreateRunTokenBucketRefillAndAdmission429(t *testing.T) {
 		}
 	}
 
+	// Pin the bucket to exactly 0 tokens (and reset the timestamp to now) so that any
+	// wall-clock time that elapsed during the sequential burst above does not partially
+	// refill the bucket before we test the 11th request.  On slow CI runners the 10
+	// sequential round-trips can take hundreds of milliseconds, which refills enough
+	// tokens (5 req/s × elapsed) to absorb the burst-exceeded check.
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE environment_admissions
+			SET create_rate_tokens=0, create_rate_updated_at=clock_timestamp()
+			WHERE environment_id=$1::uuid AND organization_id=$2::uuid`, envID, orgID)
+		return err
+	}); err != nil {
+		t.Fatalf("pin bucket after burst: %v", err)
+	}
+
 	// 2. The 11th request exceeds burst capacity and must receive 429 + Retry-After: 1
 	status, retryAfter, body := createWithResp("burst-exceeded-11")
 	if status != http.StatusTooManyRequests {
@@ -161,7 +175,7 @@ func TestClaimFifoOrderingWithinEnvironment(t *testing.T) {
 	schema := map[string]any{"type": "object"}
 	manifest := createLifecycleManifest(bundle,
 		[]map[string]any{{"name": "fifo-task", "entrypoint": "tasks/fifo.js", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000, "inputSchema": schema, "outputSchema": schema}},
-		[]map[string]any{{"manifestVersion": 1, "name": "fifo-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "fifo-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{}}},
+		[]map[string]any{{"manifestVersion": 1, "name": "fifo-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "fifo-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{"$ref": "step.output", "stepId": "node-1", "pointer": ""}}},
 	)
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "fifo-flow", manifest)
 
@@ -269,7 +283,7 @@ func TestClaimRoundRobinAcrossEnvironments(t *testing.T) {
 	schema := map[string]any{"type": "object"}
 	manifest := createLifecycleManifest(bundle,
 		[]map[string]any{{"name": "rr-task", "entrypoint": "tasks/rr.js", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000, "inputSchema": schema, "outputSchema": schema}},
-		[]map[string]any{{"manifestVersion": 1, "name": "rr-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "rr-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{}}},
+		[]map[string]any{{"manifestVersion": 1, "name": "rr-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "rr-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{"$ref": "step.output", "stepId": "node-1", "pointer": ""}}},
 	)
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID1, "rr-flow", manifest)
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID2, "rr-flow", manifest)
@@ -357,7 +371,7 @@ func TestClaimConcurrencyCapsAndQuotaWait(t *testing.T) {
 	schema := map[string]any{"type": "object"}
 	manifest := createLifecycleManifest(bundle,
 		[]map[string]any{{"name": "cap-task", "entrypoint": "tasks/cap.js", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000, "inputSchema": schema, "outputSchema": schema}},
-		[]map[string]any{{"manifestVersion": 1, "name": "cap-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "cap-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{}}},
+		[]map[string]any{{"manifestVersion": 1, "name": "cap-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "cap-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{"$ref": "step.output", "stepId": "node-1", "pointer": ""}}},
 	)
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "cap-flow", manifest)
 
@@ -500,7 +514,7 @@ func TestHistoryLimitBoundaryAndAtomicTerminalization(t *testing.T) {
 	schema := map[string]any{"type": "object"}
 	manifest := createLifecycleManifest(bundle,
 		[]map[string]any{{"name": "hist-task", "entrypoint": "tasks/hist.js", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000, "inputSchema": schema, "outputSchema": schema}},
-		[]map[string]any{{"manifestVersion": 1, "name": "hist-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "hist-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{}}},
+		[]map[string]any{{"manifestVersion": 1, "name": "hist-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "hist-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{"$ref": "step.output", "stepId": "node-1", "pointer": ""}}},
 	)
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "hist-flow", manifest)
 
