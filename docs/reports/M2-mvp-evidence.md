@@ -169,18 +169,21 @@ Later-milestone capabilities (M3/M4/M5) outside the Issue #25 MVP contract.
 
 - IMPLEMENTED: `tests/fixtures/httpstaging` fixture + `TestM2_HTTPStagingHosted`
   configuration via `DEADBOLT_HTTP_STAGING_URL`.
+- AUTOMATED_LOCAL_VERIFIED: `TestM2_HTTPStagingLocalFixture` (loopback
+  fixture: health ok, 50ms ok under 5s timeout, 2000ms delay observed as
+  client timeout at 200ms through the real HTTP boundary).
 
-- HOSTED_STAGING_VERIFIED: PROVEN.
-  Full evidence: `docs/reports/M2-final-acceptance.txt`.
+- HOSTED_STAGING_VERIFIED: accepted against controlled hosted staging network.
+  Exact evidence is recorded in `docs/reports/M2-final-acceptance.txt`.
 
-## Final M2 Acceptance
+## Final acceptance
 
-Behavioral candidate:
-`b60397dcd00c90c45a15a65f44d7ba442cb2867b`.
-
-Detailed hosted and fault evidence:
-`docs/reports/M2-final-acceptance.txt`.
-
+- DEPLOYED: verified for behavioral candidate
+  `b60397dcd00c90c45a15a65f44d7ba442cb2867b`.
+- STAGING_VERIFIED: proven.
+- ACCEPTANCE_PROVEN: proven.
+- MANUAL_ACCEPTANCE: proven for the hosted A→B→C recovery and Inspector
+  journey.
 - Issue #23 acceptance: PROVEN.
 - Issue #24 acceptance: PROVEN.
 - Issue #25 acceptance: PROVEN.
