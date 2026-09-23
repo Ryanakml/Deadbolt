@@ -291,6 +291,12 @@ func TestSameSizeCorruptionDetectedBySHA(t *testing.T) {
 	const digest = "bundle-same-size-22"
 	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, consumerManifest())
 	runID, stepA := seedExecutionRun(t, tc, orgID, envID, deploymentID, "a")
+	defer func() {
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, _ = tx.Exec(ctx, `UPDATE runs SET status='CANCELLED' WHERE id=$1::uuid`, runID)
+			return nil
+		})
+	}()
 	var stepB string
 	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `INSERT INTO run_steps

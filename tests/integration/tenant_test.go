@@ -42,6 +42,10 @@ func setupTenantContext(t *testing.T) *tenantTestContext {
 	pool := storage.NewPool(runtimePool)
 	service := tenant.NewService(pool)
 
+	_, _ = runtimePool.Exec(context.Background(), `INSERT INTO system_recovery_controls (id, mode, admission_enabled, dispatch_enabled, schedules_enabled)
+		VALUES (1, 'ACTIVE', TRUE, TRUE, TRUE)
+		ON CONFLICT (id) DO UPDATE SET mode = 'ACTIVE', admission_enabled = TRUE, dispatch_enabled = TRUE, schedules_enabled = TRUE, updated_at = clock_timestamp()`)
+
 	authCfg := auth.Config{
 		RuntimeMode:            auth.ModeHosted,
 		CookieSecure:           true,

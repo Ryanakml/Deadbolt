@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +23,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/recovery"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
+	"github.com/Ryanakml/Deadbolt/internal/storage/testdb"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 	"github.com/Ryanakml/Deadbolt/tests/fixtures/externaleffect"
@@ -47,6 +52,17 @@ func setupDisasterRecoveryHarness(t *testing.T) (*tenantTestContext, *httptest.S
 	}
 
 	recoveryMgr := recovery.NewManager(tc.pool)
+	if store, ok := artifacts.StoreFromEnv(); ok && store != nil {
+		recoveryMgr.SetArtifacts(artifacts.NewService(tc.pool, store))
+	} else {
+		cfg := artifactTestConfig(t)
+		testStore := artifacts.NewS3Store(cfg)
+		testCtx, testCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := testStore.EnsureBucket(testCtx); err == nil {
+			recoveryMgr.SetArtifacts(artifacts.NewService(tc.pool, testStore))
+		}
+		testCancel()
+	}
 
 	// Create org, project, env, API key
 	owner, _ := tenant.NewUUID()
@@ -265,12 +281,29 @@ func TestDisasterRecoveryPointRestoresAndEntersHold(t *testing.T) {
 	}
 }
 
-// TestDisasterRecoveryExternalEffectSurvivesRestore proves:
-// 1. Separate external-effect ledger survives older DB snapshot.
-// 2. Disaster reconciliation hold prevents naive re-execution of side effects.
-// 3. Operator reviews external ledger and resolves case with confirm_succeeded.
-// 4. Run completes with completion_source = 'RECONCILIATION' and 0 duplicate external side effects.
+// TestDisasterRecoveryExternalEffectSurvivesRestore proves Blueprint §27.3:
+// 1. T0 DB contains nonterminal run/attempt; real database backup taken via pg_dump.
+// 2. T1 > T0 external provider effect succeeds and survives in disk ledger outside PostgreSQL.
+// 3. Newer database state created after T0.
+// 4. Disaster simulated: PostgreSQL restored from T0 backup file via psql.
+// 5. Restored DB lacks knowledge of external success at T1, newer state gone.
+// 6. Step 2 verification: schema, tenant boundaries, artifact integrity, deletion ledger.
+// 7. Disaster recovery entered: admission/dispatch disabled, pre-disaster sessions revoked.
+// 8. Pre-disaster human and worker sessions rejected with 401 Unauthorized.
+// 9. Post-restore dispatch attempt blocked by disaster hold (0 assignments, 0 duplicate effects).
+// 10. Operator inspects surviving external ledger and resolves case with confirm_succeeded.
+// 11. Step & Run complete with completion_source = 'RECONCILIATION'.
+// 12. External effect execution count remains exactly 1, duplicate count remains 0.
 func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
+	pgDumpPath, err := exec.LookPath("pg_dump")
+	if err != nil {
+		t.Skip("pg_dump not available in PATH")
+	}
+	psqlPath, err := exec.LookPath("psql")
+	if err != nil {
+		t.Skip("psql not available in PATH")
+	}
+
 	tc, server, recoveryMgr, orgID, envID, _, humanToken, _ := setupDisasterRecoveryHarness(t)
 	defer tc.cleanup()
 	ctx := context.Background()
@@ -283,19 +316,7 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 	}
 	defer extFixture.Close()
 
-	// 2. Simulate worker having executed external side effect (e.g. payment / remote charge)
-	// BEFORE the crash/restore occurred
-	idempotencyKey := fmt.Sprintf("ext-payment-%d", time.Now().UnixNano())
-	rec, err := extFixture.ExecuteEffect(idempotencyKey, "CHARGE_CUSTOMER", map[string]any{"amount": 5000, "currency": "USD"})
-	if err != nil {
-		t.Fatalf("execute external effect: %v", err)
-	}
-	if rec.Duplicate {
-		t.Fatalf("expected initial effect not to be duplicate")
-	}
-
-	// 3. Now simulate the database travelling back in time (restored DB snapshot older than external effect)
-	// Create workflow and run that was RUNNING at recovery point
+	// 2. Setup T0 state in PostgreSQL
 	manifest := disasterManifest("charge-task", "reconcile")
 	bundleDigest := "sha256:2222333344445555666677778888999900001111bbbbbcccccdddddeeeeefffff"
 	var depID, runID, stepID string
@@ -310,16 +331,108 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 			RETURNING id::text`, orgID, envID, depID).Scan(&runID); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `INSERT INTO run_steps (organization_id, environment_id, run_id, node_id, state)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, 'node-1', 'RUNNING')
+		return tx.QueryRow(ctx, `INSERT INTO run_steps (organization_id, environment_id, run_id, node_id, state, eligible_at)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, 'node-1', 'READY', clock_timestamp())
 			RETURNING id::text`, orgID, envID, runID).Scan(&stepID)
 	})
 	if err != nil {
-		t.Fatalf("seed DB: %v", err)
+		t.Fatalf("seed T0 DB: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, _ = tx.Exec(ctx, `UPDATE runs SET status='CANCELLED' WHERE id=$1::uuid`, runID)
+			return nil
+		})
+	})
+
+	// Enroll pre-disaster worker session at T0
+	preWorker, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "pre-dr-worker")
+	advertiseDigest(t, tc, orgID, preWorker.SessionID, bundleDigest)
+
+	// Pre-disaster human operator session at T0
+	preHumanToken := humanToken
+
+	// Record T0 recovery point timestamp
+	recoveryPoint := time.Now().UTC()
+
+	// 3. Create REAL physical/logical database backup at T0
+	backupFile := filepath.Join(t.TempDir(), "t0_backup.sql")
+	dumpCmd := exec.Command(pgDumpPath, "-d", "deadbolt_integration_test", "--clean", "--if-exists", "-f", backupFile)
+	if out, err := dumpCmd.CombinedOutput(); err != nil {
+		t.Fatalf("pg_dump failed at T0: %v\nOutput:\n%s", err, string(out))
 	}
 
-	// 4. Initiate disaster recovery
-	recoveryPoint := time.Now().Add(-10 * time.Minute).UTC()
+	// 4. T1 > T0: External effect succeeds outside PostgreSQL
+	time.Sleep(10 * time.Millisecond)
+	idempotencyKey := fmt.Sprintf("ext-payment-%d", time.Now().UnixNano())
+	rec, err := extFixture.ExecuteEffect(idempotencyKey, "CHARGE_CUSTOMER", map[string]any{"amount": 5000, "currency": "USD"})
+	if err != nil {
+		t.Fatalf("execute external effect at T1: %v", err)
+	}
+	if rec.Duplicate {
+		t.Fatalf("expected initial effect not to be duplicate")
+	}
+	if extFixture.Count() != 1 {
+		t.Fatalf("expected 1 execution in external ledger, got %d", extFixture.Count())
+	}
+
+	// Simulate newer state in DB after T0 (e.g. newer run created after recovery point)
+	var postT0RunID string
+	err = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `INSERT INTO runs (organization_id, environment_id, deployment_id, workflow_name, status, input)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, 'wf-disaster', 'RUNNING', '{}'::jsonb)
+			RETURNING id::text`, orgID, envID, depID).Scan(&postT0RunID)
+	})
+	if err != nil {
+		t.Fatalf("seed post-T0 run: %v", err)
+	}
+
+	// 5. Simulate disaster & restore PostgreSQL from T0 backup
+	tc.cleanup()
+
+	restoreCmd := exec.Command(psqlPath, "-d", "deadbolt_integration_test", "-f", backupFile)
+	if out, err := restoreCmd.CombinedOutput(); err != nil {
+		t.Fatalf("psql restore to T0 failed: %v\nOutput:\n%s", err, string(out))
+	}
+
+	// Reconnect test harness against recovered database
+	tc = setupTenantContext(t)
+	defer tc.cleanup()
+	recoveryMgr = recovery.NewManager(tc.pool)
+	if store, ok := artifacts.StoreFromEnv(); ok && store != nil {
+		recoveryMgr.SetArtifacts(artifacts.NewService(tc.pool, store))
+	} else {
+		cfg := artifactTestConfig(t)
+		testStore := artifacts.NewS3Store(cfg)
+		testCtx, testCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := testStore.EnsureBucket(testCtx); err == nil {
+			recoveryMgr.SetArtifacts(artifacts.NewService(tc.pool, testStore))
+		}
+		testCancel()
+	}
+	prodMux := controlplane.BuildMux(tc.authCfg, tc.runtimePool, nil, nil)
+	server = httptest.NewServer(prodMux)
+	defer server.Close()
+
+	// Prove recovered DB lacks knowledge of T1 newer state
+	var checkPostT0 int
+	_ = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM runs WHERE id = $1::uuid`, postT0RunID).Scan(&checkPostT0)
+	})
+	if checkPostT0 != 0 {
+		t.Fatalf("expected post-T0 run to be absent after restore, got count=%d", checkPostT0)
+	}
+
+	// 6. Verify Step 2 (Blueprint §27.3): schema, tenant boundaries, artifact integrity, deletion ledger
+	integrityReport, err := recoveryMgr.VerifyIntegrity(ctx)
+	if err != nil {
+		t.Fatalf("VerifyIntegrity failed: %v", err)
+	}
+	if !integrityReport.OverallPassed {
+		t.Fatalf("recovery integrity verification failed: %+v", integrityReport.Checks)
+	}
+
+	// 7. Enter disaster recovery: mark nonterminal runs on hold with uncertainty window
 	incidentAt := time.Now().UTC()
 	_, err = recoveryMgr.PrepareDisasterRecovery(ctx, recovery.PrepareRequest{
 		RecoveryPoint: recoveryPoint,
@@ -330,14 +443,12 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 		t.Fatalf("prepare disaster recovery: %v", err)
 	}
 
-	// 5. Verify the external effect ledger survived outside PostgreSQL
-	// Re-instantiate fixture from the same directory to simulate service reboot / persistence
+	// Verify external ledger survived outside PostgreSQL
 	survivedFixture, err := externaleffect.NewFixture(extDir)
 	if err != nil {
 		t.Fatalf("reload external fixture: %v", err)
 	}
 	defer survivedFixture.Close()
-
 	if survivedFixture.Count() != 1 {
 		t.Fatalf("expected 1 record in external ledger after restore, got %d", survivedFixture.Count())
 	}
@@ -346,11 +457,8 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 		t.Fatalf("expected idempotency key %s to exist in external ledger", idempotencyKey)
 	}
 
-	// 6. Verify run step is on hold with open reconciliation case
+	// 8. Session Revocation Proof
 	caseID, rev := openReconciliationCase(t, tc, orgID, stepID)
-
-	// 7. Operator reviews external effect ledger, sees the external charge succeeded,
-	// and resolves the reconciliation case with action 'confirm_succeeded'
 	outputPayload := map[string]any{
 		"chargeId":       "ch_123456",
 		"status":         "CHARGED",
@@ -365,20 +473,59 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 		"expectedRevision": rev,
 	}
 
-	// Verify pre-disaster human session was revoked by disaster recovery
-	staleStatus, _ := resolveCaseHTTP(t, server, humanToken, orgID, caseID, resolveBody)
+	// Pre-disaster human session is rejected with 401
+	staleStatus, _ := resolveCaseHTTP(t, server, preHumanToken, orgID, caseID, resolveBody)
 	if staleStatus != http.StatusUnauthorized {
-		t.Fatalf("expected pre-disaster session to be rejected with 401 Unauthorized, got %d", staleStatus)
+		t.Fatalf("expected pre-disaster human session to be 401 Unauthorized, got %d", staleStatus)
 	}
 
-	// Post-disaster operator logs in to resolve reconciliation cases
+	// Pre-disaster worker session is rejected with 401
+	var stalePollResp worker.PollResponseDTO
+	staleWorkerStatus := postWorkerJSON(t, server, "/worker/v1/poll", preWorker.SessionToken, worker.PollRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "poll-stale", WorkerID: preWorker.WorkerID,
+		SessionID: preWorker.SessionID, AvailableSlots: 1, DeploymentDigests: []string{bundleDigest}, Pool: "default",
+	}, &stalePollResp)
+	if staleWorkerStatus != http.StatusUnauthorized {
+		t.Fatalf("expected pre-disaster worker session to be 401 Unauthorized, got %d", staleWorkerStatus)
+	}
+
+	// 9. Post-restore dispatch attempt blocked by disaster hold
+	if _, err := recoveryMgr.GradualResume(ctx, "RESUMING"); err != nil {
+		t.Fatalf("gradual resume to RESUMING: %v", err)
+	}
+
+	// New post-disaster worker session attempts to claim work
+	postWorker, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "post-dr-worker")
+	advertiseDigest(t, tc, orgID, postWorker.SessionID, bundleDigest)
+
+	var freshPollResp worker.PollResponseDTO
+	freshPollStatus := postWorkerJSON(t, server, "/worker/v1/poll", postWorker.SessionToken, worker.PollRequestDTO{
+		ProtocolVersion: worker.ProtocolVersion, RequestID: "poll-fresh", WorkerID: postWorker.WorkerID,
+		SessionID: postWorker.SessionID, AvailableSlots: 1, DeploymentDigests: []string{bundleDigest}, Pool: "default",
+	}, &freshPollResp)
+	if freshPollStatus != http.StatusOK {
+		t.Fatalf("expected 200 OK from fresh poll, got %d", freshPollStatus)
+	}
+	if len(freshPollResp.Assignments) != 0 {
+		t.Fatalf("DISASTER RECONCILIATION HOLD VIOLATION: held step was claimed by worker! assignments=%d", len(freshPollResp.Assignments))
+	}
+
+	// External effect was NOT re-executed
+	if survivedFixture.Count() != 1 {
+		t.Fatalf("expected execution count to remain 1, got %d", survivedFixture.Count())
+	}
+	if survivedFixture.DuplicateCount() != 0 {
+		t.Fatalf("expected 0 duplicates, got %d", survivedFixture.DuplicateCount())
+	}
+
+	// 10. Operator inspects surviving external ledger and resolves case
 	postOpToken, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleOperator, "post-dr-op")
 	status, res := resolveCaseHTTP(t, server, postOpToken, orgID, caseID, resolveBody)
 	if status != http.StatusOK {
 		t.Fatalf("expected 200 OK resolving reconciliation case, got %d: %v", status, res)
 	}
 
-	// 8. Verify the step and run completed as SUCCEEDED with completion_source = 'RECONCILIATION'
+	// 11. Verify step and run completed as SUCCEEDED with completion_source = 'RECONCILIATION'
 	var finalRunStatus string
 	var stepState string
 	var completionSource *string
@@ -398,7 +545,10 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 		t.Fatalf("expected completion_source 'RECONCILIATION', got %v", completionSource)
 	}
 
-	// 9. Verify external ledger has NO duplicate attempts (0 duplicate side effects)
+	// 12. Final verification of external effect execution and duplicate counts
+	if survivedFixture.Count() != 1 {
+		t.Fatalf("expected final execution count 1, got %d", survivedFixture.Count())
+	}
 	if survivedFixture.DuplicateCount() != 0 {
 		t.Fatalf("duplicate external side effect occurred! expected 0 duplicates, got %d", survivedFixture.DuplicateCount())
 	}
@@ -827,7 +977,7 @@ func TestDisasterRecoveryPolicyResolutionPerTask(t *testing.T) {
 
 // seedReadyArtifactRun claims, starts, and completes an artifact upload so the
 // run stays nonterminal (RUNNING) with a READY artifact attached.
-func seedReadyArtifactRun(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID, suffix string) (runID, stepID, artifactID, storageKey string) {
+func seedReadyArtifactRun(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID, suffix string) (runID, stepID, artifactID, storageKey string, cancelRun func()) {
 	t.Helper()
 	ctx := context.Background()
 	session, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "dr-artifact-"+suffix)
@@ -859,7 +1009,14 @@ func seedReadyArtifactRun(t *testing.T, tc *tenantTestContext, server *httptest.
 	if storageKey == "" {
 		t.Fatalf("expected storage key for artifact %s", artifactID)
 	}
-	return runID, stepID, artifactID, storageKey
+	cancelRun = func() {
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, _ = tx.Exec(context.Background(), `UPDATE runs SET status='CANCELLED' WHERE id=$1::uuid`, runID)
+			return nil
+		})
+	}
+	t.Cleanup(cancelRun)
+	return runID, stepID, artifactID, storageKey, cancelRun
 }
 
 // TestDisasterRecoveryArtifactIntegrityValid proves a valid referenced READY
@@ -869,7 +1026,8 @@ func TestDisasterRecoveryArtifactIntegrityValid(t *testing.T) {
 	defer tc.cleanup()
 	defer server.Close()
 	ctx := context.Background()
-	_, _, _, _ = seedReadyArtifactRun(t, tc, server, orgID, envID, "valid")
+	_, _, _, _, cancelRun := seedReadyArtifactRun(t, tc, server, orgID, envID, "valid")
+	defer cancelRun()
 	mgr := recovery.NewManager(tc.pool)
 	mgr.SetArtifacts(artifacts.NewService(tc.pool, store))
 	report, err := mgr.VerifyIntegrity(ctx)
@@ -891,7 +1049,8 @@ func TestDisasterRecoveryArtifactIntegrityMissing(t *testing.T) {
 	defer tc.cleanup()
 	defer server.Close()
 	ctx := context.Background()
-	_, _, _, storageKey := seedReadyArtifactRun(t, tc, server, orgID, envID, "missing")
+	_, _, _, storageKey, cancelRun := seedReadyArtifactRun(t, tc, server, orgID, envID, "missing")
+	defer cancelRun()
 	if err := store.Delete(ctx, storageKey); err != nil {
 		t.Fatalf("delete S3 object: %v", err)
 	}
@@ -916,7 +1075,8 @@ func TestDisasterRecoveryArtifactIntegrityCorrupt(t *testing.T) {
 	defer tc.cleanup()
 	defer server.Close()
 	ctx := context.Background()
-	_, _, _, storageKey := seedReadyArtifactRun(t, tc, server, orgID, envID, "corrupt")
+	_, _, _, storageKey, cancelRun := seedReadyArtifactRun(t, tc, server, orgID, envID, "corrupt")
+	defer cancelRun()
 	putURL, _, err := store.PresignPut(ctx, storageKey, "application/octet-stream", 5*time.Minute)
 	if err != nil {
 		t.Fatalf("presign put: %v", err)
@@ -960,5 +1120,196 @@ func TestDisasterRecoveryCompatibleBinaryRollbackSmoke(t *testing.T) {
 	outputStr := string(out)
 	if !bytes.Contains(out, []byte("DRY RUN passed")) {
 		t.Errorf("expected DRY RUN passed in output, got: %s", outputStr)
+	}
+}
+
+// TestDisasterRecoveryRestoreScriptFailureFailsDrill proves:
+// when authoritative disaster preparation encounters an invalid configuration or error,
+// the restore drill fails closed (non-zero exit code) and never claims success.
+func TestDisasterRecoveryRestoreScriptFailureFailsDrill(t *testing.T) {
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("failed to get repo root: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "scripts", "restore-staging-db.sh")
+
+	cmd := exec.Command(scriptPath, "--disaster-recovery", "--recovery-point", "not-a-valid-timestamp")
+	cmd.Env = append(os.Environ(), "DRY_RUN=false")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected script to fail closed with invalid recovery point, got exit code 0: %s", string(out))
+	}
+	if bytes.Contains(out, []byte("ISOLATED RECOVERY DRILL COMPLETED SUCCESSFULLY")) {
+		t.Fatalf("script claimed success despite preparation failure: %s", string(out))
+	}
+}
+
+// TestDisasterRecoveryRealBinaryRollbackSmoke proves Blueprint §26:
+// 1. A previous compatible binary (from base commit e8918c3) starts cleanly against the forward schema (v23).
+// 2. /readyz succeeds (HTTP 200, status="ready", database="healthy", schema="current").
+// 3. /version identifies the expected old image/commit SHA.
+// 4. Basic compatible read paths (/livez) succeed.
+// 5. Schema version remains 23 (no automatic down migration, no schema rollback).
+func TestDisasterRecoveryRealBinaryRollbackSmoke(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real binary rollback smoke in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available in PATH")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available in PATH")
+	}
+
+	const baseCommit = "e8918c33645fcbf1d5bc425aeddb0ac44143a01f"
+	const expectedImageDigest = "sha256:e8918c33previousimagedigest"
+
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+
+	cachedBin := filepath.Join(os.TempDir(), "deadbolt-cp-"+baseCommit[:8])
+	if _, err := os.Stat(cachedBin); err != nil {
+		buildDir := t.TempDir()
+		archiveCmd := exec.Command("git", "archive", baseCommit, "cmd/", "internal/", "go.mod", "go.sum", "contracts/")
+		archiveCmd.Dir = repoRoot
+		tarCmd := exec.Command("tar", "-x", "-C", buildDir)
+		pipe, err := archiveCmd.StdoutPipe()
+		if err != nil {
+			t.Fatalf("archive stdout pipe: %v", err)
+		}
+		tarCmd.Stdin = pipe
+		if err := archiveCmd.Start(); err != nil {
+			t.Fatalf("git archive failed: %v", err)
+		}
+		if err := tarCmd.Start(); err != nil {
+			t.Fatalf("tar extract failed: %v", err)
+		}
+		if err := archiveCmd.Wait(); err != nil {
+			t.Fatalf("git archive wait: %v", err)
+		}
+		if err := tarCmd.Wait(); err != nil {
+			t.Fatalf("tar wait: %v", err)
+		}
+
+		buildCmd := exec.Command("go", "build",
+			"-ldflags", fmt.Sprintf("-X main.CommitSHA=%s -X main.ImageDigest=%s", baseCommit, expectedImageDigest),
+			"-o", cachedBin, "./cmd/control-plane")
+		buildCmd.Dir = buildDir
+		if out, err := buildCmd.CombinedOutput(); err != nil {
+			t.Fatalf("go build previous binary failed: %v\nOutput:\n%s", err, string(out))
+		}
+	}
+
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	dbURL := testdb.GetRoleDatabaseURL("deadbolt_runtime", "deadbolt_integration_test")
+	sysURL := testdb.GetRoleDatabaseURL("deadbolt_system", "deadbolt_integration_test")
+
+	cmd := exec.Command(cachedBin)
+	cmd.Env = append(os.Environ(),
+		"RUNTIME_MODE=local",
+		"LISTEN_ADDR="+listenAddr,
+		"DATABASE_URL="+dbURL,
+		"SYSTEM_DATABASE_URL="+sysURL,
+		"PORT="+strconv.Itoa(port),
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start previous binary failed: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = cmd.Wait()
+	}()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	readyURL := fmt.Sprintf("http://%s/readyz", listenAddr)
+	versionURL := fmt.Sprintf("http://%s/version", listenAddr)
+	liveURL := fmt.Sprintf("http://%s/livez", listenAddr)
+
+	ready := false
+	var lastReadyResp string
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(readyURL)
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastReadyResp = string(body)
+			if resp.StatusCode == http.StatusOK {
+				ready = true
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatalf("previous binary failed /readyz check within deadline: last output: %s\nstdout: %s\nstderr: %s",
+			lastReadyResp, stdout.String(), stderr.String())
+	}
+
+	var readyData map[string]any
+	if err := json.Unmarshal([]byte(lastReadyResp), &readyData); err != nil {
+		t.Fatalf("unmarshal /readyz response: %v", err)
+	}
+	if readyData["status"] != "ready" {
+		t.Errorf("expected status=ready, got %v", readyData["status"])
+	}
+	if readyData["database"] != "healthy" {
+		t.Errorf("expected database=healthy, got %v", readyData["database"])
+	}
+	if readyData["schema"] != "current" {
+		t.Errorf("expected schema=current (forward schema v23 >= expected v22), got %v", readyData["schema"])
+	}
+
+	verResp, err := client.Get(versionURL)
+	if err != nil {
+		t.Fatalf("GET /version failed: %v", err)
+	}
+	defer verResp.Body.Close()
+	if verResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /version, got %d", verResp.StatusCode)
+	}
+	var verData map[string]any
+	if err := json.NewDecoder(verResp.Body).Decode(&verData); err != nil {
+		t.Fatalf("decode /version response: %v", err)
+	}
+	if verData["commit"] != baseCommit {
+		t.Errorf("expected commit %s, got %v", baseCommit, verData["commit"])
+	}
+	if verData["image_digest"] != expectedImageDigest {
+		t.Errorf("expected image_digest %s, got %v", expectedImageDigest, verData["image_digest"])
+	}
+
+	liveResp, err := client.Get(liveURL)
+	if err != nil {
+		t.Fatalf("GET /livez failed: %v", err)
+	}
+	defer liveResp.Body.Close()
+	if liveResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /livez, got %d", liveResp.StatusCode)
+	}
+
+	var latestAppliedVersion int64
+	err = tc.pool.QueryRow(context.Background(), `SELECT MAX(version_id) FROM goose_db_version WHERE is_applied = true`).Scan(&latestAppliedVersion)
+	if err != nil {
+		t.Fatalf("query goose_db_version: %v", err)
+	}
+	if latestAppliedVersion < 23 {
+		t.Fatalf("INVARIANT VIOLATION: schema was rolled back to %d! Must remain on forward schema 23 (Blueprint §26)", latestAppliedVersion)
 	}
 }

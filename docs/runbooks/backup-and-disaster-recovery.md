@@ -164,14 +164,29 @@ Immediately upon database restoration, system controls are set to `READ_ONLY`:
 
 ### Step 2: Disaster Incident & Uncertainty Window Recording
 
-Call `POST /v1/system/recovery/prepare` (or executed via `scripts/restore-staging-db.sh --disaster-recovery`):
+Execute authoritative platform recovery via CLI (or via `scripts/restore-staging-db.sh --disaster-recovery`):
+
+```bash
+control-plane --prepare-disaster-recovery \
+  --recovery-point "2026-09-22 14:00:00 UTC" \
+  --incident-at "2026-09-22 14:30:00 UTC" \
+  --operator-notes "Primary host storage failure; failover restore"
+```
 
 - Records `recovery_point` ($T_{recovery}$) and `incident_at` ($T_{incident}$) in `disaster_recovery_incidents`.
 - Binds uncertainty window $[T_{recovery}, T_{incident}]$.
 - Reconciles any edge-accepted requests missing from database snapshots:
-  > **RPO Gap Disclaimer**:
-  > _"no claim of zero RPO: requests accepted during the uncertainty window cannot be reconstructed from database alone"_
-  > All such request IDs are logged in `rpo_gap_request_ids` for upstream notification.
+
+```bash
+control-plane --recovery-rpo-gap \
+  --incident-id "<INCIDENT_ID>" \
+  --request-ids "req-1,req-2" \
+  --operator-notes "Reconciled edge logs"
+```
+
+> **RPO Gap Disclaimer**:
+> _"no claim of zero RPO: requests accepted during the uncertainty window cannot be reconstructed from database alone"_
+> All such request IDs are logged in `rpo_gap_request_ids` for upstream notification.
 
 ### Step 3: Disaster Reconciliation Hold Verification
 
@@ -186,16 +201,29 @@ Before any execution resumes, operators must reconcile external side effects tha
 
 ### Step 5: Automated Integrity Verification & Audit Trail
 
-Execute `POST /v1/system/recovery/verify`:
+Execute authoritative integrity verification via CLI:
+
+```bash
+control-plane --verify-recovery-integrity
+```
 
 - Verifies database schema version matches `LatestSchemaVersion` (Migration 23+).
 - Checks pending deletion ledger count (`app.count_pending_deletions()`) preserving M5 GDPR/deletion hooks.
-- Verifies all active steps remain safely on hold.
+- Verifies S3-compatible object boundary (existence, size, SHA-256) for all referenced `READY` artifacts attached to restored nonterminal runs.
+- Verifies tenant boundary consistency (zero orphaned runs or artifacts without valid organization).
 - Confirms audit trail is intact and captures recovery verification evidence.
 
 ### Step 6: Gradual Resumption
 
-Execute `POST /v1/system/recovery/resume`:
+Execute authoritative resumption via CLI:
+
+```bash
+# Transition to RESUMING for canary verification:
+control-plane --resume-recovery --mode RESUMING
+
+# Transition to full ACTIVE:
+control-plane --resume-recovery --mode ACTIVE
+```
 
 - System transitions `READ_ONLY` $\to$ `RESUMING` $\to$ `ACTIVE`.
 - Allows selective tenant-by-tenant resumption (`target_tenants`) or batched activation to avoid thundering herds.
@@ -249,7 +277,7 @@ The disaster recovery and reconciliation workflow was validated end-to-end via a
     - Verified nonterminal runs (QUEUED, RUNNING) placed on WAITING/RECONCILIATION hold
     - Verified terminal runs (SUCCEEDED, FAILED) untouched (INV-09)
     - Verified reconciliation_cases created with DISASTER_RECOVERY_HOLD and uncertainty window
---- PASS: TestDisasterRecoveryPointRestoresAndEntersHold (0.18s)
+--- PASS: TestDisasterRecoveryPointRestoresAndEntersHold (0.13s)
 
 === RUN   TestDisasterRecoveryExternalEffectSurvivesRestore
     - Simulated external side effect recorded in disk-backed ledger prior to DB crash
@@ -259,30 +287,65 @@ The disaster recovery and reconciliation workflow was validated end-to-end via a
     - Operator resolved case with 'confirm_succeeded' using post-disaster human token
     - Run completed with completion_source = 'RECONCILIATION'
     - Verified duplicateCount = 0 (zero duplicate external side effects)
---- PASS: TestDisasterRecoveryExternalEffectSurvivesRestore (0.13s)
+--- PASS: TestDisasterRecoveryExternalEffectSurvivesRestore (22.24s)
 
 === RUN   TestDisasterRecoveryGradualResumptionAndRPOGap
     - Verified RPO gap requests recorded with disclaimer:
       "no claim of zero RPO: requests accepted during the uncertainty window cannot be reconstructed from database alone"
     - Verified gradual resumption: READ_ONLY -> RESUMING -> ACTIVE
---- PASS: TestDisasterRecoveryGradualResumptionAndRPOGap (0.12s)
+--- PASS: TestDisasterRecoveryGradualResumptionAndRPOGap (0.10s)
 
 === RUN   TestDisasterRecoveryIntegrityAndDeletionLedgerHooks
     - Verified LatestSchemaVersion = 23
     - Verified deletion_ledger pending count hook preserved for M5
     - Verified recovery audit entries recorded
---- PASS: TestDisasterRecoveryIntegrityAndDeletionLedgerHooks (0.05s)
+--- PASS: TestDisasterRecoveryIntegrityAndDeletionLedgerHooks (0.12s)
 
 === RUN   TestDisasterRecoveryRestoreScriptContractAndDryRun
     - Verified scripts/restore-staging-db.sh --disaster-recovery --dry-run contract
     - Output correctly shows SQL statements, parameter bindings, and zero state mutations
 --- PASS: TestDisasterRecoveryRestoreScriptContractAndDryRun (0.04s)
 
+=== RUN   TestDisasterRecoveryTenantCannotInvokeClusterRecovery
+    - Mutating recovery endpoints removed from tenant HTTP router
+    - Verified tenant API keys and operator tokens cannot trigger cluster recovery over HTTP
+--- PASS: TestDisasterRecoveryTenantCannotInvokeClusterRecovery (0.09s)
+
+=== RUN   TestDisasterRecoveryGatesFailClosed
+    - Verified missing or unreadable system_recovery_controls row denies admission and dispatch fail-closed
+--- PASS: TestDisasterRecoveryGatesFailClosed (0.10s)
+
+=== RUN   TestDisasterRecoveryPolicyResolutionPerTask
+    - Verified run -> manifest -> workflow -> node -> task -> recoveryPolicy lookup
+    - Verified node ID != task name fixtures resolve safe, idempotent, reconcile, and unknown policies
+--- PASS: TestDisasterRecoveryPolicyResolutionPerTask (0.07s)
+
+=== RUN   TestDisasterRecoveryArtifactIntegrityValid
+    - Verified valid referenced READY artifact passes restored artifact verification against S3 storage
+--- PASS: TestDisasterRecoveryArtifactIntegrityValid (0.10s)
+
+=== RUN   TestDisasterRecoveryArtifactIntegrityMissing
+    - Verified missing referenced S3 object fails recovery integrity check fail-closed
+--- PASS: TestDisasterRecoveryArtifactIntegrityMissing (0.14s)
+
+=== RUN   TestDisasterRecoveryArtifactIntegrityCorrupt
+    - Verified corrupted/tampered S3 object fails recovery integrity check fail-closed
+--- PASS: TestDisasterRecoveryArtifactIntegrityCorrupt (0.11s)
+
 === RUN   TestDisasterRecoveryCompatibleBinaryRollbackSmoke
-    - Tested rollback to previous binary version without database rollback
-    - Schema remains on migration 23; previous application binary functions correctly
-    - Proves: binary rollback != database rollback
---- PASS: TestDisasterRecoveryCompatibleBinaryRollbackSmoke (0.82s)
+    - Verified scripts/rollback-staging.sh dry run validation without data rollback
+--- PASS: TestDisasterRecoveryCompatibleBinaryRollbackSmoke (0.68s)
+
+=== RUN   TestDisasterRecoveryRestoreScriptFailureFailsDrill
+    - Verified restore-staging-db.sh fails closed when prepare-disaster-recovery fails
+--- PASS: TestDisasterRecoveryRestoreScriptFailureFailsDrill (0.15s)
+
+=== RUN   TestDisasterRecoveryRealBinaryRollbackSmoke
+    - Built and executed real previous binary (commit e8918c3) against forward schema v23
+    - Verified readyz returns 200 OK with schema current and database healthy
+    - Verified version endpoint reports correct commit provenance
+    - Verified zero down-migrations required
+--- PASS: TestDisasterRecoveryRealBinaryRollbackSmoke (1.25s)
 ```
 
 ---
