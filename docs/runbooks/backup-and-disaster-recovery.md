@@ -207,7 +207,7 @@ Execute authoritative integrity verification via CLI:
 control-plane --verify-recovery-integrity
 ```
 
-- Verifies database schema version matches `LatestSchemaVersion` (Migration 23+).
+- Verifies database schema version matches `LatestSchemaVersion` (Migration 24+).
 - Checks pending deletion ledger count (`app.count_pending_deletions()`) preserving M5 GDPR/deletion hooks.
 - Verifies S3-compatible object boundary (existence, size, SHA-256) for all referenced `READY` artifacts attached to restored nonterminal runs.
 - Verifies tenant boundary consistency (zero orphaned runs or artifacts without valid organization).
@@ -296,7 +296,7 @@ The disaster recovery and reconciliation workflow was validated end-to-end via a
 --- PASS: TestDisasterRecoveryGradualResumptionAndRPOGap (0.10s)
 
 === RUN   TestDisasterRecoveryIntegrityAndDeletionLedgerHooks
-    - Verified LatestSchemaVersion = 23
+    - Verified LatestSchemaVersion = 24
     - Verified deletion_ledger pending count hook preserved for M5
     - Verified recovery audit entries recorded
 --- PASS: TestDisasterRecoveryIntegrityAndDeletionLedgerHooks (0.12s)
@@ -341,7 +341,7 @@ The disaster recovery and reconciliation workflow was validated end-to-end via a
 --- PASS: TestDisasterRecoveryRestoreScriptFailureFailsDrill (0.15s)
 
 === RUN   TestDisasterRecoveryRealBinaryRollbackSmoke
-    - Built and executed real previous binary (commit e8918c3) against forward schema v23
+    - Built and executed real previous binary (commit e8918c3) against forward schema v24
     - Verified readyz returns 200 OK with schema current and database healthy
     - Verified version endpoint reports correct commit provenance
     - Verified zero down-migrations required

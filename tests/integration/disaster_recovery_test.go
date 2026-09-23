@@ -1309,7 +1309,7 @@ func TestDisasterRecoveryRealBinaryRollbackSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query goose_db_version: %v", err)
 	}
-	if latestAppliedVersion < 23 {
-		t.Fatalf("INVARIANT VIOLATION: schema was rolled back to %d! Must remain on forward schema 23 (Blueprint §26)", latestAppliedVersion)
+	if latestAppliedVersion < 24 {
+		t.Fatalf("INVARIANT VIOLATION: schema was rolled back to %d! Must remain on forward schema 24 (Blueprint §26)", latestAppliedVersion)
 	}
 }

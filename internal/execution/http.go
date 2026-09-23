@@ -117,6 +117,20 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, r, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "Inline JSON payload exceeds 256 KiB")
 			return
 		}
+		if errors.Is(err, ErrWorkflowTooLarge) {
+			errJSON(w, r, http.StatusUnprocessableEntity, "WORKFLOW_TOO_LARGE", "Workflow exceeds the 50-node limit")
+			return
+		}
+		if errors.Is(err, ErrRunQuotaExceeded) {
+			w.Header().Set("Retry-After", "60")
+			errJSON(w, r, http.StatusTooManyRequests, "RUN_QUOTA_EXCEEDED", "Environment has reached the nonterminal run limit")
+			return
+		}
+		if errors.Is(err, ErrCreateRateLimited) {
+			w.Header().Set("Retry-After", "1")
+			errJSON(w, r, http.StatusTooManyRequests, "CREATE_RUN_RATE_LIMITED", "Run creation rate exceeded; retry shortly")
+			return
+		}
 		if errors.Is(err, ErrNoActiveDeployment) {
 			errJSON(w, r, http.StatusNotFound, "NO_ACTIVE_DEPLOYMENT", "No active deployment found for workflow")
 			return

@@ -858,12 +858,12 @@ func TestClaimS3BlockDoesNotHoldAuthoritativeTx(t *testing.T) {
 
 	consumerSessCtx := &worker.WorkerSessionContext{
 		SessionID: consumerSession.SessionID, WorkerID: consumerSession.WorkerID,
-		OrganizationID: orgID, EnvironmentID: envID,
+		OrganizationID: orgID, EnvironmentID: envID, PoolName: "default",
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	plainSessCtx := &worker.WorkerSessionContext{
 		SessionID: plainSession.SessionID, WorkerID: plainSession.WorkerID,
-		OrganizationID: orgID, EnvironmentID: envID,
+		OrganizationID: orgID, EnvironmentID: envID, PoolName: "default",
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	consumerReq := &worker.PollRequestDTO{
