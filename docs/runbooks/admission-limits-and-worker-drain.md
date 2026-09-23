@@ -20,6 +20,13 @@ as-built behavior with pointers to code and regression tests.
 | Attempts per task                              | default 3, max 10           | Retry policy                                                                                                                                 |
 | Events per run                                 | 10,000, final slot reserved | Non-terminal append at 9,999 rejected `HISTORY_LIMIT_EXCEEDED`; terminal `RUN_FAILED` commits as event 10,000 exactly once                   |
 
+### 1.1 Concurrency model (MVP)
+
+- **Environment concurrency:** Canonical MVP execution cap (`environment_admissions.max_concurrency`, ceiling 10).
+- **Worker slots:** Server-side available-slot ceiling = 2 (`DefaultSlots`); worker advertisements above 2 are clamped.
+- **Worker pool:** Routing, compatibility, and live-lease accounting dimension at Claim; no independent configurable MVP concurrency cap.
+- **Task concurrency:** No independent configurable per-task concurrency cap in MVP. Independent pool/task caps require an explicit future contract.
+
 ## 2. Admission behavior (429 + Retry-After)
 
 - `RUN_QUOTA_EXCEEDED` → 429 + `Retry-After: 60`. Accepted work is never

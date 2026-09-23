@@ -820,7 +820,7 @@ If the DB is unavailable, the API accepts no new runs and the gateway does not g
 
 ### 19.3 Fairness and backpressure
 
-Task FIFO within an environment is ordered by eligible_at then ID, with round-robin across environments that have eligible work. Claim locks the environment admission row and ensures live lease count does not exceed the cap. Worker-pool and task-concurrency limits are calculated at the same boundary. The gateway does not hand thousands of assignments to a worker that has only two slots.
+Task FIFO within an environment is ordered by eligible_at then ID, with round-robin across environments that have eligible work. Claim locks the environment admission row and ensures live lease count does not exceed the cap. For MVP, concurrency admission at the Claim boundary is bounded by the environment live-lease limit and the worker's server-side available-slot ceiling. Worker pool remains a routing, compatibility, and live-lease accounting dimension but has no independent configurable numeric concurrency cap in MVP. MVP does not expose an independent per-task concurrency cap. Independent per-pool or per-task concurrency controls require an explicit future contract defining their configuration surface and defaults before they can be enabled. The gateway does not hand thousands of assignments to a worker that has only two slots.
 
 The API returns `429` + `Retry-After` when admission quota is full; a run that has already been accepted is not dropped. Ready tasks may wait for quota with reason `QUOTA_WAIT`. Outbox/log/upload backlogs have queue-size limits and alerts; diagnostic logs may drop with a counter, but execution events must not drop.
 
@@ -1155,7 +1155,7 @@ The following numbers are **initial default product limits** intended to control
 | Active schedules per environment         | Not available         | 100                   |
 | Event count per run                      | 10,000                | 20,000                |
 
-The platform operator defines versioned hard limits; tenants may request lower limits but cannot raise the hard cap through API payloads. Increasing a cap requires a measured capacity review. Admission checks allocate storage reservation before upload. An over-limit artifact upload is rejected before it can be used as a result. The event-count cap must not prevent recording a terminal failure: reserve terminal-event budget, stop further scheduling with `HISTORY_LIMIT_EXCEEDED`, then terminalize atomically. Heartbeats are not events every 5 seconds; store liveness timestamps and write only meaningful changes into history.
+The platform operator defines versioned hard limits; tenants may request lower limits but cannot raise the hard cap through API payloads. Concurrency admission in MVP is bounded by the environment running/claimed attempts cap (10) and worker available-slot ceiling (2); independent pool or per-task concurrency caps are not exposed in MVP. Increasing a cap requires a measured capacity review. Admission checks allocate storage reservation before upload. An over-limit artifact upload is rejected before it can be used as a result. The event-count cap must not prevent recording a terminal failure: reserve terminal-event budget, stop further scheduling with `HISTORY_LIMIT_EXCEEDED`, then terminalize atomically. Heartbeats are not events every 5 seconds; store liveness timestamps and write only meaningful changes into history.
 
 ### 27.2 Targets that must be measured
 
@@ -1476,8 +1476,8 @@ OIDC provider, hosting provider, domain, and exact supported toolchain versions 
 
 The following checklist is a design review, not runtime acceptance evidence. Whenever the blueprint changes, recheck all of these contract pairs:
 
-| Pair being checked            | Contract consistency in this baseline                                                  |
-| ----------------------------- | -------------------------------------------------------------------------------------- |
+| Pair being checked             | Contract consistency in this baseline                                                  |
+| ------------------------------ | -------------------------------------------------------------------------------------- |
 | Product promise ↔ recovery    | Durable committed state; no promise of arbitrary external exactly-once                 |
 | SDK ↔ execution model         | Builder produces DAG manifest; no arbitrary workflow async/replay examples             |
 | Deploy UX ↔ execution mode    | Register manifest, distribute customer bundle, activate; no hosted code execution      |
