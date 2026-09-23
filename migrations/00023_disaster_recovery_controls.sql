@@ -19,7 +19,17 @@ CREATE TABLE IF NOT EXISTS system_recovery_controls (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-ALTER TABLE system_recovery_controls OWNER TO deadbolt_migrator;
+-- Owner to deadbolt_migrator only when the role exists (tests bootstrap
+-- roles; clean compose clones do not). Unconditional ALTER OWNER fails
+-- the compose smoke with 'role "deadbolt_migrator" does not exist'.
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_migrator') THEN
+        ALTER TABLE system_recovery_controls OWNER TO deadbolt_migrator;
+    END IF;
+END $$;
+-- +goose StatementEnd
 
 INSERT INTO system_recovery_controls (id, mode, admission_enabled, dispatch_enabled, schedules_enabled)
 VALUES (1, 'ACTIVE', TRUE, TRUE, TRUE)
@@ -42,7 +52,14 @@ CREATE TABLE IF NOT EXISTS disaster_recovery_incidents (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-ALTER TABLE disaster_recovery_incidents OWNER TO deadbolt_migrator;
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_migrator') THEN
+        ALTER TABLE disaster_recovery_incidents OWNER TO deadbolt_migrator;
+    END IF;
+END $$;
+-- +goose StatementEnd
 
 -- 3. Deletion Ledger (Blueprint §18.3: Restored backups must reapply deletion ledger before customer access opens)
 CREATE TABLE IF NOT EXISTS deletion_ledger (
@@ -57,7 +74,14 @@ CREATE TABLE IF NOT EXISTS deletion_ledger (
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-ALTER TABLE deletion_ledger OWNER TO deadbolt_migrator;
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_migrator') THEN
+        ALTER TABLE deletion_ledger OWNER TO deadbolt_migrator;
+    END IF;
+END $$;
+-- +goose StatementEnd
 
 ALTER TABLE deletion_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deletion_ledger FORCE ROW LEVEL SECURITY;
@@ -80,7 +104,14 @@ AS $$
 $$;
 -- +goose StatementEnd
 
-ALTER FUNCTION app.count_pending_deletions() OWNER TO deadbolt_migrator;
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_migrator') THEN
+        ALTER FUNCTION app.count_pending_deletions() OWNER TO deadbolt_migrator;
+    END IF;
+END $$;
+-- +goose StatementEnd
 
 REVOKE ALL ON FUNCTION app.count_pending_deletions() FROM PUBLIC;
 
@@ -103,7 +134,14 @@ AS $$
 $$;
 -- +goose StatementEnd
 
-ALTER FUNCTION app.enumerate_recovery_tenants() OWNER TO deadbolt_migrator;
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'deadbolt_migrator') THEN
+        ALTER FUNCTION app.enumerate_recovery_tenants() OWNER TO deadbolt_migrator;
+    END IF;
+END $$;
+-- +goose StatementEnd
 
 REVOKE ALL ON FUNCTION app.enumerate_recovery_tenants() FROM PUBLIC;
 
