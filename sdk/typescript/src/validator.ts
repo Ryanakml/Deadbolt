@@ -81,6 +81,72 @@ function guaranteed(schema: JSONValue, parts: string[]): boolean {
     );
   return false;
 }
+export function validateChoiceExpression(
+  expr: JSONValue,
+  allowedAncestors?: Set<string>,
+): void {
+  if (expr === null || typeof expr !== "object" || Array.isArray(expr)) {
+    fail("INVALID_EXPRESSION");
+  }
+  const v = expr as ObjectValue;
+  const keys = Object.keys(v);
+  if (keys.length !== 2 || typeof v.op !== "string" || !Array.isArray(v.args)) {
+    fail("INVALID_EXPRESSION");
+  }
+  const op = v.op;
+  const args = v.args as JSONValue[];
+  if (op === "not") {
+    if (args.length !== 1) fail("INVALID_EXPRESSION");
+    validateChoiceExpression(args[0], allowedAncestors);
+    return;
+  }
+  if (op === "and" || op === "or") {
+    if (args.length < 1) fail("INVALID_EXPRESSION");
+    for (const a of args) validateChoiceExpression(a, allowedAncestors);
+    return;
+  }
+  if (op === "exists") {
+    if (args.length !== 1) fail("INVALID_EXPRESSION");
+    const ref = object(args[0]);
+    reference(ref);
+    if (
+      ref.$ref === "step.output" &&
+      allowedAncestors &&
+      !allowedAncestors.has(String(ref.stepId))
+    ) {
+      fail("INVALID_EXPRESSION");
+    }
+    return;
+  }
+  if (["eq", "neq", "gt", "gte", "lt", "lte", "in"].includes(op)) {
+    if (args.length !== 2) fail("INVALID_EXPRESSION");
+    const checkArg = (a: JSONValue) => {
+      if (a !== null && typeof a === "object" && !Array.isArray(a)) {
+        const objVal = a as ObjectValue;
+        if (Object.hasOwn(objVal, "$ref")) {
+          reference(objVal);
+          if (
+            objVal.$ref === "step.output" &&
+            allowedAncestors &&
+            !allowedAncestors.has(String(objVal.stepId))
+          ) {
+            fail("INVALID_EXPRESSION");
+          }
+          return;
+        }
+        if (Object.hasOwn(objVal, "literal")) {
+          if (Object.keys(objVal).length !== 1) fail("INVALID_EXPRESSION");
+          return;
+        }
+      }
+    };
+    checkArg(args[0]);
+    checkArg(args[1]);
+    return;
+  }
+  fail("INVALID_EXPRESSION");
+}
+
 function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
   const m = object(manifest);
   if (m.manifestVersion !== 1) fail("UNSUPPORTED_MANIFEST_VERSION");
@@ -103,8 +169,13 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     const id = String(n.id);
     if (byId.has(id)) fail("DUPLICATE_NODE_ID");
     byId.set(id, n);
-    if (n.type !== "task") fail("UNSUPPORTED_CAPABILITY");
-    if (!tasks.has(String(n.task))) fail("MISSING_TASK_REF");
+    const ntype = String(n.type);
+    if (ntype !== "task" && ntype !== "choice" && ntype !== "merge") {
+      fail("UNSUPPORTED_CAPABILITY");
+    }
+    if (ntype === "task") {
+      if (!tasks.has(String(n.task))) fail("MISSING_TASK_REF");
+    }
   }
   for (const n of nodes)
     for (const d of (n.after ?? []) as string[]) {
@@ -126,6 +197,219 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     return set;
   };
   nodes.forEach((n) => visit(String(n.id)));
+
+  const descendants = new Map<string, Set<string>>();
+  for (const id of byId.keys()) descendants.set(id, new Set());
+  for (const [id, ancSet] of ancestors) {
+    for (const anc of ancSet) {
+      descendants.get(anc)!.add(id);
+    }
+  }
+
+  const choices = new Map<string, ObjectValue>();
+  const merges = new Map<string, ObjectValue>();
+  const mergeForChoice = new Map<string, string>();
+  for (const n of nodes) {
+    const id = String(n.id);
+    if (n.type === "choice") choices.set(id, n);
+    else if (n.type === "merge") merges.set(id, n);
+  }
+
+  for (const [id, n] of choices) {
+    const c = object(n.choice ?? {});
+    const branches = (c.branches ?? []) as ObjectValue[];
+    const def = c.default !== undefined ? String(c.default) : "";
+    if (branches.length === 0 || (branches.length < 2 && !def)) {
+      fail("INVALID_CHOICE");
+    }
+    const branchNames = new Set<string>();
+    for (const b of branches) {
+      const name = String(b.name ?? "");
+      if (!name || branchNames.has(name)) fail("INVALID_CHOICE");
+      branchNames.add(name);
+      if (b.condition !== undefined) {
+        validateChoiceExpression(b.condition as JSONValue, ancestors.get(id)!);
+      }
+    }
+    if (def) branchNames.add(def);
+  }
+
+  for (const [id, n] of merges) {
+    const mrg = object(n.merge ?? {});
+    const choiceId = String(mrg.choice ?? "");
+    const choiceNode = choices.get(choiceId);
+    if (!choiceNode || !ancestors.get(id)!.has(choiceId)) {
+      fail("INVALID_MERGE");
+    }
+    if (mergeForChoice.has(choiceId)) fail("INVALID_MERGE");
+    mergeForChoice.set(choiceId, id);
+
+    const mBranches = (mrg.branches ?? []) as ObjectValue[];
+    if (mBranches.length === 0) fail("INVALID_MERGE");
+    const c = object(choiceNode.choice ?? {});
+    const cBranches = (c.branches ?? []) as ObjectValue[];
+    const cNames = new Set<string>();
+    for (const b of cBranches) cNames.add(String(b.name));
+    if (c.default !== undefined) cNames.add(String(c.default));
+
+    const mNames = new Set<string>();
+    for (const b of mBranches) {
+      const bName = String(b.branch ?? "");
+      const term = String(b.terminal ?? "");
+      if (!bName || !term || !cNames.has(bName) || mNames.has(bName)) {
+        fail("INVALID_MERGE");
+      }
+      if (
+        !byId.has(term) ||
+        !ancestors.get(id)!.has(term) ||
+        !descendants.get(choiceId)!.has(term)
+      ) {
+        fail("INVALID_MERGE");
+      }
+      mNames.add(bName);
+    }
+    for (const cn of cNames) {
+      if (!mNames.has(cn)) fail("INVALID_MERGE");
+    }
+    if (mrg.outputSchema !== undefined) {
+      validateSchema(
+        mrg.outputSchema as JSONValue,
+        schemas["payload-schema.schema.json"],
+      );
+    }
+  }
+
+  for (const id of choices.keys()) {
+    if (!mergeForChoice.has(id)) fail("INVALID_CHOICE");
+  }
+
+  const choiceBranchNodeSets = new Map<string, Map<string, Set<string>>>();
+  for (const choiceId of choices.keys()) {
+    const mergeId = mergeForChoice.get(choiceId)!;
+    const mrg = object(merges.get(mergeId)!.merge ?? {});
+    const mBranches = (mrg.branches ?? []) as ObjectValue[];
+    const bMap = new Map<string, Set<string>>();
+    choiceBranchNodeSets.set(choiceId, bMap);
+
+    for (const b of mBranches) {
+      const bName = String(b.branch);
+      const term = String(b.terminal);
+      const bSet = new Set<string>();
+      for (const nodeId of byId.keys()) {
+        if (nodeId === choiceId || nodeId === mergeId) continue;
+        if (
+          descendants.get(choiceId)!.has(nodeId) &&
+          (nodeId === term || ancestors.get(term)!.has(nodeId))
+        ) {
+          bSet.add(nodeId);
+        }
+      }
+      if (bSet.size === 0) fail("INVALID_BRANCH");
+      bMap.set(bName, bSet);
+    }
+
+    // Check for cross-branch dependency before overlap check
+    for (let i = 0; i < mBranches.length; i++) {
+      const tI = String(mBranches[i].terminal);
+      const nodesI = new Set<string>([tI]);
+      for (const anc of ancestors.get(tI)!) {
+        if (anc !== choiceId && !ancestors.get(choiceId)!.has(anc)) {
+          nodesI.add(anc);
+        }
+      }
+      for (let j = 0; j < mBranches.length; j++) {
+        if (i === j) continue;
+        const tJ = String(mBranches[j].terminal);
+        const nodesJ = new Set<string>([tJ]);
+        for (const anc of ancestors.get(tJ)!) {
+          if (anc !== choiceId && !ancestors.get(choiceId)!.has(anc)) {
+            nodesJ.add(anc);
+          }
+        }
+        for (const v of nodesJ) {
+          for (const dep of (byId.get(v)!.after ?? []) as string[]) {
+            if (nodesI.has(dep)) {
+              fail("CROSS_BRANCH_DEPENDENCY");
+            }
+          }
+        }
+      }
+    }
+
+    const branchList = Array.from(bMap.keys());
+    for (let i = 0; i < branchList.length; i++) {
+      for (let j = i + 1; j < branchList.length; j++) {
+        const set1 = bMap.get(branchList[i])!;
+        const set2 = bMap.get(branchList[j])!;
+        for (const u of set1) {
+          if (set2.has(u)) fail("IRREDUCIBLE_GRAPH");
+        }
+      }
+    }
+
+    for (const [bName1, bSet1] of bMap) {
+      for (const u of bSet1) {
+        for (const dep of (byId.get(u)!.after ?? []) as string[]) {
+          for (const [bName2, bSet2] of bMap) {
+            if (bName1 !== bName2 && bSet2.has(dep)) {
+              fail("CROSS_BRANCH_DEPENDENCY");
+            }
+          }
+        }
+      }
+    }
+
+    for (const bSet of bMap.values()) {
+      for (const u of bSet) {
+        for (const dep of (byId.get(u)!.after ?? []) as string[]) {
+          if (
+            dep === choiceId ||
+            bSet.has(dep) ||
+            ancestors.get(choiceId)!.has(dep)
+          ) {
+            continue;
+          }
+          fail("CROSS_BRANCH_DEPENDENCY");
+        }
+        for (const w of byId.keys()) {
+          for (const d of (byId.get(w)!.after ?? []) as string[]) {
+            if (d === u) {
+              if (w !== mergeId && !bSet.has(w)) {
+                fail("IRREDUCIBLE_GRAPH");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (const choiceId of choices.keys()) {
+    let depth = 1;
+    for (const [otherChoiceId, bMap] of choiceBranchNodeSets) {
+      if (otherChoiceId === choiceId) continue;
+      for (const bSet of bMap.values()) {
+        if (bSet.has(choiceId)) depth++;
+      }
+    }
+    if (depth > 8) fail("CHOICE_NESTING_EXCEEDED");
+  }
+
+  const nodeAllowed = new Map<string, Set<string>>();
+  for (const id of byId.keys()) {
+    const allowed = new Set(ancestors.get(id)!);
+    for (const [choiceId, bMap] of choiceBranchNodeSets) {
+      const mergeId = mergeForChoice.get(choiceId)!;
+      for (const bSet of bMap.values()) {
+        if (id === mergeId) continue;
+        if (!bSet.has(id)) {
+          for (const bNode of bSet) allowed.delete(bNode);
+        }
+      }
+    }
+    nodeAllowed.set(id, allowed);
+  }
+
   const used = new Set<string>();
   const mapping = (
     v: JSONValue,
@@ -147,7 +431,29 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
       if (v.$ref === "step.output") {
         const id = String(v.stepId);
         if (!allowed.has(id)) fail("INPUT_MAPPING_ERROR");
-        source = tasks.get(String(byId.get(id)!.task))!.outputSchema;
+        const node = byId.get(id)!;
+        if (node.type === "merge") {
+          const mrg = object(node.merge ?? {});
+          source = (mrg.outputSchema as JSONValue) ?? {
+            type: "object",
+            properties: {
+              branch: { type: "string" },
+              value: {},
+            },
+            required: ["branch", "value"],
+          };
+        } else if (node.type === "choice") {
+          source = {
+            type: "object",
+            properties: {
+              selected: { type: "string" },
+              branch: { type: "string" },
+            },
+            required: ["selected", "branch"],
+          };
+        } else {
+          source = tasks.get(String(node.task))!.outputSchema;
+        }
         if (isOutput) used.add(id);
       }
       if (
@@ -159,8 +465,27 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     }
     Object.values(v).forEach((x) => mapping(x, allowed, isOutput));
   };
-  nodes.forEach((n) => mapping(n.input ?? {}, ancestors.get(String(n.id))!));
-  mapping(m.output, new Set(byId.keys()), true);
+  nodes.forEach((n) => {
+    const id = String(n.id);
+    mapping(n.input ?? {}, nodeAllowed.get(id)!);
+    if (n.type === "merge") {
+      const mrg = object(n.merge ?? {});
+      for (const b of (mrg.branches ?? []) as ObjectValue[]) {
+        if (b.value !== undefined) {
+          mapping(b.value as JSONValue, ancestors.get(id)!);
+        }
+      }
+    }
+  });
+
+  const allOutputsAllowed = new Set(byId.keys());
+  for (const bMap of choiceBranchNodeSets.values()) {
+    for (const bSet of bMap.values()) {
+      for (const bNode of bSet) allOutputsAllowed.delete(bNode);
+    }
+  }
+  mapping(m.output, allOutputsAllowed, true);
+
   const referencedAsDependency = new Set(
     nodes.flatMap((n) => (n.after ?? []) as string[]),
   );

@@ -6,6 +6,9 @@ import {
   input,
   output,
   literal,
+  choiceNode,
+  mergeNode,
+  expr,
   ContractError,
 } from "../dist/index.js";
 
@@ -308,4 +311,211 @@ test("defineWorkflow allows leaf declared with sideEffect: true", () => {
     output: { val: input("/val") },
   });
   assert.equal(wf.nodes[0].sideEffect, true);
+});
+
+test("defineWorkflow accepts valid choice and merge workflow with typed helpers", () => {
+  const numberSchema = {
+    type: "object",
+    properties: { x: { type: "integer" } },
+    required: ["x"],
+    additionalProperties: false,
+  };
+  const taskInt = defineTask({
+    name: "task-int",
+    inputSchema: numberSchema,
+    outputSchema: numberSchema,
+    recovery: "safe",
+  });
+
+  const wf = defineWorkflow({
+    name: "choice-merge-wf",
+    inputSchema: numberSchema,
+    outputSchema: {
+      type: "object",
+      properties: {
+        branch: { type: "string" },
+        value: { type: "integer" },
+      },
+      required: ["branch", "value"],
+      additionalProperties: false,
+    },
+    tasks: [taskInt],
+    nodes: [
+      choiceNode("decide", {
+        branches: [
+          {
+            name: "opt_a",
+            condition: expr("gt", input("/x"), literal(5)),
+          },
+          {
+            name: "opt_b",
+          },
+        ],
+        default: "opt_b",
+      }),
+      {
+        id: "term_a",
+        type: "task",
+        task: taskInt,
+        after: ["decide"],
+        input: { x: input("/x") },
+      },
+      {
+        id: "term_b",
+        type: "task",
+        task: taskInt,
+        after: ["decide"],
+        input: { x: input("/x") },
+      },
+      mergeNode(
+        "join",
+        {
+          choice: "decide",
+          branches: [
+            {
+              branch: "opt_a",
+              terminal: "term_a",
+              value: output("term_a", "/x"),
+            },
+            {
+              branch: "opt_b",
+              terminal: "term_b",
+              value: output("term_b", "/x"),
+            },
+          ],
+        },
+        ["term_a", "term_b"],
+      ),
+    ],
+    output: {
+      branch: output("join", "/branch"),
+      value: output("join", "/value"),
+    },
+  });
+
+  assert.equal(wf.nodes.length, 4);
+  const manifest = wf.toManifest();
+  assert.equal(manifest.nodes[0].type, "choice");
+  assert.equal(manifest.nodes[3].type, "merge");
+});
+
+test("defineWorkflow rejects choice condition with invalid operator", () => {
+  const numberSchema = {
+    type: "object",
+    properties: { x: { type: "integer" } },
+    required: ["x"],
+    additionalProperties: false,
+  };
+  const taskInt = defineTask({
+    name: "task-int",
+    inputSchema: numberSchema,
+    outputSchema: numberSchema,
+    recovery: "safe",
+  });
+
+  assert.throws(
+    () =>
+      defineWorkflow({
+        name: "choice-bad-op",
+        inputSchema: numberSchema,
+        outputSchema: numberSchema,
+        tasks: [taskInt],
+        nodes: [
+          choiceNode("decide", {
+            branches: [
+              {
+                name: "opt_a",
+                condition: expr("eval", input("/x")), // illegal operator
+              },
+            ],
+            default: "opt_a",
+          }),
+          {
+            id: "term_a",
+            type: "task",
+            task: taskInt,
+            after: ["decide"],
+            input: { x: input("/x") },
+          },
+          mergeNode(
+            "join",
+            {
+              choice: "decide",
+              branches: [
+                {
+                  branch: "opt_a",
+                  terminal: "term_a",
+                  value: output("term_a", "/x"),
+                },
+              ],
+            },
+            ["term_a"],
+          ),
+        ],
+        output: { x: output("join", "/value") },
+      }),
+    (err) => err instanceof ContractError && err.code === "INVALID_EXPRESSION",
+  );
+});
+
+test("defineWorkflow rejects cross-branch dependency", () => {
+  const numberSchema = {
+    type: "object",
+    properties: { x: { type: "integer" } },
+    required: ["x"],
+    additionalProperties: false,
+  };
+  const taskInt = defineTask({
+    name: "task-int",
+    inputSchema: numberSchema,
+    outputSchema: numberSchema,
+    recovery: "safe",
+  });
+
+  assert.throws(
+    () =>
+      defineWorkflow({
+        name: "choice-cross-branch",
+        inputSchema: numberSchema,
+        outputSchema: numberSchema,
+        tasks: [taskInt],
+        nodes: [
+          choiceNode("decide", {
+            branches: [
+              { name: "opt_a", condition: expr("eq", input("/x"), literal(1)) },
+              { name: "opt_b" },
+            ],
+            default: "opt_b",
+          }),
+          {
+            id: "term_a",
+            type: "task",
+            task: taskInt,
+            after: ["decide"],
+            input: { x: input("/x") },
+          },
+          {
+            id: "term_b",
+            type: "task",
+            task: taskInt,
+            after: ["decide", "term_a"], // CROSS BRANCH DEPENDENCY!
+            input: { x: input("/x") },
+          },
+          mergeNode(
+            "join",
+            {
+              choice: "decide",
+              branches: [
+                { branch: "opt_a", terminal: "term_a" },
+                { branch: "opt_b", terminal: "term_b" },
+              ],
+            },
+            ["term_a", "term_b"],
+          ),
+        ],
+        output: { x: output("join", "/value") },
+      }),
+    (err) =>
+      err instanceof ContractError && err.code === "CROSS_BRANCH_DEPENDENCY",
+  );
 });

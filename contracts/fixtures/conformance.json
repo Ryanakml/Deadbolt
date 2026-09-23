@@ -2846,7 +2846,7 @@
     "op": "workflow",
     "manifest": {
       "manifestVersion": 1,
-      "name": "linear",
+      "name": "choice_workflow",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2873,9 +2873,37 @@
       },
       "nodes": [
         {
-          "id": "a",
+          "id": "decide",
           "type": "choice",
+          "choice": {
+            "branches": [
+              {
+                "name": "left",
+                "condition": {
+                  "op": "gt",
+                  "args": [
+                    {
+                      "$ref": "run.input",
+                      "pointer": "/x"
+                    },
+                    {
+                      "literal": 5
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "right"
+              }
+            ],
+            "default": "right"
+          }
+        },
+        {
+          "id": "b_left",
+          "type": "task",
           "task": "noop",
+          "after": ["decide"],
           "input": {
             "x": {
               "$ref": "run.input",
@@ -2884,24 +2912,51 @@
           }
         },
         {
-          "id": "b",
+          "id": "b_right",
           "type": "task",
           "task": "noop",
-          "after": ["a"],
+          "after": ["decide"],
           "input": {
             "x": {
-              "$ref": "step.output",
-              "stepId": "a",
+              "$ref": "run.input",
               "pointer": "/x"
             }
+          }
+        },
+        {
+          "id": "join",
+          "type": "merge",
+          "after": ["b_left", "b_right"],
+          "merge": {
+            "choice": "decide",
+            "branches": [
+              {
+                "branch": "left",
+                "terminal": "b_left",
+                "value": {
+                  "$ref": "step.output",
+                  "stepId": "b_left",
+                  "pointer": "/x"
+                }
+              },
+              {
+                "branch": "right",
+                "terminal": "b_right",
+                "value": {
+                  "$ref": "step.output",
+                  "stepId": "b_right",
+                  "pointer": "/x"
+                }
+              }
+            ]
           }
         }
       ],
       "output": {
         "x": {
           "$ref": "step.output",
-          "stepId": "b",
-          "pointer": "/x"
+          "stepId": "join",
+          "pointer": "/value"
         }
       }
     },
@@ -2937,7 +2992,7 @@
       }
     ],
     "expected": {
-      "error": "UNSUPPORTED_CAPABILITY"
+      "value": true
     }
   },
   {
@@ -2945,7 +3000,7 @@
     "op": "workflow",
     "manifest": {
       "manifestVersion": 1,
-      "name": "linear",
+      "name": "merge_workflow",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2961,20 +3016,49 @@
       "outputSchema": {
         "type": "object",
         "properties": {
-          "x": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 9
+          "branch": {
+            "type": "string"
+          },
+          "value": {
+            "type": "integer"
           }
         },
-        "required": ["x"],
+        "required": ["branch", "value"],
         "additionalProperties": false
       },
       "nodes": [
         {
-          "id": "a",
-          "type": "merge",
+          "id": "decide",
+          "type": "choice",
+          "choice": {
+            "branches": [
+              {
+                "name": "opt_a",
+                "condition": {
+                  "op": "eq",
+                  "args": [
+                    {
+                      "$ref": "run.input",
+                      "pointer": "/x"
+                    },
+                    {
+                      "literal": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "opt_b"
+              }
+            ],
+            "default": "opt_b"
+          }
+        },
+        {
+          "id": "term_a",
+          "type": "task",
           "task": "noop",
+          "after": ["decide"],
           "input": {
             "x": {
               "$ref": "run.input",
@@ -2983,24 +3067,69 @@
           }
         },
         {
-          "id": "b",
+          "id": "term_b",
           "type": "task",
           "task": "noop",
-          "after": ["a"],
+          "after": ["decide"],
           "input": {
             "x": {
-              "$ref": "step.output",
-              "stepId": "a",
+              "$ref": "run.input",
               "pointer": "/x"
+            }
+          }
+        },
+        {
+          "id": "join",
+          "type": "merge",
+          "after": ["term_a", "term_b"],
+          "merge": {
+            "choice": "decide",
+            "branches": [
+              {
+                "branch": "opt_a",
+                "terminal": "term_a",
+                "value": {
+                  "$ref": "step.output",
+                  "stepId": "term_a",
+                  "pointer": "/x"
+                }
+              },
+              {
+                "branch": "opt_b",
+                "terminal": "term_b",
+                "value": {
+                  "$ref": "step.output",
+                  "stepId": "term_b",
+                  "pointer": "/x"
+                }
+              }
+            ],
+            "outputSchema": {
+              "type": "object",
+              "properties": {
+                "branch": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "integer"
+                }
+              },
+              "required": ["branch", "value"],
+              "additionalProperties": false
             }
           }
         }
       ],
       "output": {
-        "x": {
+        "branch": {
           "$ref": "step.output",
-          "stepId": "b",
-          "pointer": "/x"
+          "stepId": "join",
+          "pointer": "/branch"
+        },
+        "value": {
+          "$ref": "step.output",
+          "stepId": "join",
+          "pointer": "/value"
         }
       }
     },
@@ -3036,7 +3165,7 @@
       }
     ],
     "expected": {
-      "error": "UNSUPPORTED_CAPABILITY"
+      "value": true
     }
   },
   {
@@ -5941,6 +6070,407 @@
     ],
     "expected": {
       "error": "INPUT_MAPPING_ERROR"
+    }
+  },
+  {
+    "id": "graph_choice_cross_branch_dep",
+    "op": "workflow",
+    "manifest": {
+      "manifestVersion": 1,
+      "name": "choice_cross_dep",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9
+          }
+        },
+        "required": ["x"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9
+          }
+        },
+        "required": ["x"],
+        "additionalProperties": false
+      },
+      "nodes": [
+        {
+          "id": "decide",
+          "type": "choice",
+          "choice": {
+            "branches": [
+              {
+                "name": "left",
+                "condition": {
+                  "op": "gt",
+                  "args": [
+                    {
+                      "$ref": "run.input",
+                      "pointer": "/x"
+                    },
+                    {
+                      "literal": 5
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "right"
+              }
+            ],
+            "default": "right"
+          }
+        },
+        {
+          "id": "b_left",
+          "type": "task",
+          "task": "noop",
+          "after": ["decide"],
+          "input": {
+            "x": {
+              "$ref": "run.input",
+              "pointer": "/x"
+            }
+          }
+        },
+        {
+          "id": "b_right",
+          "type": "task",
+          "task": "noop",
+          "after": ["decide", "b_left"],
+          "input": {
+            "x": {
+              "$ref": "run.input",
+              "pointer": "/x"
+            }
+          }
+        },
+        {
+          "id": "join",
+          "type": "merge",
+          "after": ["b_left", "b_right"],
+          "merge": {
+            "choice": "decide",
+            "branches": [
+              {
+                "branch": "left",
+                "terminal": "b_left"
+              },
+              {
+                "branch": "right",
+                "terminal": "b_right"
+              }
+            ]
+          }
+        }
+      ],
+      "output": {
+        "x": {
+          "$ref": "step.output",
+          "stepId": "join",
+          "pointer": "/value"
+        }
+      }
+    },
+    "tasks": [
+      {
+        "name": "noop",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            }
+          },
+          "required": ["x"],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            }
+          },
+          "required": ["x"],
+          "additionalProperties": false
+        },
+        "recovery": "safe",
+        "entrypoint": "tasks.js#noop"
+      }
+    ],
+    "expected": {
+      "error": "CROSS_BRANCH_DEPENDENCY"
+    }
+  },
+  {
+    "id": "graph_choice_cross_branch_ref",
+    "op": "workflow",
+    "manifest": {
+      "manifestVersion": 1,
+      "name": "choice_cross_ref",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9
+          }
+        },
+        "required": ["x"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9
+          }
+        },
+        "required": ["x"],
+        "additionalProperties": false
+      },
+      "nodes": [
+        {
+          "id": "decide",
+          "type": "choice",
+          "choice": {
+            "branches": [
+              {
+                "name": "left",
+                "condition": {
+                  "op": "gt",
+                  "args": [
+                    {
+                      "$ref": "run.input",
+                      "pointer": "/x"
+                    },
+                    {
+                      "literal": 5
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "right"
+              }
+            ],
+            "default": "right"
+          }
+        },
+        {
+          "id": "b_left",
+          "type": "task",
+          "task": "noop",
+          "after": ["decide"],
+          "input": {
+            "x": {
+              "$ref": "run.input",
+              "pointer": "/x"
+            }
+          }
+        },
+        {
+          "id": "b_right",
+          "type": "task",
+          "task": "noop",
+          "after": ["decide"],
+          "input": {
+            "x": {
+              "$ref": "run.input",
+              "pointer": "/x"
+            }
+          }
+        },
+        {
+          "id": "join",
+          "type": "merge",
+          "after": ["b_left", "b_right"],
+          "merge": {
+            "choice": "decide",
+            "branches": [
+              {
+                "branch": "left",
+                "terminal": "b_left"
+              },
+              {
+                "branch": "right",
+                "terminal": "b_right"
+              }
+            ]
+          }
+        },
+        {
+          "id": "downstream",
+          "type": "task",
+          "task": "noop",
+          "after": ["join"],
+          "input": {
+            "x": {
+              "$ref": "step.output",
+              "stepId": "b_left",
+              "pointer": "/x"
+            }
+          }
+        }
+      ],
+      "output": {
+        "x": {
+          "$ref": "step.output",
+          "stepId": "downstream",
+          "pointer": "/x"
+        }
+      }
+    },
+    "tasks": [
+      {
+        "name": "noop",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            }
+          },
+          "required": ["x"],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            }
+          },
+          "required": ["x"],
+          "additionalProperties": false
+        },
+        "recovery": "safe",
+        "entrypoint": "tasks.js#noop"
+      }
+    ],
+    "expected": {
+      "error": "INPUT_MAPPING_ERROR"
+    }
+  },
+  {
+    "id": "graph_merge_missing_choice",
+    "op": "workflow",
+    "manifest": {
+      "manifestVersion": 1,
+      "name": "merge_missing_choice",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9
+          }
+        },
+        "required": ["x"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9
+          }
+        },
+        "required": ["x"],
+        "additionalProperties": false
+      },
+      "nodes": [
+        {
+          "id": "b_left",
+          "type": "task",
+          "task": "noop",
+          "input": {
+            "x": {
+              "$ref": "run.input",
+              "pointer": "/x"
+            }
+          }
+        },
+        {
+          "id": "join",
+          "type": "merge",
+          "after": ["b_left"],
+          "merge": {
+            "choice": "non_existent_choice",
+            "branches": [
+              {
+                "branch": "left",
+                "terminal": "b_left"
+              }
+            ]
+          }
+        }
+      ],
+      "output": {
+        "x": {
+          "$ref": "step.output",
+          "stepId": "join",
+          "pointer": "/value"
+        }
+      }
+    },
+    "tasks": [
+      {
+        "name": "noop",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            }
+          },
+          "required": ["x"],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9
+            }
+          },
+          "required": ["x"],
+          "additionalProperties": false
+        },
+        "recovery": "safe",
+        "entrypoint": "tasks.js#noop"
+      }
+    ],
+    "expected": {
+      "error": "INVALID_MERGE"
     }
   }
 ]
