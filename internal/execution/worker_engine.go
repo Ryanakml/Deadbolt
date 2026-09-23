@@ -527,6 +527,63 @@ func scheduleRetryOrHoldTx(ctx context.Context, tx storage.Tx, organizationID, e
 }
 
 func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID, stepID, reasonCode string, actorID *string) error {
+	// Fail-fast is a single durable settlement: preserve successful siblings,
+	// but revoke every other live owner and leave a stop command for workers
+	// that may still be executing customer code.  The run is terminal even if
+	// a worker is late to observe its stop (the stop record is the durable
+	// hand-off, not an implicit rollback claim).
+	type liveFailureAttempt struct {
+		attemptID string
+		stepID    string
+		started   bool
+	}
+	rows, err := tx.Query(ctx, `SELECT a.id::text, rs.id::text,
+			(a.status='RUNNING' OR a.started_at IS NOT NULL)
+		FROM runs r
+		JOIN run_steps rs ON rs.run_id=r.id AND rs.organization_id=r.organization_id
+		JOIN task_attempts a ON a.step_id=rs.id AND a.organization_id=rs.organization_id
+		WHERE r.id=$1::uuid AND r.organization_id=$2::uuid
+		  AND a.status IN ('CLAIMED','RUNNING')
+		ORDER BY rs.id, a.id
+		FOR UPDATE OF r, rs, a`, runID, organizationID)
+	if err != nil {
+		return err
+	}
+	live := make([]liveFailureAttempt, 0)
+	for rows.Next() {
+		var item liveFailureAttempt
+		if err := rows.Scan(&item.attemptID, &item.stepID, &item.started); err != nil {
+			rows.Close()
+			return err
+		}
+		live = append(live, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	var stopCount int
+	for _, item := range live {
+		effectStatus := "NOT_APPLIED"
+		if item.started {
+			effectStatus = "UNKNOWN"
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_attempts SET status='CANCELLED', completed_at=clock_timestamp(),
+			error=jsonb_build_object('code','SIBLING_FAILED','message','A dependency failed and the run was failed fast','retryable',false,'effectStatus',$1::text)
+			WHERE id=$2::uuid AND organization_id=$3::uuid AND status IN ('CLAIMED','RUNNING')`, effectStatus, item.attemptID, organizationID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM task_leases WHERE attempt_id=$1::uuid AND organization_id=$2::uuid`, item.attemptID, organizationID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO stop_commands
+			(organization_id, attempt_id, reason, deadline_at)
+			VALUES ($1::uuid, $2::uuid, 'SIBLING_FAILED', clock_timestamp()+INTERVAL '10 seconds')`, organizationID, item.attemptID); err != nil {
+			return err
+		}
+		stopCount++
+	}
 	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED', wait_reason=$1, updated_at=clock_timestamp()
 		WHERE id=$2::uuid AND organization_id=$3::uuid`, reasonCode, stepID, organizationID); err != nil {
 		return err
@@ -550,7 +607,7 @@ func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID,
 		return err
 	}
 	return appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
-		"status": "FAILED", "reason": reasonCode, "stepId": stepID,
+		"status": "FAILED", "reason": reasonCode, "stepId": stepID, "stopCount": stopCount,
 	})
 }
 
@@ -1566,41 +1623,52 @@ func advanceAfterStepSuccessTx(ctx context.Context, tx storage.Tx, organizationI
 	stepRows.Close()
 
 	if targetWorkflow != nil {
-		// Advance BLOCKED steps whose dependencies in 'after' are all SUCCEEDED
-		for _, node := range targetWorkflow.Nodes {
+		// Re-evaluate until stable because manifests need not be topologically
+		// ordered; skipped propagation must not leave a downstream join stuck.
+		for changed := true; changed; {
+			changed = false
+			for _, node := range targetWorkflow.Nodes {
 			st, ok := stepsByNode[node.ID]
 			if !ok || st.state != "BLOCKED" {
 				continue
 			}
 			allDepsMet := true
+			dependencySkipped := false
 			for _, depID := range node.After {
 				depStep, depExists := stepsByNode[depID]
-				if !depExists || (depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED") {
+				if !depExists {
 					allDepsMet = false
 					break
 				}
+				if depStep.state == "SKIPPED" {
+					dependencySkipped = true
+				}
+				if depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED" {
+					allDepsMet = false
+				}
 			}
 			if allDepsMet {
+				if dependencySkipped {
+					if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED',wait_reason='DEPENDENCY_SKIPPED',updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, st.id, organizationID); err != nil {
+						return err
+					}
+				st.state = "SKIPPED"
+					changed = true
+					if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
+						"stepId": st.id, "nodeId": node.ID, "reason": "DEPENDENCY_SKIPPED",
+					}); err != nil {
+						return err
+					}
+					continue
+				}
 				// Evaluate input mapping if present
 				if node.Input != nil {
 					mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
 					inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
 					if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
 						// Non-retryable mapping error per Blueprint §10.4 & §14.2
-						if _, uErr := tx.Exec(ctx, `UPDATE run_steps SET state='FAILED',wait_reason='INPUT_MAPPING_ERROR',updated_at=clock_timestamp()
-							WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, organizationID); uErr != nil {
-							return uErr
-						}
-						if _, uErr := tx.Exec(ctx, `UPDATE runs SET status='FAILED',reason_code='INPUT_MAPPING_ERROR',updated_at=clock_timestamp()
-							WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID); uErr != nil {
-							return uErr
-						}
-						if err := appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
-							"reason": "INPUT_MAPPING_ERROR", "nodeId": node.ID,
-						}); err != nil {
-							return err
-						}
-						return nil
+						return failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INPUT_MAPPING_ERROR", nil)
 					}
 				}
 				// Unblock to READY
@@ -1609,6 +1677,7 @@ func advanceAfterStepSuccessTx(ctx context.Context, tx storage.Tx, organizationI
 					return err
 				}
 				st.state = "READY"
+				changed = true
 				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", map[string]any{
 					"stepId": st.id, "nodeId": node.ID,
 				}); err != nil {

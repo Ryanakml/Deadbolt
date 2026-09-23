@@ -1325,6 +1325,7 @@
           "id": "a",
           "type": "task",
           "task": "noop",
+          "sideEffect": true,
           "input": {
             "x": {
               "$ref": "run.input",
@@ -1448,7 +1449,8 @@
           "id": "c",
           "type": "task",
           "task": "noop",
-          "after": ["a"]
+          "after": ["a"],
+          "sideEffect": true
         }
       ],
       "output": {
@@ -1491,7 +1493,7 @@
       }
     ],
     "expected": {
-      "error": "UNSUPPORTED_CAPABILITY"
+      "value": true
     }
   },
   {
@@ -1529,6 +1531,7 @@
           "id": "a",
           "type": "task",
           "task": "noop",
+          "sideEffect": true,
           "input": {
             "x": {
               "$ref": "run.input",
@@ -1542,8 +1545,7 @@
           "task": "noop",
           "input": {
             "x": {
-              "$ref": "step.output",
-              "stepId": "a",
+              "$ref": "run.input",
               "pointer": "/x"
             }
           }
@@ -1589,7 +1591,7 @@
       }
     ],
     "expected": {
-      "error": "UNSUPPORTED_CAPABILITY"
+      "value": true
     }
   },
   {

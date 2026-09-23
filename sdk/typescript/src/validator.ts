@@ -98,8 +98,7 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     tasks.set(String(task.name), task);
   }
   const nodes = m.nodes as ObjectValue[],
-    byId = new Map<string, ObjectValue>(),
-    successors = new Map<string, number>();
+    byId = new Map<string, ObjectValue>();
   for (const n of nodes) {
     const id = String(n.id);
     if (byId.has(id)) fail("DUPLICATE_NODE_ID");
@@ -110,7 +109,6 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
   for (const n of nodes)
     for (const d of (n.after ?? []) as string[]) {
       if (!byId.has(d)) fail("MISSING_DEPENDENCY");
-      successors.set(d, (successors.get(d) ?? 0) + 1);
     }
   const ancestors = new Map<string, Set<string>>(),
     visiting = new Set<string>();
@@ -128,16 +126,6 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     return set;
   };
   nodes.forEach((n) => visit(String(n.id)));
-  if (
-    nodes.filter((n) => !(n.after as JSONValue[] | undefined)?.length)
-      .length !== 1 ||
-    nodes.some(
-      (n) =>
-        ((n.after ?? []) as JSONValue[]).length > 1 ||
-        (successors.get(String(n.id)) ?? 0) > 1,
-    )
-  )
-    fail("UNSUPPORTED_CAPABILITY");
   const used = new Set<string>();
   const mapping = (
     v: JSONValue,
@@ -173,9 +161,12 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
   };
   nodes.forEach((n) => mapping(n.input ?? {}, ancestors.get(String(n.id))!));
   mapping(m.output, new Set(byId.keys()), true);
+  const referencedAsDependency = new Set(
+    nodes.flatMap((n) => (n.after ?? []) as string[]),
+  );
   for (const n of nodes)
     if (
-      !successors.has(String(n.id)) &&
+      !referencedAsDependency.has(String(n.id)) &&
       !used.has(String(n.id)) &&
       n.sideEffect !== true
     )

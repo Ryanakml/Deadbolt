@@ -131,8 +131,8 @@ test("defineWorkflow rejects unresolved task reference", () => {
   );
 });
 
-test("defineWorkflow rejects non-linear fan-out graph with UNSUPPORTED_CAPABILITY", () => {
-  assert.throws(
+test("defineWorkflow accepts static parallel fan-out graphs", () => {
+  assert.doesNotThrow(
     () =>
       defineWorkflow({
         name: "fan-out-wf",
@@ -156,14 +156,13 @@ test("defineWorkflow rejects non-linear fan-out graph with UNSUPPORTED_CAPABILIT
             id: "branch2",
             type: "task",
             task: taskC,
-            after: ["root"], // root has 2 successors -> non-linear fan-out!
+            after: ["root"],
             input: { val: output("root", "/val") },
+            sideEffect: true,
           },
         ],
         output: { val: output("branch1", "/val") },
       }),
-    (err) =>
-      err instanceof ContractError && err.code === "UNSUPPORTED_CAPABILITY",
   );
 });
 
