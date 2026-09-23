@@ -667,3 +667,129 @@ func TestHistoryLimitBoundaryAndAtomicTerminalization(t *testing.T) {
 		t.Fatalf("expected final sequence exactly 10,000, got %d", finalSeq)
 	}
 }
+
+// TestSchedulerFairnessRoundRobinAcrossEnvironments proves Blueprint 19.3
+// scheduler fairness: the org-scoped control-plane scheduler
+// (ReconcileReadyWork) must not let one environment's backlog starve another
+// environment in its bounded LIMIT 50 batch.
+//
+// Setup: 60 repairable runs in Env A (reconciliation_checked_at NULL, so a
+// naive ORDER BY checked_at,id would take 50 x Env A first) plus 3
+// repairable runs in Env B (checked_at set, sorting strictly after A).
+// A single ReconcileReadyWork pass must still repair all 3 Env B runs:
+// the per-environment interleave puts B's positions 1-3 inside the batch.
+// A second pass drains the remainder, proving no starvation over time.
+//
+// Workers remain environment-bound throughout; fairness is a scheduler
+// property, not cross-environment claiming (Claim stays env-scoped FIFO).
+func TestSchedulerFairnessRoundRobinAcrossEnvironments(t *testing.T) {
+	tc, server, orgID, envID1, adminKey := setupRunLifecycleTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	ctx := context.Background()
+	var projID string
+	_ = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT project_id FROM environments WHERE id=$1::uuid`, envID1).Scan(&projID)
+	})
+	env2, err := tc.service.CreateEnvironment(ctx, orgID, projID, tenant.EnvDevelopment, 10)
+	if err != nil {
+		t.Fatalf("create second env: %v", err)
+	}
+	envID2 := env2.ID
+	adminKey2 := bootstrapTestKey(t, tc.service, orgID, envID2, []string{
+		tenant.CapDeploymentsRegister,
+		tenant.CapDeploymentsActivateStaging,
+		tenant.CapDeploymentsWrite,
+		tenant.CapRunsCreate,
+		tenant.CapRunsRead,
+		tenant.CapAdminKey,
+	})
+
+	bundle := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	schema := map[string]any{"type": "object"}
+	manifest := createLifecycleManifest(bundle,
+		[]map[string]any{{"name": "rr2-task", "entrypoint": "tasks/rr2.js", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000, "inputSchema": schema, "outputSchema": schema}},
+		[]map[string]any{{"manifestVersion": 1, "name": "rr2-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{
+			{"id": "node-1", "type": "task", "task": "rr2-task", "after": []any{}, "input": map[string]any{}},
+			{"id": "node-2", "type": "task", "task": "rr2-task", "after": []any{"node-1"}, "input": map[string]any{}},
+		}, "output": map[string]any{"$ref": "step.output", "stepId": "node-2", "pointer": ""}}},
+	)
+	depA := registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID1, "rr2-flow", manifest)
+	depB := registerAndActivateTestWorkflow(t, tc, server, adminKey2, orgID, envID2, "rr2-flow", manifest)
+
+	// Seed runs whose node-2 is BLOCKED behind a SUCCEEDED node-1, i.e.
+	// exactly what ReconcileReadyWork repairs.
+	insertRepairable := func(envID, depID string) string {
+		var runID string
+		if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+			if err := tx.QueryRow(ctx, `INSERT INTO runs
+				(organization_id,environment_id,deployment_id,workflow_name,status)
+				VALUES ($1::uuid,$2::uuid,$3::uuid,'rr2-flow','QUEUED') RETURNING id::text`,
+				orgID, envID, depID).Scan(&runID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO run_steps
+				(organization_id,environment_id,run_id,node_id,state,eligible_at)
+				VALUES ($1::uuid,$2::uuid,$3::uuid,'node-1','SUCCEEDED',clock_timestamp())`,
+				orgID, envID, runID); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO run_steps
+				(organization_id,environment_id,run_id,node_id,state,eligible_at)
+				VALUES ($1::uuid,$2::uuid,$3::uuid,'node-2','BLOCKED',clock_timestamp())`,
+				orgID, envID, runID)
+			return err
+		}); err != nil {
+			t.Fatalf("seed repairable run: %v", err)
+		}
+		return runID
+	}
+
+	for i := 0; i < 60; i++ {
+		insertRepairable(envID1, depA)
+	}
+	var envBRuns []string
+	for i := 0; i < 3; i++ {
+		envBRuns = append(envBRuns, insertRepairable(envID2, depB))
+	}
+	// Force naive ordering to prefer Env A: B sorts strictly after all of A.
+	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE runs SET reconciliation_checked_at=clock_timestamp()
+			WHERE organization_id=$1::uuid AND environment_id=$2::uuid`, orgID, envID2)
+		return err
+	}); err != nil {
+		t.Fatalf("pin B behind A: %v", err)
+	}
+
+	engine := execution.NewWorkerEngine(tc.pool)
+	repaired, err := engine.ReconcileReadyWork(ctx, orgID)
+	if err != nil {
+		t.Fatalf("reconcile pass 1: %v", err)
+	}
+	if repaired != 50 {
+		t.Fatalf("pass 1 repaired=%d, want 50 (bounded batch)", repaired)
+	}
+	readyCount := func(runID string) int {
+		var n int
+		_ = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT count(*) FROM run_steps
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid
+				  AND node_id='node-2' AND state='READY'`, runID, orgID).Scan(&n)
+		})
+		return n
+	}
+	for _, runID := range envBRuns {
+		if readyCount(runID) != 1 {
+			t.Fatalf("env B run %s not repaired in first batch: starved behind env A", runID)
+		}
+	}
+
+	repaired2, err := engine.ReconcileReadyWork(ctx, orgID)
+	if err != nil {
+		t.Fatalf("reconcile pass 2: %v", err)
+	}
+	if repaired+repaired2 != 63 {
+		t.Fatalf("total repaired=%d, want 63 (no run left behind)", repaired+repaired2)
+	}
+}
