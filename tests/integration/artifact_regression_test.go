@@ -291,6 +291,12 @@ func TestSameSizeCorruptionDetectedBySHA(t *testing.T) {
 	const digest = "bundle-same-size-22"
 	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, consumerManifest())
 	runID, stepA := seedExecutionRun(t, tc, orgID, envID, deploymentID, "a")
+	defer func() {
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, _ = tx.Exec(ctx, `UPDATE runs SET status='CANCELLED' WHERE id=$1::uuid`, runID)
+			return nil
+		})
+	}()
 	var stepB string
 	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `INSERT INTO run_steps
@@ -656,7 +662,7 @@ func resolveForTest(names []string) (map[string]string, error) {
 	return values, nil
 }
 
-// --- Migration 21→22 ---
+// --- Migration 21→23 ---
 
 func TestMigrationFreshAnd21To23(t *testing.T) {
 	db, runtimePool, _ := setupTestDB(t)
@@ -664,21 +670,22 @@ func TestMigrationFreshAnd21To23(t *testing.T) {
 	defer runtimePool.Close()
 	ctx := context.Background()
 	runner := migrator.NewRunner(db, "../../migrations")
+	defer func() { _ = runner.Up(ctx) }()
 	v, err := runner.Version(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 23 {
-		t.Fatalf("fresh DB must be 23, got %d", v)
+	if v != migrator.LatestSchemaVersion {
+		t.Fatalf("fresh DB must be %d, got %d", migrator.LatestSchemaVersion, v)
 	}
-	// Existing schema 21 → apply 22 → healthy.
+	// Existing schema 21 → apply 23 → healthy.
 	if err := runner.DownTo(ctx, 21); err != nil {
 		t.Fatalf("down to 21: %v", err)
 	}
 	if v, _ := runner.Version(ctx); v != 21 {
 		t.Fatalf("down version=%d want 21", v)
 	}
-	if err := runner.Up(ctx); err != nil {
+	if err := runner.UpTo(ctx, 23); err != nil {
 		t.Fatalf("up to 23: %v", err)
 	}
 	if v, _ := runner.Version(ctx); v != 23 {
@@ -852,12 +859,12 @@ func TestClaimS3BlockDoesNotHoldAuthoritativeTx(t *testing.T) {
 
 	consumerSessCtx := &worker.WorkerSessionContext{
 		SessionID: consumerSession.SessionID, WorkerID: consumerSession.WorkerID,
-		OrganizationID: orgID, EnvironmentID: envID,
+		OrganizationID: orgID, EnvironmentID: envID, PoolName: "default",
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	plainSessCtx := &worker.WorkerSessionContext{
 		SessionID: plainSession.SessionID, WorkerID: plainSession.WorkerID,
-		OrganizationID: orgID, EnvironmentID: envID,
+		OrganizationID: orgID, EnvironmentID: envID, PoolName: "default",
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	consumerReq := &worker.PollRequestDTO{

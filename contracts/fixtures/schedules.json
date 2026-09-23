@@ -1,0 +1,161 @@
+{
+  "version": "1.0.0",
+  "description": "Controlled-clock golden fixtures for Deadbolt recurring schedules (Blueprint §17, SP-05)",
+  "fixtures": [
+    {
+      "id": "cron_parsing_standard_5_field",
+      "category": "cron_syntax",
+      "cron": "15 10 1 * *",
+      "timezone": "UTC",
+      "reference_time": "2026-01-01T10:00:00Z",
+      "expected_next_utc": "2026-01-01T10:15:00Z",
+      "description": "Standard 5-field cron parsing at 10:15 on day 1 of month"
+    },
+    {
+      "id": "cron_step_expression",
+      "category": "cron_syntax",
+      "cron": "*/15 * * * *",
+      "timezone": "UTC",
+      "reference_time": "2026-06-15T08:05:00Z",
+      "expected_next_utc": "2026-06-15T08:15:00Z",
+      "description": "Step expression matches next 15-minute boundary"
+    },
+    {
+      "id": "cron_range_and_list",
+      "category": "cron_syntax",
+      "cron": "0 9,12,18 1-5 * *",
+      "timezone": "UTC",
+      "reference_time": "2026-06-01T09:00:00Z",
+      "expected_next_utc": "2026-06-01T12:00:00Z",
+      "description": "List and range combination matches next listed hour on days 1-5"
+    },
+    {
+      "id": "dst_spring_forward_missing_wall_time_skipped_ny",
+      "category": "dst_gap",
+      "cron": "30 2 * * *",
+      "timezone": "America/New_York",
+      "reference_time": "2026-03-07T07:30:00Z",
+      "expected_next_utc": "2026-03-09T06:30:00Z",
+      "description": "America/New_York springs forward 02:00->03:00 on 2026-03-08. Wall time 02:30 never occurs and must be skipped entirely, advancing to 2026-03-09 02:30 EDT (06:30 UTC)"
+    },
+    {
+      "id": "dst_spring_forward_missing_wall_time_skipped_london",
+      "category": "dst_gap",
+      "cron": "30 1 * * *",
+      "timezone": "Europe/London",
+      "reference_time": "2026-03-28T01:30:00Z",
+      "expected_next_utc": "2026-03-30T00:30:00Z",
+      "description": "Europe/London springs forward 01:00->02:00 on 2026-03-29. Wall time 01:30 never occurs and must be skipped, advancing to 2026-03-30 01:30 BST (00:30 UTC)"
+    },
+    {
+      "id": "dst_fall_back_repeated_wall_time_first_utc_only_ny",
+      "category": "dst_fold",
+      "cron": "30 1 * * *",
+      "timezone": "America/New_York",
+      "reference_time": "2026-11-01T04:00:00Z",
+      "expected_next_utc": "2026-11-01T05:30:00Z",
+      "expected_subsequent_utc": "2026-11-02T06:30:00Z",
+      "description": "America/New_York falls back 02:00->01:00 on 2026-11-01. Wall time 01:30 occurs at 05:30 UTC (EDT) and 06:30 UTC (EST). Blueprint §17 requires first UTC occurrence only; subsequent run advances to next day"
+    },
+    {
+      "id": "dst_fall_back_repeated_wall_time_first_utc_only_london",
+      "category": "dst_fold",
+      "cron": "30 1 * * *",
+      "timezone": "Europe/London",
+      "reference_time": "2026-10-25T00:00:00Z",
+      "expected_next_utc": "2026-10-25T00:30:00Z",
+      "expected_subsequent_utc": "2026-10-26T01:30:00Z",
+      "description": "Europe/London falls back 02:00->01:00 on 2026-10-25. Wall time 01:30 occurs at 00:30 UTC (BST) and 01:30 UTC (GMT). Blueprint §17 takes only the first UTC occurrence"
+    },
+    {
+      "id": "dst_half_hour_transition_lord_howe",
+      "category": "dst_gap",
+      "cron": "15 2 * * *",
+      "timezone": "Australia/Lord_Howe",
+      "reference_time": "2026-10-03T15:00:00Z",
+      "expected_next_utc": "2026-10-04T15:15:00Z",
+      "description": "Australia/Lord_Howe transitions by 30 minutes (02:00->02:30) on 2026-10-04. Wall time 02:15 does not exist on 2026-10-04 and is skipped; next occurrence is 2026-10-05 02:15 +11:00 (2026-10-04T15:15:00Z)"
+    },
+    {
+      "id": "misfire_coalesce_one_multiple_missed",
+      "category": "misfire_downtime",
+      "cron": "0 * * * *",
+      "timezone": "UTC",
+      "last_occurrence_time": "2026-04-10T10:00:00Z",
+      "now_after_downtime": "2026-04-10T14:30:00Z",
+      "expected_coalesced_occurrence_utc": "2026-04-10T14:00:00Z",
+      "expected_skipped_count": 3,
+      "expected_missed_occurrences_utc": [
+        "2026-04-10T11:00:00Z",
+        "2026-04-10T12:00:00Z",
+        "2026-04-10T13:00:00Z",
+        "2026-04-10T14:00:00Z"
+      ],
+      "expected_next_future_utc": "2026-04-10T15:00:00Z",
+      "description": "Scheduler down from 10:15 to 14:30. 4 occurrences missed (11:00, 12:00, 13:00, 14:00). Coalesce-one creates run for latest missed (14:00) with skipped_count=3 and next future 15:00"
+    },
+    {
+      "id": "misfire_coalesce_one_single_missed",
+      "category": "misfire_downtime",
+      "cron": "0 * * * *",
+      "timezone": "UTC",
+      "last_occurrence_time": "2026-04-10T10:00:00Z",
+      "now_after_downtime": "2026-04-10T11:20:00Z",
+      "expected_coalesced_occurrence_utc": "2026-04-10T11:00:00Z",
+      "expected_skipped_count": 0,
+      "expected_missed_occurrences_utc": ["2026-04-10T11:00:00Z"],
+      "expected_next_future_utc": "2026-04-10T12:00:00Z",
+      "description": "Scheduler down briefly and missed 1 occurrence (11:00). Runs 11:00 with skipped_count=0 and next future 12:00"
+    },
+    {
+      "id": "misfire_coalesce_zero_missed_on_schedule",
+      "category": "misfire_downtime",
+      "cron": "0 * * * *",
+      "timezone": "UTC",
+      "last_occurrence_time": "2026-04-10T10:00:00Z",
+      "now_after_downtime": "2026-04-10T10:45:00Z",
+      "expected_coalesced_occurrence_utc": null,
+      "expected_skipped_count": 0,
+      "expected_missed_occurrences_utc": [],
+      "expected_next_future_utc": "2026-04-10T11:00:00Z",
+      "description": "Scheduler evaluated before next occurrence is due. 0 missed occurrences"
+    },
+    {
+      "id": "overlap_policy_skip_when_previous_nonterminal",
+      "category": "overlap",
+      "cron": "*/10 * * * *",
+      "timezone": "UTC",
+      "previous_run_status": "RUNNING",
+      "expected_action": "SKIP",
+      "expected_skipped_reason": "SKIPPED_OVERLAP",
+      "description": "Previous scheduled run still RUNNING. Skip-overlap policy records SKIPPED_OVERLAP and advances schedule"
+    },
+    {
+      "id": "overlap_policy_start_when_previous_terminal",
+      "category": "overlap",
+      "cron": "*/10 * * * *",
+      "timezone": "UTC",
+      "previous_run_status": "SUCCEEDED",
+      "expected_action": "START",
+      "expected_skipped_reason": null,
+      "description": "Previous scheduled run SUCCEEDED. Next occurrence starts normally"
+    },
+    {
+      "id": "schedule_revision_changes_future_only",
+      "category": "revision",
+      "schedule_id": "00000000-0000-0000-0000-000000000001",
+      "initial_revision": 1,
+      "initial_cron": "0 10 * * *",
+      "updated_revision": 2,
+      "updated_cron": "0 15 * * *",
+      "past_occurrence_utc": "2026-05-01T10:00:00Z",
+      "revision_effective_time": "2026-05-01T12:00:00Z",
+      "expected_future_occurrence_utc": "2026-05-01T15:00:00Z",
+      "expected_occurrence_keys": {
+        "past": "00000000-0000-0000-0000-000000000001:1:2026-05-01T10:00:00Z",
+        "future": "00000000-0000-0000-0000-000000000001:2:2026-05-01T15:00:00Z"
+      },
+      "description": "Revision increments when editing schedule. Past occurrences retain revision 1; future occurrences evaluate under revision 2"
+    }
+  ]
+}

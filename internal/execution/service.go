@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
+	"github.com/Ryanakml/Deadbolt/internal/recovery"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
@@ -209,6 +210,17 @@ func (s *Service) CreateRun(
 			return fmt.Errorf("query idempotency: %w", err)
 		}
 
+		// Disaster recovery admission gate (Blueprint §27.3). Fail closed:
+		// a missing or unreadable controls row must not admit new runs.
+		var admissionEnabled bool
+		var recMode string
+		if err := tx.QueryRow(ctx, `SELECT admission_enabled, mode FROM system_recovery_controls WHERE id = 1`).Scan(&admissionEnabled, &recMode); err != nil {
+			return fmt.Errorf("%w: read system recovery controls: %v", recovery.ErrRecoveryControlsUnavailable, err)
+		}
+		if !admissionEnabled || recMode == "READ_ONLY" || recMode == "DISASTER_RECOVERY" {
+			return recovery.ErrAdmissionDisabled
+		}
+
 		// 2. Serialize all environment admission decisions. The lock must be
 		// acquired before counting nonterminal runs or recent creates so
 		// concurrent CreateRun requests cannot pass the same cap together.
@@ -219,21 +231,18 @@ func (s *Service) CreateRun(
 			FOR UPDATE`, envID, orgID).Scan(&admissionEnvironmentID); err != nil {
 			return fmt.Errorf("lock environment admission: %w", err)
 		}
-		var availableCreateTokens float64
+		var remainingTokens float64
 		if err := tx.QueryRow(ctx, `UPDATE environment_admissions
 			SET create_rate_tokens = LEAST(10::double precision,
-				create_rate_tokens + EXTRACT(EPOCH FROM (clock_timestamp() - create_rate_updated_at)) * 5),
+				create_rate_tokens + EXTRACT(EPOCH FROM (clock_timestamp() - create_rate_updated_at)) * 5) - 1,
 				create_rate_updated_at = clock_timestamp(), updated_at = clock_timestamp()
 			WHERE environment_id = $1::uuid AND organization_id = $2::uuid
-			RETURNING create_rate_tokens`, envID, orgID).Scan(&availableCreateTokens); err != nil {
-			return fmt.Errorf("refill create-run rate bucket: %w", err)
-		}
-		if availableCreateTokens < 1 {
-			return ErrCreateRateLimited
-		}
-		if _, err := tx.Exec(ctx, `UPDATE environment_admissions
-			SET create_rate_tokens = create_rate_tokens - 1, updated_at = clock_timestamp()
-			WHERE environment_id = $1::uuid AND organization_id = $2::uuid`, envID, orgID); err != nil {
+			  AND LEAST(10::double precision,
+				create_rate_tokens + EXTRACT(EPOCH FROM (clock_timestamp() - create_rate_updated_at)) * 5) >= 1
+			RETURNING create_rate_tokens`, envID, orgID).Scan(&remainingTokens); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrCreateRateLimited
+			}
 			return fmt.Errorf("debit create-run rate bucket: %w", err)
 		}
 		var nonterminalRuns int
