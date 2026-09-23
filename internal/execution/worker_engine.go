@@ -802,26 +802,63 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 	}
 	var pending []pendingClaim
 	snapshotErr := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
-				d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at, rs.environment_id::text
-			FROM run_steps rs
+		var query string
+		var args []any
+		if session.EnvironmentID != "" {
+			query = `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
+					d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at, rs.environment_id::text
+				FROM run_steps rs
+				JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+				JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+				JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
+				JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
+				JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
+				WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
+					AND (candidate_w.pool_name=$5 OR $5 = '' OR candidate_w.pool_name='default')
+					AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
+					AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
+					AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
+					AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
+						JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
+						WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
+							AND rc.organization_id=$2::uuid AND rc.status='OPEN')
+				ORDER BY rs.eligible_at, rs.id
+				LIMIT $4
+				FOR UPDATE OF r, rs SKIP LOCKED`
+			args = []any{session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, effectivePool}
+		} else {
+			query = `WITH candidates AS (
+				SELECT rs.id AS step_id,
+					ROW_NUMBER() OVER (ORDER BY ROW_NUMBER() OVER (PARTITION BY rs.environment_id ORDER BY rs.eligible_at, rs.id), rs.eligible_at, rs.id) AS ord
+				FROM run_steps rs
+				JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+				JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+				JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
+				JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
+				JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
+				WHERE rs.organization_id=$2::uuid
+					AND (candidate_w.pool_name=$4 OR $4 = '' OR candidate_w.pool_name='default')
+					AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
+					AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
+					AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
+					AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
+						JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
+						WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
+							AND rc.organization_id=$2::uuid AND rc.status='OPEN')
+				ORDER BY ROW_NUMBER() OVER (PARTITION BY rs.environment_id ORDER BY rs.eligible_at, rs.id), rs.eligible_at, rs.id
+				LIMIT $3
+			)
+			SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
+					d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at, rs.environment_id::text
+			FROM candidates c
+			JOIN run_steps rs ON rs.id=c.step_id AND rs.organization_id=$2::uuid
 			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
 			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-			JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
-			JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
-			JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
-			WHERE rs.organization_id=$2::uuid AND ($3::text = '' OR rs.environment_id=$3::uuid)
-				AND (candidate_w.pool_name=$5 OR $5 = '' OR candidate_w.pool_name='default')
-				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
-				AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
-				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
-				AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
-					JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
-					WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
-						AND rc.organization_id=$2::uuid AND rc.status='OPEN')
-			ORDER BY ROW_NUMBER() OVER (PARTITION BY rs.environment_id ORDER BY rs.eligible_at, rs.id), rs.eligible_at, rs.id
-			LIMIT $4
-			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, effectivePool)
+			ORDER BY c.ord
+			FOR UPDATE OF r, rs SKIP LOCKED`
+			args = []any{session.SessionID, session.OrganizationID, req.AvailableSlots, effectivePool}
+		}
+		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("snapshot claim candidates: %w", err)
 		}
