@@ -1,12 +1,20 @@
 package integration_test
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,45 +27,100 @@ import (
 	"github.com/Ryanakml/Deadbolt/tests/fixtures/httpstaging"
 )
 
-// m2ABCBundle is a fixed digest label for the M2 gate A→B→C workflow. The
-// bundle digest is advertised by both workers via the real poll path, so the
-// claim below exercises the production compatibility check.
-const m2ABCBundle = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+// m2RealWorkflow is the A→B→C workflow executed by two actual worker Agents
+// through real Node child processes in the central M2 gate test.
+const m2RealWorkflow = "m2-gate-real-pipeline"
 
-// m2ABCManifest declares a linear A→B→C workflow where every task uses
+// Node handler sources for the real runnable A→B→C bundle. Task input
+// carries markerDir (mapped from run input) so every child execution leaves
+// observable runtime evidence outside the database. B blocks on a release
+// file so the test can observe B in-flight on Agent 1 before killing it.
+const m2RealTaskA = `import { appendFileSync } from "node:fs";
+export default async function task(input, ctx) {
+  appendFileSync(input.markerDir + "/calls.log", "A " + ctx.operationId + "\n");
+  return { accountId: "acc-m2-real" };
+}
+`
+
+const m2RealTaskB = `import { appendFileSync, existsSync } from "node:fs";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export default async function task(input, ctx) {
+  appendFileSync(input.markerDir + "/calls.log", "B-start " + ctx.operationId + "\n");
+  // Abort (SIGTERM from the Agent kill path) strictly wins over release: it
+  // is checked before the release file, so a killed child can never write
+  // B-done afterwards. The release file is attempt-scoped, so only the
+  // recovered attempt's child can ever complete.
+  let aborted = false;
+  if (ctx.signal) {
+    ctx.signal.addEventListener("abort", () => { aborted = true; });
+  }
+  const release = input.markerDir + "/b.release." + ctx.attemptId;
+  const deadline = Date.now() + 55000;
+  for (;;) {
+    if (aborted) {
+      appendFileSync(input.markerDir + "/calls.log", "B-aborted " + ctx.attemptId + "\n");
+      throw new Error("TASK_ABORTED");
+    }
+    if (existsSync(release)) break;
+    if (Date.now() > deadline) throw new Error("B_RELEASE_TIMEOUT");
+    await sleep(100);
+  }
+  appendFileSync(input.markerDir + "/calls.log", "B-done " + ctx.operationId + "\n");
+  return { message: "hello-real" };
+}
+`
+
+const m2RealTaskC = `import { appendFileSync } from "node:fs";
+export default async function task(input, ctx) {
+  appendFileSync(input.markerDir + "/calls.log", "C " + ctx.operationId + "\n");
+  return { confirmationCode: "CONF-M2-REAL" };
+}
+`
+
+// m2RealABCManifest declares a linear A→B→C workflow where every task uses
 // recovery "safe" so lease loss retries with the same operation ID under the
-// persisted backoff timer (Blueprint §13.3, F-05).
-func m2ABCManifest() (tasks []map[string]any, workflows []map[string]any) {
-	mkSchema := func(prop string) map[string]any {
+// persisted backoff timer (Blueprint §13.3, F-05). markerDir flows from run
+// input into every task so handlers can record runtime execution evidence.
+func m2RealABCManifest() (tasks []map[string]any, workflows []map[string]any) {
+	mkSchema := func(props map[string]any, required []any) map[string]any {
 		return map[string]any{
 			"type":                 "object",
-			"properties":           map[string]any{prop: map[string]any{"type": "string"}},
-			"required":             []any{prop},
+			"properties":           props,
+			"required":             required,
 			"additionalProperties": false,
 		}
 	}
-	mkTask := func(name, entry string, inProp, outProp string) map[string]any {
+	strProp := map[string]any{"type": "string"}
+	mkTask := func(name, entry string, inProps map[string]any, inReq []any, outProps map[string]any, outReq []any) map[string]any {
 		return map[string]any{
 			"name":                name,
 			"entrypoint":          entry,
 			"timeoutMs":           60000,
 			"recovery":            "safe",
-			"inputSchema":         mkSchema(inProp),
-			"outputSchema":        mkSchema(outProp),
+			"inputSchema":         mkSchema(inProps, inReq),
+			"outputSchema":        mkSchema(outProps, outReq),
 			"retry":               map[string]any{"maxAttempts": 3, "initialDelayMs": 1000, "maxDelayMs": 30000},
 			"idempotencyWindowMs": 305000,
 		}
 	}
 	tasks = []map[string]any{
-		mkTask("task-a", "tasks/a.js", "email", "accountId"),
-		mkTask("task-b", "tasks/b.js", "accountId", "message"),
-		mkTask("task-c", "tasks/c.js", "welcomeMessage", "confirmationCode"),
+		mkTask("task-a", "tasks/a.mjs",
+			map[string]any{"email": strProp, "markerDir": strProp}, []any{"email", "markerDir"},
+			map[string]any{"accountId": strProp}, []any{"accountId"}),
+		mkTask("task-b", "tasks/b.mjs",
+			map[string]any{"accountId": strProp, "markerDir": strProp}, []any{"accountId", "markerDir"},
+			map[string]any{"message": strProp}, []any{"message"}),
+		mkTask("task-c", "tasks/c.mjs",
+			map[string]any{"welcomeMessage": strProp, "markerDir": strProp}, []any{"welcomeMessage", "markerDir"},
+			map[string]any{"confirmationCode": strProp}, []any{"confirmationCode"}),
 	}
+	markerFromRun := map[string]any{"$ref": "run.input", "pointer": "/markerDir"}
 	workflows = []map[string]any{
 		{
 			"manifestVersion": 1,
-			"name":            "m2-gate-pipeline",
-			"inputSchema":     mkSchema("customerEmail"),
+			"name":            m2RealWorkflow,
+			"inputSchema": mkSchema(map[string]any{"customerEmail": strProp, "markerDir": strProp},
+				[]any{"customerEmail", "markerDir"}),
 			"outputSchema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"finalConfirmation": map[string]any{"type": "string"}},
@@ -66,15 +129,24 @@ func m2ABCManifest() (tasks []map[string]any, workflows []map[string]any) {
 			"nodes": []map[string]any{
 				{
 					"id": "node-a", "type": "task", "task": "task-a", "after": []any{},
-					"input": map[string]any{"email": map[string]any{"$ref": "run.input", "pointer": "/customerEmail"}},
+					"input": map[string]any{
+						"email":     map[string]any{"$ref": "run.input", "pointer": "/customerEmail"},
+						"markerDir": markerFromRun,
+					},
 				},
 				{
 					"id": "node-b", "type": "task", "task": "task-b", "after": []any{"node-a"},
-					"input": map[string]any{"accountId": map[string]any{"$ref": "step.output", "stepId": "node-a", "pointer": "/accountId"}},
+					"input": map[string]any{
+						"accountId": map[string]any{"$ref": "step.output", "stepId": "node-a", "pointer": "/accountId"},
+						"markerDir": markerFromRun,
+					},
 				},
 				{
 					"id": "node-c", "type": "task", "task": "task-c", "after": []any{"node-b"},
-					"input": map[string]any{"welcomeMessage": map[string]any{"$ref": "step.output", "stepId": "node-b", "pointer": "/message"}},
+					"input": map[string]any{
+						"welcomeMessage": map[string]any{"$ref": "step.output", "stepId": "node-b", "pointer": "/message"},
+						"markerDir":      markerFromRun,
+					},
 				},
 			},
 			"output": map[string]any{
@@ -83,6 +155,178 @@ func m2ABCManifest() (tasks []map[string]any, workflows []map[string]any) {
 		},
 	}
 	return tasks, workflows
+}
+
+// writeM2RealBundle writes a real runnable tar bundle with the three M2 gate
+// task handlers plus the immutable platform identity file, mirroring
+// production `runtime build` output. It returns the SHA-256 bundle digest.
+func writeM2RealBundle(t *testing.T, dir, targetOS, targetArch string) string {
+	t.Helper()
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	for name, code := range map[string]string{
+		"tasks/a.mjs": m2RealTaskA,
+		"tasks/b.mjs": m2RealTaskB,
+		"tasks/c.mjs": m2RealTaskC,
+	} {
+		content := []byte(code)
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(content))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	platformBytes, err := worker.CanonicalPlatformBytes(targetOS, targetArch)
+	if err != nil {
+		t.Fatalf("canonical platform bytes: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: worker.BundlePlatformPath, Mode: 0o644, Size: int64(len(platformBytes))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(platformBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive.Bytes()))
+	if err := os.WriteFile(filepath.Join(dir, digest+".tar"), archive.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
+// m2IssueEnrollmentToken issues a single-use worker enrollment token through
+// the real public API. The actual Agent consumes it during ensureIdentity.
+func m2IssueEnrollmentToken(t *testing.T, serverURL string, adminKey *tenant.GeneratedKey, orgID, envID, suffix string) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"poolName": "default"})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/v1/environments/%s/worker-enrollments", serverURL, envID), bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	req.Header.Set("X-Organization-ID", orgID)
+	req.Header.Set("Idempotency-Key", "m2-real-enroll-"+suffix)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("issue enrollment token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("issue enrollment token status=%d body=%s", resp.StatusCode, string(raw))
+	}
+	var info worker.EnrollmentTokenInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		t.Fatalf("decode enrollment token: %v", err)
+	}
+	if info.Token == "" {
+		t.Fatal("empty enrollment token")
+	}
+	return info.Token
+}
+
+// m2StartAgent boots an actual worker.Agent (authenticated enrollment,
+// polling, Start/heartbeat/Complete, real Node child processes) on the
+// calling test's goroutine pool. Cancellation of the returned context is the
+// test's worker-process-equivalent kill boundary: the Agent loop stops,
+// heartbeats stop because the Agent stopped, and its active Node child is
+// terminated according to current Agent behavior.
+func m2StartAgent(t *testing.T, serverURL, bundleDir, runnerPath, token, name string, starts *atomic.Int32, logs *synchronizedBuffer) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
+	agent, err := worker.NewAgent(worker.AgentConfig{
+		ControlPlaneURL:   serverURL,
+		KeyPath:           filepath.Join(t.TempDir(), name+".key"),
+		EnrollmentToken:   token,
+		BundleDir:         bundleDir,
+		RunnerPath:        runnerPath,
+		Slots:             1,
+		PollTimeout:       200 * time.Millisecond,
+		HeartbeatInterval: 300 * time.Millisecond,
+		DrainGracePeriod:  2 * time.Second,
+		Logger:            log.New(logs, "", 0),
+		OnTaskProcessStart: func() {
+			starts.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("create agent %s: %v", name, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = agent.Start(ctx)
+	}()
+	return cancel, done
+}
+
+// m2WaitFor polls cond until it reports ready or the timeout elapses.
+func m2WaitFor(t *testing.T, timeout time.Duration, what string, cond func() (string, bool)) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		state, ok := cond()
+		if ok {
+			return state
+		}
+		last = state
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s: last=%s", what, last)
+	return ""
+}
+
+// m2NodeAttempts returns this run's attempts for one node ordered by attempt
+// number as "id=status=epoch=session" strings.
+func m2NodeAttempts(t *testing.T, tc *tenantTestContext, orgID, runID, nodeID string) []string {
+	t.Helper()
+	var out []string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT a.id::text, a.status, a.epoch, COALESCE(a.session_id::text,'') FROM task_attempts a JOIN run_steps rs ON rs.id=a.step_id JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND r.organization_id=$2::uuid AND rs.node_id=$3 ORDER BY a.attempt_number`, runID, orgID, nodeID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, status, session string
+			var epoch int64
+			if err := rows.Scan(&id, &status, &epoch, &session); err != nil {
+				return err
+			}
+			out = append(out, fmt.Sprintf("%s=%s=epoch%d=session%s", id, status, epoch, session))
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// m2ReadCalls returns the marker lines written by real Node child executions.
+func m2ReadCalls(markerDir string) []string {
+	raw, err := os.ReadFile(filepath.Join(markerDir, "calls.log"))
+	if err != nil {
+		return nil
+	}
+	var lines []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func m2CountPrefix(lines []string, prefix string) int {
+	count := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			count++
+		}
+	}
+	return count
 }
 
 func m2GetSnapshot(t *testing.T, serverURL, runID, token, orgID string) execution.RunSnapshotDTO {
@@ -107,20 +351,37 @@ func m2GetSnapshot(t *testing.T, serverURL, runID, token, orgID string) executio
 }
 
 // TestM2_TwoWorkerABCRecoveryKillDuringB is the central Blueprint §29.2
-// scenario for Issue #25: A→B→C through the real Deadbolt path (real HTTP
-// API, real PostgreSQL, real worker sessions, real ownership/leases) with two
-// workers. Worker 1 is killed while B owns the attempt; B recovers per its
-// configured safe-retry policy on worker 2 without rerunning A; C runs after;
-// API, DB, event history, and Inspector-visible state agree.
+// scenario for Issue #25, executed through the real Deadbolt path with two
+// ACTUAL worker.Agent processes and real Node child execution:
 //
-// Kill simulation: the test stops heartbeats from worker 1 (no heartbeat is
-// ever sent after Start, matching a dead process), advances the DB clock by
-// expiring the lease timestamp only, then runs the REAL production reconciler
-// (ReconcileExpiredLeases) and the REAL timer firing path
-// (FireDueRetryTimers). The test never writes the final attempt/step state
-// directly; the engine decides LOST → backoff timer → READY → epoch+1 claim.
-// Stale worker-1 mutations are then proven rejected through the real HTTP
-// fencing path.
+//   - Agent 1 is the only worker at first: it runs A (real child) to
+//     SUCCEEDED, then claims and starts B.
+//   - B blocks on an attempt-scoped release file, so the test observes B
+//     observably RUNNING/in-flight on Agent 1 (DB attempt RUNNING + B-start
+//     marker written by the real child + Agent 1 child count) before killing
+//     it.
+//   - Agent 1 is killed via context cancellation: its Agent loop actually
+//     stops, heartbeats stop because the Agent stopped, and its active Node
+//     child is terminated per current Agent behavior (SIGTERM abort observed
+//     via a B-aborted marker, then SIGKILL after the supervisor grace
+//     period). Abort strictly wins over release in the handler and the
+//     release file is attempt-scoped, so Agent 1 provably never writes
+//     B-done.
+//   - Ownership expires (controlled clock advancement only; final step/attempt
+//     state is never written directly) and the production recovery path
+//     (ReconcileExpiredLeases + FireDueRetryTimers) marks B LOST, parks the
+//     safe-retry backoff timer, and re-queues B.
+//   - Agent 2 starts, claims B with a newer epoch and the same operation ID,
+//     completes B, then completes C. The run ends SUCCEEDED.
+//   - A is proven executed exactly once by BOTH runtime evidence (calls.log:
+//     A x1, B-start x2 under one operation ID, B-done x1, C x1; per-agent
+//     child counts 2 and 2) and durable evidence (A attempts 1/1, B LOST +
+//     SUCCEEDED, C attempts 1/1). API, DB, event history, and
+//     Inspector-visible state agree.
+//
+// Stale Start/heartbeat/Complete fencing mutations are proven by the dedicated
+// stale-worker gate groups (Issue #17); the dead Agent is not resurrected to
+// replay them here.
 //
 // Host-resilience scope: two worker processes on one host prove
 // worker-process failure only. Host-failure resilience is NOT claimed.
@@ -130,23 +391,45 @@ func TestM2_TwoWorkerABCRecoveryKillDuringB(t *testing.T) {
 	defer server.Close()
 	ctx := context.Background()
 
-	tasks, workflows := m2ABCManifest()
-	manifest := createLifecycleManifest(m2ABCBundle, tasks, workflows)
-	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "m2-gate-pipeline", manifest)
+	// Real runnable bundle + manifest pinned to the host architecture so the
+	// Agent's bundle identity and host-compatibility checks pass on both
+	// darwin/arm64 developer machines and linux CI.
+	targetOS, targetArch := "linux", runtime.GOARCH
+	bundleDir := t.TempDir()
+	bundle := writeM2RealBundle(t, bundleDir, targetOS, targetArch)
+	tasks, workflows := m2RealABCManifest()
+	rawManifest := createLifecycleManifest(bundle, tasks, workflows)
+	var manifestMap map[string]any
+	if err := json.Unmarshal(rawManifest, &manifestMap); err != nil {
+		t.Fatal(err)
+	}
+	manifestMap["targetOS"], manifestMap["targetArchitecture"] = targetOS, targetArch
+	manifest, _ := json.Marshal(manifestMap)
+	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, m2RealWorkflow, manifest)
 
-	// Two workers on one host (worker-process failure scope only).
-	worker1, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "m2-gate-w1")
-	worker2, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "m2-gate-w2")
+	markerDir := t.TempDir()
+	runnerPath, err := filepath.Abs("../../runner/node/dist/index.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two actual worker Agents (authenticated enrollment, real Node child
+	// processes). Both run on this host: worker-process failure is proven,
+	// host-failure resilience is NOT claimed.
+	tok1 := m2IssueEnrollmentToken(t, server.URL, adminKey, orgID, envID, "real1")
+	tok2 := m2IssueEnrollmentToken(t, server.URL, adminKey, orgID, envID, "real2")
+	var w1Starts, w2Starts atomic.Int32
+	var w1Logs, w2Logs synchronizedBuffer
 
 	// Create run through the real public API (same path the SDK uses).
 	createBody, _ := json.Marshal(map[string]any{
 		"environment": "staging",
-		"input":       map[string]any{"customerEmail": "m2-gate@example.com"},
+		"input":       map[string]any{"customerEmail": "m2-gate-real@example.com", "markerDir": markerDir},
 	})
-	createReq, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/workflows/m2-gate-pipeline/runs", bytes.NewReader(createBody))
+	createReq, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/workflows/"+m2RealWorkflow+"/runs", bytes.NewReader(createBody))
 	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	createReq.Header.Set("X-Organization-ID", orgID)
-	createReq.Header.Set("Idempotency-Key", "m2-gate-run-001")
+	createReq.Header.Set("Idempotency-Key", "m2-gate-real-run-001")
 	createReq.Header.Set("Content-Type", "application/json")
 	createResp, err := http.DefaultClient.Do(createReq)
 	if err != nil {
@@ -161,37 +444,63 @@ func TestM2_TwoWorkerABCRecoveryKillDuringB(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&run); err != nil {
 		t.Fatalf("decode run: %v", err)
 	}
-	t.Logf("M2-GATE runID=%s worker1=%s/%s worker2=%s/%s", run.ID, worker1.WorkerID, worker1.SessionID, worker2.WorkerID, worker2.SessionID)
+	t.Logf("M2-GATE-REAL runID=%s markerDir=%s bundle=%s", run.ID, markerDir, bundle)
 
-	// A succeeds on worker 1.
-	claimA := claimExecution(t, server, worker1, m2ABCBundle, "m2-gate-claim-a")
-	if claimA.RunID != run.ID {
-		t.Fatalf("claimed wrong run for A: %s vs %s", claimA.RunID, run.ID)
+	// Agent 1 is the only worker at first: it runs A, then starts B.
+	cancel1, agent1Done := m2StartAgent(t, server.URL, bundleDir, runnerPath, tok1, "m2-real-w1", &w1Starts, &w1Logs)
+
+	// A completes on Agent 1 as a real child execution.
+	m2WaitFor(t, 60*time.Second, "A SUCCEEDED", func() (string, bool) {
+		a := m2NodeAttempts(t, tc, orgID, run.ID, "node-a")
+		state := fmt.Sprintf("attempts=%v", a)
+		return state, len(a) == 1 && strings.Contains(a[0], "=SUCCEEDED=")
+	})
+
+	// B becomes observably in-flight on Agent 1: DB attempt RUNNING, B-start
+	// marker written by the real child, and Agent 1's second child launched.
+	// No blind race: Agent 1 is killed only after this is observed.
+	b1desc := m2WaitFor(t, 60*time.Second, "B RUNNING on agent 1", func() (string, bool) {
+		b := m2NodeAttempts(t, tc, orgID, run.ID, "node-b")
+		calls := m2ReadCalls(markerDir)
+		state := fmt.Sprintf("attempts=%v calls=%v agent1children=%d", b, calls, w1Starts.Load())
+		if len(b) == 1 && strings.Contains(b[0], "=RUNNING=") &&
+			m2CountPrefix(calls, "B-start ") == 1 && w1Starts.Load() == 2 {
+			return state, true
+		}
+		return state, false
+	})
+	t.Logf("M2-GATE-REAL B in-flight on agent 1: %s", b1desc)
+	// Kill Agent 1 while B is in-flight: the Agent loop actually stops,
+	// heartbeats stop because the Agent stopped, and its active Node child is
+	// terminated per current Agent behavior (SIGTERM abort, then SIGKILL after
+	// the supervisor grace period). Termination is observable: the killed
+	// child writes B-aborted and can never write B-done afterwards.
+	b1 := m2NodeAttempts(t, tc, orgID, run.ID, "node-b")
+	if len(b1) != 1 {
+		t.Fatalf("expected one B attempt owned by agent 1, got %v", b1)
 	}
-	startNode(t, server, worker1, claimA.AttemptID, claimA.OwnershipEpoch)
-	completeNode(t, server, worker1, claimA.AttemptID, claimA.OwnershipEpoch, "SUCCEEDED",
-		map[string]any{"accountId": "acc_m2_001"}, "digest-m2-a")
-	t.Logf("M2-GATE A attemptID=%s epoch=%d opID=%s", claimA.AttemptID, claimA.OwnershipEpoch, claimA.OperationID)
-
-	snapAfterA := m2GetSnapshot(t, server.URL, run.ID, adminKey.PlaintextKey, orgID)
-	stepStateAfterA := map[string]contracts.StepStatus{}
-	for _, s := range snapAfterA.Steps {
-		stepStateAfterA[s.NodeID] = s.Status
+	attempt1ID := strings.Split(b1[0], "=")[0]
+	cancel1()
+	select {
+	case <-agent1Done:
+		t.Logf("M2-GATE-REAL agent 1 loop stopped")
+	case <-time.After(20 * time.Second):
+		t.Fatal("agent 1 did not stop after kill")
 	}
-	if stepStateAfterA["node-a"] != contracts.StepStatusSUCCEEDED || stepStateAfterA["node-b"] != contracts.StepStatusREADY {
-		t.Fatalf("after A: unexpected states %+v", stepStateAfterA)
+	m2WaitFor(t, 20*time.Second, "B-aborted by killed agent 1", func() (string, bool) {
+		calls := m2ReadCalls(markerDir)
+		state := fmt.Sprintf("calls=%v", calls)
+		return state, m2CountPrefix(calls, "B-aborted "+attempt1ID) == 1
+	})
+	if got := m2CountPrefix(m2ReadCalls(markerDir), "B-done "); got != 0 {
+		t.Fatalf("agent 1 must never complete B after the kill: B-done=%d", got)
 	}
 
-	// B begins on worker 1.
-	claimB1 := claimExecution(t, server, worker1, m2ABCBundle, "m2-gate-claim-b1")
-	startNode(t, server, worker1, claimB1.AttemptID, claimB1.OwnershipEpoch)
-	t.Logf("M2-GATE B attempt1=%s epoch=%d opID=%s worker=%s session=%s",
-		claimB1.AttemptID, claimB1.OwnershipEpoch, claimB1.OperationID, worker1.WorkerID, worker1.SessionID)
-
-	// Kill worker 1 while B owns the attempt: stop heartbeats (none sent),
-	// advance only the lease clock, then run the real production reconciler.
+	// Ownership expires (controlled clock advancement only; final step/attempt
+	// state is never written directly) and the production recovery path marks
+	// B LOST with the safe-retry backoff timer parked.
 	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE task_leases SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE attempt_id=$1::uuid`, claimB1.AttemptID)
+		_, err := tx.Exec(ctx, `UPDATE task_leases SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE step_id IN (SELECT rs.id FROM run_steps rs JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND r.organization_id=$2::uuid AND rs.node_id='node-b')`, run.ID, orgID)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -200,60 +509,35 @@ func TestM2_TwoWorkerABCRecoveryKillDuringB(t *testing.T) {
 	if _, err := engine.ReconcileExpiredLeases(ctx, orgID); err != nil {
 		t.Fatalf("reconcile expired leases: %v", err)
 	}
-
-	// B must have followed its safe-retry policy: LOST attempt, backoff timer
-	// parked, no blind second attempt yet.
-	var b1Status string
-	var bAttemptsAfterKill, pendingTimers int
+	bAfterKill := m2NodeAttempts(t, tc, orgID, run.ID, "node-b")
+	if len(bAfterKill) != 1 || !strings.Contains(bAfterKill[0], "=LOST=") {
+		t.Fatalf("B attempt 1 must be LOST after kill, got %v", bAfterKill)
+	}
 	var bStepState, bWaitReason string
+	var pendingTimers int
 	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT status FROM task_attempts WHERE id=$1::uuid`, claimB1.AttemptID).Scan(&b1Status); err != nil {
+		var wr *string
+		if err := tx.QueryRow(ctx, `SELECT rs.state, rs.wait_reason FROM run_steps rs JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND r.organization_id=$2::uuid AND rs.node_id='node-b'`, run.ID, orgID).Scan(&bStepState, &wr); err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_attempts ta JOIN run_steps rs ON rs.id=ta.step_id JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND rs.node_id='node-b'`, run.ID).Scan(&bAttemptsAfterKill); err != nil {
-			return err
+		if wr != nil {
+			bWaitReason = *wr
 		}
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM timers tm JOIN run_steps rs ON rs.id=tm.step_id JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND rs.node_id='node-b' AND tm.state='PENDING'`, run.ID).Scan(&pendingTimers); err != nil {
-			return err
-		}
-		return tx.QueryRow(ctx, `SELECT rs.state, COALESCE(rs.wait_reason,'') FROM run_steps rs JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND rs.node_id='node-b'`, run.ID).Scan(&bStepState, &bWaitReason)
+		return tx.QueryRow(ctx, `SELECT count(*) FROM timers tm JOIN run_steps rs ON rs.id=tm.step_id JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND r.organization_id=$2::uuid AND rs.node_id='node-b' AND tm.state='PENDING'`, run.ID, orgID).Scan(&pendingTimers)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if b1Status != "LOST" {
-		t.Fatalf("B attempt 1 must be LOST after kill, got %s", b1Status)
+	if bStepState != "WAITING" || bWaitReason != "RETRY_BACKOFF" || pendingTimers != 1 {
+		t.Fatalf("B must park backoff timer per safe policy: step=%s/%s timers=%d attempts=%v", bStepState, bWaitReason, pendingTimers, bAfterKill)
 	}
-	if bStepState != "WAITING" || bWaitReason != "RETRY_BACKOFF" || pendingTimers != 1 || bAttemptsAfterKill != 1 {
-		t.Fatalf("B must park backoff timer per safe policy: step=%s/%s timers=%d attempts=%d", bStepState, bWaitReason, pendingTimers, bAttemptsAfterKill)
-	}
-	t.Logf("M2-GATE B killed: attempt1 LOST, step WAITING/RETRY_BACKOFF, 1 pending timer")
+	t.Logf("M2-GATE-REAL B killed: attempt LOST, step WAITING/RETRY_BACKOFF, 1 pending timer")
 
-	// Stale worker 1 mutations must be rejected through the real fencing path.
-	var staleHB worker.HeartbeatResponseDTO
-	hbStatus := postWorkerJSON(t, server, "/worker/v1/heartbeat", worker1.SessionToken, worker.HeartbeatRequestDTO{
-		ProtocolVersion: worker.ProtocolVersion, RequestID: "m2-gate-stale-hb",
-		WorkerID: worker1.WorkerID, SessionID: worker1.SessionID,
-		Attempts: []worker.HeartbeatAttemptDTO{{AttemptID: claimB1.AttemptID, OwnershipEpoch: claimB1.OwnershipEpoch}},
-	}, &staleHB)
-	if hbStatus != http.StatusOK || len(staleHB.Stops) != 1 {
-		t.Fatalf("stale heartbeat must return a stop directive: status=%d resp=%+v", hbStatus, staleHB)
-	}
-	staleComplete := worker.CompleteRequestDTO{
-		ProtocolVersion: worker.ProtocolVersion, RequestID: "m2-gate-stale-complete",
-		WorkerID: worker1.WorkerID, SessionID: worker1.SessionID,
-		AttemptID: claimB1.AttemptID, OwnershipEpoch: claimB1.OwnershipEpoch,
-		Outcome: "SUCCEEDED", Output: map[string]any{"message": "stale"},
-	}
-	staleComplete.ResultDigest, _ = worker.CanonicalCompletionDigest(&staleComplete)
-	if status := postWorkerJSON(t, server, "/worker/v1/complete", worker1.SessionToken, staleComplete, &worker.ErrorEnvelopeDTO{}); status != http.StatusConflict {
-		t.Fatalf("stale completion must be rejected with 409, got %d", status)
-	}
-	t.Logf("M2-GATE stale worker-1 heartbeat stopped + completion rejected (409)")
-
-	// Policy permits takeover when the backoff timer fires: force due (clock
-	// advancement only) then run the real timer firing path.
+	// The backoff timer fires through the production timer path, then Agent 2
+	// starts. Only after Agent 2 observably owns B (attempt 2 started) is
+	// exactly that attempt released via its attempt-scoped release file, so
+	// the recovered child — and no other — can complete.
 	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE timers SET due_at=clock_timestamp()-INTERVAL '1 second' WHERE step_id=(SELECT rs.id FROM run_steps rs JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND rs.node_id='node-b') AND state='PENDING'`, run.ID)
+		_, err := tx.Exec(ctx, `UPDATE timers SET due_at=clock_timestamp()-INTERVAL '1 second' WHERE step_id IN (SELECT rs.id FROM run_steps rs JOIN runs r ON r.id=rs.run_id WHERE r.id=$1::uuid AND r.organization_id=$2::uuid AND rs.node_id='node-b') AND state='PENDING'`, run.ID, orgID)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -261,36 +545,85 @@ func TestM2_TwoWorkerABCRecoveryKillDuringB(t *testing.T) {
 	if fired, err := engine.FireDueRetryTimers(ctx, orgID); err != nil || fired != 1 {
 		t.Fatalf("expected backoff timer to fire once, fired=%d err=%v", fired, err)
 	}
+	cancel2, agent2Done := m2StartAgent(t, server.URL, bundleDir, runnerPath, tok2, "m2-real-w2", &w2Starts, &w2Logs)
+	defer func() {
+		cancel2()
+		select {
+		case <-agent2Done:
+		case <-time.After(20 * time.Second):
+			t.Error("agent 2 did not stop after cancel")
+		}
+	}()
 
-	// Worker 2 takes over B with a newer epoch and the same operation ID.
-	claimB2 := claimExecution(t, server, worker2, m2ABCBundle, "m2-gate-claim-b2")
-	if claimB2.AttemptID == claimB1.AttemptID {
-		t.Fatalf("worker 2 must receive a new attempt, got same %s", claimB2.AttemptID)
+	attempt2ID := ""
+	m2WaitFor(t, 60*time.Second, "agent 2 starts B", func() (string, bool) {
+		b := m2NodeAttempts(t, tc, orgID, run.ID, "node-b")
+		calls := m2ReadCalls(markerDir)
+		state := fmt.Sprintf("attempts=%v calls=%v agent2children=%d", b, calls, w2Starts.Load())
+		if len(b) == 2 && m2CountPrefix(calls, "B-start ") == 2 {
+			attempt2ID = strings.Split(b[1], "=")[0]
+			return state, true
+		}
+		return state, false
+	})
+	t.Logf("M2-GATE-REAL agent 2 owns B attempt %s", attempt2ID)
+	if err := os.WriteFile(filepath.Join(markerDir, "b.release."+attempt2ID), []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if claimB2.OwnershipEpoch <= claimB1.OwnershipEpoch {
-		t.Fatalf("worker 2 epoch must exceed %d, got %d", claimB1.OwnershipEpoch, claimB2.OwnershipEpoch)
-	}
-	if claimB2.OperationID != claimB1.OperationID {
-		t.Fatalf("operation ID must be stable across retry: %s vs %s", claimB1.OperationID, claimB2.OperationID)
-	}
-	t.Logf("M2-GATE B attempt2=%s epoch=%d opID=%s worker=%s session=%s",
-		claimB2.AttemptID, claimB2.OwnershipEpoch, claimB2.OperationID, worker2.WorkerID, worker2.SessionID)
-	startNode(t, server, worker2, claimB2.AttemptID, claimB2.OwnershipEpoch)
-	completeNode(t, server, worker2, claimB2.AttemptID, claimB2.OwnershipEpoch, "SUCCEEDED",
-		map[string]any{"message": "hello recovered"}, "digest-m2-b")
 
-	// C executes only after B recovered.
-	claimC := claimExecution(t, server, worker2, m2ABCBundle, "m2-gate-claim-c")
-	completePreState := m2GetSnapshot(t, server.URL, run.ID, adminKey.PlaintextKey, orgID)
-	for _, s := range completePreState.Steps {
-		if s.NodeID == "node-c" && s.Status != contracts.StepStatusREADY && s.Status != contracts.StepStatusRUNNING {
-			t.Fatalf("C must be READY/RUNNING after B recovery, got %s", s.Status)
+	m2WaitFor(t, 120*time.Second, "run SUCCEEDED", func() (string, bool) {
+		var status string
+		if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid`, run.ID).Scan(&status)
+		}); err != nil {
+			return fmt.Sprintf("query: %v", err), false
+		}
+		return status, status == "SUCCEEDED"
+	})
+
+	// Runtime proof that A was not rerun: exactly one A child execution, two
+	// B executions under one operation ID with a single B completion, one
+	// C execution, and one observable kill of the first B child.
+	calls := m2ReadCalls(markerDir)
+	if m2CountPrefix(calls, "A ") != 1 {
+		t.Fatalf("A must execute exactly once at runtime, calls=%v", calls)
+	}
+	if m2CountPrefix(calls, "B-start ") != 2 {
+		t.Fatalf("B must start twice at runtime (killed + recovered), calls=%v", calls)
+	}
+	if m2CountPrefix(calls, "B-aborted "+attempt1ID) != 1 {
+		t.Fatalf("killed B child must observably abort, calls=%v", calls)
+	}
+	if m2CountPrefix(calls, "B-done ") != 1 {
+		t.Fatalf("B must complete exactly once at runtime, calls=%v", calls)
+	}
+	if m2CountPrefix(calls, "C ") != 1 {
+		t.Fatalf("C must execute exactly once at runtime, calls=%v", calls)
+	}
+	var bOps []string
+	for _, line := range calls {
+		if strings.HasPrefix(line, "B-start ") {
+			bOps = append(bOps, strings.TrimSpace(strings.TrimPrefix(line, "B-start ")))
 		}
 	}
-	startNode(t, server, worker2, claimC.AttemptID, claimC.OwnershipEpoch)
-	completeNode(t, server, worker2, claimC.AttemptID, claimC.OwnershipEpoch, "SUCCEEDED",
-		map[string]any{"confirmationCode": "CONF-M2-001"}, "digest-m2-c")
-	t.Logf("M2-GATE C attemptID=%s epoch=%d", claimC.AttemptID, claimC.OwnershipEpoch)
+	if len(bOps) != 2 || bOps[0] == "" || bOps[0] != bOps[1] {
+		t.Fatalf("both B executions must share one operation ID, got %v", bOps)
+	}
+	if w1Starts.Load() != 2 {
+		t.Fatalf("agent 1 must launch exactly A and B children, got %d", w1Starts.Load())
+	}
+	if w2Starts.Load() != 2 {
+		t.Fatalf("agent 2 must launch exactly B and C children, got %d", w2Starts.Load())
+	}
+	t.Logf("M2-GATE-REAL runtime evidence calls=%v agent1children=%d agent2children=%d opID=%s",
+		calls, w1Starts.Load(), w2Starts.Load(), bOps[0])
+
+	// Durable proof: B is LOST + SUCCEEDED with a newer epoch.
+	bFinal := m2NodeAttempts(t, tc, orgID, run.ID, "node-b")
+	if len(bFinal) != 2 || !strings.Contains(bFinal[0], "=LOST=") || !strings.Contains(bFinal[1], "=SUCCEEDED=") {
+		t.Fatalf("B must be LOST+SUCCEEDED, got %v", bFinal)
+	}
+	t.Logf("M2-GATE-REAL B durable: %v", bFinal)
 
 	// Final agreement: API state, DB state, event history, Inspector snapshot.
 	apiSnap := m2GetSnapshot(t, server.URL, run.ID, adminKey.PlaintextKey, orgID)
@@ -298,7 +631,7 @@ func TestM2_TwoWorkerABCRecoveryKillDuringB(t *testing.T) {
 		t.Fatalf("final run must be SUCCEEDED, got %s", apiSnap.Status)
 	}
 	out, _ := apiSnap.Output.(map[string]any)
-	if out["finalConfirmation"] != "CONF-M2-001" {
+	if out["finalConfirmation"] != "CONF-M2-REAL" {
 		t.Fatalf("unexpected final output: %+v", apiSnap.Output)
 	}
 	svcSnap, err := execution.NewService(tc.pool, tc.service).GetRun(ctx, orgID, run.ID)
