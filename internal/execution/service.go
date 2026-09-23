@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/contracts"
+	"github.com/Ryanakml/Deadbolt/internal/recovery"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
@@ -207,6 +208,17 @@ func (s *Service) CreateRun(
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("query idempotency: %w", err)
+		}
+
+		// Disaster recovery admission gate (Blueprint §27.3). Fail closed:
+		// a missing or unreadable controls row must not admit new runs.
+		var admissionEnabled bool
+		var recMode string
+		if err := tx.QueryRow(ctx, `SELECT admission_enabled, mode FROM system_recovery_controls WHERE id = 1`).Scan(&admissionEnabled, &recMode); err != nil {
+			return fmt.Errorf("%w: read system recovery controls: %v", recovery.ErrRecoveryControlsUnavailable, err)
+		}
+		if !admissionEnabled || recMode == "READ_ONLY" || recMode == "DISASTER_RECOVERY" {
+			return recovery.ErrAdmissionDisabled
 		}
 
 		// 2. Serialize all environment admission decisions. The lock must be

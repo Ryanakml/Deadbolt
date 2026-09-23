@@ -11,6 +11,11 @@ import (
 // wired in. It intentionally carries no claim, result, or state semantics.
 var ErrExecutionEngineUnavailable = errors.New("EXECUTION_ENGINE_UNAVAILABLE: authoritative execution engine is not installed")
 
+// ErrRecoveryControlsUnavailable means the disaster recovery controls row is
+// missing or unreadable, so dispatch is denied fail-closed. It carries no
+// tenant data and no database internals.
+var ErrRecoveryControlsUnavailable = errors.New("RECOVERY_CONTROLS_UNAVAILABLE: System recovery controls are unavailable; dispatch is denied")
+
 // ExecutionEngine owns authoritative claim and completion transitions. The
 // worker transport only carries the engine's assignment/result decisions.
 type ExecutionEngine interface {

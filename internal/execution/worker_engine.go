@@ -791,6 +791,18 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 	if req.AvailableSlots <= 0 {
 		return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
 	}
+
+	// Disaster recovery dispatch gate (Blueprint §27.3). Fail closed: a
+	// missing or unreadable controls row must not grant new task ownership.
+	var dispatchEnabled bool
+	var recMode string
+	if err := e.pool.QueryRow(ctx, `SELECT dispatch_enabled, mode FROM system_recovery_controls WHERE id = 1`).Scan(&dispatchEnabled, &recMode); err != nil {
+		return nil, worker.ErrRecoveryControlsUnavailable
+	}
+	if !dispatchEnabled || recMode == "READ_ONLY" || recMode == "DISASTER_RECOVERY" {
+		return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
+	}
+
 	var reconciledRuns []string
 
 	// TX A snapshots candidates plus immutable artifact requirements and

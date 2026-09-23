@@ -52,10 +52,44 @@ func run() error {
 	logger := log.New(os.Stdout, "[DEADBOLT_CONTROL_PLANE] ", log.LstdFlags|log.Lmsgprefix)
 
 	migrateFlag := flag.Bool("migrate", false, "Run database schema migrations and exit")
+	prepareRecoveryFlag := flag.Bool("prepare-disaster-recovery", false, "Prepare disaster recovery holds with operator database authority and exit (Blueprint §27.3)")
+	verifyRecoveryFlag := flag.Bool("verify-recovery-integrity", false, "Verify recovery integrity with operator database authority and exit")
+	rpoGapRecoveryFlag := flag.Bool("recovery-rpo-gap", false, "Record RPO-gap request evidence with operator database authority and exit")
+	resumeRecoveryFlag := flag.Bool("resume-recovery", false, "Transition recovery controls (READ_ONLY/RESUMING/ACTIVE) with operator database authority and exit")
+	recoveryPointFlag := flag.String("recovery-point", os.Getenv("DEADBOLT_RECOVERY_POINT"), "Recovery point timestamp (RFC3339) for --prepare-disaster-recovery")
+	incidentAtFlag := flag.String("incident-at", os.Getenv("DEADBOLT_INCIDENT_AT"), "Incident timestamp (RFC3339); defaults to now")
+	incidentIDFlag := flag.String("incident-id", os.Getenv("DEADBOLT_INCIDENT_ID"), "Incident ID for --recovery-rpo-gap")
+	rpoGapIDsFlag := flag.String("rpo-gap-ids", os.Getenv("DEADBOLT_RPO_GAP_IDS"), "Comma-separated absent-after-recovery-point request IDs")
+	operatorNotesFlag := flag.String("operator-notes", os.Getenv("DEADBOLT_OPERATOR_NOTES"), "Operator notes recorded on the incident")
+	resumeModeFlag := flag.String("resume-mode", os.Getenv("DEADBOLT_RESUME_MODE"), "Target mode for --resume-recovery: READ_ONLY, RESUMING, or ACTIVE")
 	flag.Parse()
 
 	if *migrateFlag || os.Getenv("DEADBOLT_RUN_MIGRATIONS") == "true" {
 		return runMigrations(logger)
+	}
+
+	if *prepareRecoveryFlag {
+		recoveryPoint, err := parseRecoveryPoint(*recoveryPointFlag)
+		if err != nil {
+			return err
+		}
+		incidentAt, err := parseIncidentAt(*incidentAtFlag)
+		if err != nil {
+			return err
+		}
+		return runRecoveryPrepare(logger, recoveryPoint, incidentAt, splitCSV(*rpoGapIDsFlag), *operatorNotesFlag)
+	}
+
+	if *verifyRecoveryFlag {
+		return runRecoveryVerify(logger)
+	}
+
+	if *rpoGapRecoveryFlag {
+		return runRecoveryRPOGap(logger, *incidentIDFlag, splitCSV(*rpoGapIDsFlag), *operatorNotesFlag)
+	}
+
+	if *resumeRecoveryFlag {
+		return runRecoveryResume(logger, *resumeModeFlag)
 	}
 
 	runtimeMode := strings.ToLower(strings.TrimSpace(os.Getenv("RUNTIME_MODE")))
