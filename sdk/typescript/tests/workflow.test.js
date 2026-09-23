@@ -165,6 +165,47 @@ test("defineWorkflow accepts static parallel fan-out graphs", () => {
   );
 });
 
+test("defineWorkflow accepts multi-parent join after: [a, b]", () => {
+  assert.doesNotThrow(() =>
+    defineWorkflow({
+      name: "join-wf",
+      inputSchema: payloadSchemaString,
+      outputSchema: payloadSchemaString,
+      nodes: [
+        {
+          id: "root",
+          type: "task",
+          task: taskA,
+          input: { val: input("/val") },
+        },
+        {
+          id: "branch1",
+          type: "task",
+          task: taskB,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+        },
+        {
+          id: "branch2",
+          type: "task",
+          task: taskC,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+          sideEffect: true,
+        },
+        {
+          id: "join",
+          type: "task",
+          task: taskB,
+          after: ["branch1", "branch2"],
+          input: { val: output("branch1", "/val") },
+        },
+      ],
+      output: { val: output("join", "/val") },
+    }),
+  );
+});
+
 test("defineWorkflow rejects cycles", () => {
   assert.throws(
     () =>

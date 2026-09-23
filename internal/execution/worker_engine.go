@@ -352,6 +352,40 @@ func deriveIdempotencyDeadlineTx(ctx context.Context, tx storage.Tx, organizatio
 	return &stored, nil
 }
 
+// recomputeRunStatusForRetryTx applies Blueprint §10.2 priority after parking
+// one branch in RETRY_BACKOFF: if any live attempt (CLAIMED/RUNNING) or any
+// READY/RUNNING sibling step remains, the run stays (or returns to) RUNNING so
+// independent work remains claimable via Poll; only when all remaining work is
+// durably waiting does the run become WAITING/RETRY_BACKOFF. It is a single
+// bounded query pair and never reopens a terminal run.
+func recomputeRunStatusForRetryTx(ctx context.Context, tx storage.Tx, organizationID, runID string) error {
+	var liveAttempts int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_attempts a
+		JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
+		WHERE rs.run_id=$1::uuid AND a.organization_id=$2::uuid
+			AND a.status IN ('CLAIMED','RUNNING')`, runID, organizationID).Scan(&liveAttempts); err != nil {
+		return err
+	}
+	var readyOrRunning int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM run_steps
+		WHERE run_id=$1::uuid AND organization_id=$2::uuid
+			AND state IN ('READY','RUNNING')`, runID, organizationID).Scan(&readyOrRunning); err != nil {
+		return err
+	}
+	if liveAttempts > 0 || readyOrRunning > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE runs SET status='RUNNING', reason_code=NULL, updated_at=clock_timestamp()
+			WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING','WAITING')`, runID, organizationID); err != nil {
+			return err
+		}
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE runs SET status='WAITING', reason_code='RETRY_BACKOFF', updated_at=clock_timestamp()
+		WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING')`, runID, organizationID); err != nil {
+		return err
+	}
+	return nil
+}
+
 // scheduleRetryOrHoldTx persists a retry intent (WAITING/RETRY_BACKOFF +
 // PENDING timer with a once-chosen due_at) or routes to reconciliation /
 // terminal failure when guards forbid retry. It returns "retry", "hold", or
@@ -512,8 +546,11 @@ func scheduleRetryOrHoldTx(ctx context.Context, tx storage.Tx, organizationID, e
 		WHERE id=$2::uuid AND organization_id=$3::uuid`, dueAt, stepID, organizationID); err != nil {
 		return "", "", err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE runs SET status='WAITING', reason_code='RETRY_BACKOFF', updated_at=clock_timestamp()
-		WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING')`, runID, organizationID); err != nil {
+	// Blueprint §10.2 run-state priority for parallel DAGs: while any live
+	// attempt or READY/RUNNING sibling work exists, the run stays RUNNING so
+	// independent siblings remain claimable. WAITING/RETRY_BACKOFF applies
+	// only when all remaining work is durably waiting.
+	if err := recomputeRunStatusForRetryTx(ctx, tx, organizationID, runID); err != nil {
 		return "", "", err
 	}
 	if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_WAITING", map[string]any{
@@ -597,8 +634,15 @@ func failRunForStepTx(ctx context.Context, tx storage.Tx, organizationID, runID,
 		WHERE id=$2::uuid AND organization_id=$3::uuid`, reasonCode, runID, organizationID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', updated_at=clock_timestamp()
-		WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state IN ('BLOCKED','READY','WAITING')`, runID, organizationID); err != nil {
+	// Blueprint §10.4: every nonterminal sibling/dependent step settles
+	// atomically. Live sibling attempts were CANCELLED above, but their
+	// run_steps rows may still be RUNNING; they must become CANCELLED here.
+	// Terminal-success siblings are preserved exactly as SUCCEEDED, and the
+	// failing step itself (already FAILED) is excluded. SKIPPED is terminal
+	// and is preserved as well.
+	if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='CANCELLED', wait_reason=NULL, updated_at=clock_timestamp()
+		WHERE run_id=$1::uuid AND organization_id=$2::uuid AND id != $3::uuid
+			AND state IN ('BLOCKED','READY','WAITING','RUNNING')`, runID, organizationID, stepID); err != nil {
 		return err
 	}
 	// Pending timers die with the run so a later firing cannot resurrect it.
@@ -1610,6 +1654,110 @@ func artifactFailureCode(err error) string {
 	}
 }
 
+// dagEvalStep is the minimal per-node state shared by normal advancement and
+// reconciliation repair so both paths evaluate identical DAG semantics.
+type dagEvalStep struct {
+	id    string
+	state string
+}
+
+// evaluateBlockedDAGTx is the single authoritative graph-evaluation path for
+// BLOCKED steps (Blueprint §6, §10). Both normal post-completion advancement
+// and ReconcileReadyWork repair use it, so restart/broker-loss recovery can
+// never execute a graph differently from normal execution. Semantics:
+//   - all-success join (every dep SUCCEEDED, none SKIPPED) => READY (after
+//     committed-output mapping + target schema validation);
+//   - any dep SKIPPED (with all deps terminal SUCCEEDED/SKIPPED) => SKIPPED
+//     with DEPENDENCY_SKIPPED, propagated transitively to stability
+//     regardless of manifest node order (fixed-point loop);
+//   - mapping failure or mapped-input schema violation => deterministic
+//     non-retryable INPUT_MAPPING_ERROR via canonical fail-fast (never a
+//     transient Poll/reconciler error).
+//
+// Steps maps nodeID -> step; outputsMap carries committed dependency outputs;
+// runInput is the run input for mapping. readyEventReason names the STEP_READY
+// reason ("" for normal advancement, "RECONCILIATION" for repair). Updates are
+// conditional on still-BLOCKED so concurrent settlement cannot duplicate work.
+// Returns transitions applied and whether the run was fail-fasted.
+func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, runID, workflowName string, workflow *workflowManifest, manifest *deploymentManifest, runInput any, steps map[string]*dagEvalStep, outputsMap map[string]any, readyEventReason string) (int, bool, error) {
+	transitions := 0
+	for changed := true; changed; {
+		changed = false
+		for _, node := range workflow.Nodes {
+			st, ok := steps[node.ID]
+			if !ok || st.state != "BLOCKED" {
+				continue
+			}
+			allDepsMet := true
+			dependencySkipped := false
+			for _, depID := range node.After {
+				depStep, depExists := steps[depID]
+				if !depExists {
+					allDepsMet = false
+					break
+				}
+				if depStep.state == "SKIPPED" {
+					dependencySkipped = true
+				}
+				if depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED" {
+					allDepsMet = false
+				}
+			}
+			if !allDepsMet {
+				continue
+			}
+			if dependencySkipped {
+				tag, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED', wait_reason='DEPENDENCY_SKIPPED', updated_at=clock_timestamp()
+					WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, st.id, organizationID)
+				if err != nil {
+					return transitions, false, err
+				}
+				if tag.RowsAffected() == 0 {
+					continue
+				}
+				st.state = "SKIPPED"
+				changed = true
+				transitions++
+				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
+					"stepId": st.id, "nodeId": node.ID, "reason": "DEPENDENCY_SKIPPED",
+				}); err != nil {
+					return transitions, false, err
+				}
+				continue
+			}
+			if node.Input != nil {
+				mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
+				inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
+				if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INPUT_MAPPING_ERROR", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+			}
+			tag, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, st.id, organizationID)
+			if err != nil {
+				return transitions, false, err
+			}
+			if tag.RowsAffected() == 0 {
+				continue
+			}
+			st.state = "READY"
+			changed = true
+			transitions++
+			payload := map[string]any{"stepId": st.id, "nodeId": node.ID}
+			if readyEventReason != "" {
+				payload["reason"] = readyEventReason
+			}
+			if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", payload); err != nil {
+				return transitions, false, err
+			}
+		}
+	}
+	return transitions, false, nil
+}
+
 // advanceAfterStepSuccessTx unblocks dependency-satisfied steps and
 // terminalizes the run when every node is terminal. It is shared by worker
 // completion and audited reconciliation success so downstream scheduling
@@ -1669,67 +1817,18 @@ func advanceAfterStepSuccessTx(ctx context.Context, tx storage.Tx, organizationI
 	stepRows.Close()
 
 	if targetWorkflow != nil {
-		// Re-evaluate until stable because manifests need not be topologically
-		// ordered; skipped propagation must not leave a downstream join stuck.
-		for changed := true; changed; {
-			changed = false
-			for _, node := range targetWorkflow.Nodes {
-				st, ok := stepsByNode[node.ID]
-				if !ok || st.state != "BLOCKED" {
-					continue
-				}
-				allDepsMet := true
-				dependencySkipped := false
-				for _, depID := range node.After {
-					depStep, depExists := stepsByNode[depID]
-					if !depExists {
-						allDepsMet = false
-						break
-					}
-					if depStep.state == "SKIPPED" {
-						dependencySkipped = true
-					}
-					if depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED" {
-						allDepsMet = false
-					}
-				}
-				if allDepsMet {
-					if dependencySkipped {
-						if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED',wait_reason='DEPENDENCY_SKIPPED',updated_at=clock_timestamp()
-						WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, st.id, organizationID); err != nil {
-							return err
-						}
-						st.state = "SKIPPED"
-						changed = true
-						if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
-							"stepId": st.id, "nodeId": node.ID, "reason": "DEPENDENCY_SKIPPED",
-						}); err != nil {
-							return err
-						}
-						continue
-					}
-					// Evaluate input mapping if present
-					if node.Input != nil {
-						mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
-						inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
-						if mapErr != nil || (inputSchema != nil && contracts.ValidatePayload(inputSchema, mapped) != nil) {
-							// Non-retryable mapping error per Blueprint §10.4 & §14.2
-							return failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INPUT_MAPPING_ERROR", nil)
-						}
-					}
-					// Unblock to READY
-					if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='READY',wait_reason=NULL,eligible_at=clock_timestamp(),updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid`, st.id, organizationID); err != nil {
-						return err
-					}
-					st.state = "READY"
-					changed = true
-					if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", map[string]any{
-						"stepId": st.id, "nodeId": node.ID,
-					}); err != nil {
-						return err
-					}
-				}
+		evalSteps := make(map[string]*dagEvalStep, len(stepsByNode))
+		for nodeID, s := range stepsByNode {
+			evalSteps[nodeID] = &dagEvalStep{id: s.id, state: s.state}
+		}
+		if _, runFailed, err := evaluateBlockedDAGTx(ctx, tx, organizationID, runID, workflowName, targetWorkflow, &manifest, runInput, evalSteps, outputsMap, ""); err != nil {
+			return err
+		} else if runFailed {
+			return nil
+		}
+		for nodeID, es := range evalSteps {
+			if s, ok := stepsByNode[nodeID]; ok {
+				s.state = es.state
 			}
 		}
 
@@ -2333,20 +2432,37 @@ func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID st
 				continue
 			}
 
-			stepRows, err := tx.Query(ctx, `SELECT id::text, node_id, state FROM run_steps
+			// Load committed outputs + run input so reconciliation evaluates
+			// the identical mapping/schema semantics as normal advancement.
+			var rawRunInput []byte
+			if err := tx.QueryRow(ctx, `SELECT r.input FROM runs r
+				WHERE r.id=$1::uuid AND r.organization_id=$2::uuid`, runID, organizationID).Scan(&rawRunInput); err != nil {
+				return fmt.Errorf("query run input for run %s: %w", runID, err)
+			}
+			var runInput any
+			if len(rawRunInput) > 0 {
+				_ = json.Unmarshal(rawRunInput, &runInput)
+			}
+			stepRows, err := tx.Query(ctx, `SELECT id::text, node_id, state, output FROM run_steps
 				WHERE run_id=$1::uuid AND organization_id=$2::uuid ORDER BY id FOR UPDATE`, runID, organizationID)
 			if err != nil {
 				return fmt.Errorf("query steps for run %s: %w", runID, err)
 			}
-			type readyStep struct{ id, state string }
-			steps := make(map[string]readyStep, len(workflow.Nodes))
+			steps := make(map[string]*dagEvalStep, len(workflow.Nodes))
+			outputsMap := make(map[string]any)
 			for stepRows.Next() {
 				var id, nodeID, state string
-				if err := stepRows.Scan(&id, &nodeID, &state); err != nil {
+				var rawOut []byte
+				if err := stepRows.Scan(&id, &nodeID, &state, &rawOut); err != nil {
 					stepRows.Close()
-					return err
+					return fmt.Errorf("scan step for run %s: %w", runID, err)
 				}
-				steps[nodeID] = readyStep{id: id, state: state}
+				if len(rawOut) > 0 && string(rawOut) != "null" {
+					var out any
+					_ = json.Unmarshal(rawOut, &out)
+					outputsMap[nodeID] = out
+				}
+				steps[nodeID] = &dagEvalStep{id: id, state: state}
 			}
 			if err := stepRows.Err(); err != nil {
 				stepRows.Close()
@@ -2354,38 +2470,15 @@ func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID st
 			}
 			stepRows.Close()
 
-			for _, node := range workflow.Nodes {
-				step, ok := steps[node.ID]
-				if !ok || step.state != "BLOCKED" {
-					continue
-				}
-				depsReady := true
-				for _, dependency := range node.After {
-					dep, exists := steps[dependency]
-					if !exists || (dep.state != "SUCCEEDED" && dep.state != "SKIPPED") {
-						depsReady = false
-						break
-					}
-				}
-				if !depsReady {
-					continue
-				}
-				result, err := tx.Exec(ctx, `UPDATE run_steps
-					SET state='READY', wait_reason=NULL, eligible_at=clock_timestamp(), updated_at=clock_timestamp()
-					WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, step.id, organizationID)
-				if err != nil {
-					return fmt.Errorf("repair blocked step %s: %w", step.id, err)
-				}
-				if result.RowsAffected() == 0 {
-					continue
-				}
-				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_READY", map[string]any{
-					"stepId": step.id, "nodeId": node.ID, "reason": "RECONCILIATION",
-				}); err != nil {
-					return fmt.Errorf("record repaired step %s: %w", step.id, err)
-				}
-				repaired++
-				steps[node.ID] = readyStep{id: step.id, state: "READY"}
+			n, runFailed, err := evaluateBlockedDAGTx(ctx, tx, organizationID, runID, workflowName, workflow, &manifest, runInput, steps, outputsMap, "RECONCILIATION")
+			if err != nil {
+				return fmt.Errorf("evaluate DAG for run %s: %w", runID, err)
+			}
+			if n > 0 {
+				repaired += n
+				affectedRuns = append(affectedRuns, runID)
+			}
+			if runFailed {
 				affectedRuns = append(affectedRuns, runID)
 			}
 			// A run with unmet dependencies must yield its place to the next
@@ -2522,6 +2615,38 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 	reclaimedCount := 0
 
 	for _, c := range candidates {
+		// Stale-candidate guard: an earlier candidate in this same sweep may
+		// have fail-fasted the run to a terminal state. Revalidate
+		// authoritative run/attempt/step state under canonical lock order
+		// (run -> step -> attempt) before mutating anything. Terminal runs
+		// never gain new work from stale snapshots.
+		var curRunStatus string
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.runID, organizationID).Scan(&curRunStatus); err != nil {
+			continue
+		}
+		switch curRunStatus {
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+			continue
+		}
+		var curAttemptStatus string
+		var curStartedAt *time.Time
+		if err := tx.QueryRow(ctx, `SELECT status, started_at FROM task_attempts
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.attemptID, organizationID).Scan(&curAttemptStatus, &curStartedAt); err != nil {
+			continue
+		}
+		if curAttemptStatus != "CLAIMED" && curAttemptStatus != "RUNNING" {
+			continue
+		}
+		var curStepState string
+		if err := tx.QueryRow(ctx, `SELECT state FROM run_steps
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.stepID, organizationID).Scan(&curStepState); err != nil {
+			continue
+		}
+		switch curStepState {
+		case "SUCCEEDED", "FAILED", "CANCELLED", "SKIPPED":
+			continue
+		}
 		reclaimedRunsMap[c.runID] = struct{}{}
 		reclaimedCount++
 
@@ -2534,10 +2659,14 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 
 		// 1. Overall run deadline exceeded
 		if c.runDeadlineAt != nil && !dbNow.Before(*c.runDeadlineAt) {
-			if _, err := tx.Exec(ctx, `UPDATE task_attempts SET status='LOST', completed_at=clock_timestamp(),
+			tag, err := tx.Exec(ctx, `UPDATE task_attempts SET status='LOST', completed_at=clock_timestamp(),
 				error=jsonb_build_object('code','RUN_DEADLINE_EXCEEDED','message','Run deadline exceeded','retryable',false,'effectStatus','UNKNOWN')
-				WHERE id=$1::uuid AND organization_id=$2::uuid`, c.attemptID, organizationID); err != nil {
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('CLAIMED','RUNNING')`, c.attemptID, organizationID)
+			if err != nil {
 				return 0, nil, err
+			}
+			if tag.RowsAffected() == 0 {
+				continue
 			}
 			if _, err := tx.Exec(ctx, `DELETE FROM task_leases WHERE step_id=$1::uuid AND organization_id=$2::uuid`, c.stepID, organizationID); err != nil {
 				return 0, nil, err
@@ -2563,12 +2692,17 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			continue
 		}
 
-		// 2. Unstarted claim (status == CLAIMED or started_at == nil)
-		if c.attemptStatus == "CLAIMED" || c.startedAt == nil {
-			if _, err := tx.Exec(ctx, `UPDATE task_attempts SET status='LOST', completed_at=clock_timestamp(),
+		// 2. Unstarted claim (authoritative current status/started_at, not the
+		// pre-sweep snapshot).
+		if curAttemptStatus == "CLAIMED" || curStartedAt == nil {
+			tag, err := tx.Exec(ctx, `UPDATE task_attempts SET status='LOST', completed_at=clock_timestamp(),
 				error=jsonb_build_object('code','START_DEADLINE_EXCEEDED','message','Claim start deadline exceeded without Start','retryable',true,'effectStatus','NOT_APPLIED')
-				WHERE id=$1::uuid AND organization_id=$2::uuid`, c.attemptID, organizationID); err != nil {
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('CLAIMED','RUNNING')`, c.attemptID, organizationID)
+			if err != nil {
 				return 0, nil, err
+			}
+			if tag.RowsAffected() == 0 {
+				continue
 			}
 			if _, err := tx.Exec(ctx, `DELETE FROM task_leases WHERE step_id=$1::uuid AND organization_id=$2::uuid`, c.stepID, organizationID); err != nil {
 				return 0, nil, err
@@ -2621,10 +2755,14 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			retryable = true
 		}
 
-		if _, err := tx.Exec(ctx, `UPDATE task_attempts SET status=$1, completed_at=clock_timestamp(),
+		tag, err := tx.Exec(ctx, `UPDATE task_attempts SET status=$1, completed_at=clock_timestamp(),
 			error=jsonb_build_object('code',$2::text,'message',$3::text,'retryable',$4::boolean,'effectStatus','UNKNOWN')
-			WHERE id=$5::uuid AND organization_id=$6::uuid`, outcome, reasonCode, message, retryable, c.attemptID, organizationID); err != nil {
+			WHERE id=$5::uuid AND organization_id=$6::uuid AND status IN ('CLAIMED','RUNNING')`, outcome, reasonCode, message, retryable, c.attemptID, organizationID)
+		if err != nil {
 			return 0, nil, err
+		}
+		if tag.RowsAffected() == 0 {
+			continue
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM task_leases WHERE step_id=$1::uuid AND organization_id=$2::uuid`, c.stepID, organizationID); err != nil {
 			return 0, nil, err
@@ -2655,6 +2793,17 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 	}
 
 	for _, h := range handoffs {
+		// Same stale-sweep guard as expired candidates: a terminal run must
+		// not gain READY work from a handoff snapshot.
+		var hRunStatus string
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, h.runID, organizationID).Scan(&hRunStatus); err != nil {
+			continue
+		}
+		switch hRunStatus {
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+			continue
+		}
 		reclaimedRunsMap[h.runID] = struct{}{}
 		reclaimedCount++
 
