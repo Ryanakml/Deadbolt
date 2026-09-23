@@ -23,15 +23,20 @@ func TestWorkerDrainRefusesNewClaims(t *testing.T) {
 	defer server.Close()
 
 	bundle := "7777777777777777777777777777777777777777777777777777777777777777"
-	schema := map[string]any{"type": "object"}
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"val": map[string]any{"type": "string"}},
+		"required":             []any{"val"},
+		"additionalProperties": false,
+	}
 	manifest := createLifecycleManifest(bundle,
 		[]map[string]any{{"name": "drain-task", "entrypoint": "tasks/drain.js", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000, "inputSchema": schema, "outputSchema": schema}},
-		[]map[string]any{{"manifestVersion": 1, "name": "drain-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "drain-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{}}},
+		[]map[string]any{{"manifestVersion": 1, "name": "drain-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "drain-task", "after": []any{}, "input": map[string]any{"val": map[string]any{"$ref": "run.input", "pointer": "/val"}}}}, "output": map[string]any{"val": map[string]any{"$ref": "step.output", "stepId": "node-1", "pointer": "/val"}}}},
 	)
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "drain-flow", manifest)
 
 	// Create a run ready for claiming
-	body := bytes.NewReader([]byte(`{"environment":"staging","input":{}}`))
+	body := bytes.NewReader([]byte(`{"environment":"staging","input":{"val":"ok"}}`))
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/workflows/drain-flow/runs", body)
 	req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	req.Header.Set("X-Organization-ID", orgID)
