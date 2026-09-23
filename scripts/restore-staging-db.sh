@@ -496,7 +496,7 @@ if [[ "$MODE" == "drill" ]]; then
     # namespace so it reaches PostgreSQL on loopback; no tenant credentials
     # are involved (host-operator database authority only).
     if ! docker run --rm --network "container:${DRILL_CONTAINER_NAME}" \
-      -e DATABASE_URL="$DRILL_DB_URL" \
+      -e MIGRATOR_DATABASE_URL="$DRILL_DB_URL" \
       -e RUNTIME_MODE=hosted \
       "$RECOVERY_IMAGE" "${PREPARE_ARGS[@]}"; then
       err "RECOVERY DRILL FAILED: authoritative disaster preparation failed; drill database left non-active."
@@ -577,7 +577,7 @@ elif [[ "$MODE" == "destructive" ]]; then
     # One-off operator container sharing the live database network namespace
     # (host-operator database authority only; no tenant credentials involved).
     if ! docker run --rm --network "container:${LIVE_CONTAINER_NAME}" \
-      -e DATABASE_URL="$LIVE_DB_URL" \
+      -e MIGRATOR_DATABASE_URL="$LIVE_DB_URL" \
       -e RUNTIME_MODE=hosted \
       "$RECOVERY_IMAGE" "${LIVE_PREPARE_ARGS[@]}"; then
       err "Failed to apply authoritative disaster recovery preparation; live system left non-active."

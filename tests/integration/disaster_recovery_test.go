@@ -1145,6 +1145,109 @@ func TestDisasterRecoveryRestoreScriptFailureFailsDrill(t *testing.T) {
 	}
 }
 
+// TestDisasterRecoveryRestoreScriptHostedOperatorDatabaseEnvWiring proves:
+//  1. In both isolated drill and destructive staging restore paths, restore-staging-db.sh
+//     invokes the recovery operator container with MIGRATOR_DATABASE_URL (not DATABASE_URL)
+//     when RUNTIME_MODE=hosted.
+//  2. The host operator recovery CLI in hosted mode rejects DATABASE_URL and requires
+//     MIGRATOR_DATABASE_URL, preventing unprivileged or misconfigured execution.
+func TestDisasterRecoveryRestoreScriptHostedOperatorDatabaseEnvWiring(t *testing.T) {
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("failed to get repo root: %v", err)
+	}
+	scriptPath := filepath.Join(repoRoot, "scripts", "restore-staging-db.sh")
+	contentBytes, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("failed to read restore script: %v", err)
+	}
+	content := string(contentBytes)
+
+	// 1. Verify drill path operator invocation wiring
+	drillBlockIdx := strings.Index(content, `docker run --rm --network "container:${DRILL_CONTAINER_NAME}"`)
+	if drillBlockIdx == -1 {
+		t.Fatalf("drill container operator run invocation not found in restore script")
+	}
+	drillBlock := content[drillBlockIdx : drillBlockIdx+300]
+	if !strings.Contains(drillBlock, `-e MIGRATOR_DATABASE_URL="$DRILL_DB_URL"`) {
+		t.Errorf("drill path must pass -e MIGRATOR_DATABASE_URL=\"$DRILL_DB_URL\", found:\n%s", drillBlock)
+	}
+	if !strings.Contains(drillBlock, `-e RUNTIME_MODE=hosted`) {
+		t.Errorf("drill path must pass -e RUNTIME_MODE=hosted, found:\n%s", drillBlock)
+	}
+	if strings.Contains(drillBlock, `-e DATABASE_URL=`) {
+		t.Errorf("drill path must NOT pass -e DATABASE_URL, found:\n%s", drillBlock)
+	}
+
+	// 2. Verify destructive live path operator invocation wiring
+	liveBlockIdx := strings.Index(content, `docker run --rm --network "container:${LIVE_CONTAINER_NAME}"`)
+	if liveBlockIdx == -1 {
+		t.Fatalf("live container operator run invocation not found in restore script")
+	}
+	liveBlock := content[liveBlockIdx : liveBlockIdx+300]
+	if !strings.Contains(liveBlock, `-e MIGRATOR_DATABASE_URL="$LIVE_DB_URL"`) {
+		t.Errorf("live destructive path must pass -e MIGRATOR_DATABASE_URL=\"$LIVE_DB_URL\", found:\n%s", liveBlock)
+	}
+	if !strings.Contains(liveBlock, `-e RUNTIME_MODE=hosted`) {
+		t.Errorf("live destructive path must pass -e RUNTIME_MODE=hosted, found:\n%s", liveBlock)
+	}
+	if strings.Contains(liveBlock, `-e DATABASE_URL=`) {
+		t.Errorf("live destructive path must NOT pass -e DATABASE_URL, found:\n%s", liveBlock)
+	}
+
+	// 3. Prove that in RUNTIME_MODE=hosted, control-plane --prepare-disaster-recovery
+	// fails closed when provided DATABASE_URL instead of MIGRATOR_DATABASE_URL.
+	cmd := exec.Command("go", "run", "../../cmd/control-plane",
+		"--prepare-disaster-recovery",
+		"--recovery-point", "2026-09-23T00:00:00Z",
+	)
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "MIGRATOR_DATABASE_URL=") &&
+			!strings.HasPrefix(kv, "DEADBOLT_MIGRATOR_DATABASE_URL=") &&
+			!strings.HasPrefix(kv, "RUNTIME_MODE=") &&
+			!strings.HasPrefix(kv, "DATABASE_URL=") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env,
+		"RUNTIME_MODE=hosted",
+		"DATABASE_URL=postgres://deadbolt_admin:secret@127.0.0.1:5432/deadbolt_staging?sslmode=disable",
+	)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected control-plane to fail closed when MIGRATOR_DATABASE_URL is missing in hosted mode, but succeeded:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "MIGRATOR_DATABASE_URL is required for recovery operations") {
+		t.Fatalf("expected error message to state MIGRATOR_DATABASE_URL is required, got:\n%s", string(out))
+	}
+
+	// 4. Prove that supplying MIGRATOR_DATABASE_URL satisfies the hosted recovery requirement
+	cmdMigrator := exec.Command("go", "run", "../../cmd/control-plane",
+		"--prepare-disaster-recovery",
+		"--recovery-point", "2026-09-23T00:00:00Z",
+	)
+	var envMigrator []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "MIGRATOR_DATABASE_URL=") &&
+			!strings.HasPrefix(kv, "DEADBOLT_MIGRATOR_DATABASE_URL=") &&
+			!strings.HasPrefix(kv, "RUNTIME_MODE=") &&
+			!strings.HasPrefix(kv, "DATABASE_URL=") {
+			envMigrator = append(envMigrator, kv)
+		}
+	}
+	envMigrator = append(envMigrator,
+		"RUNTIME_MODE=hosted",
+		"MIGRATOR_DATABASE_URL=postgres://deadbolt_admin:secret@127.0.0.1:5432/deadbolt_staging?sslmode=disable",
+	)
+	cmdMigrator.Env = envMigrator
+	outMigrator, _ := cmdMigrator.CombinedOutput()
+	if strings.Contains(string(outMigrator), "MIGRATOR_DATABASE_URL is required for recovery operations") {
+		t.Fatalf("expected MIGRATOR_DATABASE_URL to be accepted by recovery operator, but got requirement error:\n%s", string(outMigrator))
+	}
+}
+
 // TestDisasterRecoveryRealBinaryRollbackSmoke proves Blueprint §26:
 // 1. A previous compatible binary (from base commit e8918c3) starts cleanly against the forward schema (v23).
 // 2. /readyz succeeds (HTTP 200, status="ready", database="healthy", schema="current").
