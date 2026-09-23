@@ -26,6 +26,7 @@ var (
 	ErrResultConflict        = errors.New("RESULT_CONFLICT: Attempt already has a different terminal result")
 	ErrInvalidOutcome        = errors.New("INVALID_OUTCOME: Attempt outcome is not supported")
 	ErrPayloadTooLarge       = errors.New("PAYLOAD_TOO_LARGE: Inline result exceeds 256 KiB")
+	ErrSessionQuotaExceeded  = errors.New("SESSION_QUOTA_EXCEEDED: Environment has reached the worker session limit")
 )
 
 const MaxInlinePayloadBytes = 256 << 10
@@ -38,6 +39,7 @@ const (
 	DefaultPollTimeout = 20 * time.Second
 	DefaultSlots       = 2
 	DrainGracePeriod   = 60 * time.Second
+	MaxWorkerSessions  = 10
 )
 
 // WorkerSessionContext contains authoritative scope derived from an authenticated session.

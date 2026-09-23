@@ -26,10 +26,19 @@ var (
 	ErrSchemaViolation       = errors.New("SCHEMA_VIOLATION: Input does not conform to workflow schema")
 	ErrEnvironmentNotFound   = errors.New("ENVIRONMENT_NOT_FOUND: Environment not found")
 	ErrPayloadTooLarge       = errors.New("PAYLOAD_TOO_LARGE: Inline JSON payload exceeds 256 KiB")
+	ErrRunQuotaExceeded      = errors.New("RUN_QUOTA_EXCEEDED: Environment has reached its nonterminal run limit")
+	ErrCreateRateLimited     = errors.New("CREATE_RUN_RATE_LIMITED: Run creation rate exceeded")
+	ErrWorkflowTooLarge      = errors.New("WORKFLOW_TOO_LARGE: Workflow exceeds the maximum node limit")
+	ErrHistoryLimitExceeded  = errors.New("HISTORY_LIMIT_EXCEEDED: Run event history budget exhausted")
 	ErrInvalidCursor         = errors.New("INVALID_CURSOR: Cursor is invalid")
 )
 
-const maxInlinePayloadBytes = worker.MaxInlinePayloadBytes
+const (
+	maxInlinePayloadBytes = worker.MaxInlinePayloadBytes
+	maxWorkflowNodes      = 50
+	maxNonterminalRuns    = 100
+	maxRunEvents          = 10000
+)
 
 type Service struct {
 	pool               *storage.Pool
@@ -200,7 +209,41 @@ func (s *Service) CreateRun(
 			return fmt.Errorf("query idempotency: %w", err)
 		}
 
-		// 2. Resolve deployment once
+		// 2. Serialize all environment admission decisions. The lock must be
+		// acquired before counting nonterminal runs or recent creates so
+		// concurrent CreateRun requests cannot pass the same cap together.
+		var admissionEnvironmentID string
+		if err := tx.QueryRow(ctx, `SELECT environment_id::text
+			FROM environment_admissions
+			WHERE environment_id = $1::uuid AND organization_id = $2::uuid
+			FOR UPDATE`, envID, orgID).Scan(&admissionEnvironmentID); err != nil {
+			return fmt.Errorf("lock environment admission: %w", err)
+		}
+		var remainingTokens float64
+		if err := tx.QueryRow(ctx, `UPDATE environment_admissions
+			SET create_rate_tokens = LEAST(10::double precision,
+				create_rate_tokens + EXTRACT(EPOCH FROM (clock_timestamp() - create_rate_updated_at)) * 5) - 1,
+				create_rate_updated_at = clock_timestamp(), updated_at = clock_timestamp()
+			WHERE environment_id = $1::uuid AND organization_id = $2::uuid
+			  AND LEAST(10::double precision,
+				create_rate_tokens + EXTRACT(EPOCH FROM (clock_timestamp() - create_rate_updated_at)) * 5) >= 1
+			RETURNING create_rate_tokens`, envID, orgID).Scan(&remainingTokens); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrCreateRateLimited
+			}
+			return fmt.Errorf("debit create-run rate bucket: %w", err)
+		}
+		var nonterminalRuns int
+		if err := tx.QueryRow(ctx, `SELECT count(*)
+			FROM runs
+			WHERE environment_id = $1::uuid AND organization_id = $2::uuid
+			  AND status IN ('QUEUED','RUNNING','WAITING','PAUSING','PAUSED','CANCELLING')`, envID, orgID).Scan(&nonterminalRuns); err != nil {
+			return fmt.Errorf("count nonterminal runs: %w", err)
+		}
+		if nonterminalRuns >= maxNonterminalRuns {
+			return ErrRunQuotaExceeded
+		}
+		// 3. Resolve deployment once
 		var deploymentID string
 		var manifestJSON []byte
 		if explicitDeploymentID != nil && *explicitDeploymentID != "" {
@@ -241,6 +284,9 @@ func (s *Service) CreateRun(
 		}
 		if targetWorkflow == nil {
 			return ErrWorkflowNotFound
+		}
+		if len(targetWorkflow.Nodes) > maxWorkflowNodes {
+			return ErrWorkflowTooLarge
 		}
 
 		if targetWorkflow.InputSchema != nil {
