@@ -801,11 +801,18 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 		effectivePool = "default"
 	}
 	var pending []pendingClaim
+	// Workers are environment-bound: every authenticated session carries its
+	// environment (see app.authenticate_worker_session). A worker must never
+	// execute work from another environment, so candidate selection is
+	// strictly env-scoped FIFO (eligible_at, id) per Blueprint 19.3.
+	// Cross-environment fairness lives in the control-plane scheduler
+	// (ReconcileReadyWork), which is org-scoped and may consider all
+	// environments without granting any worker foreign authority.
+	if session.EnvironmentID == "" {
+		return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
+	}
 	snapshotErr := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		var query string
-		var args []any
-		if session.EnvironmentID != "" {
-			query = `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
+		query := `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
 					d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at, rs.environment_id::text
 				FROM run_steps rs
 				JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
@@ -825,39 +832,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				ORDER BY rs.eligible_at, rs.id
 				LIMIT $4
 				FOR UPDATE OF r, rs SKIP LOCKED`
-			args = []any{session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, effectivePool}
-		} else {
-			query = `WITH candidates AS (
-				SELECT rs.id AS step_id,
-					ROW_NUMBER() OVER (ORDER BY ROW_NUMBER() OVER (PARTITION BY rs.environment_id ORDER BY rs.eligible_at, rs.id), rs.eligible_at, rs.id) AS ord
-				FROM run_steps rs
-				JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
-				JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-				JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
-				JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
-				JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
-				WHERE rs.organization_id=$2::uuid
-					AND (candidate_w.pool_name=$4 OR $4 = '' OR candidate_w.pool_name='default')
-					AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
-					AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
-					AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
-					AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
-						JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
-						WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
-							AND rc.organization_id=$2::uuid AND rc.status='OPEN')
-				ORDER BY ROW_NUMBER() OVER (PARTITION BY rs.environment_id ORDER BY rs.eligible_at, rs.id), rs.eligible_at, rs.id
-				LIMIT $3
-			)
-			SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
-					d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at, rs.environment_id::text
-			FROM candidates c
-			JOIN run_steps rs ON rs.id=c.step_id AND rs.organization_id=$2::uuid
-			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
-			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-			ORDER BY c.ord
-			FOR UPDATE OF r, rs SKIP LOCKED`
-			args = []any{session.SessionID, session.OrganizationID, req.AvailableSlots, effectivePool}
-		}
+		args := []any{session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, effectivePool}
 		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("snapshot claim candidates: %w", err)
@@ -990,17 +965,14 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 
 		// Serialize admission before locking runs and their steps, then derive
 		// capacity from live leases while holding that admission row.
-		admissionEnvID := session.EnvironmentID
-		if admissionEnvID == "" && len(pending) > 0 {
-			admissionEnvID = pending[0].match.environmentID
-		}
+		// The admission scope is always the worker's own environment:
+		// sessions are environment-bound, so cross-environment admission is
+		// never evaluated at the worker claim boundary.
 		var environmentID string
 		var maxConcurrency int = 10
-		if admissionEnvID != "" {
-			if err := tx.QueryRow(ctx, `SELECT environment_id::text,max_concurrency FROM environment_admissions
-				WHERE environment_id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, admissionEnvID, session.OrganizationID).Scan(&environmentID, &maxConcurrency); err != nil {
-				return err
-			}
+		if err := tx.QueryRow(ctx, `SELECT environment_id::text,max_concurrency FROM environment_admissions
+			WHERE environment_id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, session.EnvironmentID, session.OrganizationID).Scan(&environmentID, &maxConcurrency); err != nil {
+			return err
 		}
 		if maxConcurrency > 10 {
 			maxConcurrency = 10
@@ -1087,6 +1059,11 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 
 		for _, pc := range pending {
 			match := pc.match
+			// Defense in depth: never transition work outside the worker's
+			// own environment, even if a snapshot row somehow disagrees.
+			if match.environmentID != session.EnvironmentID {
+				continue
+			}
 			var manifest deploymentManifest
 			if err := json.Unmarshal(match.manifest, &manifest); err != nil {
 				return fmt.Errorf("decode deployment manifest: %w", err)
@@ -2206,17 +2183,34 @@ func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID st
 			runID, workflowName string
 			manifestBytes       []byte
 		}
+		// Round-robin candidate selection across environments (Blueprint
+		// 19.3): interleave runs so that every environment with eligible work
+		// is represented in each bounded batch. The per-environment position
+		// is computed in a CTE (window functions cannot appear with FOR
+		// UPDATE in the same query level); the outer query orders by that
+		// position so no environment starves behind another's backlog.
+		// This runs in the org-scoped control-plane scheduler, which may
+		// consider all environments; workers remain environment-bound and
+		// only ever claim within their own environment.
 		rows, err := tx.Query(ctx, `
+			WITH candidates AS (
+				SELECT r.id AS run_id,
+					ROW_NUMBER() OVER (PARTITION BY r.environment_id ORDER BY r.reconciliation_checked_at NULLS FIRST, r.id) AS env_posn,
+					r.reconciliation_checked_at AS checked_at
+				FROM runs r
+				JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+				WHERE r.organization_id=$1::uuid AND r.status IN ('QUEUED','RUNNING')
+					AND EXISTS (
+						SELECT 1 FROM run_steps blocked
+						WHERE blocked.run_id=r.id AND blocked.organization_id=r.organization_id
+							AND blocked.state='BLOCKED'
+					)
+			)
 			SELECT r.id::text, r.workflow_name, d.manifest
-			FROM runs r
+			FROM candidates c
+			JOIN runs r ON r.id=c.run_id AND r.organization_id=$1::uuid
 			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-			WHERE r.organization_id=$1::uuid AND r.status IN ('QUEUED','RUNNING')
-				AND EXISTS (
-					SELECT 1 FROM run_steps blocked
-					WHERE blocked.run_id=r.id AND blocked.organization_id=r.organization_id
-						AND blocked.state='BLOCKED'
-				)
-			ORDER BY r.reconciliation_checked_at NULLS FIRST, r.id
+			ORDER BY c.env_posn, c.checked_at NULLS FIRST, r.id
 			LIMIT 50
 			FOR UPDATE OF r SKIP LOCKED`, organizationID)
 		if err != nil {
