@@ -97,6 +97,10 @@ func (h *HTTPHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, r, http.StatusServiceUnavailable, "ADMISSION_DISABLED", "System is in disaster recovery read-only mode; run admission is disabled")
 			return
 		}
+		if errors.Is(err, recovery.ErrRecoveryControlsUnavailable) {
+			errJSON(w, r, http.StatusServiceUnavailable, "RECOVERY_CONTROLS_UNAVAILABLE", "System recovery controls are unavailable; run admission is denied")
+			return
+		}
 		if errors.Is(err, ErrMissingIdempotencyKey) {
 			errJSON(w, r, http.StatusBadRequest, "MISSING_IDEMPOTENCY_KEY", err.Error())
 			return

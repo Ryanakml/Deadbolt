@@ -36,6 +36,9 @@ fi
 
 DISASTER_RECOVERY="${DISASTER_RECOVERY:-false}"
 INCIDENT_AT="${INCIDENT_AT:-}"
+RECOVERY_POINT="${RECOVERY_POINT:-}"
+RPO_GAP_IDS="${RPO_GAP_IDS:-}"
+OPERATOR_NOTES="${OPERATOR_NOTES:-}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -60,6 +63,30 @@ while [[ $# -gt 0 ]]; do
       INCIDENT_AT="${1#*=}"
       shift
       ;;
+    --recovery-point)
+      RECOVERY_POINT="$2"
+      shift 2
+      ;;
+    --recovery-point=*)
+      RECOVERY_POINT="${1#*=}"
+      shift
+      ;;
+    --rpo-gap-ids)
+      RPO_GAP_IDS="$2"
+      shift 2
+      ;;
+    --rpo-gap-ids=*)
+      RPO_GAP_IDS="${1#*=}"
+      shift
+      ;;
+    --operator-notes)
+      OPERATOR_NOTES="$2"
+      shift 2
+      ;;
+    --operator-notes=*)
+      OPERATOR_NOTES="${1#*=}"
+      shift
+      ;;
     --target-time)
       TARGET_TIME="$2"
       shift 2
@@ -69,10 +96,10 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--drill | --destructive-staging-restore] [--disaster-recovery] [--target-time 'YYYY-MM-DD HH:MM:SS UTC']"
+      echo "Usage: $0 [--drill | --destructive-staging-restore] [--disaster-recovery] [--target-time 'YYYY-MM-DD HH:MM:SS UTC'] [--recovery-point RFC3339] [--incident-at RFC3339] [--rpo-gap-ids id1,id2] [--operator-notes '...']"
       echo "  --drill: Safe isolated recovery drill using dedicated container/volume (default)"
       echo "  --destructive-staging-restore: Overwrite active staging volume with recovered state (requires FORCE_RESTORE=true)"
-      echo "  --disaster-recovery: Apply disaster reconciliation holds, revoke sessions, and disable admission/dispatch"
+      echo "  --disaster-recovery: Apply disaster reconciliation holds, revoke sessions, and disable admission/dispatch via the authoritative control-plane recovery CLI"
       exit 0
       ;;
     *)
@@ -91,6 +118,97 @@ log() {
 
 err() {
   echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [DB_RESTORE_ERROR] $*" >&2
+}
+
+CONTROL_PLANE_BIN="${DEADBOLT_CONTROL_PLANE_BIN:-/usr/local/bin/control-plane}"
+
+# resolve_recovery_image prints the control-plane image used for one-off
+# operator recovery containers. Fails closed when it cannot be established.
+resolve_recovery_image() {
+  if [[ -n "${DEADBOLT_CONTROL_PLANE_IMAGE:-}" ]]; then
+    echo "$DEADBOLT_CONTROL_PLANE_IMAGE"
+    return 0
+  fi
+  local current_file="${RELEASE_DIR}/current"
+  if [[ -f "$current_file" ]]; then
+    local recorded
+    recorded=$(tr -d '[:space:]' < "$current_file")
+    if [[ -n "$recorded" ]]; then
+      echo "$recorded"
+      return 0
+    fi
+  fi
+  err "RECOVERY ABORTED: control-plane image could not be resolved!"
+  err "Set DEADBOLT_CONTROL_PLANE_IMAGE or ensure ${RELEASE_DIR}/current records the running release."
+  return 1
+}
+
+# derive_recovery_times sets RECOVERY_POINT_ISO/INCIDENT_AT_ISO from explicit
+# flags (falling back to target time / now). Fails closed on unparseable input.
+derive_recovery_times() {
+  local point="${RECOVERY_POINT:-${TARGET_TIME:-}}"
+  if [[ -z "$point" ]]; then
+    point="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  fi
+  RECOVERY_POINT_ISO="$(date -u -d "$point" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -j -f "%Y-%m-%d %H:%M:%S %Z" "$point" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)"
+  if [[ -z "$RECOVERY_POINT_ISO" ]]; then
+    # Accept already-ISO input verbatim when date parsing is unavailable.
+    if [[ "$point" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+      RECOVERY_POINT_ISO="$point"
+    else
+      err "RECOVERY ABORTED: cannot parse recovery point '$point' as RFC3339/UTC."
+      return 1
+    fi
+  fi
+  if [[ -n "$INCIDENT_AT" ]]; then
+    INCIDENT_AT_ISO="$(date -u -d "$INCIDENT_AT" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)"
+    if [[ -z "$INCIDENT_AT_ISO" ]]; then
+      if [[ "$INCIDENT_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+        INCIDENT_AT_ISO="$INCIDENT_AT"
+      else
+        err "RECOVERY ABORTED: cannot parse --incident-at '$INCIDENT_AT' as RFC3339/UTC."
+        return 1
+      fi
+    fi
+  else
+    INCIDENT_AT_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  fi
+  export RECOVERY_POINT_ISO INCIDENT_AT_ISO
+}
+
+# validate_recovery_state fails closed unless the target database reports
+# READ_ONLY controls with admission/dispatch/schedules disabled and a recorded
+# incident for this recovery point. The first argument is "drill" or "live"
+# and selects which container to query.
+validate_recovery_state() {
+  local target="$1"
+  local container
+  if [[ "$target" == "drill" ]]; then
+    container="$DRILL_CONTAINER_NAME"
+  else
+    container="$LIVE_CONTAINER_NAME"
+  fi
+  local pw="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}"
+  if [[ "$target" == "live" ]]; then
+    pw="${DEADBOLT_DB_ADMIN_PASSWORD:?DEADBOLT_DB_ADMIN_PASSWORD is required for live recovery validation}"
+  fi
+  local mode
+  mode=$(docker exec -e PGPASSWORD="$pw" "$container" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT mode FROM system_recovery_controls WHERE id = 1;" 2>/dev/null || echo "")
+  local flags
+  flags=$(docker exec -e PGPASSWORD="$pw" "$container" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT admission_enabled::text || ',' || dispatch_enabled::text || ',' || schedules_enabled::text FROM system_recovery_controls WHERE id = 1;" 2>/dev/null || echo "")
+  local incidents
+  incidents=$(docker exec -e PGPASSWORD="$pw" "$container" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT count(*) FROM disaster_recovery_incidents WHERE recovery_point = '${RECOVERY_POINT_ISO}'::timestamptz;" 2>/dev/null || echo "0")
+  local holds
+  holds=$(docker exec -e PGPASSWORD="$pw" "$container" psql -U deadbolt_admin -d deadbolt_staging -t -A -c "SELECT count(*) FROM reconciliation_cases WHERE reason = 'DISASTER_RECOVERY_HOLD';" 2>/dev/null || echo "0")
+  if [[ "$mode" != "READ_ONLY" || "$flags" != "f,f,f" ]]; then
+    err "RECOVERY VALIDATION FAILED: expected READ_ONLY with admission/dispatch/schedules disabled, got mode='$mode' flags='$flags'."
+    return 1
+  fi
+  if [[ ! "$incidents" =~ ^[1-9][0-9]*$ ]]; then
+    err "RECOVERY VALIDATION FAILED: no disaster incident recorded for recovery point $RECOVERY_POINT_ISO."
+    return 1
+  fi
+  log "Recovery validation passed: mode=READ_ONLY admission/dispatch/schedules disabled, incidents=$incidents holds=$holds."
 }
 
 if [[ "$DRY_RUN" == "true" ]]; then
@@ -358,14 +476,33 @@ if [[ "$MODE" == "drill" ]]; then
   fi
 
   if [[ "$DISASTER_RECOVERY" == "true" ]]; then
-    log "Applying disaster recovery controls and holds on drill database..."
-    docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}" "$DRILL_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "
-      INSERT INTO system_recovery_controls (id, mode, admission_enabled, dispatch_enabled, schedules_enabled, updated_at)
-      VALUES (1, 'READ_ONLY', FALSE, FALSE, FALSE, clock_timestamp())
-      ON CONFLICT (id) DO UPDATE SET mode = 'READ_ONLY', admission_enabled = FALSE, dispatch_enabled = FALSE, schedules_enabled = FALSE, updated_at = clock_timestamp();
-      UPDATE worker_sessions SET revoked_at = clock_timestamp() WHERE revoked_at IS NULL;
-      UPDATE auth_sessions SET revoked_at = clock_timestamp(), revocation_reason = 'DISASTER_RECOVERY_REVOCATION' WHERE revoked_at IS NULL;
-    " 2>/dev/null || true
+    log "Applying authoritative disaster recovery preparation on drill database..."
+    derive_recovery_times || exit 1
+    RECOVERY_IMAGE="$(resolve_recovery_image)" || exit 1
+    DRILL_DB_URL="postgres://deadbolt_admin:${DEADBOLT_DB_ADMIN_PASSWORD:-drill_admin_secret}@127.0.0.1:5432/deadbolt_staging?sslmode=disable"
+    PREPARE_ARGS=(
+      "$CONTROL_PLANE_BIN"
+      --prepare-disaster-recovery
+      --recovery-point "$RECOVERY_POINT_ISO"
+      --incident-at "$INCIDENT_AT_ISO"
+    )
+    if [[ -n "$RPO_GAP_IDS" ]]; then
+      PREPARE_ARGS+=(--rpo-gap-ids "$RPO_GAP_IDS")
+    fi
+    if [[ -n "$OPERATOR_NOTES" ]]; then
+      PREPARE_ARGS+=(--operator-notes "$OPERATOR_NOTES")
+    fi
+    # The one-off operator container shares the drill container network
+    # namespace so it reaches PostgreSQL on loopback; no tenant credentials
+    # are involved (host-operator database authority only).
+    if ! docker run --rm --network "container:${DRILL_CONTAINER_NAME}" \
+      -e DATABASE_URL="$DRILL_DB_URL" \
+      -e RUNTIME_MODE=hosted \
+      "$RECOVERY_IMAGE" "${PREPARE_ARGS[@]}"; then
+      err "RECOVERY DRILL FAILED: authoritative disaster preparation failed; drill database left non-active."
+      exit 1
+    fi
+    validate_recovery_state drill || exit 1
     log "Disaster recovery controls applied: admission/dispatch disabled, pre-disaster sessions revoked."
     log "Disaster reconciliation holds and uncertainty window prepared."
   fi
@@ -421,14 +558,32 @@ elif [[ "$MODE" == "destructive" ]]; then
   fi
 
   if [[ "$DISASTER_RECOVERY" == "true" ]]; then
-    log "Applying disaster recovery controls and holds on restored live database..."
-    docker exec -e PGPASSWORD="${DEADBOLT_DB_ADMIN_PASSWORD}" "$LIVE_CONTAINER_NAME" psql -U deadbolt_admin -d deadbolt_staging -c "
-      INSERT INTO system_recovery_controls (id, mode, admission_enabled, dispatch_enabled, schedules_enabled, updated_at)
-      VALUES (1, 'READ_ONLY', FALSE, FALSE, FALSE, clock_timestamp())
-      ON CONFLICT (id) DO UPDATE SET mode = 'READ_ONLY', admission_enabled = FALSE, dispatch_enabled = FALSE, schedules_enabled = FALSE, updated_at = clock_timestamp();
-      UPDATE worker_sessions SET revoked_at = clock_timestamp() WHERE revoked_at IS NULL;
-      UPDATE auth_sessions SET revoked_at = clock_timestamp(), revocation_reason = 'DISASTER_RECOVERY_REVOCATION' WHERE revoked_at IS NULL;
-    " || { err "Failed to apply disaster recovery controls"; exit 1; }
+    log "Applying authoritative disaster recovery preparation on restored live database..."
+    derive_recovery_times || exit 1
+    RECOVERY_IMAGE="$(resolve_recovery_image)" || exit 1
+    LIVE_DB_URL="postgres://deadbolt_admin:${DEADBOLT_DB_ADMIN_PASSWORD}@127.0.0.1:5432/deadbolt_staging?sslmode=disable"
+    LIVE_PREPARE_ARGS=(
+      "$CONTROL_PLANE_BIN"
+      --prepare-disaster-recovery
+      --recovery-point "$RECOVERY_POINT_ISO"
+      --incident-at "$INCIDENT_AT_ISO"
+    )
+    if [[ -n "$RPO_GAP_IDS" ]]; then
+      LIVE_PREPARE_ARGS+=(--rpo-gap-ids "$RPO_GAP_IDS")
+    fi
+    if [[ -n "$OPERATOR_NOTES" ]]; then
+      LIVE_PREPARE_ARGS+=(--operator-notes "$OPERATOR_NOTES")
+    fi
+    # One-off operator container sharing the live database network namespace
+    # (host-operator database authority only; no tenant credentials involved).
+    if ! docker run --rm --network "container:${LIVE_CONTAINER_NAME}" \
+      -e DATABASE_URL="$LIVE_DB_URL" \
+      -e RUNTIME_MODE=hosted \
+      "$RECOVERY_IMAGE" "${LIVE_PREPARE_ARGS[@]}"; then
+      err "Failed to apply authoritative disaster recovery preparation; live system left non-active."
+      exit 1
+    fi
+    validate_recovery_state live || exit 1
     log "Disaster recovery controls applied: admission/dispatch disabled, pre-disaster sessions revoked."
     log "Disaster reconciliation holds and uncertainty window prepared."
   fi

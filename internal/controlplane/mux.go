@@ -140,20 +140,19 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("POST /v1/workers/{workerId}/drain", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapWorkersDrain, workerHandler.HandleDrainWorker))))
 
 		recoveryMgr := recovery.NewManager(storagePool)
+		recoveryMgr.SetArtifacts(artifactSvc)
 		recoveryHandler := recovery.NewHTTPHandler(recoveryMgr, tenantService)
 		recoveryRoute := func(pattern, capability string, handle http.HandlerFunc) {
 			mux.Handle(pattern, tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(capability, handle))))
 		}
+		// Read-only disaster recovery visibility for tenant operators.
+		// Mutating recovery operations (prepare / rpo-gap / resume) are
+		// platform-operator actions executed via the control-plane recovery
+		// CLI with direct database authority (same trust as --migrate); they
+		// are intentionally not exposed to tenant-scoped credentials so one
+		// organization can never freeze or resume the whole platform (INV-01).
 		recoveryRoute("GET /api/v1/system/recovery", tenant.CapRunsRead, recoveryHandler.GetRecovery)
 		recoveryRoute("GET /v1/system/recovery", tenant.CapRunsRead, recoveryHandler.GetRecovery)
-		recoveryRoute("POST /api/v1/system/recovery/prepare", tenant.CapRunsControl, recoveryHandler.PrepareRecovery)
-		recoveryRoute("POST /v1/system/recovery/prepare", tenant.CapRunsControl, recoveryHandler.PrepareRecovery)
-		recoveryRoute("POST /api/v1/system/recovery/verify", tenant.CapRunsControl, recoveryHandler.VerifyIntegrity)
-		recoveryRoute("POST /v1/system/recovery/verify", tenant.CapRunsControl, recoveryHandler.VerifyIntegrity)
-		recoveryRoute("POST /api/v1/system/recovery/rpo-gap", tenant.CapRunsControl, recoveryHandler.ReconcileRPOGap)
-		recoveryRoute("POST /v1/system/recovery/rpo-gap", tenant.CapRunsControl, recoveryHandler.ReconcileRPOGap)
-		recoveryRoute("POST /api/v1/system/recovery/resume", tenant.CapRunsControl, recoveryHandler.Resume)
-		recoveryRoute("POST /v1/system/recovery/resume", tenant.CapRunsControl, recoveryHandler.Resume)
 
 		oidcClient := auth.NewOIDCClient(cfg.OIDC, http.DefaultClient)
 		bff := auth.NewBFFHandler(cfg, oidcClient, store, pool)

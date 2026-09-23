@@ -181,6 +181,10 @@ func (h *HTTPHandler) HandlePoll(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, r, http.StatusServiceUnavailable, "EXECUTION_ENGINE_UNAVAILABLE", "Execution authority is not installed", true)
 			return
 		}
+		if errors.Is(err, ErrRecoveryControlsUnavailable) {
+			h.writeError(w, r, http.StatusServiceUnavailable, "RECOVERY_CONTROLS_UNAVAILABLE", "System recovery controls are unavailable; dispatch is denied", true)
+			return
+		}
 		if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrSessionRevoked) || errors.Is(err, ErrSessionExpired) {
 			h.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", err.Error(), false)
 			return
