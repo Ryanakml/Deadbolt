@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS system_recovery_controls (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
+ALTER TABLE system_recovery_controls OWNER TO deadbolt_migrator;
+
 INSERT INTO system_recovery_controls (id, mode, admission_enabled, dispatch_enabled, schedules_enabled)
 VALUES (1, 'ACTIVE', TRUE, TRUE, TRUE)
 ON CONFLICT (id) DO NOTHING;
@@ -32,6 +34,8 @@ CREATE TABLE IF NOT EXISTS disaster_recovery_incidents (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
+ALTER TABLE disaster_recovery_incidents OWNER TO deadbolt_migrator;
+
 -- 3. Deletion Ledger (Blueprint §18.3: Restored backups must reapply deletion ledger before customer access opens)
 CREATE TABLE IF NOT EXISTS deletion_ledger (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -44,6 +48,8 @@ CREATE TABLE IF NOT EXISTS deletion_ledger (
     applied_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+
+ALTER TABLE deletion_ledger OWNER TO deadbolt_migrator;
 
 ALTER TABLE deletion_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deletion_ledger FORCE ROW LEVEL SECURITY;
@@ -66,6 +72,8 @@ AS $$
 $$;
 -- +goose StatementEnd
 
+ALTER FUNCTION app.count_pending_deletions() OWNER TO deadbolt_migrator;
+
 REVOKE ALL ON FUNCTION app.count_pending_deletions() FROM PUBLIC;
 
 -- +goose StatementBegin
@@ -86,6 +94,8 @@ AS $$
     ) active_tenants;
 $$;
 -- +goose StatementEnd
+
+ALTER FUNCTION app.enumerate_recovery_tenants() OWNER TO deadbolt_migrator;
 
 REVOKE ALL ON FUNCTION app.enumerate_recovery_tenants() FROM PUBLIC;
 
