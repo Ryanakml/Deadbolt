@@ -12,6 +12,7 @@ import (
 
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
+	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
 )
 
@@ -273,7 +274,7 @@ func TestClaimRoundRobinAcrossEnvironments(t *testing.T) {
 	_ = tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT project_id FROM environments WHERE id=$1::uuid`, envID1).Scan(&projID)
 	})
-	env2, err := tc.service.CreateEnvironment(ctx, orgID, projID, "production", 10)
+	env2, err := tc.service.CreateEnvironment(ctx, orgID, projID, tenant.EnvDevelopment, 10)
 	if err != nil {
 		t.Fatalf("create second env: %v", err)
 	}
@@ -285,31 +286,53 @@ func TestClaimRoundRobinAcrossEnvironments(t *testing.T) {
 		[]map[string]any{{"name": "rr-task", "entrypoint": "tasks/rr.js", "timeoutMs": 30000, "recovery": "idempotent", "idempotencyWindowMs": 305000, "inputSchema": schema, "outputSchema": schema}},
 		[]map[string]any{{"manifestVersion": 1, "name": "rr-flow", "inputSchema": schema, "outputSchema": schema, "nodes": []map[string]any{{"id": "node-1", "type": "task", "task": "rr-task", "after": []any{}, "input": map[string]any{}}}, "output": map[string]any{"$ref": "step.output", "stepId": "node-1", "pointer": ""}}},
 	)
+	// API keys are permanently bound to a single environment. The staging
+	// adminKey from setup cannot register, activate, or create runs in the
+	// second environment, so bootstrap a second key scoped to envID2.
+	// A development (non-production) env is used so single-worker activation
+	// preflight succeeds with the one seeded worker.
+	adminKey2 := bootstrapTestKey(t, tc.service, orgID, envID2, []string{
+		tenant.CapDeploymentsRegister,
+		tenant.CapDeploymentsActivateStaging,
+		tenant.CapDeploymentsActivateProd,
+		tenant.CapDeploymentsWrite,
+		tenant.CapWorkersDrain,
+		tenant.CapRunsCreate,
+		tenant.CapRunsRead,
+		tenant.CapPayloadRead,
+		tenant.CapAdminKey,
+	})
+
 	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID1, "rr-flow", manifest)
-	registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID2, "rr-flow", manifest)
+	registerAndActivateTestWorkflow(t, tc, server, adminKey2, orgID, envID2, "rr-flow", manifest)
 
 	// Create 2 runs in Env 1 and 2 runs in Env 2
-	createInEnv := func(envParam, key string) string {
+	createInEnv := func(envParam, key, plaintextKey string) string {
 		body := bytes.NewReader([]byte(fmt.Sprintf(`{"environment":%q,"input":{}}`, envParam)))
 		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/workflows/rr-flow/runs", body)
-		req.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+		req.Header.Set("Authorization", "Bearer "+plaintextKey)
 		req.Header.Set("X-Organization-ID", orgID)
 		req.Header.Set("Idempotency-Key", key)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil || resp.StatusCode != http.StatusAccepted {
-			t.Fatalf("create run failed: %v, status=%d", err, resp.StatusCode)
+		if err != nil {
+			t.Fatalf("create run failed: %v", err)
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			var errBody map[string]any
+			_ = json.NewDecoder(resp.Body).Decode(&errBody)
+			t.Fatalf("create run failed: status=%d body=%v", resp.StatusCode, errBody)
+		}
 		var res map[string]any
 		_ = json.NewDecoder(resp.Body).Decode(&res)
 		return res["id"].(string)
 	}
 
-	_ = createInEnv("staging", "env1-run-1")
-	_ = createInEnv("staging", "env1-run-2")
-	_ = createInEnv(envID2, "env2-run-1")
-	_ = createInEnv(envID2, "env2-run-2")
+	_ = createInEnv(envID1, "env1-run-1", adminKey.PlaintextKey)
+	_ = createInEnv(envID1, "env1-run-2", adminKey.PlaintextKey)
+	_ = createInEnv(envID2, "env2-run-1", adminKey2.PlaintextKey)
+	_ = createInEnv(envID2, "env2-run-2", adminKey2.PlaintextKey)
 
 	// Both environments have workers competing
 	w1Session, _ := enrollExecutionWorker(t, tc, server, orgID, envID1, "worker-env1")
@@ -536,15 +559,17 @@ func TestHistoryLimitBoundaryAndAtomicTerminalization(t *testing.T) {
 	ctx := context.Background()
 	engine := execution.NewWorkerEngine(tc.pool)
 
-	// Drive the run directly to sequence 9,999 (the boundary where only the reserved terminal slot remains)
+	// Drive the run to sequence 9,998: Claim consumes one non-terminal event
+	// (TASK_CLAIMED, 9,998 -> 9,999) so that Start hits the boundary where
+	// only the reserved terminal slot remains (9,999 -> 10,000).
 	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE runs SET last_event_sequence=9999 WHERE id=$1::uuid`, runID)
+		_, err := tx.Exec(ctx, `UPDATE runs SET last_event_sequence=9998 WHERE id=$1::uuid`, runID)
 		return err
 	}); err != nil {
 		t.Fatalf("drive run to boundary: %v", err)
 	}
 
-	// 1. Attempting to append a non-terminal event (e.g. STEP_READY) at 9,999 must fail with ErrHistoryLimitExceeded
+	// 1. Attempting to append a non-terminal event (TASK_STARTED) at 9,999 must fail with ErrHistoryLimitExceeded
 	workerSession, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "hist-worker")
 	advertiseDigest(t, tc, orgID, workerSession.SessionID, bundle)
 
@@ -605,7 +630,10 @@ func TestHistoryLimitBoundaryAndAtomicTerminalization(t *testing.T) {
 	req2.Header.Set("X-Organization-ID", orgID)
 	req2.Header.Set("Idempotency-Key", "hist-run-key-2")
 	req2.Header.Set("Content-Type", "application/json")
-	resp2, _ := http.DefaultClient.Do(req2)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil || resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("create second hist run: %v, status=%d", err, resp2.StatusCode)
+	}
 	defer resp2.Body.Close()
 	var createRes2 map[string]any
 	_ = json.NewDecoder(resp2.Body).Decode(&createRes2)
