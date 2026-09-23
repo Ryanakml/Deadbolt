@@ -55,6 +55,7 @@ func TestWorkerDrainRefusesNewClaims(t *testing.T) {
 	drainReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/v1/workers/%s/drain", server.URL, session.WorkerID), nil)
 	drainReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
 	drainReq.Header.Set("X-Organization-ID", orgID)
+	drainReq.Header.Set("Idempotency-Key", "idemp-drain-worker-1")
 	drainResp, err := http.DefaultClient.Do(drainReq)
 	if err != nil || drainResp.StatusCode != http.StatusOK {
 		t.Fatalf("drain worker failed: %v, status=%d", err, drainResp.StatusCode)
