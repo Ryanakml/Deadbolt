@@ -37,4 +37,3 @@ If a branch fails definitively, the run fails fast. Successful sibling outputs
 remain durable, nonterminal siblings are cancelled, their leases are revoked,
 and stop commands are persisted for workers that may still be running. These
 actions do not imply rollback of external side effects.
-

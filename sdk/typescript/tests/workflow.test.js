@@ -132,37 +132,36 @@ test("defineWorkflow rejects unresolved task reference", () => {
 });
 
 test("defineWorkflow accepts static parallel fan-out graphs", () => {
-  assert.doesNotThrow(
-    () =>
-      defineWorkflow({
-        name: "fan-out-wf",
-        inputSchema: payloadSchemaString,
-        outputSchema: payloadSchemaString,
-        nodes: [
-          {
-            id: "root",
-            type: "task",
-            task: taskA,
-            input: { val: input("/val") },
-          },
-          {
-            id: "branch1",
-            type: "task",
-            task: taskB,
-            after: ["root"],
-            input: { val: output("root", "/val") },
-          },
-          {
-            id: "branch2",
-            type: "task",
-            task: taskC,
-            after: ["root"],
-            input: { val: output("root", "/val") },
-            sideEffect: true,
-          },
-        ],
-        output: { val: output("branch1", "/val") },
-      }),
+  assert.doesNotThrow(() =>
+    defineWorkflow({
+      name: "fan-out-wf",
+      inputSchema: payloadSchemaString,
+      outputSchema: payloadSchemaString,
+      nodes: [
+        {
+          id: "root",
+          type: "task",
+          task: taskA,
+          input: { val: input("/val") },
+        },
+        {
+          id: "branch1",
+          type: "task",
+          task: taskB,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+        },
+        {
+          id: "branch2",
+          type: "task",
+          task: taskC,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+          sideEffect: true,
+        },
+      ],
+      output: { val: output("branch1", "/val") },
+    }),
   );
 });
 
