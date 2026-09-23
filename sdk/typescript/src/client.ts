@@ -304,6 +304,75 @@ export class DeadboltClient {
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
     },
+
+    /**
+     * Requests a durable pause on an active run with expectedRevision check.
+     */
+    pause: async (
+      runId: string,
+      expectedRevision: number,
+      idempotencyKey?: string,
+    ): Promise<Run> => {
+      if (!runId || typeof runId !== "string") {
+        fail("INVALID_RUN_ID");
+      }
+      const headers: Record<string, string> = {
+        "Idempotency-Key": idempotencyKey || `pause-${runId}-${Date.now()}`,
+      };
+      const res = await this.request<Run>(
+        "POST",
+        `/v1/runs/${encodeURIComponent(runId)}/pause`,
+        headers,
+        { expectedRevision },
+      );
+      return res.data;
+    },
+
+    /**
+     * Resumes a paused or pausing run with expectedRevision check.
+     */
+    resume: async (
+      runId: string,
+      expectedRevision: number,
+      idempotencyKey?: string,
+    ): Promise<Run> => {
+      if (!runId || typeof runId !== "string") {
+        fail("INVALID_RUN_ID");
+      }
+      const headers: Record<string, string> = {
+        "Idempotency-Key": idempotencyKey || `resume-${runId}-${Date.now()}`,
+      };
+      const res = await this.request<Run>(
+        "POST",
+        `/v1/runs/${encodeURIComponent(runId)}/resume`,
+        headers,
+        { expectedRevision },
+      );
+      return res.data;
+    },
+
+    /**
+     * Requests durable cancellation on an active run with expectedRevision check.
+     */
+    cancel: async (
+      runId: string,
+      expectedRevision: number,
+      idempotencyKey?: string,
+    ): Promise<Run> => {
+      if (!runId || typeof runId !== "string") {
+        fail("INVALID_RUN_ID");
+      }
+      const headers: Record<string, string> = {
+        "Idempotency-Key": idempotencyKey || `cancel-${runId}-${Date.now()}`,
+      };
+      const res = await this.request<Run>(
+        "POST",
+        `/v1/runs/${encodeURIComponent(runId)}/cancel`,
+        headers,
+        { expectedRevision },
+      );
+      return res.data;
+    },
   };
 
   readonly deployments = {

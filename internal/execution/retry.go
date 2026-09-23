@@ -315,10 +315,11 @@ func InsufficientRunDeadline(dueAt time.Time, attemptTimeoutMs int64, runDeadlin
 }
 
 // CanScheduleRetry guards scheduling a new retry intent from a failure.
-// Terminal, cancelling, paused/pausing runs never gain new timers.
+// Terminal and cancelling runs never gain new timers. Paused/pausing runs
+// record retry backoff without launching new nodes or resetting due_at.
 func CanScheduleRetry(runStatus, runReason string) bool {
 	switch runStatus {
-	case "QUEUED", "RUNNING":
+	case "QUEUED", "RUNNING", "PAUSING", "PAUSED":
 		return true
 	case "WAITING":
 		// A run already held for reconciliation must not gain a retry timer.

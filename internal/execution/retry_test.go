@@ -221,11 +221,11 @@ func TestRunDeadlineGuard(t *testing.T) {
 }
 
 func TestScheduleAndFireGuards(t *testing.T) {
-	if !CanScheduleRetry("RUNNING", "") || !CanScheduleRetry("QUEUED", "") {
-		t.Fatalf("running/queued should schedule")
+	if !CanScheduleRetry("RUNNING", "") || !CanScheduleRetry("QUEUED", "") || !CanScheduleRetry("PAUSING", "") || !CanScheduleRetry("PAUSED", "") {
+		t.Fatalf("running/queued/paused/pausing should schedule")
 	}
-	if CanScheduleRetry("FAILED", "") || CanScheduleRetry("CANCELLED", "") || CanScheduleRetry("PAUSING", "") || CanScheduleRetry("PAUSED", "") || CanScheduleRetry("CANCELLING", "") {
-		t.Fatalf("terminal/pausing/cancelling must not schedule")
+	if CanScheduleRetry("FAILED", "") || CanScheduleRetry("CANCELLED", "") || CanScheduleRetry("CANCELLING", "") {
+		t.Fatalf("terminal/cancelling must not schedule")
 	}
 	if CanScheduleRetry("WAITING", "RECONCILIATION") {
 		t.Fatalf("reconciliation hold must not schedule")
@@ -233,8 +233,8 @@ func TestScheduleAndFireGuards(t *testing.T) {
 	if !CanFireRetry("WAITING", "RETRY_BACKOFF") || !CanFireRetry("RUNNING", "") {
 		t.Fatalf("retry wait/running should fire")
 	}
-	if CanFireRetry("WAITING", "RECONCILIATION") || CanFireRetry("PAUSED", "") || CanFireRetry("FAILED", "") {
-		t.Fatalf("hold/paused/terminal must keep waiting")
+	if CanFireRetry("WAITING", "RECONCILIATION") || CanFireRetry("PAUSED", "") || CanFireRetry("PAUSING", "") || CanFireRetry("FAILED", "") {
+		t.Fatalf("hold/paused/pausing/terminal must keep waiting")
 	}
 }
 

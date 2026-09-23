@@ -601,7 +601,9 @@ function initDashboard(): void {
           <div class="run-badges">
             <span class="badge status-${snap.status.toLowerCase()}">${snap.status}</span>
             <span id="stream-freshness-badge" class="badge freshness-badge freshness-${currentStreamFreshness.toLowerCase()}">${currentStreamFreshness}</span>
-            ${snap.status === "QUEUED" || snap.status === "RUNNING" || snap.status === "WAITING" ? `<button id="cancel-run-btn" class="danger-btn">Cancel run</button>` : ""}
+            ${snap.status === "QUEUED" || snap.status === "RUNNING" || snap.status === "WAITING" ? `<button id="pause-run-btn" class="secondary-btn">Pause run</button>` : ""}
+            ${snap.status === "PAUSING" || snap.status === "PAUSED" ? `<button id="resume-run-btn" class="primary-btn">Resume run</button>` : ""}
+            ${snap.status === "QUEUED" || snap.status === "RUNNING" || snap.status === "WAITING" || snap.status === "PAUSING" || snap.status === "PAUSED" ? `<button id="cancel-run-btn" class="danger-btn">Cancel run</button>` : ""}
           </div>
         </div>
 
@@ -668,6 +670,22 @@ function initDashboard(): void {
 
       // Re-apply current transport freshness
       renderFreshness(currentStreamFreshness);
+
+      // Wire durable pause/resume controls. The backend stays authoritative:
+      // expectedRevision is captured at open time and 409s refresh in-dialog.
+      const pauseBtn = container.querySelector("#pause-run-btn");
+      if (pauseBtn) {
+        pauseBtn.addEventListener("click", (e) => {
+          openPauseDialog(api, snap, e.currentTarget as HTMLElement);
+        });
+      }
+
+      const resumeBtn = container.querySelector("#resume-run-btn");
+      if (resumeBtn) {
+        resumeBtn.addEventListener("click", (e) => {
+          openResumeDialog(api, snap, e.currentTarget as HTMLElement);
+        });
+      }
 
       // Wire durable cancellation. The backend stays authoritative:
       // expectedRevision is captured at open time and 409s refresh in-dialog.
@@ -1059,13 +1077,15 @@ function initDashboard(): void {
     const overlay = document.createElement("div");
     overlay.className = "dialog-overlay";
     overlay.id = "cancel-dialog-overlay";
+    let currentRevision = snap.revision;
+    let currentStatus = snap.status;
     overlay.innerHTML = `
       <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="cancel-dialog-title">
         <h3 id="cancel-dialog-title">Cancel run — ${escapeHtml(snap.workflowName)}</h3>
         <p class="text-muted">This revokes worker ownership and stops nonterminal work immediately.
         Already-succeeded steps are preserved. External effects already performed are
         <strong>not</strong> rolled back — verify provider state afterwards.</p>
-        <div class="hold-meta">Run revision ${snap.revision}</div>
+        <div class="hold-meta">Run revision ${currentRevision} (${currentStatus})</div>
         <div id="cancel-error" class="dialog-error" role="alert" style="display:none"></div>
         <div class="dialog-actions">
           <button id="cancel-dismiss">Keep running</button>
@@ -1079,6 +1099,7 @@ function initDashboard(): void {
     // ambiguously delivered.
     const idempotencyKey = newIdempotencyKey();
     const errorBox = overlay.querySelector("#cancel-error") as HTMLElement;
+    const metaBox = overlay.querySelector(".hold-meta") as HTMLElement;
     const confirmBtn = overlay.querySelector(
       "#cancel-confirm",
     ) as HTMLButtonElement;
@@ -1100,7 +1121,7 @@ function initDashboard(): void {
     confirmBtn.addEventListener("click", () => {
       confirmBtn.setAttribute("disabled", "true");
       api
-        .cancelRun(snap.id, snap.revision, idempotencyKey)
+        .cancelRun(snap.id, currentRevision, idempotencyKey)
         .then(() => {
           close();
           void activeInspector
@@ -1115,7 +1136,24 @@ function initDashboard(): void {
             errorBox.textContent =
               "This run changed since you opened it (409). The latest state was reloaded — review it before acting.";
             errorBox.style.display = "block";
-            void activeInspector?.fetchSnapshot().catch(() => undefined);
+            void activeInspector
+              ?.fetchSnapshot()
+              .then((latest) => {
+                if (latest) {
+                  currentRevision = latest.revision;
+                  currentStatus = latest.status;
+                  metaBox.textContent = `Run revision ${currentRevision} (${currentStatus})`;
+                  if (
+                    currentStatus === "CANCELLED" ||
+                    currentStatus === "SUCCEEDED" ||
+                    currentStatus === "FAILED"
+                  ) {
+                    confirmBtn.setAttribute("disabled", "true");
+                    errorBox.textContent = `Run is now ${currentStatus}. No further actions can be taken.`;
+                  }
+                }
+              })
+              .catch(() => undefined);
             return;
           }
           errorBox.textContent =
@@ -1127,5 +1165,207 @@ function initDashboard(): void {
 
   function closeCancelDialog(): void {
     document.getElementById("cancel-dialog-overlay")?.remove();
+  }
+
+  // openPauseDialog confirms durable pause. Pausing stops new task claims
+  // while in-flight claims finish or drain.
+  function openPauseDialog(
+    api: DashboardApiClient,
+    snap: RunSnapshot,
+    invoker: HTMLElement | null,
+  ): void {
+    closePauseDialog();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "pause-dialog-overlay";
+    let currentRevision = snap.revision;
+    let currentStatus = snap.status;
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="pause-dialog-title">
+        <h3 id="pause-dialog-title">Pause run — ${escapeHtml(snap.workflowName)}</h3>
+        <p class="text-muted">Pausing blocks new task claims immediately.
+        In-flight attempts remain active and may start or finish normally.
+        The run drains to <code>PAUSED</code> once in-flight tasks finish.</p>
+        <div class="hold-meta">Run revision ${currentRevision} (${currentStatus})</div>
+        <div id="pause-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="pause-dismiss">Keep running</button>
+          <button id="pause-confirm">Confirm pause</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const idempotencyKey = newIdempotencyKey();
+    const errorBox = overlay.querySelector("#pause-error") as HTMLElement;
+    const metaBox = overlay.querySelector(".hold-meta") as HTMLElement;
+    const confirmBtn = overlay.querySelector(
+      "#pause-confirm",
+    ) as HTMLButtonElement;
+    const close = (): void => {
+      closePauseDialog();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#pause-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    confirmBtn.focus();
+
+    confirmBtn.addEventListener("click", () => {
+      confirmBtn.setAttribute("disabled", "true");
+      api
+        .pauseRun(snap.id, currentRevision, idempotencyKey)
+        .then(() => {
+          close();
+          void activeInspector
+            ?.fetchSnapshot()
+            .catch((err: unknown) =>
+              renderError(err instanceof Error ? err : new Error(String(err))),
+            );
+        })
+        .catch((err: unknown) => {
+          confirmBtn.removeAttribute("disabled");
+          if (isConflict(err)) {
+            errorBox.textContent =
+              "This run changed since you opened it (409). The latest state was reloaded — review it before acting.";
+            errorBox.style.display = "block";
+            void activeInspector
+              ?.fetchSnapshot()
+              .then((latest) => {
+                if (latest) {
+                  currentRevision = latest.revision;
+                  currentStatus = latest.status;
+                  metaBox.textContent = `Run revision ${currentRevision} (${currentStatus})`;
+                  if (
+                    currentStatus === "PAUSED" ||
+                    currentStatus === "PAUSING"
+                  ) {
+                    confirmBtn.setAttribute("disabled", "true");
+                    errorBox.textContent = `Run is already ${currentStatus}.`;
+                  } else if (
+                    currentStatus === "CANCELLED" ||
+                    currentStatus === "SUCCEEDED" ||
+                    currentStatus === "FAILED" ||
+                    currentStatus === "CANCELLING"
+                  ) {
+                    confirmBtn.setAttribute("disabled", "true");
+                    errorBox.textContent = `Run is now ${currentStatus}; cannot pause.`;
+                  }
+                }
+              })
+              .catch(() => undefined);
+            return;
+          }
+          errorBox.textContent =
+            err instanceof Error ? err.message : String(err);
+          errorBox.style.display = "block";
+        });
+    });
+  }
+
+  function closePauseDialog(): void {
+    document.getElementById("pause-dialog-overlay")?.remove();
+  }
+
+  // openResumeDialog confirms resuming a paused or pausing run.
+  function openResumeDialog(
+    api: DashboardApiClient,
+    snap: RunSnapshot,
+    invoker: HTMLElement | null,
+  ): void {
+    closeResumeDialog();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "resume-dialog-overlay";
+    let currentRevision = snap.revision;
+    let currentStatus = snap.status;
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="resume-dialog-title">
+        <h3 id="resume-dialog-title">Resume run — ${escapeHtml(snap.workflowName)}</h3>
+        <p class="text-muted">Resuming clears the pause flag and recomputes eligibility from durable state.
+        Eligible tasks can be claimed immediately.</p>
+        <div class="hold-meta">Run revision ${currentRevision} (${currentStatus})</div>
+        <div id="resume-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="resume-dismiss">Cancel</button>
+          <button id="resume-confirm">Confirm resume</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const idempotencyKey = newIdempotencyKey();
+    const errorBox = overlay.querySelector("#resume-error") as HTMLElement;
+    const metaBox = overlay.querySelector(".hold-meta") as HTMLElement;
+    const confirmBtn = overlay.querySelector(
+      "#resume-confirm",
+    ) as HTMLButtonElement;
+    const close = (): void => {
+      closeResumeDialog();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#resume-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    confirmBtn.focus();
+
+    confirmBtn.addEventListener("click", () => {
+      confirmBtn.setAttribute("disabled", "true");
+      api
+        .resumeRun(snap.id, currentRevision, idempotencyKey)
+        .then(() => {
+          close();
+          void activeInspector
+            ?.fetchSnapshot()
+            .catch((err: unknown) =>
+              renderError(err instanceof Error ? err : new Error(String(err))),
+            );
+        })
+        .catch((err: unknown) => {
+          confirmBtn.removeAttribute("disabled");
+          if (isConflict(err)) {
+            errorBox.textContent =
+              "This run changed since you opened it (409). The latest state was reloaded — review it before acting.";
+            errorBox.style.display = "block";
+            void activeInspector
+              ?.fetchSnapshot()
+              .then((latest) => {
+                if (latest) {
+                  currentRevision = latest.revision;
+                  currentStatus = latest.status;
+                  metaBox.textContent = `Run revision ${currentRevision} (${currentStatus})`;
+                  if (
+                    currentStatus !== "PAUSED" &&
+                    currentStatus !== "PAUSING"
+                  ) {
+                    confirmBtn.setAttribute("disabled", "true");
+                    errorBox.textContent = `Run is now ${currentStatus}; cannot resume.`;
+                  }
+                }
+              })
+              .catch(() => undefined);
+            return;
+          }
+          errorBox.textContent =
+            err instanceof Error ? err.message : String(err);
+          errorBox.style.display = "block";
+        });
+    });
+  }
+
+  function closeResumeDialog(): void {
+    document.getElementById("resume-dialog-overlay")?.remove();
   }
 }

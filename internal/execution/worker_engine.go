@@ -414,7 +414,7 @@ func scheduleRetryOrHoldTx(ctx context.Context, tx storage.Tx, organizationID, e
 	// Terminal states never reopen (INV-09). If the run already terminalized
 	// (e.g. sibling fail-fast), do not schedule.
 	switch lockedRunStatus {
-	case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+	case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING":
 		return "fail", lockedRunStatus, nil
 	}
 	if !CanScheduleRetry(lockedRunStatus, lockedRunReason) {
@@ -937,6 +937,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 					AND (candidate_w.pool_name=$5 OR $5 = '' OR candidate_w.pool_name='default')
 					AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
 					AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
+					AND r.pause_requested = false
 					AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
 					AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
 						JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
@@ -1354,6 +1355,16 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 					}
 					continue
 				}
+			}
+
+			// Canonical lock order: lock run before step (Blueprint §11.2)
+			// and block claims committed after pause request.
+			var pauseReq bool
+			if err := tx.QueryRow(ctx, `SELECT pause_requested FROM runs WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, match.runID, session.OrganizationID).Scan(&pauseReq); err != nil {
+				return err
+			}
+			if pauseReq {
+				continue
 			}
 
 			var epoch int64
@@ -2165,6 +2176,9 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		if err := settleHoldAfterCompletionTx(ctx, tx, session.OrganizationID, runID); err != nil {
 			return err
 		}
+		if err := settlePauseAfterCompletionTx(ctx, tx, session.OrganizationID, runID); err != nil {
+			return err
+		}
 		if e.beforeCompleteCommit != nil {
 			return e.beforeCompleteCommit()
 		}
@@ -2566,7 +2580,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 		LEFT JOIN task_leases l ON l.attempt_id=a.id AND l.organization_id=a.organization_id
 		JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 		WHERE r.organization_id=$1::uuid
-			AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
+			AND (r.status IN ('QUEUED','RUNNING','PAUSING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
 			AND a.status IN ('CLAIMED','RUNNING')
 			AND (
 				(a.status='CLAIMED' AND (a.claim_start_deadline_at <= clock_timestamp() OR (l.expires_at IS NOT NULL AND l.expires_at <= clock_timestamp()) OR l.step_id IS NULL))
@@ -2625,7 +2639,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 		JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 		WHERE r.organization_id=$1::uuid
 			AND rs.state='WAITING' AND rs.wait_reason='RECOVERY_HANDOFF'
-			AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
+			AND (r.status IN ('QUEUED','RUNNING','PAUSING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
 		ORDER BY r.id, rs.id
 		LIMIT 50
 		FOR UPDATE OF r, rs SKIP LOCKED`, organizationID)
@@ -2923,6 +2937,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 
 	affectedRuns := make([]string, 0, len(reclaimedRunsMap))
 	for rID := range reclaimedRunsMap {
+		_ = settlePauseAfterCompletionTx(ctx, tx, organizationID, rID)
 		affectedRuns = append(affectedRuns, rID)
 	}
 	return reclaimedCount, affectedRuns, nil
