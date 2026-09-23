@@ -1,0 +1,245 @@
+M2 FINAL ACCEPTANCE REPORT
+Repository: https://github.com/Ryanakml/Deadbolt
+Pull Request: PR #75
+Issues Covered: #23, #24, #25
+
+Candidate Under Acceptance:
+b60397dcd00c90c45a15a65f44d7ba442cb2867b
+
+Control Plane Image:
+ghcr.io/ryanakml/deadbolt/control-plane@sha256:bb6e71625bb290577ea7fdab2f794377c7f84dc97b930b6820e7ba4c13e5f36b
+
+PostgreSQL Image:
+ghcr.io/ryanakml/deadbolt/postgres@sha256:53fbe0cb32862242051aa4591a4b0572d2acff05a5ce5a0feeedbd08574e6fda
+
+EXECUTIVE SUMMARY
+
+All remaining empirical acceptance criteria across Issue #23 (Admission,
+Quota, Drain, Telemetry Budgets), Issue #24 (Disaster Recovery &
+Backup/Restore Smoke), and Issue #25 (Hosted Staging Verification, Broker
+Fault, Database Outage Conservative Stop, Previous Binary Rollback) were
+executed and empirically verified against hosted staging infrastructure.
+
+Live shared staging remained undisturbed throughout fault drills, which used
+isolated ephemeral containers and networks.
+
+1. CANDIDATE PROVENANCE
+
+Public edge endpoints reported:
+commit b60397dcd00c90c45a15a65f44d7ba442cb2867b
+image ghcr.io/ryanakml/deadbolt/control-plane@sha256:bb6e71625bb290577ea7fdab2f794377c7f84dc97b930b6820e7ba4c13e5f36b
+
+/readyz returned HTTP 200 with database healthy, schema current, scheduler
+active.
+
+2. BLUEPRINT §29.2 DATABASE TRUTH CROSS-CHECK
+
+Accepted run:
+4b5d0aa4-fb8c-410c-9803-d1c2355173d0
+
+Run status:
+SUCCEEDED
+
+Deployment:
+e7c36b19-76b0-4c2b-a8b9-fd61e5c7b373
+
+Step A:
+1 attempt, epoch 1, SUCCEEDED.
+
+Step B attempt 1:
+epoch 1, LOST.
+
+Step B attempt 2:
+epoch 2, SUCCEEDED.
+
+Step C:
+1 attempt, epoch 1, SUCCEEDED.
+
+Exactly 18 durable events were recorded through RUN_COMPLETED.
+
+Result:
+PASS. Database truth matched CLI, API, and Web Inspector. Step A was never
+rerun. Step C ran once.
+
+3. ISSUE #23 ACCEPTANCE
+
+Quota and admission:
+PASS.
+- Environment live lease cap 10 enforced.
+- 11th enrollment rejected with HTTP 429 SESSION_QUOTA_EXCEEDED.
+- Retry-After: 60 returned.
+- Create-run token bucket returned HTTP 429 with Retry-After: 1.
+- Capacity-blocked runs entered WAITING / QUOTA_WAIT.
+
+Worker drain:
+PASS.
+- Disposable hosted worker entered DRAINING.
+- New claims were refused.
+- Active attempts finished within grace.
+- Forced-stop recovery followed policy.
+- Compatible bundles remained available.
+
+Log and telemetry budgets:
+PASS.
+- 16 KiB per-line bound enforced.
+- 1 MiB per-attempt bound enforced.
+- Drop receipts generated.
+- Correctness events remained intact under log flood.
+- Inspector log bounds passed.
+
+SP-02:
+PASS.
+0 deadlocks and sub-millisecond candidate scan measured.
+
+SP-04:
+PASS.
+368 kB measured relation size and sub-millisecond keyset pagination.
+
+Issue #23:
+PROVEN.
+
+4. BROKER OUTAGE FAULT
+
+Isolated stack:
+deadbolt-fault-nats
+deadbolt-fault-postgres
+deadbolt-fault-control-plane
+
+Isolated NATS was killed.
+
+Observed:
+- Outbox reported NATS unavailable.
+- Scheduler reconciliation sweeps continued.
+- /readyz remained HTTP 200 with database healthy and nats degraded.
+- Ready work progressed through authoritative database reconciliation.
+- Singular durable effects were preserved.
+
+Result:
+PASS.
+
+5. DATABASE OUTAGE CONSERVATIVE STOP
+
+Isolated PostgreSQL was stopped.
+
+Observed:
+- /readyz immediately returned HTTP 503.
+- Database reported unreachable.
+- Outbox and scheduler failed closed.
+- No false lease renewal occurred.
+- No phantom state transition occurred.
+- No new local-only ownership was created.
+
+After isolated PostgreSQL restart, /readyz returned to HTTP 200.
+
+Result:
+PASS.
+
+6. ISSUE #24 BACKUP AND RESTORE SMOKE
+
+Physical base backup:
+base_20260923T135003Z.tar.gz
+
+Restore target:
+deadbolt-recovery-drill-postgres
+
+Canonical restore command path:
+scripts/restore-staging-db.sh --drill --disaster-recovery
+
+Observed:
+- READ_ONLY recovery mode.
+- admission_enabled=false.
+- dispatch_enabled=false.
+- schedules_enabled=false.
+- Disaster recovery incident created.
+- 10 pre-disaster worker sessions revoked.
+- 7 pre-disaster auth sessions revoked.
+- Nonterminal runs received DISASTER_RECOVERY_HOLD.
+- External-effect ledger survived the older runtime snapshot.
+- No blind duplicate side effect was executed.
+- RPO-gap handling and gradual resumption tests passed.
+- Artifact valid/missing/corrupt integrity cases passed.
+
+Result:
+PASS.
+
+Issue #24:
+PROVEN.
+
+7. PREVIOUS COMPATIBLE BINARY ROLLBACK SMOKE
+
+Previous image:
+ghcr.io/ryanakml/deadbolt/control-plane@sha256:d9624576e6d72b996013e0823380518f4df6846b9263f203d493f4e2bcccef33
+
+Previous commit:
+cf0e1d902273786a6ab61a3dadb0a187e92a9761
+
+Observed:
+- Previous binary started successfully against Migration 24 schema.
+- /version returned the previous commit.
+- /readyz returned HTTP 200.
+- Forward schema version 24 was preserved.
+- No down migration was performed.
+- Compatible-binary rollback smoke tests passed.
+
+Result:
+PASS.
+
+8. HOSTED A -> B -> C FAILURE ACCEPTANCE
+
+Run:
+4b5d0aa4-fb8c-410c-9803-d1c2355173d0
+
+Observed:
+- Step A succeeded once.
+- Worker 1 owned B under epoch 1.
+- Worker 1 was killed with SIGKILL.
+- B attempt 1 became LOST after lease expiry.
+- Worker 2 recovered B under epoch 2.
+- Step A did not rerun.
+- Step C ran once after B succeeded.
+- Final run status was SUCCEEDED.
+- CLI, API, database, logs, events, and Web Inspector agreed.
+
+Result:
+PASS.
+
+9. SAFE HTTP STAGING ACCEPTANCE
+
+Controlled temporary fixture was exposed through the staging HTTPS edge.
+
+Observed:
+- /health returned HTTP 200.
+- /slow?delayMs=2000 was reachable through real TLS/public networking.
+- 300 ms client timeout produced curl exit code 28 at approximately 303 ms.
+- TestM2_HTTPStagingHosted passed through both nip.io and cubix.codes.
+- Temporary Caddy route was removed.
+- Original Caddyfile SHA-256 was restored exactly.
+- Temporary fixture container was removed.
+- /version and /readyz remained healthy after cleanup.
+
+Result:
+PASS.
+
+10. CLEANUP
+
+All temporary fault, recovery-drill, rollback-smoke containers and temporary
+networks were destroyed.
+
+Shared staging remained healthy:
+deadbolt-staging-control-plane-blue
+deadbolt-staging-postgres
+deadbolt-staging-nats
+
+Final public /version still reported:
+b60397dcd00c90c45a15a65f44d7ba442cb2867b
+
+Final /readyz:
+HTTP 200 ready.
+
+FINAL STATUS
+
+Issue #23: PROVEN
+Issue #24: PROVEN
+Issue #25: PROVEN
+PR #75 behavioral candidate: ACCEPTANCE VERIFIED
+Milestone M2: READY TO CLOSE
