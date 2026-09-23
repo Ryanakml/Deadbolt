@@ -356,8 +356,9 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 	recoveryPoint := time.Now().UTC()
 
 	// 3. Create REAL physical/logical database backup at T0
+	targetAdminURL := testdb.GetRoleDatabaseURL("", "deadbolt_integration_test")
 	backupFile := filepath.Join(t.TempDir(), "t0_backup.sql")
-	dumpCmd := exec.Command(pgDumpPath, "-d", "deadbolt_integration_test", "--clean", "--if-exists", "-f", backupFile)
+	dumpCmd := exec.Command(pgDumpPath, "-d", targetAdminURL, "--clean", "--if-exists", "-f", backupFile)
 	if out, err := dumpCmd.CombinedOutput(); err != nil {
 		t.Fatalf("pg_dump failed at T0: %v\nOutput:\n%s", err, string(out))
 	}
@@ -390,7 +391,7 @@ func TestDisasterRecoveryExternalEffectSurvivesRestore(t *testing.T) {
 	// 5. Simulate disaster & restore PostgreSQL from T0 backup
 	tc.cleanup()
 
-	restoreCmd := exec.Command(psqlPath, "-d", "deadbolt_integration_test", "-f", backupFile)
+	restoreCmd := exec.Command(psqlPath, "-d", targetAdminURL, "-f", backupFile)
 	if out, err := restoreCmd.CombinedOutput(); err != nil {
 		t.Fatalf("psql restore to T0 failed: %v\nOutput:\n%s", err, string(out))
 	}
