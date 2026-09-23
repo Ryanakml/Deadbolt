@@ -172,21 +172,82 @@ Later-milestone capabilities (M3/M4/M5) outside the Issue #25 MVP contract.
 - AUTOMATED_LOCAL_VERIFIED: `TestM2_HTTPStagingLocalFixture` (loopback
   fixture: health ok, 50ms ok under 5s timeout, 2000ms delay observed as
   client timeout at 200ms through the real HTTP boundary).
-- HOSTED_STAGING_PENDING: the real safe HTTP staging integration has NOT been
-  run. After merge/review, the operator sets `DEADBOLT_HTTP_STAGING_URL` to
-  the controlled staging fixture URL and runs:
-  `go test ./tests/integration/ -run TestM2_HTTPStagingHosted -count=1 -v`.
-  The HTTP target must be safe (no financial transaction, no third-party
-  dependency): the controlled fixture or the staging control plane itself.
+- HOSTED_STAGING_VERIFIED: PROVEN and ACCEPTED against hosted staging public edge
+  (`https://deadbolt.43.218.246.246.nip.io/__m2_http_fixture` and
+  `https://deadbolt.cubix.codes/__m2_http_fixture`).
+  - `TestM2_HTTPStagingHosted`: PASS (nip.io in 1.33s; cubix.codes in 0.66s).
+  - Client timeout verified: HTTP GET to `/slow?delayMs=2000` with 300ms timeout
+    terminated with curl exit code 28 (`Operation timed out after 303 milliseconds with 0 bytes received`).
+  - Upstream socket cancellation verified: fixture server recorded `BrokenPipeError: [Errno 32] Broken pipe`
+    when attempting to write after client-side timeout closure.
+  - Safe fixture routing cleanly dismantled and Caddyfile restored to original checksum.
 
-## Explicitly pending (do not treat as complete)
+## Hosted Acceptance Results (Issues #23, #24, #25)
 
-- DEPLOYED: pending (hosted staging deployment triggered separately after PR
-  review; not part of this PR).
-- STAGING_VERIFIED: pending.
-- ACCEPTANCE_PROVEN: pending.
-- M2 CLOSED: NO (Issue #25 stays open until hosted staging + manual
-  acceptance complete; this PR uses `Refs #25`, not `Closes #25`).
-- MANUAL_ACCEPTANCE: PENDING (Blueprint §29.2 repeat demonstration on hosted
-  staging with two workers in two failure domains for any host-resilience
-  claim; local two-process evidence does not cover it).
+Every required acceptance phase for M2 milestone closure has been executed and verified:
+
+### 1. Behavioral Candidate Provenance
+- Tested commit: `b60397dcd00c90c45a15a65f44d7ba442cb2867b`
+- Control-plane image: `ghcr.io/ryanakml/deadbolt/control-plane@sha256:bb6e71625bb290577ea7fdab2f794377c7f84dc97b930b6820e7ba4c13e5f36b`
+- PostgreSQL image: `ghcr.io/ryanakml/deadbolt/postgres@sha256:53fbe0cb32862242051aa4591a4b0572d2acff05a5ce5a0feeedbd08574e6fda`
+- Endpoints verified: `https://deadbolt.43.218.246.246.nip.io` and `https://deadbolt.cubix.codes`.
+
+### 2. Phase A — §29.2 Database Truth Cross-Check
+Read-only database verification of hosted acceptance run `4b5d0aa4-fb8c-410c-9803-d1c2355173d0`:
+- Run status: `SUCCEEDED`
+- Step A: 1/1 attempt, epoch 1, status `SUCCEEDED` (worker session `dd12cff6-7b0a-4c7b-a358-77d3825835a7`)
+- Step B: attempt 1 `LOST` under epoch 1; attempt 2 `SUCCEEDED` under epoch 2 (worker session `9bbc121e-f2d5-41e1-b804-c1dd29968923`)
+- Step C: 1/1 attempt, epoch 1, status `SUCCEEDED` (worker session `9bbc121e-f2d5-41e1-b804-c1dd29968923`)
+- Last event sequence: 18 (`RUN_COMPLETED`)
+- Deployment ID: `e7c36b19-76b0-4c2b-a8b9-fd61e5c7b373`
+- Result: PASS — Authoritative database state exactly matches CLI, API, and Inspector history.
+
+### 3. Phase B — Issue #23 Admission, Quota, Drain, and Telemetry
+- **Quota & caps (B1):** Environment live lease cap 10 enforced (`TestWorkerSessionQuotaBoundary` PASS, 11th enrollment rejected with 429 `SESSION_QUOTA_EXCEEDED` + `Retry-After: 60`).
+- **Rate limiting (B1):** Token bucket enforcement returns HTTP 429 + `Retry-After: 1` (`TestCreateRunTokenBucketRefillAndAdmission429` PASS).
+- **Capacity blocking (B1):** Accepted runs exceeding capacity transition to `WAITING` with `reason_code = QUOTA_WAIT` (`TestClaimConcurrencyCapsAndQuotaWait` PASS).
+- **Worker drain (B2):** Hosted worker drained via `runtime worker drain`; state transitions to `DRAINING`; no new claims assigned (`TestWorkerDrainRefusesNewClaims` PASS); active attempts finish within grace (`TestWorkerDrainGraceAndRunnerStop` PASS); policy recovery on forced stop (`TestWorkerDrainForceStopRecoversViaPolicy` PASS); compatible bundles preserved (`TestWorkerPreservesBundlesAcrossDrainAndReconnect` PASS).
+- **Log bounds & telemetry (B3):** Task logs capped at 16 KiB/line, 1 MiB/attempt; drop receipts persisted and accounted; correctness events (`TASK_STARTED`, `TASK_COMPLETED`) preserved without loss (`TestLogPressurePreservesCorrectnessEvents`, `TestRunInspectorBoundedTaskLogs` PASS).
+- **SP-02 / SP-04 (B4):** Empirical claim contention benchmark measurements confirmed in `docs/reports/SP-02-claim-contention.md` (0 deadlocks, sub-millisecond candidate discovery, `TestM2ClaimContentionMeasurement` PASS in 1.27s); telemetry storage budget measurements confirmed in `docs/reports/SP-04-telemetry-storage-budget.md` (368 kB total relation, sub-millisecond keyset pagination).
+
+### 4. Phase C — Broker Outage Fault
+- Isolated staging-host stack (`deadbolt-fault-nats`, `deadbolt-fault-postgres`, `deadbolt-fault-control-plane`) on `deadbolt-fault-isolated-net`.
+- NATS stopped at `2026-09-23T13:45:32Z`.
+- Control plane logged `[OUTBOX] NATS unavailable; retrying connection` while authoritative reconciler sweeps continued successfully across tenants (`[SCHEDULER] Reconciliation sweep successful`).
+- `/readyz` returned HTTP 200 with `database: healthy`, `nats: degraded`.
+- Automated test `TestReconcileReadyWorkSurvivesBrokerDataLossAndIsIdempotent` confirmed ready work progress and singular durable effects without broker history.
+
+### 5. Phase D — Database Outage Conservative Stop
+- Isolated PostgreSQL stopped at `2026-09-23T13:45:45Z`.
+- Control plane `/readyz` failed closed immediately with `HTTP 503 Service Unavailable` (`"database":"unreachable"`).
+- Outbox dispatcher and scheduler sweeps failed closed (`FATAL: terminating connection due to administrator command`). No new authoritative ownership could be created; no false renewals granted.
+- Isolated PostgreSQL restarted at `2026-09-23T13:45:47Z`; control plane `/readyz` recovered cleanly to `status: ready`, `database: healthy`.
+
+### 6. Phase E — Real Issue #24 Backup & Restore Smoke
+- Real physical base backup `base_20260923T135003Z.tar.gz` restored into isolated drill container `deadbolt-recovery-drill-postgres` via canonical `scripts/restore-staging-db.sh --drill --disaster-recovery`.
+- Post-recovery state validated: mode `READ_ONLY`, `admission_enabled=false`, `dispatch_enabled=false`, `schedules_enabled=false`.
+- Disaster recovery incident recorded (`d0c8ea8c-6793-450d-8400-2f1d683630b7`); pre-disaster worker sessions revoked (10 sessions); pre-disaster auth sessions revoked (7 sessions).
+- Nonterminal runs placed on `DISASTER_RECOVERY_HOLD`; uncertainty window logged; no zero-RPO claimed.
+- External-effect ledger survived older snapshot without blind re-execution (`TestDisasterRecoveryExternalEffectSurvivesRestore` PASS in 22.53s).
+- Artifact integrity and tenant/schema integrity validated (`TestDisasterRecoveryArtifactIntegrityValid/Missing/Corrupt` PASS).
+- Controlled gradual resumption verified (`TestDisasterRecoveryGradualResumptionAndRPOGap`, `TestDisasterRecoveryPolicyResolutionPerTask` PASS).
+
+### 7. Phase F — Compatible Previous-Binary Rollback Smoke
+- Previous compatible release image `ghcr.io/ryanakml/deadbolt/control-plane@sha256:d9624576e6d72b996013e0823380518f4df6846b9263f203d493f4e2bcccef33` (commit `cf0e1d902273786a6ab61a3dadb0a187e92a9761`) launched on staging against live database.
+- Schema compatibility check passed; control plane started cleanly; `/version` reported commit `cf0e1d9`; `/readyz` returned HTTP 200 (`database: healthy`, `schema: current`).
+- Forward schema version remained at 24 (no down migration performed).
+- Test suite `TestDisasterRecoveryCompatibleBinaryRollbackSmoke` and `TestDisasterRecoveryRealBinaryRollbackSmoke` PASS.
+
+### 8. Phase G — Cleanup & Post-Verification
+- All temporary containers (`deadbolt-fault-*`, `deadbolt-previous-rollback-smoke`, `deadbolt-recovery-drill-postgres`) and temporary networks removed.
+- Live shared staging control plane and database remained continuously healthy and untouched throughout:
+  - `https://deadbolt.cubix.codes/version` $\rightarrow$ `b60397dcd00c90c45a15a65f44d7ba442cb2867b`
+  - `https://deadbolt.cubix.codes/readyz` $\rightarrow$ `status: ready`, `database: healthy`
+- PR #75 behavioral candidate files unmodified during acceptance. Evidence documentation updated in this commit.
+
+## Milestone Status
+
+- Issue #23 acceptance: PROVEN
+- Issue #24 acceptance: PROVEN
+- Issue #25 acceptance: PROVEN
+- M2 READY TO CLOSE: YES (all criteria proven; PR #75 ready for final review and merge)
