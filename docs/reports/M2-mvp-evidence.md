@@ -172,20 +172,21 @@ Later-milestone capabilities (M3/M4/M5) outside the Issue #25 MVP contract.
 - AUTOMATED_LOCAL_VERIFIED: `TestM2_HTTPStagingLocalFixture` (loopback
   fixture: health ok, 50ms ok under 5s timeout, 2000ms delay observed as
   client timeout at 200ms through the real HTTP boundary).
+- HOSTED_STAGING_PENDING: the real safe HTTP staging integration has NOT been
+  run. After merge/review, the operator sets `DEADBOLT_HTTP_STAGING_URL` to
+  the controlled staging fixture URL and runs:
+  `go test ./tests/integration/ -run TestM2_HTTPStagingHosted -count=1 -v`.
+  The HTTP target must be safe (no financial transaction, no third-party
+  dependency): the controlled fixture or the staging control plane itself.
 
-- HOSTED_STAGING_VERIFIED: accepted against controlled hosted staging network.
-  Exact evidence is recorded in `docs/reports/M2-final-acceptance.txt`.
+## Explicitly pending (do not treat as complete)
 
-## Final acceptance
-
-- DEPLOYED: verified for behavioral candidate
-  `b60397dcd00c90c45a15a65f44d7ba442cb2867b`.
-- STAGING_VERIFIED: proven.
-- ACCEPTANCE_PROVEN: proven.
-- MANUAL_ACCEPTANCE: proven for the hosted A→B→C recovery and Inspector
-  journey.
-- Issue #23 acceptance: PROVEN.
-- Issue #24 acceptance: PROVEN.
-- Issue #25 acceptance: PROVEN.
-- M2 READY TO CLOSE: YES.
-
+- DEPLOYED: pending (hosted staging deployment triggered separately after PR
+  review; not part of this PR).
+- STAGING_VERIFIED: pending.
+- ACCEPTANCE_PROVEN: pending.
+- M2 CLOSED: NO (Issue #25 stays open until hosted staging + manual
+  acceptance complete; this PR uses `Refs #25`, not `Closes #25`).
+- MANUAL_ACCEPTANCE: PENDING (Blueprint §29.2 repeat demonstration on hosted
+  staging with two workers in two failure domains for any host-resilience
+  claim; local two-process evidence does not cover it).
