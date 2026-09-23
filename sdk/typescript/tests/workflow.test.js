@@ -131,39 +131,78 @@ test("defineWorkflow rejects unresolved task reference", () => {
   );
 });
 
-test("defineWorkflow rejects non-linear fan-out graph with UNSUPPORTED_CAPABILITY", () => {
-  assert.throws(
-    () =>
-      defineWorkflow({
-        name: "fan-out-wf",
-        inputSchema: payloadSchemaString,
-        outputSchema: payloadSchemaString,
-        nodes: [
-          {
-            id: "root",
-            type: "task",
-            task: taskA,
-            input: { val: input("/val") },
-          },
-          {
-            id: "branch1",
-            type: "task",
-            task: taskB,
-            after: ["root"],
-            input: { val: output("root", "/val") },
-          },
-          {
-            id: "branch2",
-            type: "task",
-            task: taskC,
-            after: ["root"], // root has 2 successors -> non-linear fan-out!
-            input: { val: output("root", "/val") },
-          },
-        ],
-        output: { val: output("branch1", "/val") },
-      }),
-    (err) =>
-      err instanceof ContractError && err.code === "UNSUPPORTED_CAPABILITY",
+test("defineWorkflow accepts static parallel fan-out graphs", () => {
+  assert.doesNotThrow(() =>
+    defineWorkflow({
+      name: "fan-out-wf",
+      inputSchema: payloadSchemaString,
+      outputSchema: payloadSchemaString,
+      nodes: [
+        {
+          id: "root",
+          type: "task",
+          task: taskA,
+          input: { val: input("/val") },
+        },
+        {
+          id: "branch1",
+          type: "task",
+          task: taskB,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+        },
+        {
+          id: "branch2",
+          type: "task",
+          task: taskC,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+          sideEffect: true,
+        },
+      ],
+      output: { val: output("branch1", "/val") },
+    }),
+  );
+});
+
+test("defineWorkflow accepts multi-parent join after: [a, b]", () => {
+  assert.doesNotThrow(() =>
+    defineWorkflow({
+      name: "join-wf",
+      inputSchema: payloadSchemaString,
+      outputSchema: payloadSchemaString,
+      nodes: [
+        {
+          id: "root",
+          type: "task",
+          task: taskA,
+          input: { val: input("/val") },
+        },
+        {
+          id: "branch1",
+          type: "task",
+          task: taskB,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+        },
+        {
+          id: "branch2",
+          type: "task",
+          task: taskC,
+          after: ["root"],
+          input: { val: output("root", "/val") },
+          sideEffect: true,
+        },
+        {
+          id: "join",
+          type: "task",
+          task: taskB,
+          after: ["branch1", "branch2"],
+          input: { val: output("branch1", "/val") },
+        },
+      ],
+      output: { val: output("join", "/val") },
+    }),
   );
 });
 

@@ -847,6 +847,20 @@ func TestLinearRunThroughActualAgentAndNodeChild(t *testing.T) {
 			if output["value"] != "agent-done" {
 				t.Fatalf("unexpected agent child output: %+v", snapshot.Output)
 			}
+			// The first Complete response is deliberately dropped after the
+			// control-plane commit. Run terminality can therefore become visible
+			// before the agent's bounded ACK replay reaches the test transport.
+			// Wait for that replay before asserting the exactly-once request shape.
+			ackRetryDeadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(ackRetryDeadline) {
+				completeMu.Lock()
+				replayed := len(completeRequests) >= 2
+				completeMu.Unlock()
+				if replayed {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 			completeMu.Lock()
 			requests := append([]worker.CompleteRequestDTO(nil), completeRequests...)
 			completeMu.Unlock()

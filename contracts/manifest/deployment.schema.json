@@ -307,7 +307,7 @@
             "additionalProperties": false
           }
         },
-        "description": "Versioned language contract. Control fields are reserved for V1. Executable M0/MVP validation rejects non-linear or non-task graphs; no control execution is enabled."
+        "description": "Versioned language contract. Control fields are reserved for V1. Executable task-only static DAGs support parallel dependencies; control-node execution is not enabled."
       }
     }
   },

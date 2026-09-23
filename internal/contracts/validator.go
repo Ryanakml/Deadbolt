@@ -107,7 +107,6 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		tasks[name] = task
 	}
 	byID := map[string]map[string]any{}
-	successors := map[string]int{}
 	for _, v := range nodes {
 		n := obj(v)
 		id := str(n["id"])
@@ -128,7 +127,6 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 			if byID[d] == nil {
 				return failure("MISSING_DEPENDENCY")
 			}
-			successors[d]++
 		}
 	}
 	ancestors := map[string]map[string]bool{}
@@ -162,20 +160,6 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		if _, err := visit(str(obj(v)["id"])); err != nil {
 			return err
 		}
-	}
-	roots := 0
-	for _, v := range nodes {
-		n := obj(v)
-		count := len(arr(n["after"]))
-		if count == 0 {
-			roots++
-		}
-		if count > 1 || successors[str(n["id"])] > 1 {
-			return failure("UNSUPPORTED_CAPABILITY")
-		}
-	}
-	if roots != 1 {
-		return failure("UNSUPPORTED_CAPABILITY")
 	}
 	used := map[string]bool{}
 	var mapping func(any, map[string]bool, bool) error
@@ -236,10 +220,16 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 	if err := mapping(m["output"], all, true); err != nil {
 		return err
 	}
+	referencedAsDependency := map[string]bool{}
+	for _, v := range nodes {
+		for _, dep := range arr(obj(v)["after"]) {
+			referencedAsDependency[str(dep)] = true
+		}
+	}
 	for _, v := range nodes {
 		n := obj(v)
 		id := str(n["id"])
-		if successors[id] == 0 && !used[id] && n["sideEffect"] != true {
+		if !referencedAsDependency[id] && !used[id] && n["sideEffect"] != true {
 			return failure("ORPHAN_LEAF")
 		}
 	}

@@ -350,7 +350,7 @@ export const schemas: Record<string, JSONValue> = {
               "additionalProperties": false
             }
           },
-          "description": "Versioned language contract. Control fields are reserved for V1. Executable M0/MVP validation rejects non-linear or non-task graphs; no control execution is enabled."
+          "description": "Versioned language contract. Control fields are reserved for V1. Executable task-only static DAGs support parallel dependencies; control-node execution is not enabled."
         }
       }
     },
@@ -770,7 +770,7 @@ export const schemas: Record<string, JSONValue> = {
         "additionalProperties": false
       }
     },
-    "description": "Versioned language contract. Control fields are reserved for V1. Executable M0/MVP validation rejects non-linear or non-task graphs; no control execution is enabled."
+    "description": "Versioned language contract. Control fields are reserved for V1. Executable task-only static DAGs support parallel dependencies; control-node execution is not enabled."
   },
   "worker/protocol.schema.json": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
