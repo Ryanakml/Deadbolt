@@ -457,6 +457,8 @@ export class RunInspector {
     listeners = [];
     logs = null;
     logsError = null;
+    stepLogs = new Map();
+    stepLogsError = new Map();
     events = [];
     eventsHasMore = false;
     eventsNextCursor = null;
@@ -571,37 +573,75 @@ export class RunInspector {
         try {
             const res = await apiFetch(url);
             if (res.status === 403) {
-                this.logsError =
-                    "Diagnostic task logs require payload:read capability (redacted by tenant policy).";
-                this.logs = null;
-                this.notifyLogs();
+                const errMsg = "Diagnostic task logs require payload:read capability (redacted by tenant policy).";
+                if (stepId) {
+                    this.stepLogsError.set(stepId, errMsg);
+                    this.notifyLogs(null, errMsg, stepId);
+                }
+                else {
+                    this.logsError = errMsg;
+                    this.logs = null;
+                    this.notifyLogs(null, errMsg);
+                }
                 return null;
             }
             if (!res.ok) {
                 throw new Error(`Failed to fetch logs (HTTP ${res.status}): ${res.statusText}`);
             }
             const data = (await res.json());
-            if (append && this.logs) {
-                this.logs = {
-                    ...data,
-                    items: [...this.logs.items, ...data.items],
-                };
+            if (stepId) {
+                const existing = this.stepLogs.get(stepId);
+                let finalData;
+                if (append && existing) {
+                    finalData = {
+                        ...data,
+                        items: [...existing.items, ...data.items],
+                    };
+                }
+                else {
+                    finalData = data;
+                }
+                this.stepLogs.set(stepId, finalData);
+                this.stepLogsError.delete(stepId);
+                this.notifyLogs(finalData, undefined, stepId);
+                return finalData;
             }
             else {
-                this.logs = data;
+                if (append && this.logs) {
+                    this.logs = {
+                        ...data,
+                        items: [...this.logs.items, ...data.items],
+                    };
+                }
+                else {
+                    this.logs = data;
+                }
+                this.logsError = null;
+                this.notifyLogs(this.logs, undefined);
+                return this.logs;
             }
-            this.logsError = null;
-            this.notifyLogs();
-            return data;
         }
         catch (err) {
-            this.logsError = err instanceof Error ? err.message : String(err);
-            if (!append) {
-                this.logs = null;
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (stepId) {
+                this.stepLogsError.set(stepId, errMsg);
+                if (!append) {
+                    this.stepLogs.delete(stepId);
+                }
+                this.notifyLogs(null, errMsg, stepId);
             }
-            this.notifyLogs();
+            else {
+                this.logsError = errMsg;
+                if (!append) {
+                    this.logs = null;
+                }
+                this.notifyLogs(null, errMsg);
+            }
             return null;
         }
+    }
+    getStepLogs(stepId) {
+        return this.stepLogs.get(stepId) ?? null;
     }
     startStream() {
         if (this.streamClient) {
@@ -868,10 +908,10 @@ export class RunInspector {
             }
         }
     }
-    notifyLogs() {
+    notifyLogs(logs = this.logs, error, stepId) {
         for (const l of this.listeners) {
             if (l.onLogsUpdated) {
-                l.onLogsUpdated(this.logs, this.logsError ?? undefined);
+                l.onLogsUpdated(logs, error ?? this.logsError ?? undefined, stepId);
             }
         }
     }

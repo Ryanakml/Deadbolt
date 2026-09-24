@@ -532,6 +532,49 @@ function initDashboard(): void {
     collapsedClusters.clear();
     cachedStepLogs.clear();
     lastSnap = null;
+    let graphScrollLeft = 0;
+    let graphScrollTop = 0;
+    let listScrollTop = 0;
+    let stepLogsWindowStart = 0;
+
+    function captureFocusDescriptor(root: HTMLElement): string | null {
+      const active = document.activeElement as HTMLElement | null;
+      if (!active || !root.contains(active)) return null;
+      if (active.id) {
+        return `#${active.id}`;
+      }
+      const stepId = active.getAttribute("data-step-id");
+      if (stepId) {
+        if (active.classList.contains("dag-node")) {
+          return `.dag-node[data-step-id="${stepId}"]`;
+        }
+        if (active.classList.contains("select-step-btn")) {
+          return `.select-step-btn[data-step-id="${stepId}"]`;
+        }
+        if (active.classList.contains("accessible-step-card")) {
+          return `.accessible-step-card[data-step-id="${stepId}"]`;
+        }
+        return `[data-step-id="${stepId}"]`;
+      }
+      const role = active.getAttribute("role");
+      const ariaLabel = active.getAttribute("aria-label");
+      if (role && ariaLabel) {
+        return `[role="${role}"][aria-label="${ariaLabel}"]`;
+      }
+      return null;
+    }
+
+    function restoreFocus(root: HTMLElement, descriptor: string | null): void {
+      if (!descriptor) return;
+      try {
+        const el = root.querySelector<HTMLElement>(descriptor);
+        if (el && typeof el.focus === "function") {
+          el.focus();
+        }
+      } catch {
+        // Ignore invalid selector
+      }
+    }
 
     activeInspector = new RunInspector(runId);
     activeInspector.subscribe({
@@ -545,8 +588,15 @@ function initDashboard(): void {
       },
       onEventsUpdated: (events, hasMore, nextCursor) =>
         renderEvents(events, hasMore, nextCursor),
-      onLogsUpdated: (logs, err) =>
-        renderLogs(logs, err, selectedStepId ?? undefined),
+      onLogsUpdated: (logs, err, stepId) => {
+        if (stepId && logs) {
+          cachedStepLogs.set(stepId, logs);
+          if (selectedStepId === stepId) {
+            renderSnapshot(lastSnap!);
+          }
+        }
+        renderLogs(logs, err, stepId ?? selectedStepId ?? undefined);
+      },
       onError: (err) => {
         if (isUnauthorized(err)) {
           handleUnauthorized();
@@ -562,6 +612,18 @@ function initDashboard(): void {
       lastSnap = snap;
       const container = document.getElementById("inspector-content");
       if (!container) return;
+
+      // Capture focus and scroll state before replacing innerHTML
+      const focusDescriptor = captureFocusDescriptor(container);
+      const existingGraphScroll = document.getElementById("graph-scroll-area");
+      if (existingGraphScroll) {
+        graphScrollLeft = existingGraphScroll.scrollLeft;
+        graphScrollTop = existingGraphScroll.scrollTop;
+      }
+      const existingListScroll = document.getElementById("list-scroll-area");
+      if (existingListScroll) {
+        listScrollTop = existingListScroll.scrollTop;
+      }
 
       // Select default step if not selected or no longer valid
       if (!selectedStepId || !snap.steps.some((s) => s.id === selectedStepId)) {
@@ -585,15 +647,12 @@ function initDashboard(): void {
 
       // Compute graph layout (1 node per logical step; attempts stay in step detail)
       const layout = computeGraphLayout(snap.steps, collapsedClusters);
-      const graphScrollArea = document.getElementById("graph-scroll-area");
-      const scrollLeft = graphScrollArea ? graphScrollArea.scrollLeft : 0;
-      const scrollTop = graphScrollArea ? graphScrollArea.scrollTop : 0;
       const minimap = computeMinimap(
         layout,
         800,
         450,
-        scrollLeft,
-        scrollTop,
+        graphScrollLeft,
+        graphScrollTop,
         160,
         100,
       );
@@ -859,19 +918,42 @@ function initDashboard(): void {
             ? `<div class="events-window-info" role="status" aria-live="polite">Showing events ${stepEventsBounded.offset + 1}–${Math.min(stepEventsBounded.offset + stepEventsBounded.events.length, stepEventsBounded.total)} of ${stepEventsBounded.total}.</div>`
             : "";
 
-        // Logs Tab Content
+        // Logs Tab Content - bounded rendering
         let logsContent = "";
         const stepLogs = cachedStepLogs.get(selectedStep.id);
         if (stepLogs && stepLogs.items.length > 0) {
+          const stepLogsBounded = virtualizeItems(
+            stepLogs.items,
+            stepLogsWindowStart,
+            LOGS_PAGE_SIZE,
+          );
+          const visibleStepLogItems = stepLogsBounded.items;
+          const stepLogsHasMore =
+            stepLogs.nextCursor != null || stepLogsBounded.hasMore;
+
+          const logLines = visibleStepLogItems
+            .map((line) => {
+              const time = new Date(line.timestamp).toLocaleTimeString();
+              return `<div class="log-line log-${line.level}"><span class="log-time">${time}</span> <span class="log-level">[${line.level.toUpperCase()}]</span> <span class="log-msg">${escapeHtml(line.message)}</span></div>`;
+            })
+            .join("");
+
+          const stepLogWindowInfo =
+            stepLogs.items.length > LOGS_PAGE_SIZE
+              ? `<div class="logs-window-info" role="status" aria-live="polite">Showing logs ${stepLogsBounded.offset + 1}–${Math.min(stepLogsBounded.offset + visibleStepLogItems.length, stepLogsBounded.total)} of ${stepLogsBounded.total}.</div>`
+              : "";
+
+          let stepLoadMoreHtml = "";
+          if (stepLogsHasMore) {
+            stepLoadMoreHtml = `<button id="load-more-step-logs-btn" class="load-more-btn" data-step-id="${escapeHtml(selectedStep.id)}">${stepLogs.nextCursor ? "Load More Step Logs" : "Load More Step Logs (local)"}</button>`;
+          }
+
           logsContent = `
+            ${stepLogWindowInfo}
             <div class="log-terminal" role="region" aria-label="Step Task Logs">
-              ${stepLogs.items
-                .map((line) => {
-                  const time = new Date(line.timestamp).toLocaleTimeString();
-                  return `<div class="log-line log-${line.level}"><span class="log-time">${time}</span><span class="log-level">[${line.level.toUpperCase()}]</span><span class="log-msg">${escapeHtml(line.message)}</span></div>`;
-                })
-                .join("")}
+              ${logLines}
             </div>
+            ${stepLoadMoreHtml}
           `;
         } else if (stepLogs?.expired) {
           logsContent = `<div class="logs-notice logs-expired">Logs have expired due to the 7-day retention policy.</div>`;
@@ -1111,14 +1193,16 @@ function initDashboard(): void {
           }
           if (newIdx >= 0) {
             currentViewMode = viewTabOrder[newIdx];
-            updateViewRovingTabindex(newIdx);
             renderSnapshot(lastSnap!);
-            viewButtons[newIdx]?.focus();
+            const targetId =
+              viewTabOrder[newIdx] === "graph"
+                ? "view-mode-graph-btn"
+                : "view-mode-list-btn";
+            const newBtn = container.querySelector<HTMLElement>(`#${targetId}`);
+            newBtn?.focus();
           }
         });
       });
-
-      // Wire collapse/expand groups button
 
       // Wire collapse/expand groups button
       const collapseBtn = container.querySelector("#toggle-collapse-btn");
@@ -1137,12 +1221,11 @@ function initDashboard(): void {
       }
 
       // Wire minimap scroll binding to graph scroll container
-      const minimapSvgEl = document.getElementById("minimap-svg");
       const scrollAreaEl = document.getElementById("graph-scroll-area");
       if (scrollAreaEl) {
         scrollAreaEl.addEventListener("scroll", () => {
-          const sl = scrollAreaEl.scrollLeft;
-          const st = scrollAreaEl.scrollTop;
+          graphScrollLeft = scrollAreaEl.scrollLeft;
+          graphScrollTop = scrollAreaEl.scrollTop;
           if (lastSnap) {
             const layout = computeGraphLayout(
               lastSnap.steps,
@@ -1152,8 +1235,8 @@ function initDashboard(): void {
               layout,
               800,
               450,
-              sl,
-              st,
+              graphScrollLeft,
+              graphScrollTop,
               160,
               100,
             );
@@ -1164,7 +1247,6 @@ function initDashboard(): void {
               vp.setAttribute("width", String(newMinimap.viewport.width));
               vp.setAttribute("height", String(newMinimap.viewport.height));
             }
-            // viewBox stays "0 0 160 100" to keep coordinate system consistent
           }
         });
       }
@@ -1174,9 +1256,11 @@ function initDashboard(): void {
       let listScrollTimer: ReturnType<typeof setTimeout> | null = null;
       if (listScrollArea) {
         listScrollArea.addEventListener("scroll", () => {
+          listScrollTop = listScrollArea.scrollTop;
           if (listScrollTimer) clearTimeout(listScrollTimer);
           listScrollTimer = setTimeout(() => {
             const scrollTop = listScrollArea.scrollTop;
+            listScrollTop = scrollTop;
             const itemHeight = 140;
             const newIndex = Math.floor(scrollTop / itemHeight);
             const clampedIndex = Math.max(
@@ -1204,6 +1288,7 @@ function initDashboard(): void {
           const stepId = nodeEl.getAttribute("data-step-id");
           if (stepId && stepId !== selectedStepId) {
             selectedStepId = stepId;
+            stepLogsWindowStart = 0;
             renderSnapshot(lastSnap!);
           }
         };
@@ -1224,6 +1309,7 @@ function initDashboard(): void {
           );
           if (stepId) {
             selectedStepId = stepId;
+            stepLogsWindowStart = 0;
             renderSnapshot(lastSnap!);
           }
         });
@@ -1249,7 +1335,7 @@ function initDashboard(): void {
             !cachedStepLogs.has(selectedStep.id)
           ) {
             activeInspector?.fetchLogs(selectedStep.id).then((l) => {
-              cachedStepLogs.set(selectedStep.id, l);
+              if (l) cachedStepLogs.set(selectedStep.id, l);
               renderSnapshot(lastSnap!);
             });
           }
@@ -1291,6 +1377,29 @@ function initDashboard(): void {
         });
       }
 
+      // Wire Load More Step Logs button
+      const loadMoreStepLogsBtn = document.getElementById(
+        "load-more-step-logs-btn",
+      );
+      if (loadMoreStepLogsBtn && selectedStep) {
+        loadMoreStepLogsBtn.addEventListener("click", () => {
+          const currentLogs = cachedStepLogs.get(selectedStep.id);
+          stepLogsWindowStart += LOGS_PAGE_SIZE;
+          if (currentLogs?.nextCursor) {
+            loadMoreStepLogsBtn.textContent = "Loading...";
+            loadMoreStepLogsBtn.setAttribute("disabled", "true");
+            activeInspector?.fetchLogs(
+              selectedStep.id,
+              undefined,
+              currentLogs.nextCursor,
+              true,
+            );
+          } else {
+            renderSnapshot(lastSnap!);
+          }
+        });
+      }
+
       // Wire Load More Steps button
       const loadMoreStepsBtn = document.getElementById("load-more-steps-btn");
       if (loadMoreStepsBtn) {
@@ -1299,17 +1408,25 @@ function initDashboard(): void {
             loadMoreStepsBtn.getAttribute("data-list-offset") ?? "0",
           );
           listScrollIndex = offset;
+          listScrollTop = offset * 140;
           renderSnapshot(lastSnap!);
         });
       }
 
-      // Restore scroll positions after rerender
-      setTimeout(() => {
-        const lsa = document.getElementById("list-scroll-area");
-        if (lsa) {
-          lsa.scrollTop = 0;
-        }
-      }, 0);
+      // Restore physical scroll positions immediately on the new DOM elements
+      const newGraphScrollArea = document.getElementById("graph-scroll-area");
+      if (newGraphScrollArea) {
+        newGraphScrollArea.scrollLeft = graphScrollLeft;
+        newGraphScrollArea.scrollTop = graphScrollTop;
+      }
+
+      const newLsa = document.getElementById("list-scroll-area");
+      if (newLsa) {
+        newLsa.scrollTop = listScrollTop;
+      }
+
+      // Restore focus to active element if still present in new DOM
+      restoreFocus(container, focusDescriptor);
 
       // Wire durable pause/resume controls. The backend stays authoritative:
       // expectedRevision is captured at open time and 409s refresh in-dialog.

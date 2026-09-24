@@ -619,7 +619,11 @@ export function getBoundedEvents(
 export interface InspectorListener {
   onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
   onFreshnessChanged?: (freshness: StreamFreshness) => void;
-  onLogsUpdated?: (logs: TaskLogsResponse | null, error?: string) => void;
+  onLogsUpdated?: (
+    logs: TaskLogsResponse | null,
+    error?: string,
+    stepId?: string,
+  ) => void;
   onEventsUpdated?: (
     events: RunEvent[],
     hasMore: boolean,
@@ -636,6 +640,8 @@ export class RunInspector {
   private listeners: InspectorListener[] = [];
   private logs: TaskLogsResponse | null = null;
   private logsError: string | null = null;
+  private stepLogs: Map<string, TaskLogsResponse> = new Map();
+  private stepLogsError: Map<string, string> = new Map();
   private events: RunEvent[] = [];
   private eventsHasMore = false;
   private eventsNextCursor: number | null = null;
@@ -771,10 +777,16 @@ export class RunInspector {
     try {
       const res = await apiFetch(url);
       if (res.status === 403) {
-        this.logsError =
+        const errMsg =
           "Diagnostic task logs require payload:read capability (redacted by tenant policy).";
-        this.logs = null;
-        this.notifyLogs();
+        if (stepId) {
+          this.stepLogsError.set(stepId, errMsg);
+          this.notifyLogs(null, errMsg, stepId);
+        } else {
+          this.logsError = errMsg;
+          this.logs = null;
+          this.notifyLogs(null, errMsg);
+        }
         return null;
       }
       if (!res.ok) {
@@ -783,25 +795,55 @@ export class RunInspector {
         );
       }
       const data = (await res.json()) as TaskLogsResponse;
-      if (append && this.logs) {
-        this.logs = {
-          ...data,
-          items: [...this.logs.items, ...data.items],
-        };
+      if (stepId) {
+        const existing = this.stepLogs.get(stepId);
+        let finalData: TaskLogsResponse;
+        if (append && existing) {
+          finalData = {
+            ...data,
+            items: [...existing.items, ...data.items],
+          };
+        } else {
+          finalData = data;
+        }
+        this.stepLogs.set(stepId, finalData);
+        this.stepLogsError.delete(stepId);
+        this.notifyLogs(finalData, undefined, stepId);
+        return finalData;
       } else {
-        this.logs = data;
+        if (append && this.logs) {
+          this.logs = {
+            ...data,
+            items: [...this.logs.items, ...data.items],
+          };
+        } else {
+          this.logs = data;
+        }
+        this.logsError = null;
+        this.notifyLogs(this.logs, undefined);
+        return this.logs;
       }
-      this.logsError = null;
-      this.notifyLogs();
-      return data;
     } catch (err: unknown) {
-      this.logsError = err instanceof Error ? err.message : String(err);
-      if (!append) {
-        this.logs = null;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (stepId) {
+        this.stepLogsError.set(stepId, errMsg);
+        if (!append) {
+          this.stepLogs.delete(stepId);
+        }
+        this.notifyLogs(null, errMsg, stepId);
+      } else {
+        this.logsError = errMsg;
+        if (!append) {
+          this.logs = null;
+        }
+        this.notifyLogs(null, errMsg);
       }
-      this.notifyLogs();
       return null;
     }
+  }
+
+  public getStepLogs(stepId: string): TaskLogsResponse | null {
+    return this.stepLogs.get(stepId) ?? null;
   }
 
   private startStream(): void {
@@ -1105,10 +1147,14 @@ export class RunInspector {
     }
   }
 
-  private notifyLogs(): void {
+  private notifyLogs(
+    logs: TaskLogsResponse | null = this.logs,
+    error?: string,
+    stepId?: string,
+  ): void {
     for (const l of this.listeners) {
       if (l.onLogsUpdated) {
-        l.onLogsUpdated(this.logs, this.logsError ?? undefined);
+        l.onLogsUpdated(logs, error ?? this.logsError ?? undefined, stepId);
       }
     }
   }

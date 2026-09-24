@@ -108,7 +108,7 @@ export declare function getBoundedEvents(events: RunEvent[], offset: number, lim
 export interface InspectorListener {
     onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
     onFreshnessChanged?: (freshness: StreamFreshness) => void;
-    onLogsUpdated?: (logs: TaskLogsResponse | null, error?: string) => void;
+    onLogsUpdated?: (logs: TaskLogsResponse | null, error?: string, stepId?: string) => void;
     onEventsUpdated?: (events: RunEvent[], hasMore: boolean, nextCursor: number | null) => void;
     onError?: (err: Error) => void;
 }
@@ -120,6 +120,8 @@ export declare class RunInspector {
     private listeners;
     private logs;
     private logsError;
+    private stepLogs;
+    private stepLogsError;
     private events;
     private eventsHasMore;
     private eventsNextCursor;
@@ -132,6 +134,7 @@ export declare class RunInspector {
     fetchSnapshot(): Promise<RunSnapshot>;
     fetchEvents(cursor?: number, append?: boolean): Promise<RunEventsResponse | null>;
     fetchLogs(stepId?: string, attemptId?: string, cursor?: string, append?: boolean): Promise<TaskLogsResponse | null>;
+    getStepLogs(stepId: string): TaskLogsResponse | null;
     private startStream;
     applyEvent(event: RunEvent): void;
     private notifySnapshot;
