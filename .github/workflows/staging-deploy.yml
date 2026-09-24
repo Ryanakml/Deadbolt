@@ -209,3 +209,11 @@ jobs:
 
           # Trigger remote deployment orchestration with explicit host configuration source
           $SSH_CMD "cd /opt/deadbolt && DEADBOLT_CONFIG_FILE='/etc/deadbolt/staging.env' DEADBOLT_POSTGRES_IMAGE='$POSTGRES_DIGEST' DEADBOLT_IMAGE_DIGEST='$IMAGE_DIGEST' DEADBOLT_COMMIT_SHA='$COMMIT_SHA' ./scripts/deploy-staging.sh"
+
+          # Issue #31 exact-artifact browser acceptance. Resolve the approved
+          # domain from the protected host configuration, then exercise the
+          # deployed edge with real Chrome at mobile/tablet/desktop viewports.
+          STAGING_DOMAIN=$($SSH_CMD "set -a && source /etc/deadbolt/staging.env && printf '%s' \"\$DEADBOLT_STAGING_DOMAIN\"")
+          test -n "$STAGING_DOMAIN"
+          CHROME_BIN="$(command -v google-chrome)" node --experimental-websocket scripts/m3-hosted-browser-acceptance.mjs \
+            "https://$STAGING_DOMAIN" "$COMMIT_SHA" "$IMAGE_DIGEST"
