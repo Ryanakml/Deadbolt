@@ -118,8 +118,12 @@ Control plane endpoints enforce strict role-based access control (RBAC) and scop
 
 - **`runs:control` Capability Required:**
   - `POST /v1/runs/{id}/pause` and `POST /v1/runs/{id}/resume` require the `runs:control` capability.
-  - Organization roles `Owner`, `Admin`, and `Developer` possess `runs:control` and are admitted with `200 OK`.
-  - The `Viewer` role lacks `runs:control` and is rejected with `403 Forbidden`.
+  - Canonical organization role matrix for `runs:control` (matching `internal/tenant/rbac.go` and `apps/dashboard/src/permissions.ts`):
+    - `Viewer`: No (`403 Forbidden`)
+    - `Developer`: Yes (`200 OK`)
+    - `Operator`: Yes (`200 OK`)
+    - `Admin`: Yes (`200 OK`)
+    - `Owner`: Yes (`200 OK`)
   - Machine API keys must explicitly include the `runs:control` capability string in their token capabilities.
 - **UI Gating:**
   - The Deadbolt Run Inspector evaluates the authenticated user's permissions and conditionally displays Pause and Resume action buttons only to authorized operators.

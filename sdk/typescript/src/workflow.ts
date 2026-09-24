@@ -74,6 +74,28 @@ export type WorkflowNodeType =
   | "approval"
   | "delay";
 
+export interface ChoiceBranch {
+  name: string;
+  condition?: JSONValue;
+}
+
+export interface ChoiceNodeConfig {
+  branches: ChoiceBranch[];
+  default?: string;
+}
+
+export interface MergeBranch {
+  branch: string;
+  terminal: string;
+  value?: JSONValue;
+}
+
+export interface MergeNodeConfig {
+  choice: string;
+  branches: MergeBranch[];
+  outputSchema: JSONValue;
+}
+
 export interface WorkflowNode {
   id: string;
   type: WorkflowNodeType;
@@ -81,10 +103,40 @@ export interface WorkflowNode {
   after?: string[];
   input?: Record<string, JSONValue>;
   sideEffect?: boolean;
-  choice?: Record<string, JSONValue>;
-  merge?: Record<string, JSONValue>;
+  choice?: ChoiceNodeConfig | Record<string, JSONValue>;
+  merge?: MergeNodeConfig | Record<string, JSONValue>;
   approval?: Record<string, JSONValue>;
   delayMs?: number;
+}
+
+export function choiceNode(
+  id: string,
+  config: ChoiceNodeConfig,
+  after?: string[],
+): WorkflowNode {
+  return {
+    id,
+    type: "choice",
+    choice: config as unknown as Record<string, JSONValue>,
+    ...(after && after.length > 0 ? { after } : {}),
+  };
+}
+
+export function mergeNode(
+  id: string,
+  config: MergeNodeConfig,
+  after?: string[],
+): WorkflowNode {
+  return {
+    id,
+    type: "merge",
+    merge: config as unknown as Record<string, JSONValue>,
+    ...(after && after.length > 0 ? { after } : {}),
+  };
+}
+
+export function expr(op: string, ...args: JSONValue[]): ObjectValue {
+  return { op, args };
 }
 
 export interface WorkflowConfig<TInput = unknown, TOutput = unknown> {

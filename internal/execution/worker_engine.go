@@ -85,12 +85,36 @@ func (e *WorkerEngine) SetBeforeResumeLockHookForTest(hook func(context.Context)
 	e.beforeResumeLock = hook
 }
 
+type choiceBranch struct {
+	Name      string `json:"name"`
+	Condition any    `json:"condition"`
+}
+
+type choiceConfig struct {
+	Branches []choiceBranch `json:"branches"`
+	Default  string         `json:"default"`
+}
+
+type mergeBranch struct {
+	Branch   string `json:"branch"`
+	Terminal string `json:"terminal"`
+	Value    any    `json:"value"`
+}
+
+type mergeConfig struct {
+	Choice       string        `json:"choice"`
+	Branches     []mergeBranch `json:"branches"`
+	OutputSchema any           `json:"outputSchema"`
+}
+
 type workflowNode struct {
-	ID    string   `json:"id"`
-	Type  string   `json:"type"`
-	Task  string   `json:"task"`
-	After []string `json:"after"`
-	Input any      `json:"input"`
+	ID     string        `json:"id"`
+	Type   string        `json:"type"`
+	Task   string        `json:"task"`
+	After  []string      `json:"after"`
+	Input  any           `json:"input"`
+	Choice *choiceConfig `json:"choice"`
+	Merge  *mergeConfig  `json:"merge"`
 }
 
 type workflowManifest struct {
@@ -948,6 +972,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 				JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
 				JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
 				WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
+					AND rs.kind='task'
 					AND (candidate_w.pool_name=$5 OR $5 = '' OR candidate_w.pool_name='default')
 					AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
 					AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
@@ -1686,6 +1711,60 @@ type dagEvalStep struct {
 	state string
 }
 
+func buildGraphRelations(nodes []workflowNode) (ancestors map[string]map[string]bool, descendants map[string]map[string]bool) {
+	ancestors = make(map[string]map[string]bool, len(nodes))
+	descendants = make(map[string]map[string]bool, len(nodes))
+	for _, n := range nodes {
+		ancestors[n.ID] = make(map[string]bool)
+		descendants[n.ID] = make(map[string]bool)
+	}
+	for _, n := range nodes {
+		for _, dep := range n.After {
+			ancestors[n.ID][dep] = true
+			descendants[dep][n.ID] = true
+		}
+	}
+	for _, k := range nodes {
+		for _, i := range nodes {
+			for _, j := range nodes {
+				if ancestors[i.ID][k.ID] && ancestors[k.ID][j.ID] {
+					ancestors[i.ID][j.ID] = true
+					descendants[j.ID][i.ID] = true
+				}
+			}
+		}
+	}
+	return ancestors, descendants
+}
+
+func getBranchNodes(workflow *workflowManifest, choiceID string, ancestors, descendants map[string]map[string]bool) map[string]map[string]bool {
+	var mergeNode *workflowNode
+	for i := range workflow.Nodes {
+		if workflow.Nodes[i].Type == "merge" && workflow.Nodes[i].Merge != nil && workflow.Nodes[i].Merge.Choice == choiceID {
+			mergeNode = &workflow.Nodes[i]
+			break
+		}
+	}
+	if mergeNode == nil || mergeNode.Merge == nil {
+		return nil
+	}
+	res := make(map[string]map[string]bool, len(mergeNode.Merge.Branches))
+	for _, b := range mergeNode.Merge.Branches {
+		bSet := make(map[string]bool)
+		term := b.Terminal
+		for _, n := range workflow.Nodes {
+			if n.ID == choiceID || n.ID == mergeNode.ID {
+				continue
+			}
+			if descendants[choiceID][n.ID] && (n.ID == term || ancestors[term][n.ID]) {
+				bSet[n.ID] = true
+			}
+		}
+		res[b.Branch] = bSet
+	}
+	return res
+}
+
 // evaluateBlockedDAGTx is the single authoritative graph-evaluation path for
 // BLOCKED steps (Blueprint §6, §10). Both normal post-completion advancement
 // and ReconcileReadyWork repair use it, so restart/broker-loss recovery can
@@ -1697,7 +1776,11 @@ type dagEvalStep struct {
 //     regardless of manifest node order (fixed-point loop);
 //   - mapping failure or mapped-input schema violation => deterministic
 //     non-retryable INPUT_MAPPING_ERROR via canonical fail-fast (never a
-//     transient Poll/reconciler error).
+//     transient Poll/reconciler error);
+//   - choice nodes evaluate declared expression, persist selected branch,
+//     and immediately skip unselected branch nodes with BRANCH_NOT_SELECTED;
+//   - merge nodes wait for selected branch terminal only, never hang on skipped
+//     unselected branches, and produce canonical {branch, value} output.
 //
 // Steps maps nodeID -> step; outputsMap carries committed dependency outputs;
 // runInput is the run input for mapping. readyEventReason names the STEP_READY
@@ -1706,6 +1789,7 @@ type dagEvalStep struct {
 // Returns transitions applied and whether the run was fail-fasted.
 func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, runID, workflowName string, workflow *workflowManifest, manifest *deploymentManifest, runInput any, steps map[string]*dagEvalStep, outputsMap map[string]any, readyEventReason string) (int, bool, error) {
 	transitions := 0
+	ancestors, descendants := buildGraphRelations(workflow.Nodes)
 	for changed := true; changed; {
 		changed = false
 		for _, node := range workflow.Nodes {
@@ -1713,6 +1797,200 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 			if !ok || st.state != "BLOCKED" {
 				continue
 			}
+
+			nodeType := node.Type
+			if nodeType == "" {
+				nodeType = "task"
+			}
+
+			if nodeType == "merge" {
+				if node.Merge == nil {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+				choiceStep, choiceExists := steps[node.Merge.Choice]
+				if !choiceExists {
+					continue
+				}
+				if choiceStep.state == "SKIPPED" {
+					tag, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED', wait_reason='DEPENDENCY_SKIPPED', updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, st.id, organizationID)
+					if err != nil {
+						return transitions, false, err
+					}
+					if tag.RowsAffected() == 0 {
+						continue
+					}
+					st.state = "SKIPPED"
+					changed = true
+					transitions++
+					if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
+						"stepId": st.id, "nodeId": node.ID, "reason": "DEPENDENCY_SKIPPED",
+					}); err != nil {
+						return transitions, false, err
+					}
+					continue
+				}
+				if choiceStep.state != "SUCCEEDED" {
+					continue
+				}
+
+				var selectedBranch string
+				if choiceOut, ok := outputsMap[node.Merge.Choice].(map[string]any); ok {
+					if sel, ok := choiceOut["selected"].(string); ok {
+						selectedBranch = sel
+					} else if sel, ok := choiceOut["branch"].(string); ok {
+						selectedBranch = sel
+					}
+				}
+				if selectedBranch == "" {
+					continue
+				}
+
+				var selectedMergeBranch *mergeBranch
+				for i := range node.Merge.Branches {
+					if node.Merge.Branches[i].Branch == selectedBranch {
+						selectedMergeBranch = &node.Merge.Branches[i]
+						break
+					}
+				}
+				if selectedMergeBranch == nil {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+
+				termStep, ok := steps[selectedMergeBranch.Terminal]
+				if !ok || termStep.state != "SUCCEEDED" {
+					continue
+				}
+
+				// Blueprint §16.2 / F-16: the merge waits only on declared branch
+				// terminals. Any other node from an unselected branch present in
+				// `after` must be ignored and must never SKIP the merge. Only
+				// legitimate non-branch/common dependencies participate in the
+				// skipped check below.
+				branchNodes := getBranchNodes(workflow, node.Merge.Choice, ancestors, descendants)
+				unselectedBranchNodes := make(map[string]bool)
+				for bName, bSet := range branchNodes {
+					if bName == selectedBranch {
+						continue
+					}
+					for nid := range bSet {
+						unselectedBranchNodes[nid] = true
+					}
+				}
+				// Declared unselected terminals are always a subset of the above,
+				// but keep the explicit terminal set for clarity.
+				for _, mb := range node.Merge.Branches {
+					if mb.Branch != selectedBranch {
+						unselectedBranchNodes[mb.Terminal] = true
+					}
+				}
+
+				otherDepsMet := true
+				otherDepSkipped := false
+				for _, depID := range node.After {
+					if unselectedBranchNodes[depID] {
+						continue
+					}
+					depStep, depExists := steps[depID]
+					if !depExists {
+						otherDepsMet = false
+						break
+					}
+					if depStep.state == "SKIPPED" {
+						otherDepSkipped = true
+					}
+					if depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED" {
+						otherDepsMet = false
+						break
+					}
+				}
+				if !otherDepsMet {
+					continue
+				}
+				if otherDepSkipped {
+					tag, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED', wait_reason='DEPENDENCY_SKIPPED', updated_at=clock_timestamp()
+						WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, st.id, organizationID)
+					if err != nil {
+						return transitions, false, err
+					}
+					if tag.RowsAffected() == 0 {
+						continue
+					}
+					st.state = "SKIPPED"
+					changed = true
+					transitions++
+					if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
+						"stepId": st.id, "nodeId": node.ID, "reason": "DEPENDENCY_SKIPPED",
+					}); err != nil {
+						return transitions, false, err
+					}
+					continue
+				}
+
+				var val any
+				if selectedMergeBranch.Value != nil {
+					mappedVal, mapErr := contracts.MapInput(selectedMergeBranch.Value, runInput, outputsMap)
+					if mapErr != nil {
+						if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INPUT_MAPPING_ERROR", nil); err != nil {
+							return transitions, false, err
+						}
+						return transitions, true, nil
+					}
+					val = mappedVal
+				} else {
+					val = outputsMap[selectedMergeBranch.Terminal]
+				}
+
+				mergeOut := map[string]any{
+					"branch": selectedBranch,
+					"value":  val,
+				}
+				// Frozen Blueprint §16.2 requires an explicit merge outputSchema.
+				// Every committed merge result is validated; a missing schema
+				// fails closed as a malformed manifest.
+				if node.Merge.OutputSchema == nil {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+				if err := contracts.ValidatePayload(node.Merge.OutputSchema, mergeOut); err != nil {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "SCHEMA_VALIDATION_ERROR", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+
+				mergeBytes, err := json.Marshal(mergeOut)
+				if err != nil {
+					return transitions, false, err
+				}
+				tag, err := tx.Exec(ctx, `UPDATE run_steps SET state='SUCCEEDED', wait_reason=NULL, output=$1::jsonb, updated_at=clock_timestamp()
+					WHERE id=$2::uuid AND organization_id=$3::uuid AND state='BLOCKED'`, mergeBytes, st.id, organizationID)
+				if err != nil {
+					return transitions, false, err
+				}
+				if tag.RowsAffected() == 0 {
+					continue
+				}
+				st.state = "SUCCEEDED"
+				outputsMap[node.ID] = mergeOut
+				changed = true
+				transitions++
+				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SUCCEEDED", map[string]any{
+					"stepId": st.id, "nodeId": node.ID, "output": mergeOut,
+				}); err != nil {
+					return transitions, false, err
+				}
+				continue
+			}
+
 			allDepsMet := true
 			dependencySkipped := false
 			for _, depID := range node.After {
@@ -1726,6 +2004,7 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 				}
 				if depStep.state != "SUCCEEDED" && depStep.state != "SKIPPED" {
 					allDepsMet = false
+					break
 				}
 			}
 			if !allDepsMet {
@@ -1750,6 +2029,121 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 				}
 				continue
 			}
+
+			if nodeType == "choice" {
+				if node.Choice == nil || len(node.Choice.Branches) == 0 {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+				var selectedBranch string
+				matched := false
+				// Fallback-only semantics: evaluate conditional branches in
+				// declaration order. The designated default never participates
+				// as an unconditional branch before fallback; declaration order
+				// applies solely to actual conditions.
+				defaultName := node.Choice.Default
+				declared := map[string]bool{}
+				for _, b := range node.Choice.Branches {
+					declared[b.Name] = true
+				}
+				// Malformed persisted manifests fail closed.
+				if defaultName != "" && !declared[defaultName] {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+				for _, b := range node.Choice.Branches {
+					if b.Name == defaultName {
+						continue
+					}
+					if b.Condition == nil {
+						if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+							return transitions, false, err
+						}
+						return transitions, true, nil
+					}
+					condMet, evalErr := contracts.EvaluateChoice(b.Condition, runInput, outputsMap)
+					if evalErr != nil {
+						if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+							return transitions, false, err
+						}
+						return transitions, true, nil
+					}
+					if condMet {
+						selectedBranch = b.Name
+						matched = true
+						break
+					}
+				}
+				if !matched && defaultName != "" {
+					selectedBranch = defaultName
+					matched = true
+				}
+				if !matched {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+
+				choiceOut := map[string]any{
+					"selected": selectedBranch,
+					"branch":   selectedBranch,
+				}
+				choiceBytes, err := json.Marshal(choiceOut)
+				if err != nil {
+					return transitions, false, err
+				}
+				tag, err := tx.Exec(ctx, `UPDATE run_steps SET state='SUCCEEDED', wait_reason=NULL, output=$1::jsonb, updated_at=clock_timestamp()
+					WHERE id=$2::uuid AND organization_id=$3::uuid AND state='BLOCKED'`, choiceBytes, st.id, organizationID)
+				if err != nil {
+					return transitions, false, err
+				}
+				if tag.RowsAffected() == 0 {
+					continue
+				}
+				st.state = "SUCCEEDED"
+				outputsMap[node.ID] = choiceOut
+				changed = true
+				transitions++
+				if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SUCCEEDED", map[string]any{
+					"stepId": st.id, "nodeId": node.ID, "output": choiceOut,
+				}); err != nil {
+					return transitions, false, err
+				}
+
+				branchNodes := getBranchNodes(workflow, node.ID, ancestors, descendants)
+				for bName, bSet := range branchNodes {
+					if bName == selectedBranch {
+						continue
+					}
+					for unselectedID := range bSet {
+						unst, ok := steps[unselectedID]
+						if !ok || unst.state != "BLOCKED" {
+							continue
+						}
+						tagSkip, err := tx.Exec(ctx, `UPDATE run_steps SET state='SKIPPED', wait_reason='BRANCH_NOT_SELECTED', updated_at=clock_timestamp()
+							WHERE id=$1::uuid AND organization_id=$2::uuid AND state='BLOCKED'`, unst.id, organizationID)
+						if err != nil {
+							return transitions, false, err
+						}
+						if tagSkip.RowsAffected() > 0 {
+							unst.state = "SKIPPED"
+							transitions++
+							if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_SKIPPED", map[string]any{
+								"stepId": unst.id, "nodeId": unselectedID, "reason": "BRANCH_NOT_SELECTED",
+							}); err != nil {
+								return transitions, false, err
+							}
+						}
+					}
+				}
+				continue
+			}
+
 			if node.Input != nil {
 				mapped, mapErr := contracts.MapInput(node.Input, runInput, outputsMap)
 				inputSchema, _ := manifest.taskSchemas(workflowName, node.ID)
