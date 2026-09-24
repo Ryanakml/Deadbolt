@@ -61,15 +61,6 @@ func (e *WorkerEngine) PauseRun(
 	if audit == nil {
 		return nil, tenant.ErrAuditRequired
 	}
-	// Blueprint §10.2 priority: the run deadline outranks pause. Settle an
-	// already-expired run in its own committed transaction before the
-	// idempotent command path (whose error rollback must never swallow the
-	// settlement), so pause can never park an expired run in PAUSING/PAUSED.
-	if settled, err := e.settleOverdueRunForControl(ctx, orgID, runID); err != nil {
-		return nil, err
-	} else if settled {
-		return nil, ErrRunDeadlineExceeded
-	}
 	var resp *RunDTO
 	mutate := func(ctx context.Context, tx storage.Tx) error {
 		r, err := e.pauseRunTx(ctx, tx, orgID, runID, req.ExpectedRevision, audit)
@@ -79,17 +70,25 @@ func (e *WorkerEngine) PauseRun(
 		resp = r
 		return nil
 	}
+	var execErr error
 	if e.commands != nil {
-		_, err := e.commands.WithCommandTx(ctx, orgID, "", http.StatusOK, mutate,
+		_, execErr = e.commands.WithCommandTx(ctx, orgID, "", http.StatusOK, mutate,
 			func() any { return resp },
 			func(raw json.RawMessage) error { return json.Unmarshal(raw, &resp) })
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
+	} else {
+		execErr = e.pool.WithTenantTx(ctx, orgID, mutate)
 	}
-	if err := e.pool.WithTenantTx(ctx, orgID, mutate); err != nil {
-		return nil, err
+
+	if execErr != nil {
+		// Blueprint §10.2 priority: if a fresh command finds the run deadline
+		// exceeded under the lock, durably settle it in its own committed
+		// transaction so rollback does not swallow the failure.
+		if errors.Is(execErr, ErrRunDeadlineExceeded) {
+			if _, settleErr := e.settleOverdueRunForControl(ctx, orgID, runID); settleErr != nil {
+				return nil, settleErr
+			}
+		}
+		return nil, execErr
 	}
 	return resp, nil
 }
@@ -99,14 +98,21 @@ func (e *WorkerEngine) pauseRunTx(
 	orgID, runID string, expectedRevision int64,
 	audit *tenant.AuditContext,
 ) (*RunDTO, error) {
+	if e.beforePauseLock != nil {
+		if err := e.beforePauseLock(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	var status, reason string
 	var revision int64
 	var environmentID string
 	var pauseRequested bool
-	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,''), revision, environment_id::text, pause_requested
+	var deadline *time.Time
+	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,''), revision, environment_id::text, pause_requested, deadline_at
 		FROM runs
 		WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`,
-		runID, orgID).Scan(&status, &reason, &revision, &environmentID, &pauseRequested); err != nil {
+		runID, orgID).Scan(&status, &reason, &revision, &environmentID, &pauseRequested, &deadline); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrRunNotFound
 		}
@@ -120,6 +126,13 @@ func (e *WorkerEngine) pauseRunTx(
 	}
 	if revision != expectedRevision {
 		return nil, ErrRevisionConflict
+	}
+	expired, err := runDeadlineExceededTx(ctx, tx, deadline)
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return nil, ErrRunDeadlineExceeded
 	}
 	if pauseRequested && (status == "PAUSING" || status == "PAUSED") {
 		// Duplicate pause request with matching revision: idempotent.
@@ -263,14 +276,6 @@ func (e *WorkerEngine) ResumeRun(
 	if audit == nil {
 		return nil, tenant.ErrAuditRequired
 	}
-	// Blueprint §10.2 priority: the run deadline outranks resume. Settle an
-	// already-expired run in its own committed transaction before any state
-	// recomputation so resume can never reopen it.
-	if settled, err := e.settleOverdueRunForControl(ctx, orgID, runID); err != nil {
-		return nil, err
-	} else if settled {
-		return nil, ErrRunDeadlineExceeded
-	}
 	var resp *RunDTO
 	mutate := func(ctx context.Context, tx storage.Tx) error {
 		r, err := e.resumeRunTx(ctx, tx, orgID, runID, req.ExpectedRevision, audit)
@@ -280,17 +285,25 @@ func (e *WorkerEngine) ResumeRun(
 		resp = r
 		return nil
 	}
+	var execErr error
 	if e.commands != nil {
-		_, err := e.commands.WithCommandTx(ctx, orgID, "", http.StatusOK, mutate,
+		_, execErr = e.commands.WithCommandTx(ctx, orgID, "", http.StatusOK, mutate,
 			func() any { return resp },
 			func(raw json.RawMessage) error { return json.Unmarshal(raw, &resp) })
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
+	} else {
+		execErr = e.pool.WithTenantTx(ctx, orgID, mutate)
 	}
-	if err := e.pool.WithTenantTx(ctx, orgID, mutate); err != nil {
-		return nil, err
+
+	if execErr != nil {
+		// Blueprint §10.2 priority: if a fresh command finds the run deadline
+		// exceeded under the lock, durably settle it in its own committed
+		// transaction so rollback does not swallow the failure.
+		if errors.Is(execErr, ErrRunDeadlineExceeded) {
+			if _, settleErr := e.settleOverdueRunForControl(ctx, orgID, runID); settleErr != nil {
+				return nil, settleErr
+			}
+		}
+		return nil, execErr
 	}
 	return resp, nil
 }
@@ -300,17 +313,24 @@ func (e *WorkerEngine) resumeRunTx(
 	orgID, runID string, expectedRevision int64,
 	audit *tenant.AuditContext,
 ) (*RunDTO, error) {
+	if e.beforeResumeLock != nil {
+		if err := e.beforeResumeLock(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	var status, reason, workflowName string
 	var revision int64
 	var environmentID string
 	var pauseRequested bool
+	var deadline *time.Time
 	var manifestBytes, rawRunInput []byte
 	if err := tx.QueryRow(ctx, `SELECT r.status, COALESCE(r.reason_code,''), r.revision,
-			r.environment_id::text, r.pause_requested, r.workflow_name, d.manifest, r.input
+			r.environment_id::text, r.pause_requested, r.deadline_at, r.workflow_name, d.manifest, r.input
 		FROM runs r
 		JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 		WHERE r.id=$1::uuid AND r.organization_id=$2::uuid FOR UPDATE OF r`,
-		runID, orgID).Scan(&status, &reason, &revision, &environmentID, &pauseRequested,
+		runID, orgID).Scan(&status, &reason, &revision, &environmentID, &pauseRequested, &deadline,
 		&workflowName, &manifestBytes, &rawRunInput); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrRunNotFound
@@ -325,6 +345,13 @@ func (e *WorkerEngine) resumeRunTx(
 	}
 	if revision != expectedRevision {
 		return nil, ErrRevisionConflict
+	}
+	expired, err := runDeadlineExceededTx(ctx, tx, deadline)
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return nil, ErrRunDeadlineExceeded
 	}
 	if !pauseRequested && status != "PAUSING" && status != "PAUSED" {
 		return nil, ErrRunNotPaused

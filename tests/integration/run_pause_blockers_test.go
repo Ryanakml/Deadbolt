@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Ryanakml/Deadbolt/internal/controlplane"
 	"github.com/Ryanakml/Deadbolt/internal/execution"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -1046,5 +1047,275 @@ func TestPauseClaimTransactionOrdering(t *testing.T) {
 		"SUCCEEDED", map[string]any{"ok": true}, nil)
 	if status, _, _, _ := pauseBlockerRunState(t, tc, orgID, runID2); status != "PAUSED" {
 		t.Fatalf("claim-before-pause attempt must finish and drain to PAUSED, got %s", status)
+	}
+}
+
+// TestPauseCommandIdempotencyReplayPastDeadline proves Blocker A Problem 1:
+// a completed pause mutation preserves its recorded outcome on replay even
+// after the run deadline passes and the run is terminalized.
+func TestPauseCommandIdempotencyReplayPastDeadline(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	const digest = "bundle-replay-deadline-1"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, safeManifest(3, 1000, 30000))
+	runID, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleDeveloper, "replay-deadline-dev")
+
+	rev := runRevision(t, tc, orgID, runID)
+	idempotencyKey := "idemp-pause-replay-deadline-test"
+
+	// 1. Initial pause succeeds with 200 PAUSED.
+	status, body := pauseRunHTTP(t, server, token, orgID, runID, rev, idempotencyKey)
+	if status != http.StatusOK || body["status"] != "PAUSED" {
+		t.Fatalf("expected 200 PAUSED, got %d (%v)", status, body)
+	}
+	originalRev := body["revision"]
+
+	// 2. Run deadline passes, and run is settled to FAILED/RUN_DEADLINE_EXCEEDED.
+	pauseBlockerExpireSQL(t, tc, orgID, `UPDATE runs SET deadline_at = clock_timestamp() - INTERVAL '1 minute' WHERE id=$1::uuid`, runID)
+	sweepLeases(t, tc, orgID)
+	st, reason, _, _ := pauseBlockerRunState(t, tc, orgID, runID)
+	if st != "FAILED" || reason != "RUN_DEADLINE_EXCEEDED" {
+		t.Fatalf("expected run to be FAILED/RUN_DEADLINE_EXCEEDED, got %s/%s", st, reason)
+	}
+
+	// 3. Retry identical pause with the SAME idempotency key.
+	// Must faithfully replay the recorded 200 outcome without reinterpreting through current run state.
+	status2, body2 := pauseRunHTTP(t, server, token, orgID, runID, rev, idempotencyKey)
+	if status2 != http.StatusOK {
+		t.Fatalf("replayed pause must return 200 OK, got %d (%v)", status2, body2)
+	}
+	if body2["status"] != "PAUSED" || body2["revision"] != originalRev {
+		t.Fatalf("replayed pause must match original outcome, got %v", body2)
+	}
+
+	// 4. A fresh pause request with a new idempotency key must be rejected (terminal run).
+	status3, body3 := pauseRunHTTP(t, server, token, orgID, runID, rev, "idemp-fresh-pause-key")
+	if status3 != http.StatusConflict || body3["code"] != "RUN_TERMINAL" {
+		t.Fatalf("fresh pause on terminal run must be 409 RUN_TERMINAL, got %d (%v)", status3, body3)
+	}
+}
+
+// TestResumeCommandIdempotencyReplayPastDeadline proves Blocker A Problem 1 for resume:
+// a completed resume mutation preserves its recorded outcome on replay even
+// after the run deadline passes and the run is terminalized.
+func TestResumeCommandIdempotencyReplayPastDeadline(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	const digest = "bundle-resume-replay-1"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, safeManifest(3, 1000, 30000))
+	runID, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleDeveloper, "resume-replay-dev")
+
+	// Pause first.
+	rev := runRevision(t, tc, orgID, runID)
+	if status, _ := pauseRunHTTP(t, server, token, orgID, runID, rev, ""); status != http.StatusOK {
+		t.Fatalf("pause setup failed, got %d", status)
+	}
+
+	// Resume with explicit idempotency key -> 200 QUEUED.
+	resumeRev := runRevision(t, tc, orgID, runID)
+	resumeKey := "idemp-resume-replay-deadline-test"
+	status, body := resumeRunHTTP(t, server, token, orgID, runID, resumeRev, resumeKey)
+	if status != http.StatusOK || body["status"] != "QUEUED" {
+		t.Fatalf("expected 200 QUEUED, got %d (%v)", status, body)
+	}
+	originalRev := body["revision"]
+
+	// Deadline passes and run is swept to FAILED.
+	pauseBlockerExpireSQL(t, tc, orgID, `UPDATE runs SET deadline_at = clock_timestamp() - INTERVAL '1 minute' WHERE id=$1::uuid`, runID)
+	sweepLeases(t, tc, orgID)
+	st, reason, _, _ := pauseBlockerRunState(t, tc, orgID, runID)
+	if st != "FAILED" || reason != "RUN_DEADLINE_EXCEEDED" {
+		t.Fatalf("expected run to be FAILED/RUN_DEADLINE_EXCEEDED, got %s/%s", st, reason)
+	}
+
+	// Retry identical resume with the SAME idempotency key.
+	status2, body2 := resumeRunHTTP(t, server, token, orgID, runID, resumeRev, resumeKey)
+	if status2 != http.StatusOK {
+		t.Fatalf("replayed resume must return 200 OK, got %d (%v)", status2, body2)
+	}
+	if body2["status"] != "QUEUED" || body2["revision"] != originalRev {
+		t.Fatalf("replayed resume must match original outcome, got %v", body2)
+	}
+
+	// Fresh resume request must be rejected.
+	status3, body3 := resumeRunHTTP(t, server, token, orgID, runID, resumeRev, "idemp-fresh-resume-key")
+	if status3 != http.StatusConflict || body3["code"] != "RUN_TERMINAL" {
+		t.Fatalf("fresh resume on terminal run must be 409 RUN_TERMINAL, got %d (%v)", status3, body3)
+	}
+}
+
+// TestFreshPauseDeadlineCrossingBeforeLockTOCTOU proves Blocker A Problem 2:
+// deadline revalidation is authoritative under the run lock; if deadline expires
+// right before the mutation acquires the lock, pause is rejected (409 RUN_DEADLINE_EXCEEDED)
+// and the run is durably settled to FAILED/RUN_DEADLINE_EXCEEDED.
+func TestFreshPauseDeadlineCrossingBeforeLockTOCTOU(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+
+	owner, _ := tenant.NewUUID()
+	org, err := tc.service.CreateOrganization(ctx, owner, "TOCTOU Pause Org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := tc.service.CreateProject(ctx, org.ID, "TOCTOU Project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := tc.service.CreateEnvironment(ctx, org.ID, project.ID, tenant.EnvStaging, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	engine := execution.NewWorkerEngine(tc.pool)
+	prodMux := controlplane.BuildMuxWithComponents(tc.authCfg, tc.runtimePool, nil, nil, nil, nil, engine)
+	server := httptest.NewServer(prodMux)
+	defer server.Close()
+
+	const digest = "bundle-toctou-pause-1"
+	deploymentID := seedRetryDeployment(t, tc, org.ID, env.ID, digest, safeManifest(3, 1000, 30000))
+	runID, _ := seedExecutionRun(t, tc, org.ID, env.ID, deploymentID, "node-a")
+	token, _ := reconcileHumanToken(t, tc, org.ID, tenant.RoleDeveloper, "toctou-pause-dev")
+
+	// Hook simulates deadline crossing right before pauseRunTx locks the run.
+	engine.SetBeforePauseLockHookForTest(func(ctx context.Context) error {
+		return tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE runs SET deadline_at = clock_timestamp() - INTERVAL '1 minute' WHERE id=$1::uuid`, runID)
+			return err
+		})
+	})
+
+	rev := runRevision(t, tc, org.ID, runID)
+	status, body := pauseRunHTTP(t, server, token, org.ID, runID, rev, "key-toctou-pause-1")
+	if status != http.StatusConflict || body["code"] != "RUN_DEADLINE_EXCEEDED" {
+		t.Fatalf("pause must be rejected with 409 RUN_DEADLINE_EXCEEDED, got %d (%v)", status, body)
+	}
+
+	// Verify run is durably settled to FAILED/RUN_DEADLINE_EXCEEDED in the database.
+	runSt, reason, _, _ := pauseBlockerRunState(t, tc, org.ID, runID)
+	if runSt != "FAILED" || reason != "RUN_DEADLINE_EXCEEDED" {
+		t.Fatalf("run must be settled to FAILED/RUN_DEADLINE_EXCEEDED, got %s/%s", runSt, reason)
+	}
+	if countRunEvents(t, tc, org.ID, runID, "RUN_FAILED") != 1 {
+		t.Fatalf("expected exactly 1 RUN_FAILED event")
+	}
+}
+
+// TestFreshResumeDeadlineCrossingBeforeLockTOCTOU proves Blocker A Problem 2 for resume:
+// if deadline expires right before resumeRunTx acquires the lock, resume is rejected
+// (409 RUN_DEADLINE_EXCEEDED), the run is settled, and work cannot reopen past deadline.
+func TestFreshResumeDeadlineCrossingBeforeLockTOCTOU(t *testing.T) {
+	tc := setupTenantContext(t)
+	defer tc.cleanup()
+	ctx := context.Background()
+
+	owner, _ := tenant.NewUUID()
+	org, err := tc.service.CreateOrganization(ctx, owner, "TOCTOU Resume Org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := tc.service.CreateProject(ctx, org.ID, "TOCTOU Project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := tc.service.CreateEnvironment(ctx, org.ID, project.ID, tenant.EnvStaging, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	engine := execution.NewWorkerEngine(tc.pool)
+	prodMux := controlplane.BuildMuxWithComponents(tc.authCfg, tc.runtimePool, nil, nil, nil, nil, engine)
+	server := httptest.NewServer(prodMux)
+	defer server.Close()
+
+	const digest = "bundle-toctou-resume-1"
+	deploymentID := seedRetryDeployment(t, tc, org.ID, env.ID, digest, safeManifest(3, 1000, 30000))
+	runID, stepID := seedExecutionRun(t, tc, org.ID, env.ID, deploymentID, "node-a")
+	token, _ := reconcileHumanToken(t, tc, org.ID, tenant.RoleDeveloper, "toctou-resume-dev")
+
+	// Pause cleanly first.
+	rev := runRevision(t, tc, org.ID, runID)
+	if status, _ := pauseRunHTTP(t, server, token, org.ID, runID, rev, ""); status != http.StatusOK {
+		t.Fatalf("setup pause failed, got %d", status)
+	}
+
+	// Hook simulates deadline crossing right before resumeRunTx locks the run.
+	engine.SetBeforeResumeLockHookForTest(func(ctx context.Context) error {
+		return tc.pool.WithTenantTx(ctx, org.ID, func(ctx context.Context, tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE runs SET deadline_at = clock_timestamp() - INTERVAL '1 minute' WHERE id=$1::uuid`, runID)
+			return err
+		})
+	})
+
+	resumeRev := runRevision(t, tc, org.ID, runID)
+	status, body := resumeRunHTTP(t, server, token, org.ID, runID, resumeRev, "key-toctou-resume-1")
+	if status != http.StatusConflict || body["code"] != "RUN_DEADLINE_EXCEEDED" {
+		t.Fatalf("resume must be rejected with 409 RUN_DEADLINE_EXCEEDED, got %d (%v)", status, body)
+	}
+
+	// Verify run is settled and work cannot reopen.
+	runSt, reason, _, _ := pauseBlockerRunState(t, tc, org.ID, runID)
+	if runSt != "FAILED" || reason != "RUN_DEADLINE_EXCEEDED" {
+		t.Fatalf("run must be settled to FAILED/RUN_DEADLINE_EXCEEDED, got %s/%s", runSt, reason)
+	}
+	if st, _ := pauseBlockerStepState(t, tc, org.ID, stepID); st == "READY" {
+		t.Fatalf("step must not reopen to READY past deadline")
+	}
+}
+
+// TestConcurrentSweepVsPauseResumeDeadlineRace proves that concurrent sweep
+// vs pause/resume on an expired run yields a single authoritative terminal result,
+// with exactly one terminal event and no work reopening.
+func TestConcurrentSweepVsPauseResumeDeadlineRace(t *testing.T) {
+	tc, server, orgID, envID, _ := setupWorkerIntegrationTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	const digest = "bundle-race-sweep-pause-1"
+	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, safeManifest(3, 1000, 30000))
+	token, _ := reconcileHumanToken(t, tc, orgID, tenant.RoleDeveloper, "race-sweep-dev")
+
+	for i := 0; i < 5; i++ {
+		runID, _ := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+		// Expire deadline immediately.
+		pauseBlockerExpireSQL(t, tc, orgID, `UPDATE runs SET deadline_at = clock_timestamp() - INTERVAL '1 minute' WHERE id=$1::uuid`, runID)
+		rev := runRevision(t, tc, orgID, runID)
+
+		var wg sync.WaitGroup
+		var pauseStatus int
+		var pauseBody map[string]any
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			sweepLeases(t, tc, orgID)
+		}()
+		go func() {
+			defer wg.Done()
+			pauseStatus, pauseBody = pauseRunHTTP(t, server, token, orgID, runID, rev, fmt.Sprintf("race-key-%d", i))
+		}()
+		wg.Wait()
+
+		// Pause should either be 409 RUN_DEADLINE_EXCEEDED (if it won) or 409 RUN_TERMINAL (if sweep won).
+		if pauseStatus != http.StatusConflict || (pauseBody["code"] != "RUN_DEADLINE_EXCEEDED" && pauseBody["code"] != "RUN_TERMINAL") {
+			t.Fatalf("iteration %d: expected 409 RUN_DEADLINE_EXCEEDED or RUN_TERMINAL, got %d (%v)", i, pauseStatus, pauseBody)
+		}
+
+		// Run must be settled to FAILED/RUN_DEADLINE_EXCEEDED.
+		st, reason, _, _ := pauseBlockerRunState(t, tc, orgID, runID)
+		if st != "FAILED" || reason != "RUN_DEADLINE_EXCEEDED" {
+			t.Fatalf("iteration %d: run must be FAILED/RUN_DEADLINE_EXCEEDED, got %s/%s", i, st, reason)
+		}
+
+		// Exactly one RUN_FAILED event must exist.
+		if count := countRunEvents(t, tc, orgID, runID, "RUN_FAILED"); count != 1 {
+			t.Fatalf("iteration %d: expected exactly 1 RUN_FAILED event, got %d", i, count)
+		}
 	}
 }

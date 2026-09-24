@@ -30,6 +30,8 @@ type WorkerEngine struct {
 	artifacts            *artifacts.Service
 	beforeCompleteCommit func() error
 	afterCompleteCommit  func() error
+	beforePauseLock      func(context.Context) error
+	beforeResumeLock     func(context.Context) error
 }
 
 func NewWorkerEngine(pool *storage.Pool, hub ...*EventHub) *WorkerEngine {
@@ -69,6 +71,18 @@ func (e *WorkerEngine) SetBeforeCompleteCommitHookForTest(hook func() error) {
 // Complete has committed. Production constructors leave it nil.
 func (e *WorkerEngine) SetAfterCompleteCommitHookForTest(hook func() error) {
 	e.afterCompleteCommit = hook
+}
+
+// SetBeforePauseLockHookForTest injects an action right before acquiring the
+// authoritative run lock in PauseRun. Production constructors leave it nil.
+func (e *WorkerEngine) SetBeforePauseLockHookForTest(hook func(context.Context) error) {
+	e.beforePauseLock = hook
+}
+
+// SetBeforeResumeLockHookForTest injects an action right before acquiring the
+// authoritative run lock in ResumeRun. Production constructors leave it nil.
+func (e *WorkerEngine) SetBeforeResumeLockHookForTest(hook func(context.Context) error) {
+	e.beforeResumeLock = hook
 }
 
 type workflowNode struct {
