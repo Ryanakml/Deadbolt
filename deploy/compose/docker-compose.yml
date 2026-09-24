@@ -26,7 +26,7 @@ services:
     volumes:
       - deadbolt_postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deadbolt_system"]
+      test: ["CMD-SHELL", "pg_isready -U deadbolt_system -d deadbolt"]
       interval: 3s
       timeout: 3s
       retries: 15
