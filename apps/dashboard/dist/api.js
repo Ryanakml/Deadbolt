@@ -210,6 +210,39 @@ export class DashboardApiClient {
         }
         return res.json();
     }
+    // pauseRun requests durable pause. The caller binds expectedRevision;
+    // a 409 means the run changed and the dialog must refresh instead of retrying blindly.
+    async pauseRun(runId, expectedRevision, idempotencyKey) {
+        const res = await apiFetch(`${this.baseUrl}/v1/runs/${encodeURIComponent(runId)}/pause`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify({ expectedRevision }),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to pause run (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
+    // resumeRun resumes a paused or pausing run.
+    async resumeRun(runId, expectedRevision, idempotencyKey) {
+        const res = await apiFetch(`${this.baseUrl}/v1/runs/${encodeURIComponent(runId)}/resume`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify({ expectedRevision }),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to resume run (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
     // listProjects discovers the active organization's projects through the
     // existing public tenant API using the BFF session cookie.
     async listProjects() {

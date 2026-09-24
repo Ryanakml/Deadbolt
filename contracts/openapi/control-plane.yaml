@@ -354,7 +354,7 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
+      x-implemented: true
       x-required-capability: runs:control
       x-minimum-capability: V1
   /runs/{id}/resume:
@@ -400,7 +400,7 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "503":
           $ref: "#/components/responses/ErrorResponse"
-      x-implemented: false
+      x-implemented: true
       x-required-capability: runs:control
       requestBody:
         required: true

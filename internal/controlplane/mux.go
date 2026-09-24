@@ -102,6 +102,10 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("POST /v1/reconciliation-cases/{id}/resolve", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsReconcile, executionHandler.ResolveCase))))
 		mux.Handle("POST /api/v1/runs/{id}/cancel", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.CancelRun))))
 		mux.Handle("POST /v1/runs/{id}/cancel", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.CancelRun))))
+		mux.Handle("POST /api/v1/runs/{id}/pause", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.PauseRun))))
+		mux.Handle("POST /v1/runs/{id}/pause", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.PauseRun))))
+		mux.Handle("POST /api/v1/runs/{id}/resume", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.ResumeRun))))
+		mux.Handle("POST /v1/runs/{id}/resume", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.ResumeRun))))
 
 		// Scoped artifacts: worker sessions (dbs_ bearers) authenticate
 		// through the worker chain with attempt-ownership checks inside the

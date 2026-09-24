@@ -30,6 +30,8 @@ type WorkerEngine struct {
 	artifacts            *artifacts.Service
 	beforeCompleteCommit func() error
 	afterCompleteCommit  func() error
+	beforePauseLock      func(context.Context) error
+	beforeResumeLock     func(context.Context) error
 }
 
 func NewWorkerEngine(pool *storage.Pool, hub ...*EventHub) *WorkerEngine {
@@ -69,6 +71,18 @@ func (e *WorkerEngine) SetBeforeCompleteCommitHookForTest(hook func() error) {
 // Complete has committed. Production constructors leave it nil.
 func (e *WorkerEngine) SetAfterCompleteCommitHookForTest(hook func() error) {
 	e.afterCompleteCommit = hook
+}
+
+// SetBeforePauseLockHookForTest injects an action right before acquiring the
+// authoritative run lock in PauseRun. Production constructors leave it nil.
+func (e *WorkerEngine) SetBeforePauseLockHookForTest(hook func(context.Context) error) {
+	e.beforePauseLock = hook
+}
+
+// SetBeforeResumeLockHookForTest injects an action right before acquiring the
+// authoritative run lock in ResumeRun. Production constructors leave it nil.
+func (e *WorkerEngine) SetBeforeResumeLockHookForTest(hook func(context.Context) error) {
+	e.beforeResumeLock = hook
 }
 
 type choiceBranch struct {
@@ -962,6 +976,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 					AND (candidate_w.pool_name=$5 OR $5 = '' OR candidate_w.pool_name='default')
 					AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
 					AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
+					AND r.pause_requested = false
 					AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
 					AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
 						JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
@@ -1379,6 +1394,16 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 					}
 					continue
 				}
+			}
+
+			// Canonical lock order: lock run before step (Blueprint §11.2)
+			// and block claims committed after pause request.
+			var pauseReq bool
+			if err := tx.QueryRow(ctx, `SELECT pause_requested FROM runs WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, match.runID, session.OrganizationID).Scan(&pauseReq); err != nil {
+				return err
+			}
+			if pauseReq {
+				continue
 			}
 
 			var epoch int64
@@ -2559,6 +2584,9 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		if err := settleHoldAfterCompletionTx(ctx, tx, session.OrganizationID, runID); err != nil {
 			return err
 		}
+		if err := settlePauseAfterCompletionTx(ctx, tx, session.OrganizationID, runID); err != nil {
+			return err
+		}
 		if e.beforeCompleteCommit != nil {
 			return e.beforeCompleteCommit()
 		}
@@ -2960,7 +2988,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 		LEFT JOIN task_leases l ON l.attempt_id=a.id AND l.organization_id=a.organization_id
 		JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 		WHERE r.organization_id=$1::uuid
-			AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
+			AND (r.status IN ('QUEUED','RUNNING','PAUSING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
 			AND a.status IN ('CLAIMED','RUNNING')
 			AND (
 				(a.status='CLAIMED' AND (a.claim_start_deadline_at <= clock_timestamp() OR (l.expires_at IS NOT NULL AND l.expires_at <= clock_timestamp()) OR l.step_id IS NULL))
@@ -3019,7 +3047,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 		JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
 		WHERE r.organization_id=$1::uuid
 			AND rs.state='WAITING' AND rs.wait_reason='RECOVERY_HANDOFF'
-			AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
+			AND (r.status IN ('QUEUED','RUNNING','PAUSING') OR (r.status='WAITING' AND r.reason_code='RECOVERY_HANDOFF'))
 		ORDER BY r.id, rs.id
 		LIMIT 50
 		FOR UPDATE OF r, rs SKIP LOCKED`, organizationID)
@@ -3069,8 +3097,14 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.runID, organizationID).Scan(&curRunStatus); err != nil {
 			continue
 		}
+		// PAUSING is nonterminal for recovery: an already-committed in-flight
+		// attempt must still finish, timeout, become LOST, schedule a durable
+		// retry/hold, or fail the run (Blueprint §10.2, §11.2). New claims
+		// stay blocked by the pause_requested guard in the claim path, not
+		// here. PAUSED (zero live attempts by definition) and terminal or
+		// cancelling runs never gain work from a stale snapshot.
 		switch curRunStatus {
-		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSED":
 			continue
 		}
 		var curStepState string
@@ -3121,6 +3155,16 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			}
 			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='RUN_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
 				WHERE id=$1::uuid AND organization_id=$2::uuid`, c.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			// Settle consistently with the canonical fail-fast path: pending
+			// timers die with the run so a later firing cannot reopen it, and
+			// open holds close mooted by the terminal decision.
+			if _, err := tx.Exec(ctx, `UPDATE timers SET state='CANCELLED', updated_at=clock_timestamp()
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, c.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if err := closeOpenCasesTx(ctx, tx, organizationID, c.runID, nil, "RUN_DEADLINE_EXCEEDED", "FAIL"); err != nil {
 				return 0, nil, err
 			}
 			if err := appendRunEvent(ctx, tx, organizationID, c.runID, "TASK_LOST", map[string]any{
@@ -3245,7 +3289,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			continue
 		}
 		switch hRunStatus {
-		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSED":
 			continue
 		}
 		reclaimedRunsMap[h.runID] = struct{}{}
@@ -3264,6 +3308,14 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			}
 			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='RUN_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
 				WHERE id=$1::uuid AND organization_id=$2::uuid`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			// Same canonical settlement as above: timers die, holds close.
+			if _, err := tx.Exec(ctx, `UPDATE timers SET state='CANCELLED', updated_at=clock_timestamp()
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if err := closeOpenCasesTx(ctx, tx, organizationID, h.runID, nil, "RUN_DEADLINE_EXCEEDED", "FAIL"); err != nil {
 				return 0, nil, err
 			}
 			if err := appendRunEvent(ctx, tx, organizationID, h.runID, "RUN_FAILED", map[string]any{
@@ -3317,6 +3369,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 
 	affectedRuns := make([]string, 0, len(reclaimedRunsMap))
 	for rID := range reclaimedRunsMap {
+		_ = settlePauseAfterCompletionTx(ctx, tx, organizationID, rID)
 		affectedRuns = append(affectedRuns, rID)
 	}
 	return reclaimedCount, affectedRuns, nil

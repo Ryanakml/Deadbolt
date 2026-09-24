@@ -368,7 +368,19 @@ export class RunInspector {
                 }
                 break;
             case "run.resumed":
-                // The server moved the run out of a hold; converge on authority.
+                if (typeof payload.status === "string") {
+                    this.snapshot.status = payload.status;
+                }
+                else {
+                    this.snapshot.status = "RUNNING";
+                }
+                if (typeof payload.reason === "string") {
+                    this.snapshot.reasonCode = payload.reason;
+                }
+                else {
+                    delete this.snapshot.reasonCode;
+                }
+                // The server moved the run out of a hold or pause; converge on authority.
                 void this.fetchSnapshot().catch(() => undefined);
                 break;
             case "step.succeeded":
@@ -424,6 +436,18 @@ export class RunInspector {
                 break;
             case "run.cancelling":
                 this.snapshot.status = "CANCELLING";
+                if (typeof payload.reason === "string") {
+                    this.snapshot.reasonCode = payload.reason;
+                }
+                break;
+            case "run.pausing":
+                this.snapshot.status = "PAUSING";
+                if (typeof payload.reason === "string") {
+                    this.snapshot.reasonCode = payload.reason;
+                }
+                break;
+            case "run.paused":
+                this.snapshot.status = "PAUSED";
                 if (typeof payload.reason === "string") {
                     this.snapshot.reasonCode = payload.reason;
                 }

@@ -328,14 +328,21 @@ func settleCancellingRunsTx(ctx context.Context, tx storage.Tx, orgID string) (i
 }
 
 // failOverdueRunsTx terminalizes runs whose deadline passed with no live
-// work left to settle them: held runs, retry waits, and never-claimed queue.
-// Runs with live attempts are left alone; their attempt deadlines already
-// incorporate the run deadline and drive recovery through policy.
+// work left to settle them: held runs, retry waits, never-claimed queue,
+// and fully paused runs. The run deadline never freezes while paused
+// (Blueprint §15.3): a PAUSED run with zero active attempts has nothing else
+// to observe its deadline, so this sweep is its authoritative settlement.
+// Runs with live attempts are left alone here; their attempt deadlines
+// already incorporate the run deadline and drive recovery through policy
+// (including the PAUSING branch of the expired-lease sweep).
+// Settlement reuses the canonical fail-fast machinery so timers die with the
+// run and open holds close mooted; no work is launched to discover expiry
+// (DB time only).
 func failOverdueRunsTx(ctx context.Context, tx storage.Tx, orgID string) (int, []string, error) {
 	rows, err := tx.Query(ctx, `SELECT DISTINCT r.id::text
 		FROM runs r
 		WHERE r.organization_id=$1::uuid
-			AND r.status IN ('QUEUED','RUNNING','WAITING')
+			AND r.status IN ('QUEUED','RUNNING','WAITING','PAUSING','PAUSED')
 			AND r.deadline_at IS NOT NULL AND r.deadline_at <= clock_timestamp()
 			AND NOT EXISTS (SELECT 1 FROM task_attempts a
 				JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
@@ -369,7 +376,7 @@ func failOverdueRunsTx(ctx context.Context, tx storage.Tx, orgID string) (int, [
 			continue
 		}
 		switch runStatus {
-		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING":
 			continue
 		}
 		var stepID string
@@ -377,6 +384,14 @@ func failOverdueRunsTx(ctx context.Context, tx storage.Tx, orgID string) (int, [
 			WHERE rs.run_id=$1::uuid AND rs.organization_id=$2::uuid
 				AND rs.state IN ('BLOCKED','READY','RUNNING','WAITING')
 			ORDER BY rs.id LIMIT 1 FOR UPDATE OF rs`, runID, orgID).Scan(&stepID); err != nil {
+			// Degenerate but possible: a nonterminal run with no remaining
+			// nonterminal step (e.g. a paused run whose steps all settled
+			// without terminalizing it). The deadline still wins: fail the
+			// run directly so it can never linger past its deadline.
+			if err := failOverdueRunWithoutStepsTx(ctx, tx, orgID, runID); err != nil {
+				return 0, nil, err
+			}
+			affected = append(affected, runID)
 			continue
 		}
 		if err := failRunForStepTx(ctx, tx, orgID, runID, stepID, "RUN_DEADLINE_EXCEEDED", nil); err != nil {
@@ -385,4 +400,30 @@ func failOverdueRunsTx(ctx context.Context, tx storage.Tx, orgID string) (int, [
 		affected = append(affected, runID)
 	}
 	return len(affected), affected, nil
+}
+
+// failOverdueRunWithoutStepsTx fails a nonterminal overdue run that has no
+// remaining nonterminal step to attribute the failure to. It applies the same
+// settlement as the canonical path: pending timers die, open holds close
+// mooted, and exactly one RUN_FAILED event is recorded.
+func failOverdueRunWithoutStepsTx(ctx context.Context, tx storage.Tx, orgID, runID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE timers SET state='CANCELLED', updated_at=clock_timestamp()
+		WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, runID, orgID); err != nil {
+		return err
+	}
+	if err := closeOpenCasesTx(ctx, tx, orgID, runID, nil, "RUN_DEADLINE_EXCEEDED", "FAIL"); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='RUN_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
+		WHERE id=$1::uuid AND organization_id=$2::uuid
+			AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED')`, runID, orgID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	return appendRunEvent(ctx, tx, orgID, runID, "RUN_FAILED", map[string]any{
+		"status": "FAILED", "reason": "RUN_DEADLINE_EXCEEDED",
+	})
 }
