@@ -211,10 +211,100 @@ export const schemas: Record<string, JSONValue> = {
                     "type": "boolean"
                   },
                   "choice": {
-                    "type": "object"
+                    "type": "object",
+                    "properties": {
+                      "branches": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                              "not": {
+                                "pattern": "[^a-zA-Z0-9_-]"
+                              }
+                            },
+                            "condition": {
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "name"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "default": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                        "not": {
+                          "pattern": "[^a-zA-Z0-9_-]"
+                        }
+                      }
+                    },
+                    "required": [
+                      "branches"
+                    ],
+                    "additionalProperties": false
                   },
                   "merge": {
-                    "type": "object"
+                    "type": "object",
+                    "properties": {
+                      "choice": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                        "not": {
+                          "pattern": "[^a-zA-Z0-9_-]"
+                        }
+                      },
+                      "branches": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "branch": {
+                              "type": "string",
+                              "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                              "not": {
+                                "pattern": "[^a-zA-Z0-9_-]"
+                              }
+                            },
+                            "terminal": {
+                              "type": "string",
+                              "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                              "not": {
+                                "pattern": "[^a-zA-Z0-9_-]"
+                              }
+                            },
+                            "value": {}
+                          },
+                          "required": [
+                            "branch",
+                            "terminal"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "outputSchema": {
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "choice",
+                      "branches",
+                      "outputSchema"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "branch": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                    "not": {
+                      "pattern": "[^a-zA-Z0-9_-]"
+                    }
                   },
                   "approval": {
                     "type": "object"
@@ -253,6 +343,82 @@ export const schemas: Record<string, JSONValue> = {
                           {
                             "required": [
                               "merge"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "approval"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "delayMs"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "type": {
+                          "const": "choice"
+                        }
+                      }
+                    },
+                    "then": {
+                      "required": [
+                        "choice"
+                      ],
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "task"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "merge"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "approval"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "delayMs"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "type": {
+                          "const": "merge"
+                        }
+                      }
+                    },
+                    "then": {
+                      "required": [
+                        "merge"
+                      ],
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "task"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "choice"
                             ]
                           },
                           {
@@ -350,7 +516,7 @@ export const schemas: Record<string, JSONValue> = {
               "additionalProperties": false
             }
           },
-          "description": "Versioned language contract. Control fields are reserved for V1. Executable task-only static DAGs support parallel dependencies; control-node execution is not enabled."
+          "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Approval and delay nodes are reserved for V1."
         }
       }
     },
@@ -631,10 +797,100 @@ export const schemas: Record<string, JSONValue> = {
               "type": "boolean"
             },
             "choice": {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "branches": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                        "not": {
+                          "pattern": "[^a-zA-Z0-9_-]"
+                        }
+                      },
+                      "condition": {
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "default": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                  "not": {
+                    "pattern": "[^a-zA-Z0-9_-]"
+                  }
+                }
+              },
+              "required": [
+                "branches"
+              ],
+              "additionalProperties": false
             },
             "merge": {
-              "type": "object"
+              "type": "object",
+              "properties": {
+                "choice": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                  "not": {
+                    "pattern": "[^a-zA-Z0-9_-]"
+                  }
+                },
+                "branches": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "branch": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                        "not": {
+                          "pattern": "[^a-zA-Z0-9_-]"
+                        }
+                      },
+                      "terminal": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                        "not": {
+                          "pattern": "[^a-zA-Z0-9_-]"
+                        }
+                      },
+                      "value": {}
+                    },
+                    "required": [
+                      "branch",
+                      "terminal"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "choice",
+                "branches",
+                "outputSchema"
+              ],
+              "additionalProperties": false
+            },
+            "branch": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+              "not": {
+                "pattern": "[^a-zA-Z0-9_-]"
+              }
             },
             "approval": {
               "type": "object"
@@ -673,6 +929,82 @@ export const schemas: Record<string, JSONValue> = {
                     {
                       "required": [
                         "merge"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "approval"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "delayMs"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "choice"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "choice"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "task"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "merge"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "approval"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "delayMs"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "merge"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "merge"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "task"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "choice"
                       ]
                     },
                     {
@@ -770,7 +1102,7 @@ export const schemas: Record<string, JSONValue> = {
         "additionalProperties": false
       }
     },
-    "description": "Versioned language contract. Control fields are reserved for V1. Executable task-only static DAGs support parallel dependencies; control-node execution is not enabled."
+    "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Approval and delay nodes are reserved for V1."
   },
   "worker/protocol.schema.json": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -327,14 +327,20 @@ func (s *Service) CreateRun(
 		}
 
 		// 5. Create run_steps from graph
+		stepIDs := make(map[string]string, len(targetWorkflow.Nodes))
+		evalSteps := make(map[string]*dagEvalStep, len(targetWorkflow.Nodes))
+		hasControlNode := false
 		for _, node := range targetWorkflow.Nodes {
 			kind := node.Type
 			if kind == "" {
 				kind = "task"
 			}
+			if kind == "choice" || kind == "merge" {
+				hasControlNode = true
+			}
 			initState := "BLOCKED"
 			var eligibleAt any = nil
-			if len(node.After) == 0 {
+			if len(node.After) == 0 && kind == "task" {
 				initState = "READY"
 				eligibleAt = time.Now()
 			}
@@ -344,10 +350,13 @@ func (s *Service) CreateRun(
 			) VALUES (
 				$1::uuid, $2::uuid, $3::uuid, $4,
 				$5, $6, $7, clock_timestamp(), clock_timestamp()
-			)`
-			if _, err := tx.Exec(ctx, stepQuery, orgID, envID, runID, node.ID, kind, initState, eligibleAt); err != nil {
+			) RETURNING id::text`
+			var stepID string
+			if err := tx.QueryRow(ctx, stepQuery, orgID, envID, runID, node.ID, kind, initState, eligibleAt).Scan(&stepID); err != nil {
 				return fmt.Errorf("insert step %s: %w", node.ID, err)
 			}
+			stepIDs[node.ID] = stepID
+			evalSteps[node.ID] = &dagEvalStep{id: stepID, state: initState}
 		}
 
 		// 6. Record idempotency
@@ -427,6 +436,36 @@ func (s *Service) CreateRun(
 			CreatedAt:      createdAt.UTC().Format(time.RFC3339),
 			DeadlineAt:     deadlineStr,
 		}
+
+		if hasControlNode {
+			outputsMap := make(map[string]any)
+			if _, runFailed, err := evaluateBlockedDAGTx(ctx, tx, orgID, runID, workflowName, targetWorkflow, &manifest, input, evalSteps, outputsMap, ""); err != nil {
+				return fmt.Errorf("evaluate initial DAG: %w", err)
+			} else if runFailed {
+				var status string
+				_ = tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, orgID).Scan(&status)
+				if status != "" {
+					resultRun.Status = contracts.RunStatus(status)
+				} else {
+					resultRun.Status = contracts.RunStatusFAILED
+				}
+			} else {
+				states := make(map[string]string, len(evalSteps))
+				for nodeID, st := range evalSteps {
+					states[nodeID] = st.state
+				}
+				if settled, err := settleRunTerminalTx(ctx, tx, orgID, runID, targetWorkflow, states, outputsMap, input, nil); err != nil {
+					return fmt.Errorf("settle initial DAG: %w", err)
+				} else if settled {
+					var status string
+					_ = tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, orgID).Scan(&status)
+					if status != "" {
+						resultRun.Status = contracts.RunStatus(status)
+					}
+				}
+			}
+		}
+
 		if s.beforeCreateCommit != nil {
 			return s.beforeCreateCommit()
 		}
