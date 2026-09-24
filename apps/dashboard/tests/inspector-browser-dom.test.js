@@ -119,6 +119,9 @@ function installDom() {
           for (const c of node.children) {
             if (c === child || search(c)) return true;
           }
+          for (const c of node._bySel.values()) {
+            if (c === child || search(c)) return true;
+          }
           return false;
         };
         return search(el);
@@ -159,19 +162,22 @@ function installDom() {
           if (sel.startsWith("#")) {
             const id = sel.slice(1);
             if (node._html.includes(`id="${id}"`)) {
+              const isNew = !node._bySel.has(`#${id}`);
               const stub = node._child(`#${id}`);
               stub.id = id;
               const openMatch = node._html.match(
                 new RegExp(`<([a-zA-Z0-9_-]+)[^>]*id="${id}"[^>]*>`),
               );
               if (openMatch) {
-                for (const am of openMatch[0].matchAll(
-                  /([a-zA-Z0-9_-]+)="([^"]*)"/g,
-                )) {
-                  stub.setAttribute(am[1], am[2]);
-                  if (am[1] === "class") {
-                    for (const c of am[2].split(/\s+/))
-                      if (c) stub.classList.add(c);
+                if (isNew) {
+                  for (const am of openMatch[0].matchAll(
+                    /([a-zA-Z0-9_-]+)="([^"]*)"/g,
+                  )) {
+                    stub.setAttribute(am[1], am[2]);
+                    if (am[1] === "class") {
+                      for (const c of am[2].split(/\s+/))
+                        if (c) stub.classList.add(c);
+                    }
                   }
                 }
                 const afterOpen = node._html.slice(
@@ -496,6 +502,13 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
     const snapshot = build200StepPersistedSnapshot();
     const logCalls = [];
 
+    let streamController = null;
+    function emitSseEvent(eventObj) {
+      if (!streamController) return;
+      const sseText = `event: event\ndata: ${JSON.stringify(eventObj)}\n\n`;
+      streamController.enqueue(new TextEncoder().encode(sseText));
+    }
+
     globalThis.fetch = async (input, init = {}) => {
       const url = String(input);
       const method = (init.method || "GET").toUpperCase();
@@ -555,7 +568,17 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
         return jsonResponse(generateStepLogs(stepId || "global", cursor));
       }
       if (url.includes(`/v1/runs/${snapshot.id}/stream`)) {
-        return new Promise(() => {});
+        const stream = new ReadableStream({
+          start(controller) {
+            streamController = controller;
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+          },
+        });
       }
       if (url.includes(`/v1/runs/${snapshot.id}`)) {
         return jsonResponse(snapshot);
@@ -616,16 +639,77 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
     );
 
     // --- Invariant 2: Graph Scroll & Minimap Sync Across Live Rerender ---
-    const graphScroll = inspectorContent.querySelector("#graph-scroll-area");
-    assert.ok(graphScroll, "Graph scroll area must exist");
+    const initialGraphScroll =
+      inspectorContent.querySelector("#graph-scroll-area");
+    assert.ok(initialGraphScroll, "Graph scroll area must exist");
 
     // Simulate scrolling the graph
-    graphScroll.scrollLeft = 140;
-    graphScroll.scrollTop = 90;
-    graphScroll._dispatch("scroll", {});
+    initialGraphScroll.scrollLeft = 140;
+    initialGraphScroll.scrollTop = 90;
+    initialGraphScroll._dispatch("scroll", {});
 
-    const minimapVp = inspectorContent.querySelector("#minimap-viewport");
-    assert.ok(minimapVp, "Minimap viewport must exist");
+    const initialMinimapVp =
+      inspectorContent.querySelector("#minimap-viewport");
+    assert.ok(initialMinimapVp, "Minimap viewport must exist");
+    const initialVpX = initialMinimapVp.getAttribute("x");
+    const initialVpY = initialMinimapVp.getAttribute("y");
+    assert.ok(
+      Number(initialVpX) > 0,
+      "Minimap viewport X must be > 0 after scrolling",
+    );
+    assert.ok(
+      Number(initialVpY) > 0,
+      "Minimap viewport Y must be > 0 after scrolling",
+    );
+
+    // Trigger a live SSE event rerender while scrolled
+    emitSseEvent({
+      id: "ev-205",
+      type: "step.ready",
+      sequence: 205,
+      committedAt: "2026-09-24T10:00:10Z",
+      payload: { stepId: "step-199", nodeId: "merge-join" },
+    });
+    await settle();
+
+    // Query fresh graph scroll area and minimap viewport in the newly rendered DOM
+    const rerenderedGraphScroll =
+      inspectorContent.querySelector("#graph-scroll-area");
+    assert.ok(rerenderedGraphScroll, "Graph scroll area must exist in new DOM");
+    assert.notEqual(
+      rerenderedGraphScroll,
+      initialGraphScroll,
+      "Live rerender must mount a fresh graph scroll container in the new DOM",
+    );
+    assert.equal(
+      rerenderedGraphScroll.scrollLeft,
+      140,
+      "Graph scrollLeft must be preserved and restored across live rerender",
+    );
+    assert.equal(
+      rerenderedGraphScroll.scrollTop,
+      90,
+      "Graph scrollTop must be preserved and restored across live rerender",
+    );
+
+    const rerenderedMinimapVp =
+      inspectorContent.querySelector("#minimap-viewport");
+    assert.ok(rerenderedMinimapVp, "Minimap viewport must exist in new DOM");
+    assert.notEqual(
+      rerenderedMinimapVp,
+      initialMinimapVp,
+      "Live rerender must mount a fresh minimap viewport rect",
+    );
+    assert.equal(
+      rerenderedMinimapVp.getAttribute("x"),
+      initialVpX,
+      "Minimap viewport X must remain synchronized after live rerender",
+    );
+    assert.equal(
+      rerenderedMinimapVp.getAttribute("y"),
+      initialVpY,
+      "Minimap viewport Y must remain synchronized after live rerender",
+    );
 
     // --- Invariant 3: Accessible List Virtualization & Physical Scroll Preservation ---
     const listBtn = inspectorContent.querySelector("#view-mode-list-btn");
@@ -633,11 +717,11 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
     listBtn.click();
     await settle();
 
-    const listScrollArea = inspectorContent.querySelector("#list-scroll-area");
-    assert.ok(listScrollArea, "List scroll area must exist for 200 steps");
+    const initialLsa = inspectorContent.querySelector("#list-scroll-area");
+    assert.ok(initialLsa, "List scroll area must exist for 200 steps");
 
     // Only bounded cards are mounted in the DOM (<= 50)
-    const mountedStepCards = listScrollArea.querySelectorAll(
+    const mountedStepCards = initialLsa.querySelectorAll(
       ".accessible-step-card",
     );
     assert.ok(
@@ -646,15 +730,27 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
     );
 
     // Simulate scrolling list to step 150 (physical scroll position 150 * 140 = 21000px)
-    listScrollArea.scrollTop = 21000;
-    listScrollArea._dispatch("scroll", {});
+    initialLsa.scrollTop = 21000;
+    initialLsa._dispatch("scroll", {});
     await settle(60); // wait for debounce
 
-    // Verify physical scroll offset was NOT reset to 0!
+    // Query the FRESH list scroll area mounted after the scroll rerender
+    const scrolledLsa = inspectorContent.querySelector("#list-scroll-area");
+    assert.ok(
+      scrolledLsa,
+      "Fresh list scroll area must exist after scroll rerender",
+    );
+    assert.notEqual(
+      scrolledLsa,
+      initialLsa,
+      "Scroll virtualization rerender must mount a new DOM container",
+    );
+
+    // Verify physical scroll offset on the NEW DOM element was NOT reset to 0!
     assert.equal(
-      listScrollArea.scrollTop,
+      scrolledLsa.scrollTop,
       21000,
-      "Virtual list scrollTop must preserve physical scroll position across rerenders, not reset to 0",
+      "Newly mounted virtual list container must preserve physical scrollTop from listScrollTop, not reset to 0",
     );
 
     // Verify step 150 is now in the rendered DOM window
@@ -664,7 +760,7 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
     );
 
     // Verify still at most 50 cards mounted
-    const mountedAfterScroll = listScrollArea.querySelectorAll(
+    const mountedAfterScroll = scrolledLsa.querySelectorAll(
       ".accessible-step-card",
     );
     assert.ok(
@@ -672,16 +768,25 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
       `DOM must maintain <= 50 cards mounted after scrolling, got ${mountedAfterScroll.length}`,
     );
 
-    // Test "Load More Steps" button
-    const loadMoreStepsBtn = listScrollArea.querySelector(
-      "#load-more-steps-btn",
-    );
+    // Test "Load More Steps" button on the FRESH container
+    const loadMoreStepsBtn = scrolledLsa.querySelector("#load-more-steps-btn");
     if (loadMoreStepsBtn) {
       loadMoreStepsBtn.click();
       await settle();
+      const lsaAfterLoadMore =
+        inspectorContent.querySelector("#list-scroll-area");
       assert.ok(
-        listScrollArea.scrollTop > 0,
-        "Load More Steps must preserve physical scroll offset, not reset to 0",
+        lsaAfterLoadMore,
+        "List scroll area must exist after Load More",
+      );
+      assert.notEqual(
+        lsaAfterLoadMore,
+        scrolledLsa,
+        "Load More must mount a fresh container in the new DOM",
+      );
+      assert.ok(
+        lsaAfterLoadMore.scrollTop > 0,
+        "Load More Steps must preserve physical scroll offset on the fresh element, not reset to 0",
       );
     }
 
@@ -765,6 +870,47 @@ describe("Production Inspector Browser DOM Integration (Issue #29)", () => {
       activeBtn.tabIndex,
       0,
       "Active tab in roving tabindex must have tabIndex = 0",
+    );
+
+    // Exercise live SSE stream rerender focus preservation:
+    // Focus a step tab button (e.g. Attempts tab)
+    const stepTabAttempts =
+      inspectorContent.querySelector("#step-tab-attempts");
+    assert.ok(stepTabAttempts, "step-tab-attempts must exist");
+    stepTabAttempts.focus();
+    assert.equal(
+      globalThis.document.activeElement,
+      stepTabAttempts,
+      "step-tab-attempts must have active focus prior to SSE rerender",
+    );
+    const focusedBeforeSse = globalThis.document.activeElement;
+
+    // Emit live SSE event that updates execution status (step.succeeded)
+    emitSseEvent({
+      id: "ev-206",
+      type: "step.succeeded",
+      sequence: 206,
+      committedAt: "2026-09-24T10:00:25Z",
+      payload: { stepId: "step-199", nodeId: "merge-join" },
+    });
+    await settle();
+
+    // The live SSE update triggers renderSnapshot, destroying old DOM elements.
+    // Verify focus was preserved on the matching element in the FRESH DOM:
+    const focusedAfterSse = globalThis.document.activeElement;
+    assert.ok(
+      focusedAfterSse,
+      "An element must retain focus after live SSE rerender",
+    );
+    assert.notEqual(
+      focusedAfterSse,
+      focusedBeforeSse,
+      "Focus must NOT remain on old detached DOM node; must be restored to fresh DOM element",
+    );
+    assert.equal(
+      focusedAfterSse.id,
+      "step-tab-attempts",
+      "Active element ID must match the element focused prior to SSE update",
     );
   });
 });
