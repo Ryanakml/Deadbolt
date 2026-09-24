@@ -51,9 +51,9 @@ type propM3Graph struct {
 	NodeMap        map[string]propM3Node
 	Ancestors      map[string]map[string]bool
 	Descendants    map[string]map[string]bool
-	ChoiceBranches map[string][]string // choiceID -> branch names
-	ChoiceDefault  map[string]string   // choiceID -> default branch
-	MergeChoice    map[string]string   // mergeID -> choiceID
+	ChoiceBranches map[string][]string          // choiceID -> branch names
+	ChoiceDefault  map[string]string            // choiceID -> default branch
+	MergeChoice    map[string]string            // mergeID -> choiceID
 	MergeTerminals map[string]map[string]string // mergeID -> branch -> terminalNodeID
 }
 
