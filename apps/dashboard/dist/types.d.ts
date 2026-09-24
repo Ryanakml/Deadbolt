@@ -1,5 +1,5 @@
 export type RunStatus = "QUEUED" | "RUNNING" | "WAITING" | "PAUSING" | "PAUSED" | "CANCELLING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
-export type StepStatus = "BLOCKED" | "READY" | "RUNNING" | "WAITING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+export type StepStatus = "BLOCKED" | "READY" | "RUNNING" | "WAITING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "SKIPPED";
 export type AttemptStatus = "CLAIMED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "TIMED_OUT" | "LOST" | "CANCELLED";
 export interface TaskAttempt {
     id: string;
@@ -14,11 +14,17 @@ export interface TaskAttempt {
 export interface RunStep {
     id: string;
     nodeId: string;
+    kind?: string;
     status: StepStatus;
+    waitReason?: string | null;
+    after?: string[];
     currentEpoch: number;
     completionSource?: string | null;
+    output?: unknown;
     attempts: TaskAttempt[];
 }
+export type StepTab = "summary" | "attempts" | "events" | "logs" | "input" | "output" | "trace";
+export type InspectorViewMode = "graph" | "list";
 export interface Run {
     id: string;
     organizationId?: string;

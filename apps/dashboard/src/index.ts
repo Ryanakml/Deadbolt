@@ -30,6 +30,18 @@ import {
   reconciliationHoldText,
   terminationBannerText,
   RESOLVE_ACTIONS,
+  getStatusPresentation,
+  computeGraphLayout,
+  computeMinimap,
+  filterEventsForStep,
+  virtualizeItems,
+} from "./inspector.js";
+import type {
+  GraphNode,
+  GraphEdge,
+  GraphLayout,
+  MinimapLayout,
+  StatusPresentation,
 } from "./inspector.js";
 import {
   clearStreamErrorOnLive,
@@ -39,11 +51,14 @@ import {
 } from "./stream.js";
 import {
   RunSnapshot,
+  RunStep,
   RunEvent,
   StreamFreshness,
   TaskLogsResponse,
   ReconciliationCase,
   ResolveAction,
+  StepTab,
+  InspectorViewMode,
 } from "./types.js";
 
 // DOM Bootstrap for browser runtime
@@ -496,6 +511,12 @@ function initDashboard(): void {
     }
 
     let currentStreamFreshness: StreamFreshness = "DISCONNECTED";
+    let currentViewMode: InspectorViewMode = "graph";
+    let selectedStepId: string | null = null;
+    let selectedStepTab: StepTab = "summary";
+    const collapsedClusters = new Set<string>();
+    const cachedStepLogs = new Map<string, TaskLogsResponse | null>();
+    let lastSnap: RunSnapshot | null = null;
 
     activeInspector = new RunInspector(runId);
     activeInspector.subscribe({
@@ -522,64 +543,93 @@ function initDashboard(): void {
     activeInspector.load();
 
     function renderSnapshot(snap: RunSnapshot): void {
+      lastSnap = snap;
       const container = document.getElementById("inspector-content");
       if (!container) return;
+
+      // Select default step if not selected or no longer valid
+      if (!selectedStepId || !snap.steps.some((s) => s.id === selectedStepId)) {
+        const priorityStep =
+          snap.steps.find((s) => s.status === "FAILED") ||
+          snap.steps.find((s) => s.status === "WAITING") ||
+          snap.steps.find((s) => s.status === "RUNNING") ||
+          snap.steps.find((s) => s.status === "READY") ||
+          snap.steps[0];
+        selectedStepId = priorityStep ? priorityStep.id : null;
+      }
+
+      const selectedStep =
+        snap.steps.find((s) => s.id === selectedStepId) ||
+        snap.steps[0] ||
+        null;
 
       // Blueprint §23.2: Pause/Resume/Cancel render only when the run state
       // permits the action AND the active identity holds runs:control.
       const controls = visibleRunControls(snap.status, canControlRuns);
-      const stepsHtml = snap.steps
-        .map((st) => {
-          const attemptsHtml = st.attempts
-            .map((att) => {
-              const started = att.startedAt
-                ? new Date(att.startedAt).toLocaleTimeString()
-                : "-";
-              return `
-            <div class="attempt-card status-${att.status.toLowerCase()}">
-              <div class="attempt-header">
-                <span class="attempt-title">Attempt #${att.attemptNumber}</span>
-                <span class="badge status-${att.status.toLowerCase()}">${att.status}</span>
-              </div>
-              <div class="attempt-details">
-                <span>Session: <code>${att.workerSessionId ? att.workerSessionId.slice(0, 8) + "..." : "-"}</code></span>
-                <span>Started: ${started}</span>
-                <span>Epoch: ${att.ownershipEpoch ?? "-"}</span>
-              </div>
-            </div>
+
+      // Compute graph layout (1 node per logical step; attempts stay in step detail)
+      const layout = computeGraphLayout(snap.steps, collapsedClusters);
+      const minimap = computeMinimap(layout, 800, 450, 0, 0, 160, 100);
+
+      // Render SVG Graph Edges and Nodes
+      const svgEdgesHtml = layout.edges
+        .map((e) => {
+          const midX = (e.fromX + e.toX) / 2;
+          const d = `M ${e.fromX} ${e.fromY} C ${midX} ${e.fromY}, ${midX} ${e.toY}, ${e.toX} ${e.toY}`;
+          const cls = e.isSkipped ? "dag-edge edge-skipped" : "dag-edge";
+          const marker = e.isSkipped
+            ? "url(#arrow-skipped)"
+            : "url(#arrow-default)";
+          return `<path class="${cls}" d="${d}" marker-end="${marker}" data-from="${escapeHtml(e.fromNodeId)}" data-to="${escapeHtml(e.toNodeId)}" />`;
+        })
+        .join("");
+
+      const svgNodesHtml = layout.nodes
+        .map((n) => {
+          const pres = getStatusPresentation(n.status);
+          const isSelected = selectedStepId === n.id;
+          const nodeClass = `dag-node status-${n.status.toLowerCase()}${isSelected ? " node-selected" : ""}${n.isCollapsedPlaceholder ? " node-collapsed" : ""}`;
+          const ariaLabel = n.isCollapsedPlaceholder
+            ? `Collapsed group of ${n.collapsedCount} parallel steps, click to expand`
+            : `Step ${n.nodeId}: ${pres.label}, ${n.attemptsCount} attempts`;
+
+          return `
+            <g class="${nodeClass}" tabindex="0" role="button" data-step-id="${escapeHtml(n.id)}" data-node-id="${escapeHtml(n.nodeId)}" data-cluster-id="${escapeHtml(n.clusterId || "")}" aria-label="${escapeHtml(ariaLabel)}" aria-pressed="${isSelected}">
+              <rect class="node-bg" x="${n.x}" y="${n.y}" width="${n.width}" height="${n.height}" rx="6" ry="6" />
+              <g class="node-badge status-${n.status.toLowerCase()}">
+                <rect class="badge-bg" x="${n.x + 8}" y="${n.y + 8}" width="88" height="20" rx="4" />
+                <text class="badge-text" x="${n.x + 12}" y="${n.y + 22}">${pres.symbol} ${escapeHtml(pres.label)}</text>
+              </g>
+              <text class="node-kind" x="${n.x + n.width - 10}" y="${n.y + 22}" text-anchor="end">${escapeHtml(n.kind)}</text>
+              <text class="node-title" x="${n.x + 10}" y="${n.y + 44}">${escapeHtml(n.nodeId)}</text>
+              <text class="node-meta" x="${n.x + 10}" y="${n.y + 60}">${
+                n.isCollapsedPlaceholder
+                  ? `[+ Expand ${n.collapsedCount} steps]`
+                  : `${n.attemptsCount} attempt${n.attemptsCount === 1 ? "" : "s"}${n.waitReason ? ` · ${escapeHtml(n.waitReason)}` : ""}`
+              }</text>
+            </g>
           `;
-            })
-            .join("");
+        })
+        .join("");
 
-          let noAttemptsHtml =
-            '<div class="no-attempts text-muted">No attempts claimed yet</div>';
-          if (
-            shouldShowWorkerWait(
-              st.status,
-              snap.waitingReason,
-              snap.activeCompatibleWorkers,
-            )
-          ) {
-            noAttemptsHtml = `
-              <div class="no-attempts waiting-warning">
-                <strong>No compatible workers available.</strong>
-                <div class="recovery-hint">
-                  Waiting for active worker advertising deployment <code>${escapeHtml(snap.deploymentId.slice(0, 8))}...</code>. Ensure an enrolled worker is running.
-                </div>
-              </div>
-            `;
-          } else if (
-            st.status === "CANCELLED" ||
-            st.status === "FAILED" ||
-            st.status === "SUCCEEDED"
-          ) {
-            noAttemptsHtml = `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(st.status))}</div>`;
-          }
+      // Minimap SVG Nodes
+      const minimapNodesHtml = minimap.nodes
+        .map((mn) => {
+          return `<rect class="mini-node status-${mn.status.toLowerCase()}" x="${mn.x}" y="${mn.y}" width="${mn.width}" height="${mn.height}" rx="1" />`;
+        })
+        .join("");
 
-          // Unknown-outcome hold: the provider may already have received the
-          // operation. Only audited resolutions are offered, never blind retry.
-          let holdHtml = "";
+      // Render Accessible List fallback
+      const listItemsHtml = snap.steps
+        .map((st) => {
+          const pres = getStatusPresentation(st.status);
+          const isSelected = selectedStepId === st.id;
+          const deps =
+            st.after && st.after.length > 0
+              ? st.after.map(escapeHtml).join(", ")
+              : "None (Root)";
           const openCase = openCaseForStep(snap, st.id);
+          let holdHtml = "";
           if (st.status === "WAITING" && openCase) {
             const evidenceRef = evidenceReference(openCase);
             holdHtml = `
@@ -594,20 +644,218 @@ function initDashboard(): void {
           }
 
           return `
-          <div class="step-card" data-step-id="${st.id}">
-            <div class="step-header">
-              <h4>${escapeHtml(st.nodeId)}</h4>
-              <span class="badge status-${st.status.toLowerCase()}">${st.status}</span>
-              ${st.completionSource ? `<span class="badge source-${st.completionSource.toLowerCase()}">${escapeHtml(st.completionSource)}</span>` : ""}
+            <li class="step-card accessible-step-card${isSelected ? " selected" : ""}" data-step-id="${escapeHtml(st.id)}" data-node-id="${escapeHtml(st.nodeId)}" role="listitem">
+              <div class="step-header">
+                <h4>${escapeHtml(st.nodeId)}</h4>
+                <div class="step-badges">
+                  <span class="kind-tag">${escapeHtml(st.kind || "task")}</span>
+                  <span class="badge status-${st.status.toLowerCase()}">${pres.symbol} ${st.status}</span>
+                  ${st.completionSource ? `<span class="badge source-${st.completionSource.toLowerCase()}">${escapeHtml(st.completionSource)}</span>` : ""}
+                </div>
+              </div>
+              <div class="step-summary-meta">
+                <div><strong>Dependencies:</strong> ${deps}</div>
+                ${st.waitReason ? `<div><strong>Wait Reason:</strong> <code class="wait-reason-tag">${escapeHtml(st.waitReason)}</code></div>` : ""}
+                <div><strong>Attempts:</strong> ${st.attempts.length}</div>
+              </div>
+              ${holdHtml}
+              <div class="step-actions">
+                <button class="secondary-btn select-step-btn" data-step-id="${escapeHtml(st.id)}" aria-label="Inspect ${escapeHtml(st.nodeId)} details" aria-pressed="${isSelected}">
+                  ${isSelected ? "Inspecting" : "Inspect Step"}
+                </button>
+              </div>
+            </li>
+          `;
+        })
+        .join("");
+
+      // Render Step Tabs Details Panel (Summary, Attempts, Events, Logs, Input, Output, Trace)
+      let stepDetailHtml = "";
+      if (selectedStep) {
+        const pres = getStatusPresentation(selectedStep.status);
+        const openCase = openCaseForStep(snap, selectedStep.id);
+        let holdHtml = "";
+        if (selectedStep.status === "WAITING" && openCase) {
+          const evidenceRef = evidenceReference(openCase);
+          holdHtml = `
+            <div class="hold-banner" role="status">
+              <strong>Waiting for reconciliation.</strong>
+              <div class="recovery-hint">${escapeHtml(reconciliationHoldText(openCase.reason))}</div>
+              ${evidenceRef ? `<div class="hold-evidence">Reference: <code>${escapeHtml(evidenceRef)}</code></div>` : ""}
+              <div class="hold-meta">Case <code>${escapeHtml(openCase.id.slice(0, 8))}…</code> · revision ${openCase.revision}</div>
+              <button class="resolve-link" data-case-id="${escapeHtml(openCase.id)}" data-revision="${openCase.revision}" data-step-id="${escapeHtml(selectedStep.id)}">Resolve</button>
             </div>
-            ${holdHtml}
-            <div class="attempts-container">
-              ${attemptsHtml || noAttemptsHtml}
+          `;
+        }
+
+        // Summary Tab Content
+        let summaryContent = `
+          <div class="step-meta-grid">
+            <div class="meta-item"><label>Node ID</label><div><code>${escapeHtml(selectedStep.nodeId)}</code></div></div>
+            <div class="meta-item"><label>Kind</label><div>${escapeHtml(selectedStep.kind || "task")}</div></div>
+            <div class="meta-item"><label>Status</label><div><span class="badge status-${selectedStep.status.toLowerCase()}">${pres.symbol} ${selectedStep.status}</span></div></div>
+            <div class="meta-item"><label>Epoch</label><div>${selectedStep.currentEpoch}</div></div>
+            <div class="meta-item"><label>Dependencies</label><div>${selectedStep.after && selectedStep.after.length > 0 ? selectedStep.after.map(escapeHtml).join(", ") : "None (Root)"}</div></div>
+            <div class="meta-item"><label>Attempts</label><div>${selectedStep.attempts.length}</div></div>
+            ${selectedStep.waitReason ? `<div class="meta-item"><label>Wait Reason</label><div><code class="wait-reason-tag">${escapeHtml(selectedStep.waitReason)}</code></div></div>` : ""}
+            ${selectedStep.completionSource ? `<div class="meta-item"><label>Completion Source</label><div>${escapeHtml(selectedStep.completionSource)}</div></div>` : ""}
+          </div>
+        `;
+
+        if (
+          shouldShowWorkerWait(
+            selectedStep.status,
+            snap.waitingReason,
+            snap.activeCompatibleWorkers,
+          )
+        ) {
+          summaryContent += `
+            <div class="waiting-warning mt-2" role="status">
+              <strong>No compatible workers available.</strong>
+              <div class="recovery-hint">
+                Waiting for active worker advertising deployment <code>${escapeHtml(snap.deploymentId.slice(0, 8))}...</code>. Ensure an enrolled worker is running.
+              </div>
+            </div>
+          `;
+        } else if (selectedStep.attempts.length === 0) {
+          summaryContent += `<div class="no-attempts text-muted mt-2">${escapeHtml(terminalStepEmptyText(selectedStep.status))}</div>`;
+        }
+
+        // Attempts Tab Content
+        const attemptsHtml =
+          selectedStep.attempts.length > 0
+            ? selectedStep.attempts
+                .map((att) => {
+                  const started = att.startedAt
+                    ? new Date(att.startedAt).toLocaleTimeString()
+                    : "-";
+                  const completed = att.completedAt
+                    ? new Date(att.completedAt).toLocaleTimeString()
+                    : "-";
+                  const attPres = getStatusPresentation(att.status);
+                  return `
+                    <div class="attempt-card status-${att.status.toLowerCase()}">
+                      <div class="attempt-header">
+                        <span class="attempt-title">Attempt #${att.attemptNumber}</span>
+                        <span class="badge status-${att.status.toLowerCase()}">${attPres.symbol} ${att.status}</span>
+                      </div>
+                      <div class="attempt-details">
+                        <span>Session: <code>${att.workerSessionId ? att.workerSessionId.slice(0, 8) + "..." : "-"}</code></span>
+                        <span>Started: ${started}</span>
+                        <span>Completed: ${completed}</span>
+                        <span>Epoch: ${att.ownershipEpoch ?? "-"}</span>
+                        ${att.error !== undefined ? `<div class="attempt-error mt-1"><label>Error:</label><pre class="code-block error-text">${escapeHtml(JSON.stringify(att.error, null, 2))}</pre></div>` : ""}
+                      </div>
+                    </div>
+                  `;
+                })
+                .join("")
+            : `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(selectedStep.status))}</div>`;
+
+        // Events Tab Content (Filtered for step)
+        const allEvs = activeInspector ? activeInspector.getEvents() : [];
+        const stepEvents = filterEventsForStep(allEvs, selectedStep);
+        const stepEventsHtml =
+          stepEvents.length > 0
+            ? stepEvents
+                .map((ev) => {
+                  const time = new Date(ev.committedAt).toLocaleTimeString();
+                  return `
+                    <div class="event-card" data-sequence="${ev.sequence}">
+                      <div class="event-header">
+                        <span class="event-type">${escapeHtml(ev.type)}</span>
+                        <span class="event-seq">#${ev.sequence}</span>
+                      </div>
+                      <div class="event-time">${time}</div>
+                      <pre class="event-payload">${escapeHtml(JSON.stringify(ev.payload, null, 2))}</pre>
+                    </div>
+                  `;
+                })
+                .join("")
+            : `<div class="text-muted">No execution events recorded for this step yet.</div>`;
+
+        // Logs Tab Content
+        let logsContent = "";
+        const stepLogs = cachedStepLogs.get(selectedStep.id);
+        if (stepLogs && stepLogs.items.length > 0) {
+          logsContent = `
+            <div class="log-terminal" role="region" aria-label="Step Task Logs">
+              ${stepLogs.items
+                .map((line) => {
+                  const time = new Date(line.timestamp).toLocaleTimeString();
+                  return `<div class="log-line log-${line.level}"><span class="log-time">${time}</span><span class="log-level">[${line.level.toUpperCase()}]</span><span class="log-msg">${escapeHtml(line.message)}</span></div>`;
+                })
+                .join("")}
+            </div>
+          `;
+        } else if (stepLogs?.expired) {
+          logsContent = `<div class="logs-notice logs-expired">Logs have expired due to the 7-day retention policy.</div>`;
+        } else {
+          logsContent = `<div class="text-muted">No logs recorded for this step yet (or click Logs to load).</div>`;
+        }
+
+        // Input Tab Content
+        const stepInput = (selectedStep as any).input;
+        const inputContent =
+          stepInput !== undefined
+            ? `<pre class="code-block">${escapeHtml(JSON.stringify(stepInput, null, 2))}</pre>`
+            : `<div class="text-muted">No step input recorded or redacted by tenant policy (<code>payload:read</code> required).</div>`;
+
+        // Output Tab Content
+        const outputContent =
+          selectedStep.output !== undefined
+            ? `<pre class="code-block">${escapeHtml(JSON.stringify(selectedStep.output, null, 2))}</pre>`
+            : `<div class="text-muted">${selectedStep.status === "SUCCEEDED" || selectedStep.status === "SKIPPED" ? "No output payload or redacted by tenant policy (<code>payload:read</code> required)." : "Step is not complete; no output produced yet."}</div>`;
+
+        // Trace Tab Content
+        const traceContent = `
+          <div class="trace-summary">
+            <div><strong>Logical Step:</strong> <code>${escapeHtml(selectedStep.nodeId)}</code> (ID: <code>${escapeHtml(selectedStep.id)}</code>)</div>
+            <div><strong>Current Epoch:</strong> ${selectedStep.currentEpoch}</div>
+            <div><strong>Total Attempts:</strong> ${selectedStep.attempts.length}</div>
+            ${selectedStep.completionSource ? `<div><strong>Completion Source:</strong> ${escapeHtml(selectedStep.completionSource)}</div>` : ""}
+            <div class="trace-attempts-list mt-2">
+              ${selectedStep.attempts
+                .map(
+                  (a) =>
+                    `<div>Attempt #${a.attemptNumber}: status <strong>${a.status}</strong>, session <code>${a.workerSessionId ? a.workerSessionId.slice(0, 8) + "..." : "-"}</code>, epoch ${a.ownershipEpoch ?? "-"}</div>`,
+                )
+                .join("")}
             </div>
           </div>
         `;
-        })
-        .join("");
+
+        stepDetailHtml = `
+          <div class="step-detail-card" role="region" aria-labelledby="step-detail-heading">
+            <div class="step-detail-header">
+              <h4 id="step-detail-heading">Step Inspector: <code>${escapeHtml(selectedStep.nodeId)}</code></h4>
+              <div class="step-badges">
+                <span class="kind-tag">${escapeHtml(selectedStep.kind || "task")}</span>
+                <span class="badge status-${selectedStep.status.toLowerCase()}">${pres.symbol} ${selectedStep.status}</span>
+              </div>
+            </div>
+            ${holdHtml}
+            <div class="step-tabs-nav" role="tablist" aria-label="Step Detail Tabs">
+              <button role="tab" id="step-tab-summary" class="step-tab-btn ${selectedStepTab === "summary" ? "active" : ""}" aria-selected="${selectedStepTab === "summary"}" aria-controls="step-panel-summary" tabindex="${selectedStepTab === "summary" ? "0" : "-1"}">Summary</button>
+              <button role="tab" id="step-tab-attempts" class="step-tab-btn ${selectedStepTab === "attempts" ? "active" : ""}" aria-selected="${selectedStepTab === "attempts"}" aria-controls="step-panel-attempts" tabindex="${selectedStepTab === "attempts" ? "0" : "-1"}">Attempts (${selectedStep.attempts.length})</button>
+              <button role="tab" id="step-tab-events" class="step-tab-btn ${selectedStepTab === "events" ? "active" : ""}" aria-selected="${selectedStepTab === "events"}" aria-controls="step-panel-events" tabindex="${selectedStepTab === "events" ? "0" : "-1"}">Events (${stepEvents.length})</button>
+              <button role="tab" id="step-tab-logs" class="step-tab-btn ${selectedStepTab === "logs" ? "active" : ""}" aria-selected="${selectedStepTab === "logs"}" aria-controls="step-panel-logs" tabindex="${selectedStepTab === "logs" ? "0" : "-1"}">Logs</button>
+              <button role="tab" id="step-tab-input" class="step-tab-btn ${selectedStepTab === "input" ? "active" : ""}" aria-selected="${selectedStepTab === "input"}" aria-controls="step-panel-input" tabindex="${selectedStepTab === "input" ? "0" : "-1"}">Input</button>
+              <button role="tab" id="step-tab-output" class="step-tab-btn ${selectedStepTab === "output" ? "active" : ""}" aria-selected="${selectedStepTab === "output"}" aria-controls="step-panel-output" tabindex="${selectedStepTab === "output" ? "0" : "-1"}">Output</button>
+              <button role="tab" id="step-tab-trace" class="step-tab-btn ${selectedStepTab === "trace" ? "active" : ""}" aria-selected="${selectedStepTab === "trace"}" aria-controls="step-panel-trace" tabindex="${selectedStepTab === "trace" ? "0" : "-1"}">Trace</button>
+            </div>
+            <div class="step-tab-content">
+              <div id="step-panel-summary" role="tabpanel" class="tab-panel ${selectedStepTab === "summary" ? "" : "hidden"}" aria-labelledby="step-tab-summary">${summaryContent}</div>
+              <div id="step-panel-attempts" role="tabpanel" class="tab-panel ${selectedStepTab === "attempts" ? "" : "hidden"}" aria-labelledby="step-tab-attempts">${attemptsHtml}</div>
+              <div id="step-panel-events" role="tabpanel" class="tab-panel ${selectedStepTab === "events" ? "" : "hidden"}" aria-labelledby="step-tab-events"><div class="step-events-timeline">${stepEventsHtml}</div></div>
+              <div id="step-panel-logs" role="tabpanel" class="tab-panel ${selectedStepTab === "logs" ? "" : "hidden"}" aria-labelledby="step-tab-logs">${logsContent}</div>
+              <div id="step-panel-input" role="tabpanel" class="tab-panel ${selectedStepTab === "input" ? "" : "hidden"}" aria-labelledby="step-tab-input">${inputContent}</div>
+              <div id="step-panel-output" role="tabpanel" class="tab-panel ${selectedStepTab === "output" ? "" : "hidden"}" aria-labelledby="step-tab-output">${outputContent}</div>
+              <div id="step-panel-trace" role="tabpanel" class="tab-panel ${selectedStepTab === "trace" ? "" : "hidden"}" aria-labelledby="step-tab-trace">${traceContent}</div>
+            </div>
+          </div>
+        `;
+      }
 
       container.innerHTML = `
         <div class="inspector-header">
@@ -643,9 +891,55 @@ function initDashboard(): void {
           ${snap.reasonCode ? `<div class="meta-item"><label>Reason</label><div>${escapeHtml(snap.reasonCode)}</div></div>` : ""}
         </div>
 
-        <section class="steps-section">
-          <h3>Execution Graph & Attempts</h3>
-          <div class="steps-grid">${stepsHtml}</div>
+        <section class="steps-section" aria-labelledby="graph-steps-heading">
+          <div class="steps-section-header">
+            <h3 id="graph-steps-heading">Execution Graph & Steps</h3>
+            <div class="view-controls" role="tablist" aria-label="View Mode">
+              <button id="view-mode-graph-btn" class="toggle-btn ${currentViewMode === "graph" ? "active" : ""}" role="tab" aria-selected="${currentViewMode === "graph"}" aria-controls="graph-view-wrapper">Graph View</button>
+              <button id="view-mode-list-btn" class="toggle-btn ${currentViewMode === "list" ? "active" : ""}" role="tab" aria-selected="${currentViewMode === "list"}" aria-controls="list-view-wrapper">Accessible List</button>
+              <button id="toggle-collapse-btn" class="secondary-btn" aria-label="Toggle collapse of parallel groups">
+                ${collapsedClusters.size > 0 ? "Expand Groups" : "Collapse Groups"}
+              </button>
+            </div>
+          </div>
+
+          <div class="graph-inspector-layout">
+            <div class="graph-main-pane">
+              <div id="graph-view-wrapper" class="graph-view-container ${currentViewMode === "graph" ? "" : "hidden"}" role="tabpanel" aria-labelledby="view-mode-graph-btn">
+                <div id="minimap-container" class="minimap-panel" aria-label="Execution Graph Minimap" role="region">
+                  <div class="minimap-title">Minimap</div>
+                  <svg id="minimap-svg" class="minimap-svg" width="160" height="100" viewBox="0 0 160 100">
+                    ${minimapNodesHtml}
+                    <rect id="minimap-viewport" class="minimap-vp" x="${minimap.viewport.x}" y="${minimap.viewport.y}" width="${minimap.viewport.width}" height="${minimap.viewport.height}" />
+                  </svg>
+                </div>
+                <div id="graph-scroll-area" class="graph-scroll-area" tabindex="0" aria-label="Workflow execution graph canvas, click steps to inspect">
+                  <svg id="graph-svg" class="dag-svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" role="graphics-document" aria-label="Workflow execution DAG">
+                    <defs>
+                      <marker id="arrow-default" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                        <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--text-secondary)" />
+                      </marker>
+                      <marker id="arrow-skipped" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                        <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--text-muted)" stroke-dasharray="2,2" />
+                      </marker>
+                    </defs>
+                    <g class="dag-edges">${svgEdgesHtml}</g>
+                    <g class="dag-nodes">${svgNodesHtml}</g>
+                  </svg>
+                </div>
+              </div>
+
+              <div id="list-view-wrapper" class="list-view-container ${currentViewMode === "list" ? "" : "hidden"}" role="tabpanel" aria-labelledby="view-mode-list-btn">
+                <ul class="accessible-steps-list" role="list">
+                  ${listItemsHtml}
+                </ul>
+              </div>
+            </div>
+
+            <div class="graph-side-pane">
+              ${stepDetailHtml}
+            </div>
+          </div>
         </section>
 
         <section class="events-section">
@@ -687,6 +981,125 @@ function initDashboard(): void {
 
       // Re-apply current transport freshness
       renderFreshness(currentStreamFreshness);
+
+      // Wire view mode buttons
+      const graphBtn = container.querySelector("#view-mode-graph-btn");
+      const listBtn = container.querySelector("#view-mode-list-btn");
+      if (graphBtn && listBtn) {
+        graphBtn.addEventListener("click", () => {
+          currentViewMode = "graph";
+          renderSnapshot(lastSnap!);
+        });
+        listBtn.addEventListener("click", () => {
+          currentViewMode = "list";
+          renderSnapshot(lastSnap!);
+        });
+      }
+
+      // Wire collapse/expand groups button
+      const collapseBtn = container.querySelector("#toggle-collapse-btn");
+      if (collapseBtn) {
+        collapseBtn.addEventListener("click", () => {
+          if (collapsedClusters.size > 0) {
+            collapsedClusters.clear();
+          } else {
+            const testLayout = computeGraphLayout(snap.steps);
+            for (const n of testLayout.nodes) {
+              if (n.clusterId) collapsedClusters.add(n.clusterId);
+            }
+          }
+          renderSnapshot(lastSnap!);
+        });
+      }
+
+      // Wire DAG SVG node selection
+      container.querySelectorAll(".dag-node").forEach((nodeEl) => {
+        const handleSelect = () => {
+          const clusterId = nodeEl.getAttribute("data-cluster-id");
+          const isCollapsed = nodeEl.classList.contains("node-collapsed");
+          if (isCollapsed && clusterId) {
+            collapsedClusters.delete(clusterId);
+            renderSnapshot(lastSnap!);
+            return;
+          }
+          const stepId = nodeEl.getAttribute("data-step-id");
+          if (stepId && stepId !== selectedStepId) {
+            selectedStepId = stepId;
+            renderSnapshot(lastSnap!);
+          }
+        };
+        nodeEl.addEventListener("click", handleSelect);
+        nodeEl.addEventListener("keydown", (e: any) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            handleSelect();
+          }
+        });
+      });
+
+      // Wire Accessible List item selection
+      container.querySelectorAll(".select-step-btn").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          const stepId = (e.currentTarget as HTMLElement).getAttribute(
+            "data-step-id",
+          );
+          if (stepId) {
+            selectedStepId = stepId;
+            renderSnapshot(lastSnap!);
+          }
+        });
+      });
+
+      // Wire Step Tabs navigation
+      const tabOrder: StepTab[] = [
+        "summary",
+        "attempts",
+        "events",
+        "logs",
+        "input",
+        "output",
+        "trace",
+      ];
+      container.querySelectorAll(".step-tab-btn").forEach((tabBtn) => {
+        const tabId = tabBtn.id.replace("step-tab-", "") as StepTab;
+        const selectTab = (t: StepTab) => {
+          selectedStepTab = t;
+          if (
+            t === "logs" &&
+            selectedStep &&
+            !cachedStepLogs.has(selectedStep.id)
+          ) {
+            activeInspector?.fetchLogs(selectedStep.id).then((l) => {
+              cachedStepLogs.set(selectedStep.id, l);
+              renderSnapshot(lastSnap!);
+            });
+          }
+          renderSnapshot(lastSnap!);
+        };
+
+        tabBtn.addEventListener("click", () => selectTab(tabId));
+        tabBtn.addEventListener("keydown", (e: any) => {
+          const idx = tabOrder.indexOf(tabId);
+          if (e.key === "ArrowRight") {
+            e.preventDefault();
+            const nextTab = tabOrder[(idx + 1) % tabOrder.length];
+            selectTab(nextTab);
+            const nextEl = container.querySelector<HTMLElement>(
+              `#step-tab-${nextTab}`,
+            );
+            nextEl?.focus();
+          } else if (e.key === "ArrowLeft") {
+            e.preventDefault();
+            const prevTab =
+              tabOrder[(idx - 1 + tabOrder.length) % tabOrder.length];
+            selectTab(prevTab);
+            const prevEl = container.querySelector<HTMLElement>(
+              `#step-tab-${prevTab}`,
+            );
+            prevEl?.focus();
+          }
+        });
+      });
 
       // Wire durable pause/resume controls. The backend stays authoritative:
       // expectedRevision is captured at open time and 409s refresh in-dialog.

@@ -32,9 +32,13 @@ type RunDTO struct {
 type RunStepDTO struct {
 	ID               string               `json:"id"`
 	NodeID           string               `json:"nodeId"`
+	Kind             *string              `json:"kind,omitempty"`
 	Status           contracts.StepStatus `json:"status"`
+	WaitReason       *string              `json:"waitReason,omitempty"`
+	After            []string             `json:"after,omitempty"`
 	CurrentEpoch     int64                `json:"currentEpoch"`
 	CompletionSource *string              `json:"completionSource,omitempty"`
+	Output           any                  `json:"output,omitempty"`
 	Attempts         []AttemptSummaryDTO  `json:"attempts"`
 }
 

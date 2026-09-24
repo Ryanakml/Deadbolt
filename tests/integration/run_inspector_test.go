@@ -1982,3 +1982,217 @@ func TestDashboardStaticFileServingSmoke(t *testing.T) {
 		t.Fatal("expected non-empty index.js")
 	}
 }
+
+func setupInspectorMultiStepWorkflow(t *testing.T, tc *tenantTestContext, server *httptest.Server, orgID, envID string, adminKey *tenant.GeneratedKey) (string, string) {
+	t.Helper()
+	tempDir := t.TempDir()
+	bundleDigest := writeAgentBundle(t, tempDir, "linux", "amd64")
+
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"val": map[string]any{"type": "string"}},
+		"required":             []any{"val"},
+		"additionalProperties": false,
+	}
+	tasks := []map[string]any{
+		{
+			"name":                "task-simple",
+			"entrypoint":          "tasks/agent.mjs",
+			"timeoutMs":           30000,
+			"recovery":            "idempotent",
+			"idempotencyWindowMs": 305000,
+			"inputSchema":         schema,
+			"outputSchema":        schema,
+		},
+	}
+	workflows := []map[string]any{
+		{
+			"manifestVersion": 1,
+			"name":            "inspector-multi-step",
+			"inputSchema":     schema,
+			"outputSchema":    schema,
+			"nodes": []map[string]any{
+				{
+					"id":    "step-1",
+					"type":  "task",
+					"task":  "task-simple",
+					"after": []any{},
+					"input": map[string]any{
+						"val": map[string]any{"$ref": "run.input", "pointer": "/val"},
+					},
+				},
+				{
+					"id":    "step-2",
+					"type":  "task",
+					"task":  "task-simple",
+					"after": []any{"step-1"},
+					"input": map[string]any{
+						"val": map[string]any{"$ref": "step.output", "stepId": "step-1", "pointer": "/val"},
+					},
+				},
+			},
+			"output": map[string]any{
+				"val": map[string]any{"$ref": "step.output", "stepId": "step-2", "pointer": "/val"},
+			},
+		},
+	}
+
+	manifestBytes := createLifecycleManifest(bundleDigest, tasks, workflows)
+	depID := registerAndActivateTestWorkflow(t, tc, server, adminKey, orgID, envID, "inspector-multi-step", manifestBytes)
+	return depID, bundleDigest
+}
+
+func TestRunInspector_StepGraphMetadataAndRedaction(t *testing.T) {
+	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
+	defer server.Close()
+
+	_, bundleDigest := setupInspectorMultiStepWorkflow(t, tc, server, orgID, envID, adminKey)
+	sessionCtx, sessionToken := enrollTestWorker(t, tc, server, orgID, envID, bundleDigest)
+
+	// Create run
+	createReq, _ := http.NewRequest("POST", server.URL+"/v1/workflows/inspector-multi-step/runs", strings.NewReader(`{"environment":"staging","input":{"val":"inspector-graph-input"}}`))
+	createReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	createReq.Header.Set("Idempotency-Key", "graph-metadata-run")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes, err := http.DefaultClient.Do(createReq)
+	if err != nil || createRes.StatusCode != http.StatusAccepted {
+		t.Fatalf("create run failed: %v", err)
+	}
+	var runResp execution.RunDTO
+	_ = json.NewDecoder(createRes.Body).Decode(&runResp)
+	createRes.Body.Close()
+
+	// Worker polls and starts
+	pollBody, _ := json.Marshal(worker.PollRequestDTO{
+		ProtocolVersion:   worker.ProtocolVersion,
+		RequestID:         "p-graph-1",
+		WorkerID:          sessionCtx.WorkerID,
+		SessionID:         sessionCtx.SessionID,
+		AvailableSlots:    1,
+		DeploymentDigests: []string{bundleDigest},
+		Pool:              "default",
+	})
+	pollReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/poll", bytes.NewReader(pollBody))
+	pollReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	pollReq.Header.Set("Content-Type", "application/json")
+	pollRes, _ := http.DefaultClient.Do(pollReq)
+	var pollResp worker.PollResponseDTO
+	_ = json.NewDecoder(pollRes.Body).Decode(&pollResp)
+	pollRes.Body.Close()
+	as := pollResp.Assignments[0]
+
+	startReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/start", strings.NewReader(
+		fmt.Sprintf(`{"protocolVersion":1,"requestId":"s-graph-1","workerId":"%s","sessionId":"%s","attemptId":"%s","ownershipEpoch":%d}`, sessionCtx.WorkerID, sessionCtx.SessionID, as.AttemptID, as.OwnershipEpoch),
+	))
+	startReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	startReq.Header.Set("Content-Type", "application/json")
+	startRes, _ := http.DefaultClient.Do(startReq)
+	startRes.Body.Close()
+
+	// Complete step-1 with output
+	compPayload := worker.CompleteRequestDTO{
+		ProtocolVersion: 1,
+		RequestID:       "c-graph-1",
+		WorkerID:        sessionCtx.WorkerID,
+		SessionID:       sessionCtx.SessionID,
+		AttemptID:       as.AttemptID,
+		OwnershipEpoch:  as.OwnershipEpoch,
+		Outcome:         "SUCCEEDED",
+		Output:          map[string]any{"val": "confidential-step-result"},
+	}
+	digest, _ := worker.CanonicalCompletionDigest(&compPayload)
+	compPayload.ResultDigest = digest
+	cb, _ := json.Marshal(compPayload)
+	compReq, _ := http.NewRequest("POST", server.URL+"/worker/v1/complete", bytes.NewReader(cb))
+	compReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	compReq.Header.Set("Content-Type", "application/json")
+	compRes, _ := http.DefaultClient.Do(compReq)
+	compRes.Body.Close()
+
+	// 1. Caller with payload:read capability receives step kind, after, and output
+	adminReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+runResp.ID, nil)
+	adminReq.Header.Set("Authorization", "Bearer "+adminKey.PlaintextKey)
+	adminRes, err := http.DefaultClient.Do(adminReq)
+	if err != nil || adminRes.StatusCode != http.StatusOK {
+		t.Fatalf("admin get run failed: %v", err)
+	}
+	var adminSnap execution.RunSnapshotDTO
+	_ = json.NewDecoder(adminRes.Body).Decode(&adminSnap)
+	adminRes.Body.Close()
+
+	if len(adminSnap.Steps) < 2 {
+		t.Fatalf("expected at least 2 steps, got %d", len(adminSnap.Steps))
+	}
+
+	// Locate step-1 and step-2
+	var step1, step2 *execution.RunStepDTO
+	for i := range adminSnap.Steps {
+		if adminSnap.Steps[i].NodeID == "step-1" {
+			step1 = &adminSnap.Steps[i]
+		}
+		if adminSnap.Steps[i].NodeID == "step-2" {
+			step2 = &adminSnap.Steps[i]
+		}
+	}
+
+	if step1 == nil || step2 == nil {
+		t.Fatalf("expected step-1 and step-2 in snapshot, got %+v", adminSnap.Steps)
+	}
+
+	if step1.Kind == nil || *step1.Kind != "task" {
+		t.Fatalf("expected step-1 kind 'task', got %v", step1.Kind)
+	}
+	if step1.Output == nil {
+		t.Fatal("expected step-1 output to be visible for caller with payload:read")
+	}
+
+	if step2.Kind == nil || *step2.Kind != "task" {
+		t.Fatalf("expected step-2 kind 'task', got %v", step2.Kind)
+	}
+	if len(step2.After) != 1 || step2.After[0] != "step-1" {
+		t.Fatalf("expected step-2 after ['step-1'], got %v", step2.After)
+	}
+
+	// 2. Caller WITHOUT payload:read capability receives step kind & after, but Output is redacted (nil)
+	restrictedKey := bootstrapTestKey(t, tc.service, orgID, envID, []string{
+		tenant.CapRunsRead,
+	})
+	viewerReq, _ := http.NewRequest("GET", server.URL+"/v1/runs/"+runResp.ID, nil)
+	viewerReq.Header.Set("Authorization", "Bearer "+restrictedKey.PlaintextKey)
+	viewerRes, err := http.DefaultClient.Do(viewerReq)
+	if err != nil || viewerRes.StatusCode != http.StatusOK {
+		t.Fatalf("viewer get run failed: %v", err)
+	}
+	var viewerSnap execution.RunSnapshotDTO
+	_ = json.NewDecoder(viewerRes.Body).Decode(&viewerSnap)
+	viewerRes.Body.Close()
+
+	var vStep1, vStep2 *execution.RunStepDTO
+	for i := range viewerSnap.Steps {
+		if viewerSnap.Steps[i].NodeID == "step-1" {
+			vStep1 = &viewerSnap.Steps[i]
+		}
+		if viewerSnap.Steps[i].NodeID == "step-2" {
+			vStep2 = &viewerSnap.Steps[i]
+		}
+	}
+
+	if vStep1 == nil || vStep2 == nil {
+		t.Fatalf("expected step-1 and step-2 in viewer snapshot")
+	}
+
+	if vStep1.Kind == nil || *vStep1.Kind != "task" {
+		t.Fatalf("expected vStep1 kind 'task', got %v", vStep1.Kind)
+	}
+	if vStep1.Output != nil {
+		t.Fatalf("security violation: expected step-1 output to be redacted (nil) for viewer, got %v", vStep1.Output)
+	}
+
+	if vStep2.Kind == nil || *vStep2.Kind != "task" {
+		t.Fatalf("expected vStep2 kind 'task', got %v", vStep2.Kind)
+	}
+	if len(vStep2.After) != 1 || vStep2.After[0] != "step-1" {
+		t.Fatalf("expected vStep2 after ['step-1'], got %v", vStep2.After)
+	}
+}
+
