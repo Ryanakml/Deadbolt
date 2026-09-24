@@ -901,7 +901,10 @@ func TestM3_ControlRaces_PauseVsCompletionAndResume(t *testing.T) {
 	pauseReq.Header.Set("Authorization", "Bearer "+controlKey.PlaintextKey)
 	pauseReq.Header.Set("X-Organization-ID", orgID)
 	pauseReq.Header.Set("Idempotency-Key", "pause-after-terminal")
-	pauseResp, _ := http.DefaultClient.Do(pauseReq)
+	pauseResp, err := http.DefaultClient.Do(pauseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer pauseResp.Body.Close()
 
 	// Invariant: terminal state wins! Status stays SUCCEEDED
@@ -916,7 +919,10 @@ func TestM3_ControlRaces_PauseVsCompletionAndResume(t *testing.T) {
 	resumeReq.Header.Set("Authorization", "Bearer "+controlKey.PlaintextKey)
 	resumeReq.Header.Set("X-Organization-ID", orgID)
 	resumeReq.Header.Set("Idempotency-Key", "resume-after-terminal")
-	resumeResp, _ := http.DefaultClient.Do(resumeReq)
+	resumeResp, err := http.DefaultClient.Do(resumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resumeResp.Body.Close()
 
 	snapFinal := m2GetSnapshot(t, server.URL, run.ID, controlKey.PlaintextKey, orgID)
