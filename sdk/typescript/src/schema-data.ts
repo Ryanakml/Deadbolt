@@ -228,13 +228,6 @@ export const schemas: Record<string, JSONValue> = {
                             },
                             "condition": {
                               "type": "object"
-                            },
-                            "target": {
-                              "type": "string",
-                              "pattern": "^[a-zA-Z0-9_-]{1,64}$",
-                              "not": {
-                                "pattern": "[^a-zA-Z0-9_-]"
-                              }
                             }
                           },
                           "required": [
@@ -301,7 +294,8 @@ export const schemas: Record<string, JSONValue> = {
                     },
                     "required": [
                       "choice",
-                      "branches"
+                      "branches",
+                      "outputSchema"
                     ],
                     "additionalProperties": false
                   },
@@ -522,7 +516,7 @@ export const schemas: Record<string, JSONValue> = {
               "additionalProperties": false
             }
           },
-          "description": "Versioned language contract. Control fields are reserved for V1. Executable task-only static DAGs support parallel dependencies; control-node execution is not enabled."
+          "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Approval and delay nodes are reserved for V1."
         }
       }
     },
@@ -820,13 +814,6 @@ export const schemas: Record<string, JSONValue> = {
                       },
                       "condition": {
                         "type": "object"
-                      },
-                      "target": {
-                        "type": "string",
-                        "pattern": "^[a-zA-Z0-9_-]{1,64}$",
-                        "not": {
-                          "pattern": "[^a-zA-Z0-9_-]"
-                        }
                       }
                     },
                     "required": [
@@ -893,7 +880,8 @@ export const schemas: Record<string, JSONValue> = {
               },
               "required": [
                 "choice",
-                "branches"
+                "branches",
+                "outputSchema"
               ],
               "additionalProperties": false
             },

@@ -223,15 +223,20 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
       fail("INVALID_CHOICE");
     }
     const branchNames = new Set<string>();
+    let conditionlessCount = 0;
     for (const b of branches) {
       const name = String(b.name ?? "");
       if (!name || branchNames.has(name)) fail("INVALID_CHOICE");
       branchNames.add(name);
       if (b.condition !== undefined) {
         validateChoiceExpression(b.condition as JSONValue, ancestors.get(id)!);
+      } else {
+        conditionlessCount++;
+        if (name !== def) fail("INVALID_CHOICE");
       }
     }
-    if (def) branchNames.add(def);
+    if (def && !branchNames.has(def)) fail("INVALID_CHOICE");
+    if (conditionlessCount > 1) fail("INVALID_CHOICE");
   }
 
   for (const [id, n] of merges) {
@@ -271,12 +276,11 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     for (const cn of cNames) {
       if (!mNames.has(cn)) fail("INVALID_MERGE");
     }
-    if (mrg.outputSchema !== undefined) {
-      validateSchema(
-        mrg.outputSchema as JSONValue,
-        schemas["payload-schema.schema.json"],
-      );
-    }
+    if (mrg.outputSchema === undefined) fail("INVALID_MERGE");
+    validateSchema(
+      mrg.outputSchema as JSONValue,
+      schemas["payload-schema.schema.json"],
+    );
   }
 
   for (const id of choices.keys()) {
@@ -385,6 +389,25 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
   }
 
   for (const choiceId of choices.keys()) {
+    const mergeId = mergeForChoice.get(choiceId)!;
+    const mrg = object(merges.get(mergeId)!.merge ?? {});
+    const terminals = new Set<string>();
+    for (const b of (mrg.branches ?? []) as ObjectValue[]) {
+      terminals.add(String(b.terminal));
+    }
+    for (const dep of (byId.get(mergeId)!.after ?? []) as string[]) {
+      let inBranch = false;
+      for (const bSet of choiceBranchNodeSets.get(choiceId)!.values()) {
+        if (bSet.has(dep)) {
+          inBranch = true;
+          break;
+        }
+      }
+      if (inBranch && !terminals.has(dep)) fail("INVALID_MERGE");
+    }
+  }
+
+  for (const choiceId of choices.keys()) {
     let depth = 1;
     for (const [otherChoiceId, bMap] of choiceBranchNodeSets) {
       if (otherChoiceId === choiceId) continue;
@@ -465,14 +488,26 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     }
     Object.values(v).forEach((x) => mapping(x, allowed, isOutput));
   };
+  const mergeChoiceById = new Map<string, string>();
+  for (const [choiceId, mergeId] of mergeForChoice) {
+    mergeChoiceById.set(mergeId, choiceId);
+  }
   nodes.forEach((n) => {
     const id = String(n.id);
     mapping(n.input ?? {}, nodeAllowed.get(id)!);
     if (n.type === "merge") {
       const mrg = object(n.merge ?? {});
+      const choiceId = mergeChoiceById.get(id)!;
       for (const b of (mrg.branches ?? []) as ObjectValue[]) {
         if (b.value !== undefined) {
-          mapping(b.value as JSONValue, ancestors.get(id)!);
+          const bName = String(b.branch);
+          const allowed = new Set<string>([
+            ...ancestors.get(choiceId)!,
+            choiceId,
+          ]);
+          const bSet = choiceBranchNodeSets.get(choiceId)?.get(bName);
+          if (bSet) for (const nodeId of bSet) allowed.add(nodeId);
+          mapping(b.value as JSONValue, allowed);
         }
       }
     }

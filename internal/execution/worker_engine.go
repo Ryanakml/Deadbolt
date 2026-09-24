@@ -74,7 +74,6 @@ func (e *WorkerEngine) SetAfterCompleteCommitHookForTest(hook func() error) {
 type choiceBranch struct {
 	Name      string `json:"name"`
 	Condition any    `json:"condition"`
-	Target    string `json:"target"`
 }
 
 type choiceConfig struct {
@@ -1844,17 +1843,33 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 					continue
 				}
 
-				unselectedTerminals := make(map[string]bool)
+				// Blueprint §16.2 / F-16: the merge waits only on declared branch
+				// terminals. Any other node from an unselected branch present in
+				// `after` must be ignored and must never SKIP the merge. Only
+				// legitimate non-branch/common dependencies participate in the
+				// skipped check below.
+				branchNodes := getBranchNodes(workflow, node.Merge.Choice, ancestors, descendants)
+				unselectedBranchNodes := make(map[string]bool)
+				for bName, bSet := range branchNodes {
+					if bName == selectedBranch {
+						continue
+					}
+					for nid := range bSet {
+						unselectedBranchNodes[nid] = true
+					}
+				}
+				// Declared unselected terminals are always a subset of the above,
+				// but keep the explicit terminal set for clarity.
 				for _, mb := range node.Merge.Branches {
 					if mb.Branch != selectedBranch {
-						unselectedTerminals[mb.Terminal] = true
+						unselectedBranchNodes[mb.Terminal] = true
 					}
 				}
 
 				otherDepsMet := true
 				otherDepSkipped := false
 				for _, depID := range node.After {
-					if unselectedTerminals[depID] {
+					if unselectedBranchNodes[depID] {
 						continue
 					}
 					depStep, depExists := steps[depID]
@@ -1911,13 +1926,20 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 					"branch": selectedBranch,
 					"value":  val,
 				}
-				if node.Merge.OutputSchema != nil {
-					if err := contracts.ValidatePayload(node.Merge.OutputSchema, mergeOut); err != nil {
-						if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "SCHEMA_VALIDATION_ERROR", nil); err != nil {
-							return transitions, false, err
-						}
-						return transitions, true, nil
+				// Frozen Blueprint §16.2 requires an explicit merge outputSchema.
+				// Every committed merge result is validated; a missing schema
+				// fails closed as a malformed manifest.
+				if node.Merge.OutputSchema == nil {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
 					}
+					return transitions, true, nil
+				}
+				if err := contracts.ValidatePayload(node.Merge.OutputSchema, mergeOut); err != nil {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "SCHEMA_VALIDATION_ERROR", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
 				}
 
 				mergeBytes, err := json.Marshal(mergeOut)
@@ -1992,11 +2014,31 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 				}
 				var selectedBranch string
 				matched := false
+				// Fallback-only semantics: evaluate conditional branches in
+				// declaration order. The designated default never participates
+				// as an unconditional branch before fallback; declaration order
+				// applies solely to actual conditions.
+				defaultName := node.Choice.Default
+				declared := map[string]bool{}
 				for _, b := range node.Choice.Branches {
+					declared[b.Name] = true
+				}
+				// Malformed persisted manifests fail closed.
+				if defaultName != "" && !declared[defaultName] {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+				for _, b := range node.Choice.Branches {
+					if b.Name == defaultName {
+						continue
+					}
 					if b.Condition == nil {
-						selectedBranch = b.Name
-						matched = true
-						break
+						if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_EXPRESSION", nil); err != nil {
+							return transitions, false, err
+						}
+						return transitions, true, nil
 					}
 					condMet, evalErr := contracts.EvaluateChoice(b.Condition, runInput, outputsMap)
 					if evalErr != nil {
@@ -2011,8 +2053,8 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 						break
 					}
 				}
-				if !matched && node.Choice.Default != "" {
-					selectedBranch = node.Choice.Default
+				if !matched && defaultName != "" {
+					selectedBranch = defaultName
 					matched = true
 				}
 				if !matched {

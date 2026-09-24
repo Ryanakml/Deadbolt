@@ -719,3 +719,265 @@ func TestChoiceMerge_ReconcilerReplayInvariance(t *testing.T) {
 		t.Fatalf("expected all 4 steps to remain SUCCEEDED or SKIPPED, got %d", countUnchanged)
 	}
 }
+
+// TestChoiceMerge_DefaultFirstReversedOrder proves fallback-only semantics:
+// the conditionless default listed first must not win immediately. With
+// branches [standard (default, conditionless) first, high-value (x>5)
+// second], input x=10 must select high-value (declaration order applies
+// solely to actual conditions), and input x=2 must fall back to standard.
+func TestChoiceMerge_DefaultFirstReversedOrder(t *testing.T) {
+	tc, server, orgID, envID, _ := setupRunLifecycleTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	bundleDigest := "8888888888888888888888888888888888888888888888888888888888888888"
+	tasks := []map[string]any{
+		parallelTask("task-a", "safe", 3),
+		parallelTask("task-b", "safe", 3),
+	}
+	// Reversed: conditionless default first.
+	nodes := []map[string]any{
+		{
+			"id": "decide", "type": "choice",
+			"choice": map[string]any{
+				"branches": []map[string]any{
+					{"name": "standard"},
+					{"name": "high-value", "condition": map[string]any{
+						"op": "gt", "args": []any{
+							map[string]any{"$ref": "run.input", "pointer": "/x"},
+							map[string]any{"literal": 5},
+						},
+					}},
+				},
+				"default": "standard",
+			},
+		},
+		{"id": "manual-review", "type": "task", "task": "task-a", "after": []any{"decide"},
+			"input": map[string]any{"x": map[string]any{"$ref": "run.input", "pointer": "/x"}}},
+		{"id": "auto-approve", "type": "task", "task": "task-b", "after": []any{"decide"},
+			"input": map[string]any{"x": map[string]any{"$ref": "run.input", "pointer": "/x"}}},
+		{"id": "join", "type": "merge", "after": []any{"manual-review", "auto-approve"},
+			"merge": map[string]any{
+				"choice": "decide",
+				"branches": []map[string]any{
+					{"branch": "high-value", "terminal": "manual-review",
+						"value": map[string]any{"x": map[string]any{"$ref": "step.output", "stepId": "manual-review", "pointer": "/x"}}},
+					{"branch": "standard", "terminal": "auto-approve",
+						"value": map[string]any{"x": map[string]any{"$ref": "step.output", "stepId": "auto-approve", "pointer": "/x"}}},
+				},
+				"outputSchema": choiceMergeTaggedSchema(),
+			}},
+	}
+	outputRef := map[string]any{
+		"branch": map[string]any{"$ref": "step.output", "stepId": "join", "pointer": "/branch"},
+		"value":  map[string]any{"$ref": "step.output", "stepId": "join", "pointer": "/value"},
+	}
+	deploymentID := seedChoiceMergeDeployment(t, tc, orgID, envID, bundleDigest, "reversed-flow", tasks, nodes, outputRef)
+	execSvc := execution.NewService(tc.pool, tc.service)
+
+	// High input must select high-value despite standard listed first.
+	runHigh, _, err := execSvc.CreateRun(context.Background(), orgID, envID, "reversed-flow", "idemp-rev-high", &deploymentID, map[string]any{"x": float64(10)}, &tenant.AuditContext{
+		ActorType: tenant.IdentityTypeMachine,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun high failed: %v", err)
+	}
+	var selectedHigh string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		var out []byte
+		if err := tx.QueryRow(ctx, `SELECT output FROM run_steps WHERE run_id=$1::uuid AND node_id='decide'`, runHigh.ID).Scan(&out); err != nil {
+			return err
+		}
+		var decideOut map[string]any
+		if err := json.Unmarshal(out, &decideOut); err != nil {
+			return err
+		}
+		selectedHigh, _ = decideOut["selected"].(string)
+		return nil
+	}); err != nil {
+		t.Fatalf("decode decide high: %v", err)
+	}
+	if selectedHigh != "high-value" {
+		t.Fatalf("reversed order: expected high-value for x=10, got %s", selectedHigh)
+	}
+
+	// Low input must fall back to standard.
+	runLow, _, err := execSvc.CreateRun(context.Background(), orgID, envID, "reversed-flow", "idemp-rev-low", &deploymentID, map[string]any{"x": float64(2)}, &tenant.AuditContext{
+		ActorType: tenant.IdentityTypeMachine,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun low failed: %v", err)
+	}
+	var selectedLow string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		var out []byte
+		if err := tx.QueryRow(ctx, `SELECT output FROM run_steps WHERE run_id=$1::uuid AND node_id='decide'`, runLow.ID).Scan(&out); err != nil {
+			return err
+		}
+		var decideOut map[string]any
+		if err := json.Unmarshal(out, &decideOut); err != nil {
+			return err
+		}
+		selectedLow, _ = decideOut["selected"].(string)
+		return nil
+	}); err != nil {
+		t.Fatalf("decode decide low: %v", err)
+	}
+	if selectedLow != "standard" {
+		t.Fatalf("reversed order fallback: expected standard for x=2, got %s", selectedLow)
+	}
+}
+
+// TestChoiceMerge_MergeIgnoresUnselectedInternalDep proves Blueprint §16.2/F-16:
+// even when merge.after contains an extra unselected-branch internal node
+// (seeded directly to bypass structural validation), the merge still executes
+// from the selected terminal and never becomes SKIPPED because of the
+// unselected branch.
+func TestChoiceMerge_MergeIgnoresUnselectedInternalDep(t *testing.T) {
+	tc, server, orgID, envID, _ := setupRunLifecycleTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	bundleDigest := "9999999999999999999999999999999999999999999999999999999999999999"
+	tasks := []map[string]any{
+		parallelTask("task-a", "safe", 3),
+		parallelTask("task-b", "safe", 3),
+	}
+	nodes := []map[string]any{
+		{"id": "decide", "type": "choice", "choice": map[string]any{
+			"branches": []map[string]any{
+				{"name": "opt_a", "condition": map[string]any{
+					"op": "gt", "args": []any{
+						map[string]any{"$ref": "run.input", "pointer": "/x"},
+						map[string]any{"literal": 5},
+					}}},
+				{"name": "opt_b"},
+			},
+			"default": "opt_b",
+		}},
+		{"id": "step_a", "type": "task", "task": "task-a", "after": []any{"decide"},
+			"input": map[string]any{"x": map[string]any{"$ref": "run.input", "pointer": "/x"}}},
+		{"id": "low_step1", "type": "task", "task": "task-b", "after": []any{"decide"},
+			"input": map[string]any{"x": map[string]any{"$ref": "run.input", "pointer": "/x"}}},
+		{"id": "step_b", "type": "task", "task": "task-b", "after": []any{"low_step1"},
+			"input": map[string]any{"x": map[string]any{"$ref": "step.output", "stepId": "low_step1", "pointer": "/x"}}},
+		{"id": "join", "type": "merge", "after": []any{"step_a", "step_b", "low_step1"},
+			"merge": map[string]any{
+				"choice": "decide",
+				"branches": []map[string]any{
+					{"branch": "opt_a", "terminal": "step_a",
+						"value": map[string]any{"x": map[string]any{"$ref": "step.output", "stepId": "step_a", "pointer": "/x"}}},
+					{"branch": "opt_b", "terminal": "step_b",
+						"value": map[string]any{"x": map[string]any{"$ref": "step.output", "stepId": "step_b", "pointer": "/x"}}},
+				},
+				"outputSchema": choiceMergeTaggedSchema(),
+			}},
+	}
+	outputRef := map[string]any{
+		"branch": map[string]any{"$ref": "step.output", "stepId": "join", "pointer": "/branch"},
+		"value":  map[string]any{"$ref": "step.output", "stepId": "join", "pointer": "/value"},
+	}
+	deploymentID := seedChoiceMergeDeployment(t, tc, orgID, envID, bundleDigest, "extra-dep-flow", tasks, nodes, outputRef)
+	workerSession, _ := enrollExecutionWorker(t, tc, server, orgID, envID, "cm-worker-extra")
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO worker_deployments (session_id,organization_id,bundle_digest) VALUES ($1::uuid,$2::uuid,$3)`, workerSession.SessionID, orgID, bundleDigest)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	execSvc := execution.NewService(tc.pool, tc.service)
+	engine := execution.NewWorkerEngine(tc.pool)
+	runDTO, _, err := execSvc.CreateRun(context.Background(), orgID, envID, "extra-dep-flow", "idemp-extra-1", &deploymentID, map[string]any{"x": float64(10)}, &tenant.AuditContext{
+		ActorType: tenant.IdentityTypeMachine,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun failed: %v", err)
+	}
+	// Selected branch terminal succeeds.
+	assignments := parallelClaim(t, engine, workerSession, orgID, envID, 1, "claim-extra-a")
+	if len(assignments) != 1 {
+		t.Fatalf("expected 1 assignment, got %d", len(assignments))
+	}
+	a := assignments[0]
+	parallelStart(t, engine, workerSession, orgID, envID, a)
+	parallelCompleteSuccess(t, engine, workerSession, orgID, envID, a, map[string]any{"x": float64(77)})
+	// Merge must execute from selected terminal, never SKIPPED via unselected branch.
+	var joinState string
+	var joinOut []byte
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT state, output FROM run_steps WHERE run_id=$1::uuid AND node_id='join'`, runDTO.ID).Scan(&joinState, &joinOut)
+	}); err != nil {
+		t.Fatalf("query join: %v", err)
+	}
+	if joinState != "SUCCEEDED" {
+		t.Fatalf("expected join SUCCEEDED despite extra unselected dep, got %s", joinState)
+	}
+	var joinMap map[string]any
+	_ = json.Unmarshal(joinOut, &joinMap)
+	if joinMap["branch"] != "opt_a" {
+		t.Fatalf("expected join branch opt_a, got %v", joinMap)
+	}
+}
+
+// TestChoiceMerge_NoMatchNoDefaultFails proves that with no matching condition
+// and no declared default, execution fails fast with INVALID_EXPRESSION.
+func TestChoiceMerge_NoMatchNoDefaultFails(t *testing.T) {
+	tc, server, orgID, envID, _ := setupRunLifecycleTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	bundleDigest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tasks := []map[string]any{parallelTask("task-a", "safe", 3), parallelTask("task-b", "safe", 3)}
+	nodes := []map[string]any{
+		{"id": "decide", "type": "choice", "choice": map[string]any{
+			"branches": []map[string]any{
+				{"name": "opt_a", "condition": map[string]any{
+					"op": "gt", "args": []any{
+						map[string]any{"$ref": "run.input", "pointer": "/x"},
+						map[string]any{"literal": 100},
+					}}},
+				{"name": "opt_b", "condition": map[string]any{
+					"op": "lt", "args": []any{
+						map[string]any{"$ref": "run.input", "pointer": "/x"},
+						map[string]any{"literal": 0},
+					}}},
+			},
+		}},
+		{"id": "step_a", "type": "task", "task": "task-a", "after": []any{"decide"},
+			"input": map[string]any{"x": map[string]any{"$ref": "run.input", "pointer": "/x"}}},
+		{"id": "step_b", "type": "task", "task": "task-b", "after": []any{"decide"},
+			"input": map[string]any{"x": map[string]any{"$ref": "run.input", "pointer": "/x"}}},
+		{"id": "join", "type": "merge", "after": []any{"step_a", "step_b"},
+			"merge": map[string]any{
+				"choice": "decide",
+				"branches": []map[string]any{
+					{"branch": "opt_a", "terminal": "step_a",
+						"value": map[string]any{"x": map[string]any{"$ref": "step.output", "stepId": "step_a", "pointer": "/x"}}},
+					{"branch": "opt_b", "terminal": "step_b",
+						"value": map[string]any{"x": map[string]any{"$ref": "step.output", "stepId": "step_b", "pointer": "/x"}}},
+				},
+				"outputSchema": choiceMergeTaggedSchema(),
+			}},
+	}
+	outputRef := map[string]any{
+		"branch": map[string]any{"$ref": "step.output", "stepId": "join", "pointer": "/branch"},
+		"value":  map[string]any{"$ref": "step.output", "stepId": "join", "pointer": "/value"},
+	}
+	deploymentID := seedChoiceMergeDeployment(t, tc, orgID, envID, bundleDigest, "no-match-flow", tasks, nodes, outputRef)
+	execSvc := execution.NewService(tc.pool, tc.service)
+	runDTO, _, err := execSvc.CreateRun(context.Background(), orgID, envID, "no-match-flow", "idemp-nomatch-1", &deploymentID, map[string]any{"x": float64(10)}, &tenant.AuditContext{
+		ActorType: tenant.IdentityTypeMachine,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun unexpected error: %v", err)
+	}
+	var status, reason string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,'') FROM runs WHERE id=$1::uuid`, runDTO.ID).Scan(&status, &reason)
+	}); err != nil {
+		t.Fatalf("query run: %v", err)
+	}
+	if status != "FAILED" || reason != "INVALID_EXPRESSION" {
+		t.Fatalf("expected FAILED/INVALID_EXPRESSION for no match no default, got %s/%s", status, reason)
+	}
+}

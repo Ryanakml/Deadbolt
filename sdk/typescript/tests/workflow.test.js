@@ -383,6 +383,15 @@ test("defineWorkflow accepts valid choice and merge workflow with typed helpers"
               value: output("term_b", "/x"),
             },
           ],
+          outputSchema: {
+            type: "object",
+            properties: {
+              branch: { type: "string" },
+              value: { type: "integer" },
+            },
+            required: ["branch", "value"],
+            additionalProperties: false,
+          },
         },
         ["term_a", "term_b"],
       ),
@@ -448,6 +457,15 @@ test("defineWorkflow rejects choice condition with invalid operator", () => {
                   value: output("term_a", "/x"),
                 },
               ],
+              outputSchema: {
+                type: "object",
+                properties: {
+                  branch: { type: "string" },
+                  value: { type: "integer" },
+                },
+                required: ["branch", "value"],
+                additionalProperties: false,
+              },
             },
             ["term_a"],
           ),
@@ -509,6 +527,15 @@ test("defineWorkflow rejects cross-branch dependency", () => {
                 { branch: "opt_a", terminal: "term_a" },
                 { branch: "opt_b", terminal: "term_b" },
               ],
+              outputSchema: {
+                type: "object",
+                properties: {
+                  branch: { type: "string" },
+                  value: { type: "integer" },
+                },
+                required: ["branch", "value"],
+                additionalProperties: false,
+              },
             },
             ["term_a", "term_b"],
           ),

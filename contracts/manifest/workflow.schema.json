@@ -76,13 +76,6 @@
                     },
                     "condition": {
                       "type": "object"
-                    },
-                    "target": {
-                      "type": "string",
-                      "pattern": "^[a-zA-Z0-9_-]{1,64}$",
-                      "not": {
-                        "pattern": "[^a-zA-Z0-9_-]"
-                      }
                     }
                   },
                   "required": ["name"],
@@ -140,7 +133,7 @@
                 "type": "object"
               }
             },
-            "required": ["choice", "branches"],
+            "required": ["choice", "branches", "outputSchema"],
             "additionalProperties": false
           },
           "branch": {

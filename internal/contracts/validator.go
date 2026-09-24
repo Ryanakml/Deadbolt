@@ -273,6 +273,7 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 			return failure("INVALID_CHOICE")
 		}
 		branchNames := map[string]bool{}
+		conditionlessCount := 0
 		for _, b := range branches {
 			bObj := obj(b)
 			if bObj == nil {
@@ -287,10 +288,26 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 				if err := ValidateChoiceExpression(cond, ancestors[id]); err != nil {
 					return err
 				}
+			} else {
+				conditionlessCount++
+				// Fallback-only semantics: only the declared default may be
+				// conditionless. Any conditionless non-default branch is
+				// ambiguous and must be rejected.
+				if name != def {
+					return failure("INVALID_CHOICE")
+				}
 			}
 		}
-		if def != "" {
-			branchNames[def] = true
+		// Declared default must reference a declared branch. It must not be
+		// silently added when undeclared.
+		if def != "" && !branchNames[def] {
+			return failure("INVALID_CHOICE")
+		}
+		// Multiple conditionless branches are ambiguous even when one of them
+		// is the default; the default is fallback-only and declaration order
+		// applies solely to actual conditions.
+		if conditionlessCount > 1 {
+			return failure("INVALID_CHOICE")
 		}
 	}
 
@@ -347,10 +364,11 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 				return failure("INVALID_MERGE")
 			}
 		}
-		if mrg["outputSchema"] != nil {
-			if err := ValidateSchema(mrg["outputSchema"]); err != nil {
-				return err
-			}
+		if mrg["outputSchema"] == nil {
+			return failure("INVALID_MERGE")
+		}
+		if err := ValidateSchema(mrg["outputSchema"]); err != nil {
+			return err
 		}
 	}
 	for id := range choices {
@@ -468,6 +486,33 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		}
 	}
 
+	// Blueprint §16.2 / F-16: for branch-related dependencies, the merge may
+	// depend only on the declared terminal for each branch. Extra direct
+	// dependencies into branch internals would couple the merge to a skipped
+	// branch and must be rejected. Legitimate non-branch/common dependencies
+	// (pre-choice ancestors) remain allowed.
+	for choiceID := range choices {
+		mergeID := mergeForChoice[choiceID]
+		mrg := obj(merges[mergeID]["merge"])
+		terminals := map[string]bool{}
+		for _, b := range arr(mrg["branches"]) {
+			terminals[str(obj(b)["terminal"])] = true
+		}
+		for _, dep := range arr(byID[mergeID]["after"]) {
+			d := str(dep)
+			inBranch := false
+			for _, bSet := range choiceBranchNodeSets[choiceID] {
+				if bSet[d] {
+					inBranch = true
+					break
+				}
+			}
+			if inBranch && !terminals[d] {
+				return failure("INVALID_MERGE")
+			}
+		}
+	}
+
 	for choiceID := range choices {
 		depth := 1
 		for otherChoiceID, bMap := range choiceBranchNodeSets {
@@ -580,6 +625,11 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		return nil
 	}
 
+	mergeChoiceByID := map[string]string{}
+	for choiceID, mergeID := range mergeForChoice {
+		mergeChoiceByID[mergeID] = choiceID
+	}
+
 	for _, v := range nodes {
 		n := obj(v)
 		id := str(n["id"])
@@ -588,10 +638,27 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		}
 		if n["type"] == "merge" {
 			mrg := obj(n["merge"])
+			choiceID := mergeChoiceByID[id]
 			for _, b := range arr(mrg["branches"]) {
 				bObj := obj(b)
 				if val := bObj["value"]; val != nil {
-					if err := mapping(val, ancestors[id], false); err != nil {
+					// Branch-specific merge values may reference only nodes
+					// in that same branch, safe common ancestors before the
+					// choice (plus the choice itself), run input, or other
+					// explicitly permitted sources. They must not reference
+					// another branch's internal node/terminal/output.
+					bName := str(bObj["branch"])
+					allowed := map[string]bool{}
+					for anc := range ancestors[choiceID] {
+						allowed[anc] = true
+					}
+					allowed[choiceID] = true
+					if bSet, ok := choiceBranchNodeSets[choiceID][bName]; ok {
+						for nodeID := range bSet {
+							allowed[nodeID] = true
+						}
+					}
+					if err := mapping(val, allowed, false); err != nil {
 						return err
 					}
 				}

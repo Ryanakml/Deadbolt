@@ -77,7 +77,6 @@ export type WorkflowNodeType =
 export interface ChoiceBranch {
   name: string;
   condition?: JSONValue;
-  target?: string;
 }
 
 export interface ChoiceNodeConfig {
@@ -94,7 +93,7 @@ export interface MergeBranch {
 export interface MergeNodeConfig {
   choice: string;
   branches: MergeBranch[];
-  outputSchema?: JSONValue;
+  outputSchema: JSONValue;
 }
 
 export interface WorkflowNode {
