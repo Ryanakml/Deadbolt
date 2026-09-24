@@ -38,18 +38,12 @@ Source-of-truth hierarchy:
   - `cumulative-regressions`: 7 passed, 1 skipped (hosted staging fixture skips as pending), 0 failed
 - **Status Accounting:**
   - `LOCAL_AUTOMATED_GATE = PASS`
-  - `HOSTED_CI = PENDING` (CI run `36010195356` on HEAD `15f01b5` in progress; prior run `36006950904` failed only on pre-existing flaky `TestParallelFailFast_RealAgent` (25s ack deadline exceeded under `-race`); fixed by widening deadline to 45s)
-  - `DEPLOYED = YES` (Staging Immutable Deploy run `36006706642` completed successfully; SHA `dbebcaa`)
-  - `HOSTED_ACCEPTANCE = NOT_VERIFIED` (staging endpoint requires operator credentials)
-  - `OVERALL_M3_GATE = PARTIAL` (Local automated suite fully green; staging deployed but hosted acceptance not yet exercised)
-- **Staging Deployment Evidence:**
-  - Staging Deploy Workflow: [36006706642](https://github.com/Ryanakml/Deadbolt/actions/runs/36006706642)
-  - Deployed SHA: `dbebcaa6de1031360a1caf04bc24f28d64618dbd`
-  - Control-plane image: `ghcr.io/ryanakml/deadbolt/control-plane:dbebcaa6de1031360a1caf04bc24f28d64618dbd@sha256:d71d4aea345f181c1ccc5852a4eaf6fda48950a15cf206f65e10eadba265259a`
-  - Postgres image: `ghcr.io/ryanakml/deadbolt/postgres:dbebcaa6de1031360a1caf04bc24f28d64618dbd@sha256:76a9fd7d528d780a6c19cc10890c91e0cedc58ed612700e7e37277972797a9fb`
-  - `/version` response: `{"version":"0.1.0","commit":"dbebcaa6de1031360a1caf04bc24f28d64618dbd","build_time":"2026-09-24T20:34:37+07:00","image_digest":"ghcr.io/ryanakml/deadbolt/control-plane@sha256:d71d4aea345f181c1ccc5852a4eaf6fda48950a15cf206f65e10eadba265259a","runtime_mode":"hosted"}`
-  - Blue/green deploy: Active slot `green` (port 8089), edge smoke passed (attempt 1/30), tenant route smoke passed (HTTP 401 on unauthenticated call)
-  - Caddy edge route switched to `deadbolt-control-plane-green:8080`
+  - `HOSTED_CI = PENDING` (must be rerun for the final candidate SHA)
+  - `DEPLOYED = NO` (no deployment evidence exists for final candidate SHA `ce4b6a8786eaa1db9f509f6281cdc62d5dd58a73`)
+  - `HOSTED_ACCEPTANCE = NOT_VERIFIED` (exact-artifact staging evidence is intentionally absent; staging endpoint requires operator credentials)
+  - `OVERALL_M3_GATE = PARTIAL` (local automated suite is green; hosted CI and exact-artifact staging acceptance remain unverified)
+
+No staging deployment or hosted acceptance result is claimed for this merge candidate. Evidence from earlier SHAs is historical only and is not used as M3 acceptance evidence.
 
 ---
 
