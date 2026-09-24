@@ -109,11 +109,12 @@ jobs:
           docker build -f deploy/Dockerfile.postgres .
       - name: Clean-clone Local Compose Boot Smoke
         run: |
-          # Keep the workflow's PostgreSQL service untouched. The Compose
-          # stack uses an isolated host port while retaining the service's
-          # internal 5432 connection.
-          export DEADBOLT_POSTGRES_PORT=55432
-          docker compose -f deploy/compose/docker-compose.yml --profile core up -d || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          # Keep the workflow's PostgreSQL service untouched. The base
+          # Compose contract keeps its explicit loopback:5432 binding; this
+          # CI-only override isolates the host port while retaining the
+          # service's internal 5432 connection.
+          export COMPOSE_SMOKE="-f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.ci-smoke.yml"
+          docker compose $COMPOSE_SMOKE --profile core up -d || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
           for i in $(seq 1 30); do
             if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
               echo "Local compose control plane is alive!"
@@ -122,15 +123,15 @@ jobs:
             sleep 2
           done
           # Verify livez returned 200 OK
-          curl -fs http://127.0.0.1:8080/livez || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          curl -fs http://127.0.0.1:8080/livez || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
           # These assets must come from the final control-plane image, not a
           # source checkout. Keep this smoke beside the image/Compose gate.
-          curl -fs http://127.0.0.1:8080/dashboard/ >/dev/null || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
-          curl -fs http://127.0.0.1:8080/dashboard/index.js >/dev/null || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
-          curl -fs http://127.0.0.1:8080/dashboard/styles.css >/dev/null || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
-          node scripts/verify-dashboard-esm.mjs http://127.0.0.1:8080/dashboard || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          curl -fs http://127.0.0.1:8080/dashboard/ >/dev/null || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
+          curl -fs http://127.0.0.1:8080/dashboard/index.js >/dev/null || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
+          curl -fs http://127.0.0.1:8080/dashboard/styles.css >/dev/null || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
+          node scripts/verify-dashboard-esm.mjs http://127.0.0.1:8080/dashboard || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
           # Execute migrations using in-container migrator runner
-          docker compose -f deploy/compose/docker-compose.yml --profile core exec -T control-plane /usr/local/bin/control-plane --migrate
+          docker compose $COMPOSE_SMOKE --profile core exec -T control-plane /usr/local/bin/control-plane --migrate
           # Verify readyz returned 200 OK after schema is current
           READYZ_OK=false
           for i in $(seq 1 15); do
@@ -142,11 +143,11 @@ jobs:
             sleep 1
           done
           if [ "$READYZ_OK" != "true" ]; then
-            docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1
+            docker compose $COMPOSE_SMOKE --profile core logs && exit 1
           fi
           # Test stop and start preserves volume persistence
-          docker compose -f deploy/compose/docker-compose.yml --profile core stop
-          docker compose -f deploy/compose/docker-compose.yml --profile core start
+          docker compose $COMPOSE_SMOKE --profile core stop
+          docker compose $COMPOSE_SMOKE --profile core start
           for i in $(seq 1 30); do
             if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
               echo "Local compose control plane restarted!"
@@ -154,9 +155,9 @@ jobs:
             fi
             sleep 2
           done
-          curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1 || (docker compose -f deploy/compose/docker-compose.yml --profile core logs && exit 1)
+          curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1 || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
           # Explicit clean teardown
-          docker compose -f deploy/compose/docker-compose.yml --profile core down -v
+          docker compose $COMPOSE_SMOKE --profile core down -v
       - name: Scan tracked source and history without printing secrets
         run: |
           bin/gitleaks git --redact --no-banner --log-opts="--all"
