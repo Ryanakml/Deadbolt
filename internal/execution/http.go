@@ -807,6 +807,8 @@ func (h *HTTPHandler) PauseRun(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, r, http.StatusConflict, "RUN_CANCELLING", "Run cancellation is in progress")
 		case errors.Is(err, ErrRevisionConflict):
 			errJSON(w, r, http.StatusConflict, "REVISION_CONFLICT", "Run changed since it was read; refresh before acting")
+		case errors.Is(err, ErrRunDeadlineExceeded):
+			errJSON(w, r, http.StatusConflict, "RUN_DEADLINE_EXCEEDED", "Run deadline has passed")
 		case errors.Is(err, tenant.ErrAuditRequired):
 			errJSON(w, r, http.StatusUnauthorized, "AUDIT_REQUIRED", "Audit context is required")
 		case errors.Is(err, tenant.ErrIdempotencyConflict):
@@ -871,6 +873,8 @@ func (h *HTTPHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, r, http.StatusConflict, "RUN_NOT_PAUSED", "Run is not paused or pausing")
 		case errors.Is(err, ErrRevisionConflict):
 			errJSON(w, r, http.StatusConflict, "REVISION_CONFLICT", "Run changed since it was read; refresh before acting")
+		case errors.Is(err, ErrRunDeadlineExceeded):
+			errJSON(w, r, http.StatusConflict, "RUN_DEADLINE_EXCEEDED", "Run deadline has passed")
 		case errors.Is(err, tenant.ErrAuditRequired):
 			errJSON(w, r, http.StatusUnauthorized, "AUDIT_REQUIRED", "Audit context is required")
 		case errors.Is(err, tenant.ErrIdempotencyConflict):
@@ -883,4 +887,3 @@ func (h *HTTPHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, resp)
 }
-

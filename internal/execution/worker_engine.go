@@ -2689,8 +2689,14 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.runID, organizationID).Scan(&curRunStatus); err != nil {
 			continue
 		}
+		// PAUSING is nonterminal for recovery: an already-committed in-flight
+		// attempt must still finish, timeout, become LOST, schedule a durable
+		// retry/hold, or fail the run (Blueprint §10.2, §11.2). New claims
+		// stay blocked by the pause_requested guard in the claim path, not
+		// here. PAUSED (zero live attempts by definition) and terminal or
+		// cancelling runs never gain work from a stale snapshot.
 		switch curRunStatus {
-		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSED":
 			continue
 		}
 		var curStepState string
@@ -2741,6 +2747,16 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			}
 			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='RUN_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
 				WHERE id=$1::uuid AND organization_id=$2::uuid`, c.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			// Settle consistently with the canonical fail-fast path: pending
+			// timers die with the run so a later firing cannot reopen it, and
+			// open holds close mooted by the terminal decision.
+			if _, err := tx.Exec(ctx, `UPDATE timers SET state='CANCELLED', updated_at=clock_timestamp()
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, c.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if err := closeOpenCasesTx(ctx, tx, organizationID, c.runID, nil, "RUN_DEADLINE_EXCEEDED", "FAIL"); err != nil {
 				return 0, nil, err
 			}
 			if err := appendRunEvent(ctx, tx, organizationID, c.runID, "TASK_LOST", map[string]any{
@@ -2865,7 +2881,7 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			continue
 		}
 		switch hRunStatus {
-		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSING", "PAUSED":
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING", "PAUSED":
 			continue
 		}
 		reclaimedRunsMap[h.runID] = struct{}{}
@@ -2884,6 +2900,14 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 			}
 			if _, err := tx.Exec(ctx, `UPDATE runs SET status='FAILED', reason_code='RUN_DEADLINE_EXCEEDED', updated_at=clock_timestamp()
 				WHERE id=$1::uuid AND organization_id=$2::uuid`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			// Same canonical settlement as above: timers die, holds close.
+			if _, err := tx.Exec(ctx, `UPDATE timers SET state='CANCELLED', updated_at=clock_timestamp()
+				WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, h.runID, organizationID); err != nil {
+				return 0, nil, err
+			}
+			if err := closeOpenCasesTx(ctx, tx, organizationID, h.runID, nil, "RUN_DEADLINE_EXCEEDED", "FAIL"); err != nil {
 				return 0, nil, err
 			}
 			if err := appendRunEvent(ctx, tx, organizationID, h.runID, "RUN_FAILED", map[string]any{

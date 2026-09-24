@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
@@ -59,6 +60,15 @@ func (e *WorkerEngine) PauseRun(
 ) (*RunDTO, error) {
 	if audit == nil {
 		return nil, tenant.ErrAuditRequired
+	}
+	// Blueprint §10.2 priority: the run deadline outranks pause. Settle an
+	// already-expired run in its own committed transaction before the
+	// idempotent command path (whose error rollback must never swallow the
+	// settlement), so pause can never park an expired run in PAUSING/PAUSED.
+	if settled, err := e.settleOverdueRunForControl(ctx, orgID, runID); err != nil {
+		return nil, err
+	} else if settled {
+		return nil, ErrRunDeadlineExceeded
 	}
 	var resp *RunDTO
 	mutate := func(ctx context.Context, tx storage.Tx) error {
@@ -149,6 +159,77 @@ func (e *WorkerEngine) pauseRunTx(
 	return queryRunDTO(ctx, tx, orgID, runID)
 }
 
+// settleOverdueRunForControl terminalizes an already-expired run observed
+// by a pause/resume control action, in its own committed transaction using
+// database time. It returns settled=true when it failed the run (the caller
+// must then refuse the control with ErrRunDeadlineExceeded). Terminal and
+// cancelling runs are left for their own settlement paths. The original
+// deadline is never reset or extended.
+func (e *WorkerEngine) settleOverdueRunForControl(ctx context.Context, orgID, runID string) (bool, error) {
+	settled := false
+	err := e.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
+		var status string
+		var deadline *time.Time
+		if err := tx.QueryRow(ctx, `SELECT status, deadline_at FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, runID, orgID).Scan(&status, &deadline); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrRunNotFound
+			}
+			return err
+		}
+		switch status {
+		case "SUCCEEDED", "FAILED", "CANCELLED", "CANCELLING":
+			return nil
+		}
+		expired, err := runDeadlineExceededTx(ctx, tx, deadline)
+		if err != nil {
+			return err
+		}
+		if !expired {
+			return nil
+		}
+		if err := settleExpiredRunForControlTx(ctx, tx, orgID, runID); err != nil {
+			return err
+		}
+		settled = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return settled, nil
+}
+
+// runDeadlineExceededTx reports whether the run deadline has passed using
+// database time. A nil deadline never expires and is never reset or extended
+// by pause, resume, retry, or reconciliation.
+func runDeadlineExceededTx(ctx context.Context, tx storage.Tx, deadline *time.Time) (bool, error) {
+	if deadline == nil {
+		return false, nil
+	}
+	var dbNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return false, err
+	}
+	return !dbNow.Before(*deadline), nil
+}
+
+// settleExpiredRunForControlTx terminalizes an already-expired run observed
+// by a pause/resume control action. It reuses the canonical fail-fast
+// settlement (timers die, holds close mooted) with steps locked in ID order
+// under the already-held run lock, so the run can never be (re)opened past
+// its original deadline.
+func settleExpiredRunForControlTx(ctx context.Context, tx storage.Tx, orgID, runID string) error {
+	var stepID string
+	if err := tx.QueryRow(ctx, `SELECT rs.id::text FROM run_steps rs
+		WHERE rs.run_id=$1::uuid AND rs.organization_id=$2::uuid
+			AND rs.state IN ('BLOCKED','READY','RUNNING','WAITING')
+		ORDER BY rs.id LIMIT 1 FOR UPDATE OF rs`, runID, orgID).Scan(&stepID); err != nil {
+		return failOverdueRunWithoutStepsTx(ctx, tx, orgID, runID)
+	}
+	return failRunForStepTx(ctx, tx, orgID, runID, stepID, "RUN_DEADLINE_EXCEEDED", nil)
+}
+
 func appendPauseAuditTx(ctx context.Context, tx storage.Tx, orgID, runID string, audit *tenant.AuditContext, targetStatus string, activeAttempts int) error {
 	meta, err := json.Marshal(map[string]any{
 		"actor_type":     audit.ActorType,
@@ -181,6 +262,14 @@ func (e *WorkerEngine) ResumeRun(
 ) (*RunDTO, error) {
 	if audit == nil {
 		return nil, tenant.ErrAuditRequired
+	}
+	// Blueprint §10.2 priority: the run deadline outranks resume. Settle an
+	// already-expired run in its own committed transaction before any state
+	// recomputation so resume can never reopen it.
+	if settled, err := e.settleOverdueRunForControl(ctx, orgID, runID); err != nil {
+		return nil, err
+	} else if settled {
+		return nil, ErrRunDeadlineExceeded
 	}
 	var resp *RunDTO
 	mutate := func(ctx context.Context, tx storage.Tx) error {
@@ -258,9 +347,13 @@ func (e *WorkerEngine) resumeRunTx(
 		_ = json.Unmarshal(rawRunInput, &runInput)
 	}
 
+	// Canonical lock order (Blueprint §11.2): run (held above) → steps in ID
+	// order. No attempt/lease/timer locks are acquired before all required
+	// step locks, so resume cannot deadlock against completion or the
+	// expired-lease sweep, which lock the same levels in the same order.
 	stepRows, err := tx.Query(ctx, `SELECT id::text, node_id, state, output
 		FROM run_steps WHERE run_id=$1::uuid AND organization_id=$2::uuid
-		FOR UPDATE`, runID, orgID)
+		ORDER BY id FOR UPDATE`, runID, orgID)
 	if err != nil {
 		return nil, err
 	}

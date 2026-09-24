@@ -2,9 +2,11 @@ export * from "./types.js";
 export * from "./stream.js";
 export * from "./inspector.js";
 export * from "./api.js";
+export * from "./permissions.js";
 import { DashboardApiClient, isUnauthorized, isConflict, newIdempotencyKey, } from "./api.js";
 import { createEnvironmentSelection, formatEnvironmentLabel, getSelectedEnvironmentId, selectEnvironment, setSelectionCatalog, setSelectionOrganization, } from "./api.js";
 import { resolveOrgState } from "./auth.js";
+import { sessionCanControlRuns, visibleRunControls } from "./permissions.js";
 import { RunInspector } from "./inspector.js";
 import { shouldShowWorkerWait, terminalStepEmptyText, openCaseForStep, reconciliationHoldText, terminationBannerText, RESOLVE_ACTIONS, } from "./inspector.js";
 import { clearStreamErrorOnLive, createStreamErrorBanner, markGlobalError, markStreamError, } from "./stream.js";
@@ -20,6 +22,11 @@ function initDashboard() {
     // selector value is always the environment UUID, never a bare name.
     const envSelection = createEnvironmentSelection();
     let activeInspector = null;
+    // Whether the active session may invoke run mutations (pause/resume/
+    // cancel, all runs:control). Derived once from the BFF session membership
+    // in enterApp; the backend remains the security authority. Mutation CTAs
+    // render only when state AND this flag both allow them (§23.2).
+    let canControlRuns = false;
     // Scoped banner state: only a transient stream error may be cleared on
     // SSE reconnect. Bootstrap/API errors stay visible.
     const streamBanner = createStreamErrorBanner();
@@ -111,6 +118,10 @@ function initDashboard() {
         // Bind the catalog to the newly established organization. Any selection
         // from a previous org is cleared first so it can never be reused.
         const orgId = session.active_organization_id ?? null;
+        // Authoritative frontend permission data for mutation CTAs: the BFF
+        // session membership decides runs:control, never button clicks or HTTP
+        // failures.
+        canControlRuns = sessionCanControlRuns(session, orgId);
         await loadEnvironmentCatalog(orgId);
         if (runIdParam) {
             inspectRun(runIdParam);
@@ -272,6 +283,9 @@ function initDashboard() {
             activeInspector.destroy();
             activeInspector = null;
         }
+        // Drop mutation authority with the session so a signed-out or expired
+        // identity can never retain visible mutation affordances.
+        canControlRuns = false;
         clearEnvironmentState();
         for (const id of ["runs-table-body", "workers-table-body"]) {
             const el = document.getElementById(id);
@@ -427,6 +441,9 @@ function initDashboard() {
             const container = document.getElementById("inspector-content");
             if (!container)
                 return;
+            // Blueprint §23.2: Pause/Resume/Cancel render only when the run state
+            // permits the action AND the active identity holds runs:control.
+            const controls = visibleRunControls(snap.status, canControlRuns);
             const stepsHtml = snap.steps
                 .map((st) => {
                 const attemptsHtml = st.attempts
@@ -505,9 +522,9 @@ function initDashboard() {
           <div class="run-badges">
             <span class="badge status-${snap.status.toLowerCase()}">${snap.status}</span>
             <span id="stream-freshness-badge" class="badge freshness-badge freshness-${currentStreamFreshness.toLowerCase()}">${currentStreamFreshness}</span>
-            ${snap.status === "QUEUED" || snap.status === "RUNNING" || snap.status === "WAITING" ? `<button id="pause-run-btn" class="secondary-btn">Pause run</button>` : ""}
-            ${snap.status === "PAUSING" || snap.status === "PAUSED" ? `<button id="resume-run-btn" class="primary-btn">Resume run</button>` : ""}
-            ${snap.status === "QUEUED" || snap.status === "RUNNING" || snap.status === "WAITING" || snap.status === "PAUSING" || snap.status === "PAUSED" ? `<button id="cancel-run-btn" class="danger-btn">Cancel run</button>` : ""}
+            ${controls.pause ? `<button id="pause-run-btn" class="secondary-btn">Pause run</button>` : ""}
+            ${controls.resume ? `<button id="resume-run-btn" class="primary-btn">Resume run</button>` : ""}
+            ${controls.cancel ? `<button id="cancel-run-btn" class="danger-btn">Cancel run</button>` : ""}
           </div>
         </div>
 
