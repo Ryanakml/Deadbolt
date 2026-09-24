@@ -1049,9 +1049,6 @@ func TestParallelRetry_RunStatePriority(t *testing.T) {
 // concurrently, the all-success join waits for both parents, and every Node
 // child receives control-plane-mapped committed ancestor outputs.
 func TestParallelDiamond_RealAgent(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("real Agent bundle fixture requires the Linux worker runtime used by CI")
-	}
 	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
 	defer tc.cleanup()
 	defer server.Close()
@@ -1171,9 +1168,6 @@ func TestParallelDiamond_RealAgent(t *testing.T) {
 // killed, stop acked), the committed output stays durable, and the late
 // ABORTED completion cannot reopen the run.
 func TestParallelFailFast_RealAgent(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("real Agent bundle fixture requires the Linux worker runtime used by CI")
-	}
 	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
 	defer tc.cleanup()
 	defer server.Close()
