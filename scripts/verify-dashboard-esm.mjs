@@ -15,6 +15,7 @@ const moduleNames = [
   "api.js",
   "auth.js",
   "inspector.js",
+  "permissions.js",
   "stream.js",
   "types.js",
 ];
