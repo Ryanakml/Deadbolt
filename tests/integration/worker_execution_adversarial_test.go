@@ -1046,6 +1046,23 @@ func TestWorkerRunningLeaseExpiryAndDurableRecovery(t *testing.T) {
 	if pendingTimers != 1 {
 		t.Fatalf("expected one pending retry timer, got %d", pendingTimers)
 	}
+	// Full-jitter backoff may legally choose a delay close to zero. Keep this
+	// timer out of the due-timer phase of ReconcileExpiredLeases while the test
+	// verifies that processing the same expired lease is idempotent. The timer
+	// is made due explicitly below when timer firing becomes the behavior under
+	// test.
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `WITH deferred AS (
+			UPDATE timers SET due_at=clock_timestamp()+INTERVAL '1 hour'
+			WHERE step_id=$1::uuid AND state='PENDING'
+			RETURNING due_at
+		)
+		UPDATE run_steps SET eligible_at=deferred.due_at, updated_at=clock_timestamp()
+		FROM deferred WHERE run_steps.id=$1::uuid`, stepID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// A second sweep must be a no-op. Lease expiry is an authoritative state
 	// transition, not a notification that can be emitted again on every sweep.
