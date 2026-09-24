@@ -93,17 +93,21 @@ run_cmd() {
 
 print_summary() {
   echo "---"
-  echo "M3-GATE SUMMARY: PASS=$PASS FAIL=$FAIL NOT_VERIFIED=$NOT_VERIFIED"
+  echo "LOCAL AUTOMATED GATE SUMMARY: PASS=$PASS FAIL=$FAIL NOT_VERIFIED=$NOT_VERIFIED"
 }
 
 fail_if_not_green() {
   if [[ "$FAIL" -ne 0 ]]; then
     echo "FAILED GROUPS: ${FAILED_GROUPS[*]}"
+    echo "LOCAL_AUTOMATED_GATE=FAIL"
+    echo "OVERALL_M3_GATE=FAIL"
     exit 1
   fi
   if [[ "$NOT_VERIFIED" -ne 0 ]]; then
     echo "NOT_VERIFIED GROUPS: ${UNVERIFIED_GROUPS[*]}"
-    echo "M3-GATE: required evidence missing; unavailable dependency is NOT VERIFIED, not PASS."
+    echo "LOCAL_AUTOMATED_GATE=NOT_VERIFIED"
+    echo "OVERALL_M3_GATE=PARTIAL"
+    echo "M3-GATE: required local evidence missing; unavailable dependency is NOT VERIFIED, not PASS."
     exit 1
   fi
 }
@@ -119,6 +123,8 @@ run_group "m3-property" -race -count=1 -v ./internal/execution/ -run '^TestM3_Pr
 if [[ "$NEW_ONLY" == "1" ]]; then
   print_summary
   fail_if_not_green
+  echo "LOCAL_AUTOMATED_GATE=PASS (new-only)"
+  echo "OVERALL_M3_GATE=PARTIAL"
   exit 0
 fi
 
@@ -142,4 +148,9 @@ run_group "cumulative-regressions" -race -count=1 ./tests/integration/ -run 'Tes
 
 print_summary
 fail_if_not_green
-echo "M3-GATE: all local groups passed. Staging hosted deployment remains PENDING_HOSTED_STAGING."
+echo "LOCAL_AUTOMATED_GATE=PASS"
+echo "HOSTED_CI=PENDING"
+echo "DEPLOYED=NO"
+echo "HOSTED_ACCEPTANCE=NOT_VERIFIED"
+echo "OVERALL_M3_GATE=PARTIAL"
+echo "M3-GATE: all local automated groups passed. Staging hosted deployment and acceptance remain pending."

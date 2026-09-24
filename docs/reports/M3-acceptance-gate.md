@@ -26,8 +26,8 @@ Source-of-truth hierarchy:
 - **Branch:** `feat/issue-31-m3-gate`
 - **Baseline Git SHA:** `c40cb0424578508e7df8d933ca4aa91a45749f76` (PR #80 merged)
 - **Local Gate Script:** `scripts/m3-gate.sh`
-- **Local Gate Result:** **`PASS=8 FAIL=0 NOT_VERIFIED=0`** (All 8 test groups passed with zero failures and zero unverified dependencies)
-- **Cumulative Test Count:**
+- **Local Automated Gate Result:** **`PASS=8 FAIL=0 NOT_VERIFIED=0`** (All 8 test groups passed with zero failures and zero unverified local dependencies)
+- **Cumulative Local Test Count:**
   - `m3-gate-new`: 12 passed, 0 skipped, 0 failed
   - `m3-property`: 10 passed, 0 skipped, 0 failed
   - `parallel-dag`: 10 passed, 0 skipped, 0 failed
@@ -36,7 +36,12 @@ Source-of-truth hierarchy:
   - `inspector-parity`: 8 passed, 0 skipped, 0 failed
   - `dashboard-suite`: 65 passed, 0 failed (DOM integration, WCAG 2.2 AA, Virtualization, SSE)
   - `cumulative-regressions`: 7 passed, 1 skipped (hosted staging fixture skips as pending), 0 failed
-- **Overall Verdict:** **LOCAL_GATE_PASSED**. The integrated M3 system satisfies all blueprint requirements and passes all automated integration, property, and negative tests. Hosted staging verification remains `HOSTED_STAGING_PENDING`.
+- **Status Accounting:**
+  - `LOCAL_AUTOMATED_GATE = PASS`
+  - `HOSTED_CI = PENDING`
+  - `DEPLOYED = NO`
+  - `HOSTED_ACCEPTANCE = NOT_VERIFIED`
+  - `OVERALL_M3_GATE = PARTIAL` (Local automated suite fully green; overall milestone gate is PARTIAL until hosted staging acceptance is executed and proven)
 
 ---
 
@@ -57,7 +62,7 @@ The acceptance gate exercises the following core M3 capabilities under real OS a
 3. **Structured Choice & Merge (Branching & Skipped Propagation):**
    - Choice node evaluates deterministic JSON/numeric expressions (`value > threshold`).
    - Selected branch step is scheduled and executed.
-   - Unselected branch is marked `SKIPPED` with durable wait reason `BRANCH_NOT_TAKEN` (F-16).
+   - Unselected branch is marked `SKIPPED` with durable wait reason `BRANCH_NOT_SELECTED` (F-16).
    - Downstream merge node evaluates input pointers across branch variants without stalling or deadlocking.
 
 4. **Nested Structured Merges:**
@@ -95,7 +100,7 @@ The acceptance gate exercises the following core M3 capabilities under real OS a
 
 11. **Inspector Parity Audit:**
     - Logical step graph representation vs physical execution attempts (1:N containment).
-    - Accurate wait reasons (`DEPENDENCY_PENDING`, `BRANCH_NOT_TAKEN`, `DEPENDENCY_FAILED`).
+    - Accurate wait reasons (`DEPENDENCY_PENDING`, `BRANCH_NOT_SELECTED`, `DEPENDENCY_FAILED`).
     - Redaction of sensitive fields in mapping expressions and payloads.
     - SSE stream convergence with monotonic sequence numbering and catch-up/resync handling.
 
@@ -250,7 +255,7 @@ Verified in `TestM3_ChoiceStructuredMerge`:
 - Choice node evaluated input condition `value = 42 > 50` -> `false`.
 - Selected branch `right` executed; unselected branch `left` marked `SKIPPED`.
 - Database assertion in `task_runs`:
-  - `step_id = 'left'`: `status = 'SKIPPED'`, `wait_reason = 'BRANCH_NOT_TAKEN'`.
+  - `step_id = 'left'`: `status = 'SKIPPED'`, `wait_reason = 'BRANCH_NOT_SELECTED'`.
   - `step_id = 'right'`: `status = 'SUCCEEDED'`.
   - `step_id = 'merge'`: `status = 'SUCCEEDED'`.
 - Join step `merge` resolved input mapping from `right` without waiting on `left` or deadlocking.
@@ -347,16 +352,18 @@ The Run Inspector and Dashboard were audited across API endpoints (`GET /v1/runs
 
 ## 10. Milestone Acceptance Status Matrix
 
-| Gate Dimension                     | Local Gate                 | Staging / Hosted CI      | Acceptance Verdict        |
-| :--------------------------------- | :------------------------- | :----------------------- | :------------------------ |
-| **Linear Composition (A → B → C)** | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Parallel DAG & Diamond Join**    | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Structured Choice & Merge**      | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Nested Structured Merges**       | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Schema Output Mapping (F-28)**   | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Fail-Fast Settlement (F-15)**    | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Control Races & Pausing (F-13)** | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Property-Based Invariants**      | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Real Two-Worker Concurrency**    | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Run Inspector & UI Parity**      | `AUTOMATED_LOCAL_VERIFIED` | `HOSTED_CI_PENDING`      | **ACCEPTED**              |
-| **Hosted Staging Verification**    | `HOSTED_STAGING_PENDING`   | `HOSTED_STAGING_PENDING` | **DEFERRED (POST-MERGE)** |
+| Gate Dimension                     | Local Gate                   | Staging / Hosted CI               | Acceptance Verdict            |
+| :--------------------------------- | :--------------------------- | :-------------------------------- | :---------------------------- |
+| **Linear Composition (A → B → C)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Parallel DAG & Diamond Join**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Structured Choice & Merge**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Nested Structured Merges**       | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Schema Output Mapping (F-28)**   | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Fail-Fast Settlement (F-15)**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Control Races & Pausing (F-13)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Property-Based Invariants**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Real Two-Worker Concurrency**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Run Inspector & UI Parity**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
+| **Hosted Staging Deployment**      | `N/A`                        | `DEPLOYED: NO`                    | **HOSTED_STAGING_PENDING**    |
+| **Hosted Acceptance Walkthrough**  | `N/A`                        | `HOSTED_ACCEPTANCE: NOT_VERIFIED` | **MANUAL_ACCEPTANCE_PENDING** |
+| **OVERALL M3 ACCEPTANCE GATE**     | `LOCAL_AUTOMATED_GATE: PASS` | `HOSTED_CI: PENDING`              | **OVERALL_M3_GATE: PARTIAL**  |
