@@ -524,9 +524,14 @@ function initDashboard() {
                 return `<rect class="mini-node status-${mn.status.toLowerCase()}" x="${mn.x}" y="${mn.y}" width="${mn.width}" height="${mn.height}" rx="1" />`;
             })
                 .join("");
-            // Virtualized Accessible List rendering
+            // Virtualized Accessible List rendering with spacers for true virtual scroll
             const virtualized = virtualizeItems(snap.steps, listScrollIndex, LIST_PAGE_SIZE);
             const visibleSteps = virtualized.items;
+            const totalSteps = snap.steps.length;
+            const ITEM_HEIGHT = 140;
+            const LIST_CONTAINER_HEIGHT = 600;
+            const topSpacerHeight = virtualized.offset * ITEM_HEIGHT;
+            const bottomSpacerHeight = Math.max(0, totalSteps - virtualized.offset - virtualized.items.length) * ITEM_HEIGHT;
             const listItemsHtml = visibleSteps
                 .map((st, vi) => {
                 const pres = getStatusPresentation(st.status);
@@ -549,7 +554,7 @@ function initDashboard() {
             `;
                 }
                 return `
-            <li class="step-card accessible-step-card${isSelected ? " selected" : ""}" data-step-id="${escapeHtml(st.id)}" data-node-id="${escapeHtml(st.nodeId)}" role="listitem" aria-posinset="${virtualized.offset + vi + 1}" aria-setsize="${virtualized.total}">
+            <li class="step-card accessible-step-card${isSelected ? " selected" : ""}" data-step-id="${escapeHtml(st.id)}" data-node-id="${escapeHtml(st.nodeId)}" role="listitem" aria-posinset="${virtualized.offset + vi + 1}" aria-setsize="${virtualized.total}" style="height:${ITEM_HEIGHT}px;">
               <div class="step-header">
                 <h4>${escapeHtml(st.nodeId)}</h4>
                 <div class="step-badges">
@@ -573,14 +578,30 @@ function initDashboard() {
           `;
             })
                 .join("");
-            const listVirtualizationInfo = snap.steps.length > LIST_PAGE_SIZE
+            const listVirtualizationHtml = totalSteps > LIST_PAGE_SIZE
                 ? `
         <div class="list-virtualization-info" role="status" aria-live="polite">
           Showing steps ${virtualized.offset + 1}–${Math.min(virtualized.offset + virtualized.items.length, virtualized.total)} of ${virtualized.total}.
-          ${virtualized.hasMore ? '<button id="load-more-steps-btn" class="load-more-btn">Load More Steps</button>' : ""}
+          ${virtualized.hasMore ? '<button id="load-more-steps-btn" class="load-more-btn" data-list-offset="${virtualized.offset + virtualized.items.length}">Load More Steps</button>' : ""}
         </div>
       `
                 : "";
+            const listHtml = totalSteps > LIST_PAGE_SIZE
+                ? `
+        <div id="list-scroll-area" class="list-scroll-area" style="height:${LIST_CONTAINER_HEIGHT}px;overflow-y:auto;" aria-label="Accessible step list, scroll to navigate">
+          <div style="height:${topSpacerHeight}px;" aria-hidden="true"></div>
+          <ul class="accessible-steps-list" role="list" aria-label="Execution steps" style="height:${visibleSteps.length * ITEM_HEIGHT}px;">
+            ${listItemsHtml}
+          </ul>
+          <div style="height:${bottomSpacerHeight}px;" aria-hidden="true"></div>
+          ${listVirtualizationHtml}
+        </div>
+      `
+                : `
+        <ul class="accessible-steps-list" role="list" aria-label="Execution steps">
+          ${listItemsHtml}
+        </ul>
+      `;
             // Render Step Tabs Details Panel (Summary, Attempts, Events, Logs, Input, Output, Trace)
             let stepDetailHtml = "";
             if (selectedStep) {
@@ -654,11 +675,12 @@ function initDashboard() {
                     })
                         .join("")
                     : `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(selectedStep.status))}</div>`;
-                // Events Tab Content (Filtered for step)
+                // Events Tab Content (Filtered for step) - bounded rendering
                 const allEvs = activeInspector ? activeInspector.getEvents() : [];
-                const stepEvents = filterEventsForStep(allEvs, selectedStep);
-                const stepEventsHtml = stepEvents.length > 0
-                    ? stepEvents
+                const stepEventsAll = filterEventsForStep(allEvs, selectedStep);
+                const stepEventsBounded = getBoundedEvents(stepEventsAll, eventsWindowStart, EVENTS_PAGE_SIZE);
+                const stepEventsHtml = stepEventsBounded.events.length > 0
+                    ? stepEventsBounded.events
                         .map((ev) => {
                         const time = new Date(ev.committedAt).toLocaleTimeString();
                         return `
@@ -674,6 +696,12 @@ function initDashboard() {
                     })
                         .join("")
                     : `<div class="text-muted">No execution events recorded for this step yet.</div>`;
+                const stepEventsLoadMore = stepEventsBounded.hasMore
+                    ? `<button id="load-more-step-events-btn" class="load-more-btn">Load More Step Events</button>`
+                    : "";
+                const stepEventsWindowInfo = stepEventsAll.length > EVENTS_PAGE_SIZE
+                    ? `<div class="events-window-info" role="status" aria-live="polite">Showing events ${stepEventsBounded.offset + 1}–${Math.min(stepEventsBounded.offset + stepEventsBounded.events.length, stepEventsBounded.total)} of ${stepEventsBounded.total}.</div>`
+                    : "";
                 // Logs Tab Content
                 let logsContent = "";
                 const stepLogs = cachedStepLogs.get(selectedStep.id);
@@ -731,7 +759,7 @@ function initDashboard() {
             <div class="step-tabs-nav" role="tablist" aria-label="Step Detail Tabs">
               <button role="tab" id="step-tab-summary" class="step-tab-btn ${selectedStepTab === "summary" ? "active" : ""}" aria-selected="${selectedStepTab === "summary"}" aria-controls="step-panel-summary" tabindex="${selectedStepTab === "summary" ? "0" : "-1"}">Summary</button>
               <button role="tab" id="step-tab-attempts" class="step-tab-btn ${selectedStepTab === "attempts" ? "active" : ""}" aria-selected="${selectedStepTab === "attempts"}" aria-controls="step-panel-attempts" tabindex="${selectedStepTab === "attempts" ? "0" : "-1"}">Attempts (${selectedStep.attempts.length})</button>
-              <button role="tab" id="step-tab-events" class="step-tab-btn ${selectedStepTab === "events" ? "active" : ""}" aria-selected="${selectedStepTab === "events"}" aria-controls="step-panel-events" tabindex="${selectedStepTab === "events" ? "0" : "-1"}">Events (${stepEvents.length})</button>
+              <button role="tab" id="step-tab-events" class="step-tab-btn ${selectedStepTab === "events" ? "active" : ""}" aria-selected="${selectedStepTab === "events"}" aria-controls="step-panel-events" tabindex="${selectedStepTab === "events" ? "0" : "-1"}">Events (${stepEventsAll.length})</button>
               <button role="tab" id="step-tab-logs" class="step-tab-btn ${selectedStepTab === "logs" ? "active" : ""}" aria-selected="${selectedStepTab === "logs"}" aria-controls="step-panel-logs" tabindex="${selectedStepTab === "logs" ? "0" : "-1"}">Logs</button>
               <button role="tab" id="step-tab-input" class="step-tab-btn ${selectedStepTab === "input" ? "active" : ""}" aria-selected="${selectedStepTab === "input"}" aria-controls="step-panel-input" tabindex="${selectedStepTab === "input" ? "0" : "-1"}">Input</button>
               <button role="tab" id="step-tab-output" class="step-tab-btn ${selectedStepTab === "output" ? "active" : ""}" aria-selected="${selectedStepTab === "output"}" aria-controls="step-panel-output" tabindex="${selectedStepTab === "output" ? "0" : "-1"}">Output</button>
@@ -740,7 +768,11 @@ function initDashboard() {
             <div class="step-tab-content">
               <div id="step-panel-summary" role="tabpanel" class="tab-panel ${selectedStepTab === "summary" ? "" : "hidden"}" aria-labelledby="step-tab-summary">${summaryContent}</div>
               <div id="step-panel-attempts" role="tabpanel" class="tab-panel ${selectedStepTab === "attempts" ? "" : "hidden"}" aria-labelledby="step-tab-attempts">${attemptsHtml}</div>
-              <div id="step-panel-events" role="tabpanel" class="tab-panel ${selectedStepTab === "events" ? "" : "hidden"}" aria-labelledby="step-tab-events"><div class="step-events-timeline">${stepEventsHtml}</div></div>
+              <div id="step-panel-events" role="tabpanel" class="tab-panel ${selectedStepTab === "events" ? "" : "hidden"}" aria-labelledby="step-tab-events">
+                  <div class="step-events-timeline">
+                    ${stepEventsWindowInfo}${stepEventsHtml}${stepEventsLoadMore}
+                  </div>
+                </div>
               <div id="step-panel-logs" role="tabpanel" class="tab-panel ${selectedStepTab === "logs" ? "" : "hidden"}" aria-labelledby="step-tab-logs">${logsContent}</div>
               <div id="step-panel-input" role="tabpanel" class="tab-panel ${selectedStepTab === "input" ? "" : "hidden"}" aria-labelledby="step-tab-input">${inputContent}</div>
               <div id="step-panel-output" role="tabpanel" class="tab-panel ${selectedStepTab === "output" ? "" : "hidden"}" aria-labelledby="step-tab-output">${outputContent}</div>
@@ -819,12 +851,7 @@ function initDashboard() {
               </div>
 
               <div id="list-view-wrapper" class="list-view-container ${currentViewMode === "list" ? "" : "hidden"}" role="tabpanel" aria-labelledby="view-mode-list-btn">
-                <div id="list-scroll-area" class="list-scroll-area" style="max-height:600px;overflow-y:auto;" aria-label="Accessible step list, scroll to navigate">
-                  <ul class="accessible-steps-list" role="list" aria-label="Execution steps">
-                    ${listItemsHtml}
-                  </ul>
-                  ${listVirtualizationInfo}
-                </div>
+                ${listHtml}
               </div>
             </div>
 
@@ -949,23 +976,27 @@ function initDashboard() {
                             vp.setAttribute("width", String(newMinimap.viewport.width));
                             vp.setAttribute("height", String(newMinimap.viewport.height));
                         }
-                        if (minimapSvgEl) {
-                            minimapSvgEl.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
-                        }
+                        // viewBox stays "0 0 160 100" to keep coordinate system consistent
                     }
                 });
             }
-            // Wire list scroll handler for virtualization
+            // Wire list scroll handler for virtualization (debounced)
             const listScrollArea = document.getElementById("list-scroll-area");
+            let listScrollTimer = null;
             if (listScrollArea) {
                 listScrollArea.addEventListener("scroll", () => {
-                    const scrollTop = listScrollArea.scrollTop;
-                    const itemHeight = 120; // approximate step card height
-                    const newIndex = Math.floor(scrollTop / itemHeight);
-                    if (newIndex !== listScrollIndex) {
-                        listScrollIndex = newIndex;
-                        renderSnapshot(lastSnap);
-                    }
+                    if (listScrollTimer)
+                        clearTimeout(listScrollTimer);
+                    listScrollTimer = setTimeout(() => {
+                        const scrollTop = listScrollArea.scrollTop;
+                        const itemHeight = 140;
+                        const newIndex = Math.floor(scrollTop / itemHeight);
+                        const clampedIndex = Math.max(0, Math.min(newIndex, Math.max(0, snap.steps.length - 1)));
+                        if (clampedIndex !== listScrollIndex) {
+                            listScrollIndex = clampedIndex;
+                            renderSnapshot(lastSnap);
+                        }
+                    }, 50);
                 });
             }
             // Wire DAG SVG node selection
@@ -1045,6 +1076,30 @@ function initDashboard() {
                     }
                 });
             });
+            // Wire Load More Step Events button
+            const loadMoreStepEventsBtn = document.getElementById("load-more-step-events-btn");
+            if (loadMoreStepEventsBtn) {
+                loadMoreStepEventsBtn.addEventListener("click", () => {
+                    eventsWindowStart += EVENTS_PAGE_SIZE;
+                    renderSnapshot(lastSnap);
+                });
+            }
+            // Wire Load More Steps button
+            const loadMoreStepsBtn = document.getElementById("load-more-steps-btn");
+            if (loadMoreStepsBtn) {
+                loadMoreStepsBtn.addEventListener("click", () => {
+                    const offset = parseInt(loadMoreStepsBtn.getAttribute("data-list-offset") ?? "0");
+                    listScrollIndex = offset;
+                    renderSnapshot(lastSnap);
+                });
+            }
+            // Restore scroll positions after rerender
+            setTimeout(() => {
+                const lsa = document.getElementById("list-scroll-area");
+                if (lsa) {
+                    lsa.scrollTop = 0;
+                }
+            }, 0);
             // Wire durable pause/resume controls. The backend stays authoritative:
             // expectedRevision is captured at open time and 409s refresh in-dialog.
             const pauseBtn = container.querySelector("#pause-run-btn");
@@ -1181,6 +1236,8 @@ function initDashboard() {
         }
         const logBounded = virtualizeItems(logs.items, logsWindowStart, LOGS_PAGE_SIZE);
         const visibleLogItems = logBounded.items;
+        // hasMore is true when server has more pages (nextCursor) OR local window has more items
+        const logsHasMore = logs.nextCursor != null || logBounded.hasMore;
         const logLines = visibleLogItems
             .map((item) => {
             const time = new Date(item.timestamp).toLocaleTimeString();
@@ -1188,8 +1245,8 @@ function initDashboard() {
         })
             .join("");
         let loadMoreHtml = "";
-        if (logBounded.hasMore && logs.nextCursor) {
-            loadMoreHtml = `<button id="load-more-logs-btn" class="load-more-btn">Load More Logs (${logBounded.hasMore} more)</button>`;
+        if (logsHasMore) {
+            loadMoreHtml = `<button id="load-more-logs-btn" class="load-more-btn">${logs.nextCursor ? "Load More Logs" : "Load More Logs (local)"}</button>`;
         }
         const logWindowInfo = logs.items.length > LOGS_PAGE_SIZE
             ? `
@@ -1199,7 +1256,7 @@ function initDashboard() {
     `
             : "";
         container.innerHTML = `${warningNotice}${logWindowInfo}<div class="log-terminal">${logLines}</div>${loadMoreHtml}`;
-        if (logBounded.hasMore && logs.nextCursor) {
+        if (logsHasMore) {
             const btn = document.getElementById("load-more-logs-btn");
             if (btn) {
                 btn.addEventListener("click", () => {

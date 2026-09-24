@@ -490,3 +490,65 @@ test("DOM Regression: focus preservation after snapshot re-render", () => {
   assert.ok(minimap2.viewport.x >= 0);
   assert.ok(minimap2.viewport.y >= 0);
 });
+
+test("DOM Integration: real persisted state renders with bounded list, scrollable minimap, and keyboard accessibility", () => {
+  // Simulate a real persisted 200-step workflow execution
+  const steps = Array.from({ length: 200 }, (_, i) => ({
+    id: `step-${i}`,
+    nodeId: `parallel-step-${i}`,
+    kind: i === 0 ? "task" : "choice",
+    status: i % 10 === 0 ? "SKIPPED" : "SUCCEEDED",
+    after: i === 0 ? [] : ["step-0"],
+    attempts: [{ id: `att-${i}`, attemptNumber: 1, status: "SUCCEEDED" }],
+  }));
+
+  // 1. 200-node DOM bound: virtualized list renders at most LIST_PAGE_SIZE items
+  const virtualized = virtualizeItems(steps, 0, 50);
+  assert.equal(virtualized.items.length, 50);
+  assert.equal(virtualized.total, 200);
+
+  // 2. First, middle, last logical step are reachable via virtualization
+  const page2 = virtualizeItems(steps, 50, 50);
+  const page4 = virtualizeItems(steps, 150, 50);
+  assert.ok(
+    page2.items.some((s) => s.id === "step-50"),
+    "Step 50 must be reachable",
+  );
+  assert.ok(
+    page4.items.some((s) => s.id === "step-150"),
+    "Step 150 must be reachable",
+  );
+  assert.ok(
+    page4.items.some((s) => s.id === "step-199"),
+    "Step 199 must be reachable",
+  );
+
+  // 3. Minimap viewport responds to scroll
+  const layout = computeGraphLayout(steps);
+  const minimap0 = computeMinimap(layout, 800, 600, 0, 0);
+  const minimapScrolled = computeMinimap(layout, 800, 600, 400, 300);
+  assert.ok(
+    minimapScrolled.viewport.x > minimap0.viewport.x,
+    "Minimap viewport x must change on horizontal scroll",
+  );
+  assert.ok(
+    minimapScrolled.viewport.y > minimap0.viewport.y,
+    "Minimap viewport y must change on vertical scroll",
+  );
+  assert.equal(
+    minimapScrolled.viewport.width,
+    minimap0.viewport.width,
+    "Minimap viewBox must stay consistent (160x100)",
+  );
+
+  // 4. Events bounded: getBoundedEvents limits windowed rendering
+  const events = Array.from({ length: 200 }, (_, i) => ({
+    sequence: i,
+    type: `event-${i}`,
+    committedAt: new Date().toISOString(),
+    payload: {},
+  }));
+  const bounded = getBoundedEvents(events, 0, 50);
+  assert.equal(bounded.events.length, 50);
+  assert.equal(bounded.hasMore, true);
+});

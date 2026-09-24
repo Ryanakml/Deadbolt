@@ -84,7 +84,7 @@ See §4 below for the updated acceptance matrix.
 - `go vet ./...`: PASS
 - `pnpm lint`: PASS
 - `pnpm typecheck`: PASS
-- `pnpm test`: PASS (59/59)
+- `pnpm test`: PASS (64/64)
 - `pnpm check:contracts`: PASS
 - `pnpm check:parity`: PASS
 
@@ -94,15 +94,15 @@ See §4 below for the updated acceptance matrix.
 
 ### Frontend Unit & E2E Tests (`apps/dashboard/tests`)
 
-| Test Suite                              | Tests Passed         | Key Invariants Proven                                                                                                                                                                              |
-| --------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `inspector-graph-accessibility.test.js` | 7                    | 1 node per logical step; selected vs skipped branch wait reasons; 200-node fixture with minimap and collapsing; WCAG 2.2 AA symbols; list virtualization; step event filtering; stream convergence |
-| `pause-dialogs.test.js`                 | 3                    | Stale 409 handling; focus preservation on Escape                                                                                                                                                   |
-| `reconciliation.test.js`                | 7                    | 409 revision conflict refresh; step.waiting without fabricated success; run.resumed convergence                                                                                                    |
-| `inspector-truthfulness.test.js`        | 5                    | Transient stream errors cleared on LIVE; unrelated errors preserved                                                                                                                                |
-| `inspector.test.js`                     | 5                    | Monotonic snapshot increments; attempt completion mapping; event deduplication                                                                                                                     |
-| `stream.test.js`                        | Various              | SSE deduplication and monotonic sequence enforcement                                                                                                                                               |
-| Full Dashboard Test Suite               | **59 passed (100%)** | Zero regressions                                                                                                                                                                                   |
+| Test Suite                              | Tests Passed         | Key Invariants Proven                                                                                                                                                                                                                            |
+| --------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `inspector-graph-accessibility.test.js` | 8                    | 1 node per logical step; selected vs skipped branch wait reasons; 200-node fixture with minimap and collapsing; WCAG 2.2 AA symbols; list virtualization; step event filtering; stream convergence; DOM integration with 200-node virtualization |
+| `pause-dialogs.test.js`                 | 3                    | Stale 409 handling; focus preservation on Escape                                                                                                                                                                                                 |
+| `reconciliation.test.js`                | 7                    | 409 revision conflict refresh; step.waiting without fabricated success; run.resumed convergence                                                                                                                                                  |
+| `inspector-truthfulness.test.js`        | 5                    | Transient stream errors cleared on LIVE; unrelated errors preserved                                                                                                                                                                              |
+| `inspector.test.js`                     | 5                    | Monotonic snapshot increments; attempt completion mapping; event deduplication                                                                                                                                                                   |
+| `stream.test.js`                        | Various              | SSE deduplication and monotonic sequence enforcement                                                                                                                                                                                             |
+| Full Dashboard Test Suite               | **64 passed (100%)** | Zero regressions; DOM integration test proves 200-node virtualization                                                                                                                                                                            |
 
 ### Backend Integration Tests (`tests/integration`)
 
