@@ -173,6 +173,11 @@ try {
     deviceScaleFactor: 1,
     mobile: false,
   });
+  // Prove that an explicit light selection overrides a dark OS preference,
+  // rather than only passing on runners whose default preference is light.
+  await client.send("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-color-scheme", value: "dark" }],
+  });
   const themes = await evaluate(
     client,
     `(() => {
@@ -198,23 +203,28 @@ try {
   );
 
   await evaluate(client, "document.querySelector('#theme-toggle').focus()");
+  // Space activates a focused native button on key-up. Using rawKeyDown and
+  // keyUp exercises Chromium's native keyboard behavior instead of calling
+  // click() from JavaScript.
   await client.send("Input.dispatchKeyEvent", {
-    type: "keyDown",
-    key: "Enter",
-    code: "Enter",
-    windowsVirtualKeyCode: 13,
+    type: "rawKeyDown",
+    key: " ",
+    code: "Space",
+    windowsVirtualKeyCode: 32,
+    nativeVirtualKeyCode: 32,
   });
   await client.send("Input.dispatchKeyEvent", {
     type: "keyUp",
-    key: "Enter",
-    code: "Enter",
-    windowsVirtualKeyCode: 13,
+    key: " ",
+    code: "Space",
+    windowsVirtualKeyCode: 32,
+    nativeVirtualKeyCode: 32,
   });
   const keyboard = await evaluate(
     client,
     `({
     focusedID: document.activeElement?.id,
-    activatedByEnter: document.documentElement.classList.contains('dark'),
+    activatedByKeyboard: document.documentElement.classList.contains('dark'),
     pressed: document.querySelector('#theme-toggle')?.getAttribute('aria-pressed'),
     navButtons: [...document.querySelectorAll('nav button')].map((button) => button.textContent.trim()),
     mainLandmark: !!document.querySelector('main[role="main"]')
@@ -260,12 +270,13 @@ try {
   if (
     !themes.light.applied ||
     themes.light.pressed !== "false" ||
-    themes.light.stored !== "light"
+    themes.light.stored !== "light" ||
+    themes.light.background === themes.dark.background
   )
     failures.push("light theme");
   if (
     keyboard.focusedID !== "theme-toggle" ||
-    !keyboard.activatedByEnter ||
+    !keyboard.activatedByKeyboard ||
     keyboard.pressed !== "true" ||
     !keyboard.mainLandmark
   )
