@@ -141,6 +141,9 @@ func createChoiceMergeRun(t *testing.T, serverURL, workflowName, adminKey, orgID
 // merge consumes high output and emits schema-valid {branch,value}, run
 // succeeds, and replay preserves the one persisted choice.
 func TestChoiceMerge_RealAgent_SelectedBranch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Agent bundle fixture requires the Linux worker runtime used by CI")
+	}
 	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
 	defer tc.cleanup()
 	defer server.Close()
@@ -297,6 +300,9 @@ func TestChoiceMerge_RealAgent_SelectedBranch(t *testing.T) {
 // real children: choice selects high, high starts and fails definitively,
 // low stays skipped, merge never executes, run fails per normal semantics.
 func TestChoiceMerge_RealAgent_SelectedBranchFailure(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Agent bundle fixture requires the Linux worker runtime used by CI")
+	}
 	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
 	defer tc.cleanup()
 	defer server.Close()

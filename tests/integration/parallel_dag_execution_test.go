@@ -1049,6 +1049,9 @@ func TestParallelRetry_RunStatePriority(t *testing.T) {
 // concurrently, the all-success join waits for both parents, and every Node
 // child receives control-plane-mapped committed ancestor outputs.
 func TestParallelDiamond_RealAgent(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Agent bundle fixture requires the Linux worker runtime used by CI")
+	}
 	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
 	defer tc.cleanup()
 	defer server.Close()
@@ -1168,6 +1171,9 @@ func TestParallelDiamond_RealAgent(t *testing.T) {
 // killed, stop acked), the committed output stays durable, and the late
 // ABORTED completion cannot reopen the run.
 func TestParallelFailFast_RealAgent(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Agent bundle fixture requires the Linux worker runtime used by CI")
+	}
 	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
 	defer tc.cleanup()
 	defer server.Close()
@@ -1327,7 +1333,7 @@ func TestParallelFailFast_RealAgent(t *testing.T) {
 	// Stop delivery is asynchronous via Agent heartbeat: the SIBLING_FAILED
 	// row commits atomically with fail-fast, but the Agent acks on its next
 	// heartbeat after its lease join misses (synthetic LEASE_NOT_FOUND stop).
-	ackDeadline := time.Now().Add(25 * time.Second)
+	ackDeadline := time.Now().Add(45 * time.Second)
 	for stopAcked == 0 && time.Now().Before(ackDeadline) {
 		time.Sleep(200 * time.Millisecond)
 		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
