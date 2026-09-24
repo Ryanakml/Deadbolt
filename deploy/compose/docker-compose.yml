@@ -68,11 +68,6 @@ services:
       - "127.0.0.1:9001:9001"
     volumes:
       - deadbolt_minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
 
   control-plane:
     build:
@@ -107,7 +102,10 @@ services:
       nats:
         condition: service_healthy
       minio:
-        condition: service_healthy
+        # The pinned Chainguard image is intentionally minimal and does not
+        # contain curl for an in-container healthcheck. Readiness is checked
+        # from the host in CI and the application retries artifact setup.
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/livez"]
       interval: 5s

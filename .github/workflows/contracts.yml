@@ -115,6 +115,18 @@ jobs:
           # service's internal 5432 connection.
           export COMPOSE_SMOKE="-f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.ci-smoke.yml"
           docker compose $COMPOSE_SMOKE --profile core up -d || (docker compose $COMPOSE_SMOKE --profile core logs && exit 1)
+          MINIO_OK=false
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+              MINIO_OK=true
+              echo "Local compose MinIO is live!"
+              break
+            fi
+            sleep 2
+          done
+          if [ "$MINIO_OK" != "true" ]; then
+            docker compose $COMPOSE_SMOKE --profile core logs && exit 1
+          fi
           for i in $(seq 1 30); do
             if curl -fs http://127.0.0.1:8080/livez >/dev/null 2>&1; then
               echo "Local compose control plane is alive!"
