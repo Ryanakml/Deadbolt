@@ -438,6 +438,17 @@ export function virtualizeItems(items, startIndex, pageSize = 50) {
         offset: clampedStart,
     };
 }
+export function getBoundedEvents(events, offset, limit = 50) {
+    const total = events.length;
+    const start = Math.max(0, Math.min(offset, total));
+    const end = Math.min(start + limit, total);
+    return {
+        events: events.slice(start, end),
+        total,
+        hasMore: end < total,
+        offset: start,
+    };
+}
 export class RunInspector {
     snapshot = null;
     streamClient = null;

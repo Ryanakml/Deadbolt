@@ -2195,4 +2195,3 @@ func TestRunInspector_StepGraphMetadataAndRedaction(t *testing.T) {
 		t.Fatalf("expected vStep2 after ['step-1'], got %v", vStep2.After)
 	}
 }
-

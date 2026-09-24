@@ -99,6 +99,12 @@ export declare function virtualizeItems<T>(items: T[], startIndex: number, pageS
     hasMore: number;
     offset: number;
 };
+export declare function getBoundedEvents(events: RunEvent[], offset: number, limit?: number): {
+    events: RunEvent[];
+    total: number;
+    hasMore: boolean;
+    offset: number;
+};
 export interface InspectorListener {
     onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
     onFreshnessChanged?: (freshness: StreamFreshness) => void;

@@ -600,6 +600,22 @@ export function virtualizeItems<T>(
   };
 }
 
+export function getBoundedEvents(
+  events: RunEvent[],
+  offset: number,
+  limit = 50,
+): { events: RunEvent[]; total: number; hasMore: boolean; offset: number } {
+  const total = events.length;
+  const start = Math.max(0, Math.min(offset, total));
+  const end = Math.min(start + limit, total);
+  return {
+    events: events.slice(start, end),
+    total,
+    hasMore: end < total,
+    offset: start,
+  };
+}
+
 export interface InspectorListener {
   onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
   onFreshnessChanged?: (freshness: StreamFreshness) => void;

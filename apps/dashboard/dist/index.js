@@ -8,7 +8,7 @@ import { createEnvironmentSelection, formatEnvironmentLabel, getSelectedEnvironm
 import { resolveOrgState } from "./auth.js";
 import { sessionCanControlRuns, visibleRunControls } from "./permissions.js";
 import { RunInspector } from "./inspector.js";
-import { shouldShowWorkerWait, terminalStepEmptyText, openCaseForStep, reconciliationHoldText, terminationBannerText, RESOLVE_ACTIONS, getStatusPresentation, computeGraphLayout, computeMinimap, filterEventsForStep, } from "./inspector.js";
+import { shouldShowWorkerWait, terminalStepEmptyText, openCaseForStep, reconciliationHoldText, terminationBannerText, RESOLVE_ACTIONS, getStatusPresentation, computeGraphLayout, computeMinimap, filterEventsForStep, virtualizeItems, getBoundedEvents, } from "./inspector.js";
 import { clearStreamErrorOnLive, createStreamErrorBanner, markGlobalError, markStreamError, } from "./stream.js";
 // DOM Bootstrap for browser runtime
 if (typeof document !== "undefined") {
@@ -30,6 +30,19 @@ function initDashboard() {
     // Scoped banner state: only a transient stream error may be cleared on
     // SSE reconnect. Bootstrap/API errors stay visible.
     const streamBanner = createStreamErrorBanner();
+    let currentStreamFreshness = "DISCONNECTED";
+    let currentViewMode = "graph";
+    let selectedStepId = null;
+    let selectedStepTab = "summary";
+    const collapsedClusters = new Set();
+    const cachedStepLogs = new Map();
+    let lastSnap = null;
+    let listScrollIndex = 0;
+    const LIST_PAGE_SIZE = 50;
+    let eventsWindowStart = 0;
+    const EVENTS_PAGE_SIZE = 50;
+    let logsWindowStart = 0;
+    const LOGS_PAGE_SIZE = 50;
     const envSelect = document.getElementById("env-select");
     const themeToggle = document.getElementById("theme-toggle");
     const runsNavBtn = document.getElementById("nav-runs");
@@ -415,13 +428,13 @@ function initDashboard() {
         if (activeInspector) {
             activeInspector.destroy();
         }
-        let currentStreamFreshness = "DISCONNECTED";
-        let currentViewMode = "graph";
-        let selectedStepId = null;
-        let selectedStepTab = "summary";
-        const collapsedClusters = new Set();
-        const cachedStepLogs = new Map();
-        let lastSnap = null;
+        currentStreamFreshness = "DISCONNECTED";
+        currentViewMode = "graph";
+        selectedStepId = null;
+        selectedStepTab = "summary";
+        collapsedClusters.clear();
+        cachedStepLogs.clear();
+        lastSnap = null;
         activeInspector = new RunInspector(runId);
         activeInspector.subscribe({
             onSnapshotUpdated: (snapshot) => renderSnapshot(snapshot),
@@ -433,7 +446,7 @@ function initDashboard() {
                 }
             },
             onEventsUpdated: (events, hasMore, nextCursor) => renderEvents(events, hasMore, nextCursor),
-            onLogsUpdated: (logs, err) => renderLogs(logs, err),
+            onLogsUpdated: (logs, err) => renderLogs(logs, err, selectedStepId ?? undefined),
             onError: (err) => {
                 if (isUnauthorized(err)) {
                     handleUnauthorized();
@@ -465,7 +478,10 @@ function initDashboard() {
             const controls = visibleRunControls(snap.status, canControlRuns);
             // Compute graph layout (1 node per logical step; attempts stay in step detail)
             const layout = computeGraphLayout(snap.steps, collapsedClusters);
-            const minimap = computeMinimap(layout, 800, 450, 0, 0, 160, 100);
+            const graphScrollArea = document.getElementById("graph-scroll-area");
+            const scrollLeft = graphScrollArea ? graphScrollArea.scrollLeft : 0;
+            const scrollTop = graphScrollArea ? graphScrollArea.scrollTop : 0;
+            const minimap = computeMinimap(layout, 800, 450, scrollLeft, scrollTop, 160, 100);
             // Render SVG Graph Edges and Nodes
             const svgEdgesHtml = layout.edges
                 .map((e) => {
@@ -508,9 +524,11 @@ function initDashboard() {
                 return `<rect class="mini-node status-${mn.status.toLowerCase()}" x="${mn.x}" y="${mn.y}" width="${mn.width}" height="${mn.height}" rx="1" />`;
             })
                 .join("");
-            // Render Accessible List fallback
-            const listItemsHtml = snap.steps
-                .map((st) => {
+            // Virtualized Accessible List rendering
+            const virtualized = virtualizeItems(snap.steps, listScrollIndex, LIST_PAGE_SIZE);
+            const visibleSteps = virtualized.items;
+            const listItemsHtml = visibleSteps
+                .map((st, vi) => {
                 const pres = getStatusPresentation(st.status);
                 const isSelected = selectedStepId === st.id;
                 const deps = st.after && st.after.length > 0
@@ -531,7 +549,7 @@ function initDashboard() {
             `;
                 }
                 return `
-            <li class="step-card accessible-step-card${isSelected ? " selected" : ""}" data-step-id="${escapeHtml(st.id)}" data-node-id="${escapeHtml(st.nodeId)}" role="listitem">
+            <li class="step-card accessible-step-card${isSelected ? " selected" : ""}" data-step-id="${escapeHtml(st.id)}" data-node-id="${escapeHtml(st.nodeId)}" role="listitem" aria-posinset="${virtualized.offset + vi + 1}" aria-setsize="${virtualized.total}">
               <div class="step-header">
                 <h4>${escapeHtml(st.nodeId)}</h4>
                 <div class="step-badges">
@@ -555,6 +573,14 @@ function initDashboard() {
           `;
             })
                 .join("");
+            const listVirtualizationInfo = snap.steps.length > LIST_PAGE_SIZE
+                ? `
+        <div class="list-virtualization-info" role="status" aria-live="polite">
+          Showing steps ${virtualized.offset + 1}–${Math.min(virtualized.offset + virtualized.items.length, virtualized.total)} of ${virtualized.total}.
+          ${virtualized.hasMore ? '<button id="load-more-steps-btn" class="load-more-btn">Load More Steps</button>' : ""}
+        </div>
+      `
+                : "";
             // Render Step Tabs Details Panel (Summary, Attempts, Events, Logs, Input, Output, Trace)
             let stepDetailHtml = "";
             if (selectedStep) {
@@ -793,9 +819,12 @@ function initDashboard() {
               </div>
 
               <div id="list-view-wrapper" class="list-view-container ${currentViewMode === "list" ? "" : "hidden"}" role="tabpanel" aria-labelledby="view-mode-list-btn">
-                <ul class="accessible-steps-list" role="list">
-                  ${listItemsHtml}
-                </ul>
+                <div id="list-scroll-area" class="list-scroll-area" style="max-height:600px;overflow-y:auto;" aria-label="Accessible step list, scroll to navigate">
+                  <ul class="accessible-steps-list" role="list" aria-label="Execution steps">
+                    ${listItemsHtml}
+                  </ul>
+                  ${listVirtualizationInfo}
+                </div>
               </div>
             </div>
 
@@ -839,19 +868,53 @@ function initDashboard() {
       `;
             // Re-apply current transport freshness
             renderFreshness(currentStreamFreshness);
-            // Wire view mode buttons
+            // Wire view mode buttons with roving tabindex and keyboard nav
+            const viewTabOrder = ["graph", "list"];
             const graphBtn = container.querySelector("#view-mode-graph-btn");
             const listBtn = container.querySelector("#view-mode-list-btn");
-            if (graphBtn && listBtn) {
-                graphBtn.addEventListener("click", () => {
-                    currentViewMode = "graph";
-                    renderSnapshot(lastSnap);
-                });
-                listBtn.addEventListener("click", () => {
-                    currentViewMode = "list";
-                    renderSnapshot(lastSnap);
+            const viewButtons = [graphBtn, listBtn].filter(Boolean);
+            function updateViewRovingTabindex(activeIndex) {
+                viewButtons.forEach((btn, i) => {
+                    if (btn) {
+                        btn.tabIndex = i === activeIndex ? 0 : -1;
+                        btn.setAttribute("aria-selected", i === activeIndex ? "true" : "false");
+                    }
                 });
             }
+            updateViewRovingTabindex(currentViewMode === "graph" ? 0 : 1);
+            viewButtons.forEach((btn, idx) => {
+                btn.addEventListener("click", () => {
+                    currentViewMode = viewTabOrder[idx];
+                    updateViewRovingTabindex(idx);
+                    renderSnapshot(lastSnap);
+                });
+                btn.addEventListener("keydown", (e) => {
+                    let newIdx = -1;
+                    if (e.key === "ArrowRight") {
+                        e.preventDefault();
+                        newIdx = (idx + 1) % viewButtons.length;
+                    }
+                    else if (e.key === "ArrowLeft") {
+                        e.preventDefault();
+                        newIdx = (idx - 1 + viewButtons.length) % viewButtons.length;
+                    }
+                    else if (e.key === "Home") {
+                        e.preventDefault();
+                        newIdx = 0;
+                    }
+                    else if (e.key === "End") {
+                        e.preventDefault();
+                        newIdx = viewButtons.length - 1;
+                    }
+                    if (newIdx >= 0) {
+                        currentViewMode = viewTabOrder[newIdx];
+                        updateViewRovingTabindex(newIdx);
+                        renderSnapshot(lastSnap);
+                        viewButtons[newIdx]?.focus();
+                    }
+                });
+            });
+            // Wire collapse/expand groups button
             // Wire collapse/expand groups button
             const collapseBtn = container.querySelector("#toggle-collapse-btn");
             if (collapseBtn) {
@@ -867,6 +930,42 @@ function initDashboard() {
                         }
                     }
                     renderSnapshot(lastSnap);
+                });
+            }
+            // Wire minimap scroll binding to graph scroll container
+            const minimapSvgEl = document.getElementById("minimap-svg");
+            const scrollAreaEl = document.getElementById("graph-scroll-area");
+            if (scrollAreaEl) {
+                scrollAreaEl.addEventListener("scroll", () => {
+                    const sl = scrollAreaEl.scrollLeft;
+                    const st = scrollAreaEl.scrollTop;
+                    if (lastSnap) {
+                        const layout = computeGraphLayout(lastSnap.steps, collapsedClusters);
+                        const newMinimap = computeMinimap(layout, 800, 450, sl, st, 160, 100);
+                        const vp = document.getElementById("minimap-viewport");
+                        if (vp) {
+                            vp.setAttribute("x", String(newMinimap.viewport.x));
+                            vp.setAttribute("y", String(newMinimap.viewport.y));
+                            vp.setAttribute("width", String(newMinimap.viewport.width));
+                            vp.setAttribute("height", String(newMinimap.viewport.height));
+                        }
+                        if (minimapSvgEl) {
+                            minimapSvgEl.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
+                        }
+                    }
+                });
+            }
+            // Wire list scroll handler for virtualization
+            const listScrollArea = document.getElementById("list-scroll-area");
+            if (listScrollArea) {
+                listScrollArea.addEventListener("scroll", () => {
+                    const scrollTop = listScrollArea.scrollTop;
+                    const itemHeight = 120; // approximate step card height
+                    const newIndex = Math.floor(scrollTop / itemHeight);
+                    if (newIndex !== listScrollIndex) {
+                        listScrollIndex = newIndex;
+                        renderSnapshot(lastSnap);
+                    }
                 });
             }
             // Wire DAG SVG node selection
@@ -1007,7 +1106,9 @@ function initDashboard() {
                 '<div class="text-muted">No events recorded yet.</div>';
             return;
         }
-        const cardsHtml = events
+        const bounded = getBoundedEvents(events, eventsWindowStart, EVENTS_PAGE_SIZE);
+        const visibleEvents = bounded.events;
+        const cardsHtml = visibleEvents
             .map((ev) => {
             const time = new Date(ev.committedAt).toLocaleTimeString();
             const payloadStr = JSON.stringify(ev.payload, null, 2);
@@ -1024,22 +1125,33 @@ function initDashboard() {
         })
             .join("");
         let loadMoreHtml = "";
-        if (hasMore && nextCursor !== null) {
+        if (bounded.hasMore && nextCursor !== null) {
+            loadMoreHtml = `<button id="load-more-events-btn" class="load-more-btn">Load Earlier Events (${events.length - visibleEvents.length} more in history)</button>`;
+        }
+        else if (hasMore && nextCursor !== null) {
             loadMoreHtml = `<button id="load-more-events-btn" class="load-more-btn">Load Earlier Events</button>`;
         }
-        container.innerHTML = cardsHtml + loadMoreHtml;
-        if (hasMore && nextCursor !== null) {
+        const windowInfo = events.length > EVENTS_PAGE_SIZE
+            ? `
+      <div class="events-window-info" role="status" aria-live="polite">
+        Showing events ${bounded.offset + 1}–${Math.min(bounded.offset + visibleEvents.length, bounded.total)} of ${bounded.total}.
+      </div>
+    `
+            : "";
+        container.innerHTML = windowInfo + cardsHtml + loadMoreHtml;
+        if (bounded.hasMore && nextCursor !== null) {
             const btn = document.getElementById("load-more-events-btn");
             if (btn) {
                 btn.addEventListener("click", () => {
                     btn.textContent = "Loading...";
                     btn.setAttribute("disabled", "true");
+                    eventsWindowStart += EVENTS_PAGE_SIZE;
                     activeInspector?.fetchEvents(nextCursor, true);
                 });
             }
         }
     }
-    function renderLogs(logs, error) {
+    function renderLogs(logs, error, stepId) {
         const container = document.getElementById("logs-container");
         if (!container)
             return;
@@ -1067,24 +1179,34 @@ function initDashboard() {
         else if (logs.droppedCount) {
             warningNotice = `<div class="logs-notice logs-restricted">${logs.droppedCount} log record(s) dropped (exceeded 16 KiB per-line limit).</div>`;
         }
-        const logLines = logs.items
+        const logBounded = virtualizeItems(logs.items, logsWindowStart, LOGS_PAGE_SIZE);
+        const visibleLogItems = logBounded.items;
+        const logLines = visibleLogItems
             .map((item) => {
             const time = new Date(item.timestamp).toLocaleTimeString();
             return `<div class="log-line log-${item.level}"><span class="log-time">${time}</span> <span class="log-level">[${item.level.toUpperCase()}]</span> <span class="log-msg">${escapeHtml(item.message)}</span></div>`;
         })
             .join("");
         let loadMoreHtml = "";
-        if (logs.nextCursor) {
-            loadMoreHtml = `<button id="load-more-logs-btn" class="load-more-btn">Load More Logs</button>`;
+        if (logBounded.hasMore && logs.nextCursor) {
+            loadMoreHtml = `<button id="load-more-logs-btn" class="load-more-btn">Load More Logs (${logBounded.hasMore} more)</button>`;
         }
-        container.innerHTML = `${warningNotice}<div class="log-terminal">${logLines}</div>${loadMoreHtml}`;
-        if (logs.nextCursor) {
+        const logWindowInfo = logs.items.length > LOGS_PAGE_SIZE
+            ? `
+      <div class="logs-window-info" role="status" aria-live="polite">
+        Showing logs ${logBounded.offset + 1}–${Math.min(logBounded.offset + visibleLogItems.length, logBounded.total)} of ${logBounded.total}.
+      </div>
+    `
+            : "";
+        container.innerHTML = `${warningNotice}${logWindowInfo}<div class="log-terminal">${logLines}</div>${loadMoreHtml}`;
+        if (logBounded.hasMore && logs.nextCursor) {
             const btn = document.getElementById("load-more-logs-btn");
             if (btn) {
                 btn.addEventListener("click", () => {
                     btn.textContent = "Loading...";
                     btn.setAttribute("disabled", "true");
-                    activeInspector?.fetchLogs(undefined, undefined, logs.nextCursor, true);
+                    logsWindowStart += LOGS_PAGE_SIZE;
+                    activeInspector?.fetchLogs(stepId ?? selectedStepId ?? undefined, undefined, logs.nextCursor, true);
                 });
             }
         }
