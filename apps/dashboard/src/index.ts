@@ -30,6 +30,19 @@ import {
   reconciliationHoldText,
   terminationBannerText,
   RESOLVE_ACTIONS,
+  getStatusPresentation,
+  computeGraphLayout,
+  computeMinimap,
+  filterEventsForStep,
+  virtualizeItems,
+  getBoundedEvents,
+} from "./inspector.js";
+import type {
+  GraphNode,
+  GraphEdge,
+  GraphLayout,
+  MinimapLayout,
+  StatusPresentation,
 } from "./inspector.js";
 import {
   clearStreamErrorOnLive,
@@ -39,11 +52,14 @@ import {
 } from "./stream.js";
 import {
   RunSnapshot,
+  RunStep,
   RunEvent,
   StreamFreshness,
   TaskLogsResponse,
   ReconciliationCase,
   ResolveAction,
+  StepTab,
+  InspectorViewMode,
 } from "./types.js";
 
 // DOM Bootstrap for browser runtime
@@ -67,6 +83,20 @@ function initDashboard(): void {
   // Scoped banner state: only a transient stream error may be cleared on
   // SSE reconnect. Bootstrap/API errors stay visible.
   const streamBanner = createStreamErrorBanner();
+
+  let currentStreamFreshness: StreamFreshness = "DISCONNECTED";
+  let currentViewMode: InspectorViewMode = "graph";
+  let selectedStepId: string | null = null;
+  let selectedStepTab: StepTab = "summary";
+  const collapsedClusters = new Set<string>();
+  const cachedStepLogs = new Map<string, TaskLogsResponse | null>();
+  let lastSnap: RunSnapshot | null = null;
+  let listScrollIndex = 0;
+  const LIST_PAGE_SIZE = 50;
+  let eventsWindowStart = 0;
+  const EVENTS_PAGE_SIZE = 50;
+  let logsWindowStart = 0;
+  const LOGS_PAGE_SIZE = 50;
 
   const envSelect = document.getElementById(
     "env-select",
@@ -495,7 +525,56 @@ function initDashboard(): void {
       activeInspector.destroy();
     }
 
-    let currentStreamFreshness: StreamFreshness = "DISCONNECTED";
+    currentStreamFreshness = "DISCONNECTED";
+    currentViewMode = "graph";
+    selectedStepId = null;
+    selectedStepTab = "summary";
+    collapsedClusters.clear();
+    cachedStepLogs.clear();
+    lastSnap = null;
+    let graphScrollLeft = 0;
+    let graphScrollTop = 0;
+    let listScrollTop = 0;
+    let stepLogsWindowStart = 0;
+
+    function captureFocusDescriptor(root: HTMLElement): string | null {
+      const active = document.activeElement as HTMLElement | null;
+      if (!active || !root.contains(active)) return null;
+      if (active.id) {
+        return `#${active.id}`;
+      }
+      const stepId = active.getAttribute("data-step-id");
+      if (stepId) {
+        if (active.classList.contains("dag-node")) {
+          return `.dag-node[data-step-id="${stepId}"]`;
+        }
+        if (active.classList.contains("select-step-btn")) {
+          return `.select-step-btn[data-step-id="${stepId}"]`;
+        }
+        if (active.classList.contains("accessible-step-card")) {
+          return `.accessible-step-card[data-step-id="${stepId}"]`;
+        }
+        return `[data-step-id="${stepId}"]`;
+      }
+      const role = active.getAttribute("role");
+      const ariaLabel = active.getAttribute("aria-label");
+      if (role && ariaLabel) {
+        return `[role="${role}"][aria-label="${ariaLabel}"]`;
+      }
+      return null;
+    }
+
+    function restoreFocus(root: HTMLElement, descriptor: string | null): void {
+      if (!descriptor) return;
+      try {
+        const el = root.querySelector<HTMLElement>(descriptor);
+        if (el && typeof el.focus === "function") {
+          el.focus();
+        }
+      } catch {
+        // Ignore invalid selector
+      }
+    }
 
     activeInspector = new RunInspector(runId);
     activeInspector.subscribe({
@@ -509,7 +588,15 @@ function initDashboard(): void {
       },
       onEventsUpdated: (events, hasMore, nextCursor) =>
         renderEvents(events, hasMore, nextCursor),
-      onLogsUpdated: (logs, err) => renderLogs(logs, err),
+      onLogsUpdated: (logs, err, stepId) => {
+        if (stepId && logs) {
+          cachedStepLogs.set(stepId, logs);
+          if (selectedStepId === stepId) {
+            renderSnapshot(lastSnap!);
+          }
+        }
+        renderLogs(logs, err, stepId ?? selectedStepId ?? undefined);
+      },
       onError: (err) => {
         if (isUnauthorized(err)) {
           handleUnauthorized();
@@ -522,64 +609,129 @@ function initDashboard(): void {
     activeInspector.load();
 
     function renderSnapshot(snap: RunSnapshot): void {
+      lastSnap = snap;
       const container = document.getElementById("inspector-content");
       if (!container) return;
+
+      // Capture focus and scroll state before replacing innerHTML
+      const focusDescriptor = captureFocusDescriptor(container);
+      const existingGraphScroll = document.getElementById("graph-scroll-area");
+      if (existingGraphScroll) {
+        graphScrollLeft = existingGraphScroll.scrollLeft;
+        graphScrollTop = existingGraphScroll.scrollTop;
+      }
+      const existingListScroll = document.getElementById("list-scroll-area");
+      if (existingListScroll) {
+        listScrollTop = existingListScroll.scrollTop;
+      }
+
+      // Select default step if not selected or no longer valid
+      if (!selectedStepId || !snap.steps.some((s) => s.id === selectedStepId)) {
+        const priorityStep =
+          snap.steps.find((s) => s.status === "FAILED") ||
+          snap.steps.find((s) => s.status === "WAITING") ||
+          snap.steps.find((s) => s.status === "RUNNING") ||
+          snap.steps.find((s) => s.status === "READY") ||
+          snap.steps[0];
+        selectedStepId = priorityStep ? priorityStep.id : null;
+      }
+
+      const selectedStep =
+        snap.steps.find((s) => s.id === selectedStepId) ||
+        snap.steps[0] ||
+        null;
 
       // Blueprint §23.2: Pause/Resume/Cancel render only when the run state
       // permits the action AND the active identity holds runs:control.
       const controls = visibleRunControls(snap.status, canControlRuns);
-      const stepsHtml = snap.steps
-        .map((st) => {
-          const attemptsHtml = st.attempts
-            .map((att) => {
-              const started = att.startedAt
-                ? new Date(att.startedAt).toLocaleTimeString()
-                : "-";
-              return `
-            <div class="attempt-card status-${att.status.toLowerCase()}">
-              <div class="attempt-header">
-                <span class="attempt-title">Attempt #${att.attemptNumber}</span>
-                <span class="badge status-${att.status.toLowerCase()}">${att.status}</span>
-              </div>
-              <div class="attempt-details">
-                <span>Session: <code>${att.workerSessionId ? att.workerSessionId.slice(0, 8) + "..." : "-"}</code></span>
-                <span>Started: ${started}</span>
-                <span>Epoch: ${att.ownershipEpoch ?? "-"}</span>
-              </div>
-            </div>
+
+      // Compute graph layout (1 node per logical step; attempts stay in step detail)
+      const layout = computeGraphLayout(snap.steps, collapsedClusters);
+      const minimap = computeMinimap(
+        layout,
+        800,
+        450,
+        graphScrollLeft,
+        graphScrollTop,
+        160,
+        100,
+      );
+
+      // Render SVG Graph Edges and Nodes
+      const svgEdgesHtml = layout.edges
+        .map((e) => {
+          const midX = (e.fromX + e.toX) / 2;
+          const d = `M ${e.fromX} ${e.fromY} C ${midX} ${e.fromY}, ${midX} ${e.toY}, ${e.toX} ${e.toY}`;
+          const cls = e.isSkipped ? "dag-edge edge-skipped" : "dag-edge";
+          const marker = e.isSkipped
+            ? "url(#arrow-skipped)"
+            : "url(#arrow-default)";
+          return `<path class="${cls}" d="${d}" marker-end="${marker}" data-from="${escapeHtml(e.fromNodeId)}" data-to="${escapeHtml(e.toNodeId)}" />`;
+        })
+        .join("");
+
+      const svgNodesHtml = layout.nodes
+        .map((n) => {
+          const pres = getStatusPresentation(n.status);
+          const isSelected = selectedStepId === n.id;
+          const nodeClass = `dag-node status-${n.status.toLowerCase()}${isSelected ? " node-selected" : ""}${n.isCollapsedPlaceholder ? " node-collapsed" : ""}`;
+          const ariaLabel = n.isCollapsedPlaceholder
+            ? `Collapsed group of ${n.collapsedCount} parallel steps, click to expand`
+            : `Step ${n.nodeId}: ${pres.label}, ${n.attemptsCount} attempts`;
+
+          return `
+            <g class="${nodeClass}" tabindex="0" role="button" data-step-id="${escapeHtml(n.id)}" data-node-id="${escapeHtml(n.nodeId)}" data-cluster-id="${escapeHtml(n.clusterId || "")}" aria-label="${escapeHtml(ariaLabel)}" aria-pressed="${isSelected}">
+              <rect class="node-bg" x="${n.x}" y="${n.y}" width="${n.width}" height="${n.height}" rx="6" ry="6" />
+              <g class="node-badge status-${n.status.toLowerCase()}">
+                <rect class="badge-bg" x="${n.x + 8}" y="${n.y + 8}" width="88" height="20" rx="4" />
+                <text class="badge-text" x="${n.x + 12}" y="${n.y + 22}">${pres.symbol} ${escapeHtml(pres.label)}</text>
+              </g>
+              <text class="node-kind" x="${n.x + n.width - 10}" y="${n.y + 22}" text-anchor="end">${escapeHtml(n.kind)}</text>
+              <text class="node-title" x="${n.x + 10}" y="${n.y + 44}">${escapeHtml(n.nodeId)}</text>
+              <text class="node-meta" x="${n.x + 10}" y="${n.y + 60}">${
+                n.isCollapsedPlaceholder
+                  ? `[+ Expand ${n.collapsedCount} steps]`
+                  : `${n.attemptsCount} attempt${n.attemptsCount === 1 ? "" : "s"}${n.waitReason ? ` · ${escapeHtml(n.waitReason)}` : ""}`
+              }</text>
+            </g>
           `;
-            })
-            .join("");
+        })
+        .join("");
 
-          let noAttemptsHtml =
-            '<div class="no-attempts text-muted">No attempts claimed yet</div>';
-          if (
-            shouldShowWorkerWait(
-              st.status,
-              snap.waitingReason,
-              snap.activeCompatibleWorkers,
-            )
-          ) {
-            noAttemptsHtml = `
-              <div class="no-attempts waiting-warning">
-                <strong>No compatible workers available.</strong>
-                <div class="recovery-hint">
-                  Waiting for active worker advertising deployment <code>${escapeHtml(snap.deploymentId.slice(0, 8))}...</code>. Ensure an enrolled worker is running.
-                </div>
-              </div>
-            `;
-          } else if (
-            st.status === "CANCELLED" ||
-            st.status === "FAILED" ||
-            st.status === "SUCCEEDED"
-          ) {
-            noAttemptsHtml = `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(st.status))}</div>`;
-          }
+      // Minimap SVG Nodes
+      const minimapNodesHtml = minimap.nodes
+        .map((mn) => {
+          return `<rect class="mini-node status-${mn.status.toLowerCase()}" x="${mn.x}" y="${mn.y}" width="${mn.width}" height="${mn.height}" rx="1" />`;
+        })
+        .join("");
 
-          // Unknown-outcome hold: the provider may already have received the
-          // operation. Only audited resolutions are offered, never blind retry.
-          let holdHtml = "";
+      // Virtualized Accessible List rendering with spacers for true virtual scroll
+      const virtualized = virtualizeItems(
+        snap.steps,
+        listScrollIndex,
+        LIST_PAGE_SIZE,
+      );
+      const visibleSteps = virtualized.items;
+      const totalSteps = snap.steps.length;
+      const ITEM_HEIGHT = 140;
+      const LIST_CONTAINER_HEIGHT = 600;
+      const topSpacerHeight = virtualized.offset * ITEM_HEIGHT;
+      const bottomSpacerHeight =
+        Math.max(
+          0,
+          totalSteps - virtualized.offset - virtualized.items.length,
+        ) * ITEM_HEIGHT;
+
+      const listItemsHtml = visibleSteps
+        .map((st, vi) => {
+          const pres = getStatusPresentation(st.status);
+          const isSelected = selectedStepId === st.id;
+          const deps =
+            st.after && st.after.length > 0
+              ? st.after.map(escapeHtml).join(", ")
+              : "None (Root)";
           const openCase = openCaseForStep(snap, st.id);
+          let holdHtml = "";
           if (st.status === "WAITING" && openCase) {
             const evidenceRef = evidenceReference(openCase);
             holdHtml = `
@@ -594,20 +746,287 @@ function initDashboard(): void {
           }
 
           return `
-          <div class="step-card" data-step-id="${st.id}">
-            <div class="step-header">
-              <h4>${escapeHtml(st.nodeId)}</h4>
-              <span class="badge status-${st.status.toLowerCase()}">${st.status}</span>
-              ${st.completionSource ? `<span class="badge source-${st.completionSource.toLowerCase()}">${escapeHtml(st.completionSource)}</span>` : ""}
+            <li class="step-card accessible-step-card${isSelected ? " selected" : ""}" data-step-id="${escapeHtml(st.id)}" data-node-id="${escapeHtml(st.nodeId)}" role="listitem" aria-posinset="${virtualized.offset + vi + 1}" aria-setsize="${virtualized.total}" style="height:${ITEM_HEIGHT}px;">
+              <div class="step-header">
+                <h4>${escapeHtml(st.nodeId)}</h4>
+                <div class="step-badges">
+                  <span class="kind-tag">${escapeHtml(st.kind || "task")}</span>
+                  <span class="badge status-${st.status.toLowerCase()}">${pres.symbol} ${st.status}</span>
+                  ${st.completionSource ? `<span class="badge source-${st.completionSource.toLowerCase()}">${escapeHtml(st.completionSource)}</span>` : ""}
+                </div>
+              </div>
+              <div class="step-summary-meta">
+                <div><strong>Dependencies:</strong> ${deps}</div>
+                ${st.waitReason ? `<div><strong>Wait Reason:</strong> <code class="wait-reason-tag">${escapeHtml(st.waitReason)}</code></div>` : ""}
+                <div><strong>Attempts:</strong> ${st.attempts.length}</div>
+              </div>
+              ${holdHtml}
+              <div class="step-actions">
+                <button class="secondary-btn select-step-btn" data-step-id="${escapeHtml(st.id)}" aria-label="Inspect ${escapeHtml(st.nodeId)} details" aria-pressed="${isSelected}">
+                  ${isSelected ? "Inspecting" : "Inspect Step"}
+                </button>
+              </div>
+            </li>
+          `;
+        })
+        .join("");
+
+      const listVirtualizationHtml =
+        totalSteps > LIST_PAGE_SIZE
+          ? `
+        <div class="list-virtualization-info" role="status" aria-live="polite">
+          Showing steps ${virtualized.offset + 1}–${Math.min(virtualized.offset + virtualized.items.length, virtualized.total)} of ${virtualized.total}.
+          ${virtualized.hasMore ? '<button id="load-more-steps-btn" class="load-more-btn" data-list-offset="${virtualized.offset + virtualized.items.length}">Load More Steps</button>' : ""}
+        </div>
+      `
+          : "";
+
+      const listHtml =
+        totalSteps > LIST_PAGE_SIZE
+          ? `
+        <div id="list-scroll-area" class="list-scroll-area" style="height:${LIST_CONTAINER_HEIGHT}px;overflow-y:auto;" aria-label="Accessible step list, scroll to navigate">
+          <div style="height:${topSpacerHeight}px;" aria-hidden="true"></div>
+          <ul class="accessible-steps-list" role="list" aria-label="Execution steps" style="height:${visibleSteps.length * ITEM_HEIGHT}px;">
+            ${listItemsHtml}
+          </ul>
+          <div style="height:${bottomSpacerHeight}px;" aria-hidden="true"></div>
+          ${listVirtualizationHtml}
+        </div>
+      `
+          : `
+        <ul class="accessible-steps-list" role="list" aria-label="Execution steps">
+          ${listItemsHtml}
+        </ul>
+      `;
+
+      // Render Step Tabs Details Panel (Summary, Attempts, Events, Logs, Input, Output, Trace)
+      let stepDetailHtml = "";
+      if (selectedStep) {
+        const pres = getStatusPresentation(selectedStep.status);
+        const openCase = openCaseForStep(snap, selectedStep.id);
+        let holdHtml = "";
+        if (selectedStep.status === "WAITING" && openCase) {
+          const evidenceRef = evidenceReference(openCase);
+          holdHtml = `
+            <div class="hold-banner" role="status">
+              <strong>Waiting for reconciliation.</strong>
+              <div class="recovery-hint">${escapeHtml(reconciliationHoldText(openCase.reason))}</div>
+              ${evidenceRef ? `<div class="hold-evidence">Reference: <code>${escapeHtml(evidenceRef)}</code></div>` : ""}
+              <div class="hold-meta">Case <code>${escapeHtml(openCase.id.slice(0, 8))}…</code> · revision ${openCase.revision}</div>
+              <button class="resolve-link" data-case-id="${escapeHtml(openCase.id)}" data-revision="${openCase.revision}" data-step-id="${escapeHtml(selectedStep.id)}">Resolve</button>
             </div>
-            ${holdHtml}
-            <div class="attempts-container">
-              ${attemptsHtml || noAttemptsHtml}
+          `;
+        }
+
+        // Summary Tab Content
+        let summaryContent = `
+          <div class="step-meta-grid">
+            <div class="meta-item"><label>Node ID</label><div><code>${escapeHtml(selectedStep.nodeId)}</code></div></div>
+            <div class="meta-item"><label>Kind</label><div>${escapeHtml(selectedStep.kind || "task")}</div></div>
+            <div class="meta-item"><label>Status</label><div><span class="badge status-${selectedStep.status.toLowerCase()}">${pres.symbol} ${selectedStep.status}</span></div></div>
+            <div class="meta-item"><label>Epoch</label><div>${selectedStep.currentEpoch}</div></div>
+            <div class="meta-item"><label>Dependencies</label><div>${selectedStep.after && selectedStep.after.length > 0 ? selectedStep.after.map(escapeHtml).join(", ") : "None (Root)"}</div></div>
+            <div class="meta-item"><label>Attempts</label><div>${selectedStep.attempts.length}</div></div>
+            ${selectedStep.waitReason ? `<div class="meta-item"><label>Wait Reason</label><div><code class="wait-reason-tag">${escapeHtml(selectedStep.waitReason)}</code></div></div>` : ""}
+            ${selectedStep.completionSource ? `<div class="meta-item"><label>Completion Source</label><div>${escapeHtml(selectedStep.completionSource)}</div></div>` : ""}
+          </div>
+        `;
+
+        if (
+          shouldShowWorkerWait(
+            selectedStep.status,
+            snap.waitingReason,
+            snap.activeCompatibleWorkers,
+          )
+        ) {
+          summaryContent += `
+            <div class="waiting-warning mt-2" role="status">
+              <strong>No compatible workers available.</strong>
+              <div class="recovery-hint">
+                Waiting for active worker advertising deployment <code>${escapeHtml(snap.deploymentId.slice(0, 8))}...</code>. Ensure an enrolled worker is running.
+              </div>
+            </div>
+          `;
+        } else if (selectedStep.attempts.length === 0) {
+          summaryContent += `<div class="no-attempts text-muted mt-2">${escapeHtml(terminalStepEmptyText(selectedStep.status))}</div>`;
+        }
+
+        // Attempts Tab Content
+        const attemptsHtml =
+          selectedStep.attempts.length > 0
+            ? selectedStep.attempts
+                .map((att) => {
+                  const started = att.startedAt
+                    ? new Date(att.startedAt).toLocaleTimeString()
+                    : "-";
+                  const completed = att.completedAt
+                    ? new Date(att.completedAt).toLocaleTimeString()
+                    : "-";
+                  const attPres = getStatusPresentation(att.status);
+                  return `
+                    <div class="attempt-card status-${att.status.toLowerCase()}">
+                      <div class="attempt-header">
+                        <span class="attempt-title">Attempt #${att.attemptNumber}</span>
+                        <span class="badge status-${att.status.toLowerCase()}">${attPres.symbol} ${att.status}</span>
+                      </div>
+                      <div class="attempt-details">
+                        <span>Session: <code>${att.workerSessionId ? att.workerSessionId.slice(0, 8) + "..." : "-"}</code></span>
+                        <span>Started: ${started}</span>
+                        <span>Completed: ${completed}</span>
+                        <span>Epoch: ${att.ownershipEpoch ?? "-"}</span>
+                        ${att.error !== undefined ? `<div class="attempt-error mt-1"><label>Error:</label><pre class="code-block error-text">${escapeHtml(JSON.stringify(att.error, null, 2))}</pre></div>` : ""}
+                      </div>
+                    </div>
+                  `;
+                })
+                .join("")
+            : `<div class="no-attempts text-muted">${escapeHtml(terminalStepEmptyText(selectedStep.status))}</div>`;
+
+        // Events Tab Content (Filtered for step) - bounded rendering
+        const allEvs = activeInspector ? activeInspector.getEvents() : [];
+        const stepEventsAll = filterEventsForStep(allEvs, selectedStep);
+        const stepEventsBounded = getBoundedEvents(
+          stepEventsAll,
+          eventsWindowStart,
+          EVENTS_PAGE_SIZE,
+        );
+        const stepEventsHtml =
+          stepEventsBounded.events.length > 0
+            ? stepEventsBounded.events
+                .map((ev) => {
+                  const time = new Date(ev.committedAt).toLocaleTimeString();
+                  return `
+                    <div class="event-card" data-sequence="${ev.sequence}">
+                      <div class="event-header">
+                        <span class="event-type">${escapeHtml(ev.type)}</span>
+                        <span class="event-seq">#${ev.sequence}</span>
+                      </div>
+                      <div class="event-time">${time}</div>
+                      <pre class="event-payload">${escapeHtml(JSON.stringify(ev.payload, null, 2))}</pre>
+                    </div>
+                  `;
+                })
+                .join("")
+            : `<div class="text-muted">No execution events recorded for this step yet.</div>`;
+
+        const stepEventsLoadMore = stepEventsBounded.hasMore
+          ? `<button id="load-more-step-events-btn" class="load-more-btn">Load More Step Events</button>`
+          : "";
+
+        const stepEventsWindowInfo =
+          stepEventsAll.length > EVENTS_PAGE_SIZE
+            ? `<div class="events-window-info" role="status" aria-live="polite">Showing events ${stepEventsBounded.offset + 1}–${Math.min(stepEventsBounded.offset + stepEventsBounded.events.length, stepEventsBounded.total)} of ${stepEventsBounded.total}.</div>`
+            : "";
+
+        // Logs Tab Content - bounded rendering
+        let logsContent = "";
+        const stepLogs = cachedStepLogs.get(selectedStep.id);
+        if (stepLogs && stepLogs.items.length > 0) {
+          const stepLogsBounded = virtualizeItems(
+            stepLogs.items,
+            stepLogsWindowStart,
+            LOGS_PAGE_SIZE,
+          );
+          const visibleStepLogItems = stepLogsBounded.items;
+          const stepLogsHasMore =
+            stepLogs.nextCursor != null || stepLogsBounded.hasMore;
+
+          const logLines = visibleStepLogItems
+            .map((line) => {
+              const time = new Date(line.timestamp).toLocaleTimeString();
+              return `<div class="log-line log-${line.level}"><span class="log-time">${time}</span> <span class="log-level">[${line.level.toUpperCase()}]</span> <span class="log-msg">${escapeHtml(line.message)}</span></div>`;
+            })
+            .join("");
+
+          const stepLogWindowInfo =
+            stepLogs.items.length > LOGS_PAGE_SIZE
+              ? `<div class="logs-window-info" role="status" aria-live="polite">Showing logs ${stepLogsBounded.offset + 1}–${Math.min(stepLogsBounded.offset + visibleStepLogItems.length, stepLogsBounded.total)} of ${stepLogsBounded.total}.</div>`
+              : "";
+
+          let stepLoadMoreHtml = "";
+          if (stepLogsHasMore) {
+            stepLoadMoreHtml = `<button id="load-more-step-logs-btn" class="load-more-btn" data-step-id="${escapeHtml(selectedStep.id)}">${stepLogs.nextCursor ? "Load More Step Logs" : "Load More Step Logs (local)"}</button>`;
+          }
+
+          logsContent = `
+            ${stepLogWindowInfo}
+            <div class="log-terminal" role="region" aria-label="Step Task Logs">
+              ${logLines}
+            </div>
+            ${stepLoadMoreHtml}
+          `;
+        } else if (stepLogs?.expired) {
+          logsContent = `<div class="logs-notice logs-expired">Logs have expired due to the 7-day retention policy.</div>`;
+        } else {
+          logsContent = `<div class="text-muted">No logs recorded for this step yet (or click Logs to load).</div>`;
+        }
+
+        // Input Tab Content
+        const stepInput = (selectedStep as any).input;
+        const inputContent =
+          stepInput !== undefined
+            ? `<pre class="code-block">${escapeHtml(JSON.stringify(stepInput, null, 2))}</pre>`
+            : `<div class="text-muted">No step input recorded or redacted by tenant policy (<code>payload:read</code> required).</div>`;
+
+        // Output Tab Content
+        const outputContent =
+          selectedStep.output !== undefined
+            ? `<pre class="code-block">${escapeHtml(JSON.stringify(selectedStep.output, null, 2))}</pre>`
+            : `<div class="text-muted">${selectedStep.status === "SUCCEEDED" || selectedStep.status === "SKIPPED" ? "No output payload or redacted by tenant policy (<code>payload:read</code> required)." : "Step is not complete; no output produced yet."}</div>`;
+
+        // Trace Tab Content
+        const traceContent = `
+          <div class="trace-summary">
+            <div><strong>Logical Step:</strong> <code>${escapeHtml(selectedStep.nodeId)}</code> (ID: <code>${escapeHtml(selectedStep.id)}</code>)</div>
+            <div><strong>Current Epoch:</strong> ${selectedStep.currentEpoch}</div>
+            <div><strong>Total Attempts:</strong> ${selectedStep.attempts.length}</div>
+            ${selectedStep.completionSource ? `<div><strong>Completion Source:</strong> ${escapeHtml(selectedStep.completionSource)}</div>` : ""}
+            <div class="trace-attempts-list mt-2">
+              ${selectedStep.attempts
+                .map(
+                  (a) =>
+                    `<div>Attempt #${a.attemptNumber}: status <strong>${a.status}</strong>, session <code>${a.workerSessionId ? a.workerSessionId.slice(0, 8) + "..." : "-"}</code>, epoch ${a.ownershipEpoch ?? "-"}</div>`,
+                )
+                .join("")}
             </div>
           </div>
         `;
-        })
-        .join("");
+
+        stepDetailHtml = `
+          <div class="step-detail-card" role="region" aria-labelledby="step-detail-heading">
+            <div class="step-detail-header">
+              <h4 id="step-detail-heading">Step Inspector: <code>${escapeHtml(selectedStep.nodeId)}</code></h4>
+              <div class="step-badges">
+                <span class="kind-tag">${escapeHtml(selectedStep.kind || "task")}</span>
+                <span class="badge status-${selectedStep.status.toLowerCase()}">${pres.symbol} ${selectedStep.status}</span>
+              </div>
+            </div>
+            ${holdHtml}
+            <div class="step-tabs-nav" role="tablist" aria-label="Step Detail Tabs">
+              <button role="tab" id="step-tab-summary" class="step-tab-btn ${selectedStepTab === "summary" ? "active" : ""}" aria-selected="${selectedStepTab === "summary"}" aria-controls="step-panel-summary" tabindex="${selectedStepTab === "summary" ? "0" : "-1"}">Summary</button>
+              <button role="tab" id="step-tab-attempts" class="step-tab-btn ${selectedStepTab === "attempts" ? "active" : ""}" aria-selected="${selectedStepTab === "attempts"}" aria-controls="step-panel-attempts" tabindex="${selectedStepTab === "attempts" ? "0" : "-1"}">Attempts (${selectedStep.attempts.length})</button>
+              <button role="tab" id="step-tab-events" class="step-tab-btn ${selectedStepTab === "events" ? "active" : ""}" aria-selected="${selectedStepTab === "events"}" aria-controls="step-panel-events" tabindex="${selectedStepTab === "events" ? "0" : "-1"}">Events (${stepEventsAll.length})</button>
+              <button role="tab" id="step-tab-logs" class="step-tab-btn ${selectedStepTab === "logs" ? "active" : ""}" aria-selected="${selectedStepTab === "logs"}" aria-controls="step-panel-logs" tabindex="${selectedStepTab === "logs" ? "0" : "-1"}">Logs</button>
+              <button role="tab" id="step-tab-input" class="step-tab-btn ${selectedStepTab === "input" ? "active" : ""}" aria-selected="${selectedStepTab === "input"}" aria-controls="step-panel-input" tabindex="${selectedStepTab === "input" ? "0" : "-1"}">Input</button>
+              <button role="tab" id="step-tab-output" class="step-tab-btn ${selectedStepTab === "output" ? "active" : ""}" aria-selected="${selectedStepTab === "output"}" aria-controls="step-panel-output" tabindex="${selectedStepTab === "output" ? "0" : "-1"}">Output</button>
+              <button role="tab" id="step-tab-trace" class="step-tab-btn ${selectedStepTab === "trace" ? "active" : ""}" aria-selected="${selectedStepTab === "trace"}" aria-controls="step-panel-trace" tabindex="${selectedStepTab === "trace" ? "0" : "-1"}">Trace</button>
+            </div>
+            <div class="step-tab-content">
+              <div id="step-panel-summary" role="tabpanel" class="tab-panel ${selectedStepTab === "summary" ? "" : "hidden"}" aria-labelledby="step-tab-summary">${summaryContent}</div>
+              <div id="step-panel-attempts" role="tabpanel" class="tab-panel ${selectedStepTab === "attempts" ? "" : "hidden"}" aria-labelledby="step-tab-attempts">${attemptsHtml}</div>
+              <div id="step-panel-events" role="tabpanel" class="tab-panel ${selectedStepTab === "events" ? "" : "hidden"}" aria-labelledby="step-tab-events">
+                  <div class="step-events-timeline">
+                    ${stepEventsWindowInfo}${stepEventsHtml}${stepEventsLoadMore}
+                  </div>
+                </div>
+              <div id="step-panel-logs" role="tabpanel" class="tab-panel ${selectedStepTab === "logs" ? "" : "hidden"}" aria-labelledby="step-tab-logs">${logsContent}</div>
+              <div id="step-panel-input" role="tabpanel" class="tab-panel ${selectedStepTab === "input" ? "" : "hidden"}" aria-labelledby="step-tab-input">${inputContent}</div>
+              <div id="step-panel-output" role="tabpanel" class="tab-panel ${selectedStepTab === "output" ? "" : "hidden"}" aria-labelledby="step-tab-output">${outputContent}</div>
+              <div id="step-panel-trace" role="tabpanel" class="tab-panel ${selectedStepTab === "trace" ? "" : "hidden"}" aria-labelledby="step-tab-trace">${traceContent}</div>
+            </div>
+          </div>
+        `;
+      }
 
       container.innerHTML = `
         <div class="inspector-header">
@@ -643,9 +1062,53 @@ function initDashboard(): void {
           ${snap.reasonCode ? `<div class="meta-item"><label>Reason</label><div>${escapeHtml(snap.reasonCode)}</div></div>` : ""}
         </div>
 
-        <section class="steps-section">
-          <h3>Execution Graph & Attempts</h3>
-          <div class="steps-grid">${stepsHtml}</div>
+        <section class="steps-section" aria-labelledby="graph-steps-heading">
+          <div class="steps-section-header">
+            <h3 id="graph-steps-heading">Execution Graph & Steps</h3>
+            <div class="view-controls" role="tablist" aria-label="View Mode">
+              <button id="view-mode-graph-btn" class="toggle-btn ${currentViewMode === "graph" ? "active" : ""}" role="tab" aria-selected="${currentViewMode === "graph"}" aria-controls="graph-view-wrapper">Graph View</button>
+              <button id="view-mode-list-btn" class="toggle-btn ${currentViewMode === "list" ? "active" : ""}" role="tab" aria-selected="${currentViewMode === "list"}" aria-controls="list-view-wrapper">Accessible List</button>
+              <button id="toggle-collapse-btn" class="secondary-btn" aria-label="Toggle collapse of parallel groups">
+                ${collapsedClusters.size > 0 ? "Expand Groups" : "Collapse Groups"}
+              </button>
+            </div>
+          </div>
+
+          <div class="graph-inspector-layout">
+            <div class="graph-main-pane">
+              <div id="graph-view-wrapper" class="graph-view-container ${currentViewMode === "graph" ? "" : "hidden"}" role="tabpanel" aria-labelledby="view-mode-graph-btn">
+                <div id="minimap-container" class="minimap-panel" aria-label="Execution Graph Minimap" role="region">
+                  <div class="minimap-title">Minimap</div>
+                  <svg id="minimap-svg" class="minimap-svg" width="160" height="100" viewBox="0 0 160 100">
+                    ${minimapNodesHtml}
+                    <rect id="minimap-viewport" class="minimap-vp" x="${minimap.viewport.x}" y="${minimap.viewport.y}" width="${minimap.viewport.width}" height="${minimap.viewport.height}" />
+                  </svg>
+                </div>
+                <div id="graph-scroll-area" class="graph-scroll-area" tabindex="0" aria-label="Workflow execution graph canvas, click steps to inspect">
+                  <svg id="graph-svg" class="dag-svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" role="graphics-document" aria-label="Workflow execution DAG">
+                    <defs>
+                      <marker id="arrow-default" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                        <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--text-secondary)" />
+                      </marker>
+                      <marker id="arrow-skipped" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                        <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--text-muted)" stroke-dasharray="2,2" />
+                      </marker>
+                    </defs>
+                    <g class="dag-edges">${svgEdgesHtml}</g>
+                    <g class="dag-nodes">${svgNodesHtml}</g>
+                  </svg>
+                </div>
+              </div>
+
+              <div id="list-view-wrapper" class="list-view-container ${currentViewMode === "list" ? "" : "hidden"}" role="tabpanel" aria-labelledby="view-mode-list-btn">
+                ${listHtml}
+              </div>
+            </div>
+
+            <div class="graph-side-pane">
+              ${stepDetailHtml}
+            </div>
+          </div>
         </section>
 
         <section class="events-section">
@@ -687,6 +1150,283 @@ function initDashboard(): void {
 
       // Re-apply current transport freshness
       renderFreshness(currentStreamFreshness);
+
+      // Wire view mode buttons with roving tabindex and keyboard nav
+      const viewTabOrder: InspectorViewMode[] = ["graph", "list"];
+      const graphBtn = container.querySelector("#view-mode-graph-btn");
+      const listBtn = container.querySelector("#view-mode-list-btn");
+      const viewButtons = [graphBtn, listBtn].filter(Boolean) as HTMLElement[];
+
+      function updateViewRovingTabindex(activeIndex: number): void {
+        viewButtons.forEach((btn, i) => {
+          if (btn) {
+            btn.tabIndex = i === activeIndex ? 0 : -1;
+            btn.setAttribute(
+              "aria-selected",
+              i === activeIndex ? "true" : "false",
+            );
+          }
+        });
+      }
+      updateViewRovingTabindex(currentViewMode === "graph" ? 0 : 1);
+
+      viewButtons.forEach((btn, idx) => {
+        btn.addEventListener("click", () => {
+          currentViewMode = viewTabOrder[idx];
+          updateViewRovingTabindex(idx);
+          renderSnapshot(lastSnap!);
+        });
+        btn.addEventListener("keydown", (e: KeyboardEvent) => {
+          let newIdx = -1;
+          if (e.key === "ArrowRight") {
+            e.preventDefault();
+            newIdx = (idx + 1) % viewButtons.length;
+          } else if (e.key === "ArrowLeft") {
+            e.preventDefault();
+            newIdx = (idx - 1 + viewButtons.length) % viewButtons.length;
+          } else if (e.key === "Home") {
+            e.preventDefault();
+            newIdx = 0;
+          } else if (e.key === "End") {
+            e.preventDefault();
+            newIdx = viewButtons.length - 1;
+          }
+          if (newIdx >= 0) {
+            currentViewMode = viewTabOrder[newIdx];
+            renderSnapshot(lastSnap!);
+            const targetId =
+              viewTabOrder[newIdx] === "graph"
+                ? "view-mode-graph-btn"
+                : "view-mode-list-btn";
+            const newBtn = container.querySelector<HTMLElement>(`#${targetId}`);
+            newBtn?.focus();
+          }
+        });
+      });
+
+      // Wire collapse/expand groups button
+      const collapseBtn = container.querySelector("#toggle-collapse-btn");
+      if (collapseBtn) {
+        collapseBtn.addEventListener("click", () => {
+          if (collapsedClusters.size > 0) {
+            collapsedClusters.clear();
+          } else {
+            const testLayout = computeGraphLayout(snap.steps);
+            for (const n of testLayout.nodes) {
+              if (n.clusterId) collapsedClusters.add(n.clusterId);
+            }
+          }
+          renderSnapshot(lastSnap!);
+        });
+      }
+
+      // Wire minimap scroll binding to graph scroll container
+      const scrollAreaEl = document.getElementById("graph-scroll-area");
+      if (scrollAreaEl) {
+        scrollAreaEl.addEventListener("scroll", () => {
+          graphScrollLeft = scrollAreaEl.scrollLeft;
+          graphScrollTop = scrollAreaEl.scrollTop;
+          if (lastSnap) {
+            const layout = computeGraphLayout(
+              lastSnap.steps,
+              collapsedClusters,
+            );
+            const newMinimap = computeMinimap(
+              layout,
+              800,
+              450,
+              graphScrollLeft,
+              graphScrollTop,
+              160,
+              100,
+            );
+            const vp = document.getElementById("minimap-viewport");
+            if (vp) {
+              vp.setAttribute("x", String(newMinimap.viewport.x));
+              vp.setAttribute("y", String(newMinimap.viewport.y));
+              vp.setAttribute("width", String(newMinimap.viewport.width));
+              vp.setAttribute("height", String(newMinimap.viewport.height));
+            }
+          }
+        });
+      }
+
+      // Wire list scroll handler for virtualization (debounced)
+      const listScrollArea = document.getElementById("list-scroll-area");
+      let listScrollTimer: ReturnType<typeof setTimeout> | null = null;
+      if (listScrollArea) {
+        listScrollArea.addEventListener("scroll", () => {
+          listScrollTop = listScrollArea.scrollTop;
+          if (listScrollTimer) clearTimeout(listScrollTimer);
+          listScrollTimer = setTimeout(() => {
+            const scrollTop = listScrollArea.scrollTop;
+            listScrollTop = scrollTop;
+            const itemHeight = 140;
+            const newIndex = Math.floor(scrollTop / itemHeight);
+            const clampedIndex = Math.max(
+              0,
+              Math.min(newIndex, Math.max(0, snap.steps.length - 1)),
+            );
+            if (clampedIndex !== listScrollIndex) {
+              listScrollIndex = clampedIndex;
+              renderSnapshot(lastSnap!);
+            }
+          }, 50);
+        });
+      }
+
+      // Wire DAG SVG node selection
+      container.querySelectorAll(".dag-node").forEach((nodeEl) => {
+        const handleSelect = () => {
+          const clusterId = nodeEl.getAttribute("data-cluster-id");
+          const isCollapsed = nodeEl.classList.contains("node-collapsed");
+          if (isCollapsed && clusterId) {
+            collapsedClusters.delete(clusterId);
+            renderSnapshot(lastSnap!);
+            return;
+          }
+          const stepId = nodeEl.getAttribute("data-step-id");
+          if (stepId && stepId !== selectedStepId) {
+            selectedStepId = stepId;
+            stepLogsWindowStart = 0;
+            renderSnapshot(lastSnap!);
+          }
+        };
+        nodeEl.addEventListener("click", handleSelect);
+        nodeEl.addEventListener("keydown", (e: any) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            handleSelect();
+          }
+        });
+      });
+
+      // Wire Accessible List item selection
+      container.querySelectorAll(".select-step-btn").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          const stepId = (e.currentTarget as HTMLElement).getAttribute(
+            "data-step-id",
+          );
+          if (stepId) {
+            selectedStepId = stepId;
+            stepLogsWindowStart = 0;
+            renderSnapshot(lastSnap!);
+          }
+        });
+      });
+
+      // Wire Step Tabs navigation
+      const tabOrder: StepTab[] = [
+        "summary",
+        "attempts",
+        "events",
+        "logs",
+        "input",
+        "output",
+        "trace",
+      ];
+      container.querySelectorAll(".step-tab-btn").forEach((tabBtn) => {
+        const tabId = tabBtn.id.replace("step-tab-", "") as StepTab;
+        const selectTab = (t: StepTab) => {
+          selectedStepTab = t;
+          if (
+            t === "logs" &&
+            selectedStep &&
+            !cachedStepLogs.has(selectedStep.id)
+          ) {
+            activeInspector?.fetchLogs(selectedStep.id).then((l) => {
+              if (l) cachedStepLogs.set(selectedStep.id, l);
+              renderSnapshot(lastSnap!);
+            });
+          }
+          renderSnapshot(lastSnap!);
+        };
+
+        tabBtn.addEventListener("click", () => selectTab(tabId));
+        tabBtn.addEventListener("keydown", (e: any) => {
+          const idx = tabOrder.indexOf(tabId);
+          if (e.key === "ArrowRight") {
+            e.preventDefault();
+            const nextTab = tabOrder[(idx + 1) % tabOrder.length];
+            selectTab(nextTab);
+            const nextEl = container.querySelector<HTMLElement>(
+              `#step-tab-${nextTab}`,
+            );
+            nextEl?.focus();
+          } else if (e.key === "ArrowLeft") {
+            e.preventDefault();
+            const prevTab =
+              tabOrder[(idx - 1 + tabOrder.length) % tabOrder.length];
+            selectTab(prevTab);
+            const prevEl = container.querySelector<HTMLElement>(
+              `#step-tab-${prevTab}`,
+            );
+            prevEl?.focus();
+          }
+        });
+      });
+
+      // Wire Load More Step Events button
+      const loadMoreStepEventsBtn = document.getElementById(
+        "load-more-step-events-btn",
+      );
+      if (loadMoreStepEventsBtn) {
+        loadMoreStepEventsBtn.addEventListener("click", () => {
+          eventsWindowStart += EVENTS_PAGE_SIZE;
+          renderSnapshot(lastSnap!);
+        });
+      }
+
+      // Wire Load More Step Logs button
+      const loadMoreStepLogsBtn = document.getElementById(
+        "load-more-step-logs-btn",
+      );
+      if (loadMoreStepLogsBtn && selectedStep) {
+        loadMoreStepLogsBtn.addEventListener("click", () => {
+          const currentLogs = cachedStepLogs.get(selectedStep.id);
+          stepLogsWindowStart += LOGS_PAGE_SIZE;
+          if (currentLogs?.nextCursor) {
+            loadMoreStepLogsBtn.textContent = "Loading...";
+            loadMoreStepLogsBtn.setAttribute("disabled", "true");
+            activeInspector?.fetchLogs(
+              selectedStep.id,
+              undefined,
+              currentLogs.nextCursor,
+              true,
+            );
+          } else {
+            renderSnapshot(lastSnap!);
+          }
+        });
+      }
+
+      // Wire Load More Steps button
+      const loadMoreStepsBtn = document.getElementById("load-more-steps-btn");
+      if (loadMoreStepsBtn) {
+        loadMoreStepsBtn.addEventListener("click", () => {
+          const offset = parseInt(
+            loadMoreStepsBtn.getAttribute("data-list-offset") ?? "0",
+          );
+          listScrollIndex = offset;
+          listScrollTop = offset * 140;
+          renderSnapshot(lastSnap!);
+        });
+      }
+
+      // Restore physical scroll positions immediately on the new DOM elements
+      const newGraphScrollArea = document.getElementById("graph-scroll-area");
+      if (newGraphScrollArea) {
+        newGraphScrollArea.scrollLeft = graphScrollLeft;
+        newGraphScrollArea.scrollTop = graphScrollTop;
+      }
+
+      const newLsa = document.getElementById("list-scroll-area");
+      if (newLsa) {
+        newLsa.scrollTop = listScrollTop;
+      }
+
+      // Restore focus to active element if still present in new DOM
+      restoreFocus(container, focusDescriptor);
 
       // Wire durable pause/resume controls. The backend stays authoritative:
       // expectedRevision is captured at open time and 409s refresh in-dialog.
@@ -760,7 +1500,14 @@ function initDashboard(): void {
       return;
     }
 
-    const cardsHtml = events
+    const bounded = getBoundedEvents(
+      events,
+      eventsWindowStart,
+      EVENTS_PAGE_SIZE,
+    );
+    const visibleEvents = bounded.events;
+
+    const cardsHtml = visibleEvents
       .map((ev) => {
         const time = new Date(ev.committedAt).toLocaleTimeString();
         const payloadStr = JSON.stringify(ev.payload, null, 2);
@@ -778,25 +1525,41 @@ function initDashboard(): void {
       .join("");
 
     let loadMoreHtml = "";
-    if (hasMore && nextCursor !== null) {
+    if (bounded.hasMore && nextCursor !== null) {
+      loadMoreHtml = `<button id="load-more-events-btn" class="load-more-btn">Load Earlier Events (${events.length - visibleEvents.length} more in history)</button>`;
+    } else if (hasMore && nextCursor !== null) {
       loadMoreHtml = `<button id="load-more-events-btn" class="load-more-btn">Load Earlier Events</button>`;
     }
 
-    container.innerHTML = cardsHtml + loadMoreHtml;
+    const windowInfo =
+      events.length > EVENTS_PAGE_SIZE
+        ? `
+      <div class="events-window-info" role="status" aria-live="polite">
+        Showing events ${bounded.offset + 1}–${Math.min(bounded.offset + visibleEvents.length, bounded.total)} of ${bounded.total}.
+      </div>
+    `
+        : "";
 
-    if (hasMore && nextCursor !== null) {
+    container.innerHTML = windowInfo + cardsHtml + loadMoreHtml;
+
+    if (bounded.hasMore && nextCursor !== null) {
       const btn = document.getElementById("load-more-events-btn");
       if (btn) {
         btn.addEventListener("click", () => {
           btn.textContent = "Loading...";
           btn.setAttribute("disabled", "true");
+          eventsWindowStart += EVENTS_PAGE_SIZE;
           activeInspector?.fetchEvents(nextCursor, true);
         });
       }
     }
   }
 
-  function renderLogs(logs: TaskLogsResponse | null, error?: string): void {
+  function renderLogs(
+    logs: TaskLogsResponse | null,
+    error?: string,
+    stepId?: string,
+  ): void {
     const container = document.getElementById("logs-container");
     if (!container) return;
 
@@ -828,7 +1591,16 @@ function initDashboard(): void {
       warningNotice = `<div class="logs-notice logs-restricted">${logs.droppedCount} log record(s) dropped (exceeded 16 KiB per-line limit).</div>`;
     }
 
-    const logLines = logs.items
+    const logBounded = virtualizeItems(
+      logs.items,
+      logsWindowStart,
+      LOGS_PAGE_SIZE,
+    );
+    const visibleLogItems = logBounded.items;
+    // hasMore is true when server has more pages (nextCursor) OR local window has more items
+    const logsHasMore = logs.nextCursor != null || logBounded.hasMore;
+
+    const logLines = visibleLogItems
       .map((item) => {
         const time = new Date(item.timestamp).toLocaleTimeString();
         return `<div class="log-line log-${item.level}"><span class="log-time">${time}</span> <span class="log-level">[${item.level.toUpperCase()}]</span> <span class="log-msg">${escapeHtml(item.message)}</span></div>`;
@@ -836,20 +1608,30 @@ function initDashboard(): void {
       .join("");
 
     let loadMoreHtml = "";
-    if (logs.nextCursor) {
-      loadMoreHtml = `<button id="load-more-logs-btn" class="load-more-btn">Load More Logs</button>`;
+    if (logsHasMore) {
+      loadMoreHtml = `<button id="load-more-logs-btn" class="load-more-btn">${logs.nextCursor ? "Load More Logs" : "Load More Logs (local)"}</button>`;
     }
 
-    container.innerHTML = `${warningNotice}<div class="log-terminal">${logLines}</div>${loadMoreHtml}`;
+    const logWindowInfo =
+      logs.items.length > LOGS_PAGE_SIZE
+        ? `
+      <div class="logs-window-info" role="status" aria-live="polite">
+        Showing logs ${logBounded.offset + 1}–${Math.min(logBounded.offset + visibleLogItems.length, logBounded.total)} of ${logBounded.total}.
+      </div>
+    `
+        : "";
 
-    if (logs.nextCursor) {
+    container.innerHTML = `${warningNotice}${logWindowInfo}<div class="log-terminal">${logLines}</div>${loadMoreHtml}`;
+
+    if (logsHasMore) {
       const btn = document.getElementById("load-more-logs-btn");
       if (btn) {
         btn.addEventListener("click", () => {
           btn.textContent = "Loading...";
           btn.setAttribute("disabled", "true");
+          logsWindowStart += LOGS_PAGE_SIZE;
           activeInspector?.fetchLogs(
-            undefined,
+            stepId ?? selectedStepId ?? undefined,
             undefined,
             logs.nextCursor,
             true,

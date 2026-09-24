@@ -512,7 +512,34 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			_ = json.Unmarshal(rawError, &runError)
 		}
 
-		rows, err := tx.Query(ctx, `SELECT id::text, node_id, state, current_epoch, completion_source
+		nodeAfterMap := make(map[string][]string)
+		nodeKindMap := make(map[string]string)
+		if run.DeploymentID != "" {
+			var manifestBytes []byte
+			_ = tx.QueryRow(ctx, `SELECT manifest FROM deployments WHERE id = $1::uuid AND organization_id = $2::uuid`,
+				run.DeploymentID, orgID).Scan(&manifestBytes)
+			if len(manifestBytes) > 0 {
+				var manifest deploymentManifest
+				if err := json.Unmarshal(manifestBytes, &manifest); err == nil {
+					for _, wf := range manifest.Workflows {
+						if wf.Name == run.WorkflowName {
+							for _, n := range wf.Nodes {
+								afterCopy := make([]string, len(n.After))
+								copy(afterCopy, n.After)
+								nodeAfterMap[n.ID] = afterCopy
+								if n.Type != "" {
+									nodeKindMap[n.ID] = n.Type
+								}
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+
+		rows, err := tx.Query(ctx, `SELECT id::text, node_id, state, current_epoch, completion_source,
+			kind, wait_reason, output
 			FROM run_steps
 			WHERE run_id = $1::uuid AND organization_id = $2::uuid
 			ORDER BY created_at ASC, id ASC`, runID, orgID)
@@ -525,10 +552,30 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 		for rows.Next() {
 			var st RunStepDTO
 			var stateStr string
-			if err := rows.Scan(&st.ID, &st.NodeID, &stateStr, &st.CurrentEpoch, &st.CompletionSource); err != nil {
+			var kindStr, waitReasonStr *string
+			var rawStepOutput []byte
+			if err := rows.Scan(&st.ID, &st.NodeID, &stateStr, &st.CurrentEpoch, &st.CompletionSource,
+				&kindStr, &waitReasonStr, &rawStepOutput); err != nil {
 				return err
 			}
 			st.Status = contracts.StepStatus(stateStr)
+			if kindStr != nil && *kindStr != "" {
+				st.Kind = kindStr
+			} else if k, ok := nodeKindMap[st.NodeID]; ok && k != "" {
+				st.Kind = &k
+			}
+			st.WaitReason = waitReasonStr
+			if afterList, ok := nodeAfterMap[st.NodeID]; ok {
+				st.After = afterList
+			} else {
+				st.After = []string{}
+			}
+			if len(rawStepOutput) > 0 && string(rawStepOutput) != "null" {
+				var parsedOutput any
+				if err := json.Unmarshal(rawStepOutput, &parsedOutput); err == nil {
+					st.Output = parsedOutput
+				}
+			}
 			st.Attempts = []AttemptSummaryDTO{}
 			steps = append(steps, st)
 		}

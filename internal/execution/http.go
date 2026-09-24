@@ -189,6 +189,7 @@ func (h *HTTPHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 		snapshot.Output = nil
 		snapshot.Error = nil
 		for i := range snapshot.Steps {
+			snapshot.Steps[i].Output = nil
 			for j := range snapshot.Steps[i].Attempts {
 				snapshot.Steps[i].Attempts[j].Error = nil
 			}

@@ -6,6 +6,8 @@ import {
   TaskAttempt,
   AttemptStatus,
   StepStatus,
+  StepTab,
+  InspectorViewMode,
   TaskLogsResponse,
   StreamFreshness,
   ReconciliationCase,
@@ -34,6 +36,9 @@ export function shouldShowWorkerWait(
 export function terminalStepEmptyText(stepStatus: StepStatus): string {
   if (stepStatus === "CANCELLED") {
     return "Cancelled before execution — no attempt executed.";
+  }
+  if (stepStatus === "SKIPPED") {
+    return "Skipped — branch not selected or upstream dependency skipped.";
   }
   return "No attempt executed.";
 }
@@ -115,10 +120,510 @@ export function terminationBannerText(
   return null;
 }
 
+export interface StatusPresentation {
+  status: string;
+  symbol: string;
+  label: string;
+  ariaLabel: string;
+}
+
+export function getStatusPresentation(status: string): StatusPresentation {
+  switch (status.toUpperCase()) {
+    case "SUCCEEDED":
+      return {
+        status,
+        symbol: "✓",
+        label: "Succeeded",
+        ariaLabel: "Status: Succeeded",
+      };
+    case "FAILED":
+      return {
+        status,
+        symbol: "✕",
+        label: "Failed",
+        ariaLabel: "Status: Failed",
+      };
+    case "SKIPPED":
+      return {
+        status,
+        symbol: "↷",
+        label: "Skipped",
+        ariaLabel: "Status: Skipped",
+      };
+    case "CANCELLED":
+      return {
+        status,
+        symbol: "⊘",
+        label: "Cancelled",
+        ariaLabel: "Status: Cancelled",
+      };
+    case "RUNNING":
+      return {
+        status,
+        symbol: "●",
+        label: "Running",
+        ariaLabel: "Status: Running",
+      };
+    case "WAITING":
+      return {
+        status,
+        symbol: "⏳",
+        label: "Waiting",
+        ariaLabel: "Status: Waiting",
+      };
+    case "PAUSING":
+      return {
+        status,
+        symbol: "⏸",
+        label: "Pausing",
+        ariaLabel: "Status: Pausing",
+      };
+    case "PAUSED":
+      return {
+        status,
+        symbol: "⏸",
+        label: "Paused",
+        ariaLabel: "Status: Paused",
+      };
+    case "CANCELLING":
+      return {
+        status,
+        symbol: "⊘",
+        label: "Cancelling",
+        ariaLabel: "Status: Cancelling",
+      };
+    case "QUEUED":
+      return {
+        status,
+        symbol: "⋯",
+        label: "Queued",
+        ariaLabel: "Status: Queued",
+      };
+    case "READY":
+      return {
+        status,
+        symbol: "○",
+        label: "Ready",
+        ariaLabel: "Status: Ready",
+      };
+    case "BLOCKED":
+      return {
+        status,
+        symbol: "◌",
+        label: "Blocked",
+        ariaLabel: "Status: Blocked",
+      };
+    case "CLAIMED":
+      return {
+        status,
+        symbol: "◷",
+        label: "Claimed",
+        ariaLabel: "Status: Claimed",
+      };
+    case "LOST":
+      return {
+        status,
+        symbol: "⚠",
+        label: "Lost",
+        ariaLabel: "Status: Lost",
+      };
+    case "TIMED_OUT":
+      return {
+        status,
+        symbol: "⏰",
+        label: "Timed Out",
+        ariaLabel: "Status: Timed Out",
+      };
+    default:
+      return {
+        status,
+        symbol: "•",
+        label: status,
+        ariaLabel: `Status: ${status}`,
+      };
+  }
+}
+
+export interface GraphNode {
+  id: string;
+  nodeId: string;
+  kind: string;
+  status: StepStatus;
+  waitReason?: string | null;
+  after: string[];
+  attemptsCount: number;
+  output?: unknown;
+  currentEpoch: number;
+  completionSource?: string | null;
+  level: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  clusterId?: string;
+  isCollapsedPlaceholder?: boolean;
+  collapsedCount?: number;
+  collapsedNodeIds?: string[];
+}
+
+export interface GraphEdge {
+  fromNodeId: string;
+  toNodeId: string;
+  fromX: number;
+  fromY: number;
+  toX: number;
+  toY: number;
+  isSkipped: boolean;
+}
+
+export interface GraphLayout {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  width: number;
+  height: number;
+  levels: number;
+}
+
+export function computeGraphLayout(
+  steps: Array<{
+    id: string;
+    nodeId: string;
+    kind?: string;
+    status: StepStatus;
+    waitReason?: string | null;
+    after?: string[];
+    currentEpoch?: number;
+    completionSource?: string | null;
+    output?: unknown;
+    attempts?: TaskAttempt[];
+  }>,
+  collapsedClusterIds: Set<string> = new Set(),
+): GraphLayout {
+  if (steps.length === 0) {
+    return { nodes: [], edges: [], width: 400, height: 200, levels: 0 };
+  }
+
+  // 1. Calculate topological level for each logical step
+  const stepMap = new Map(steps.map((s) => [s.nodeId, s]));
+  const levelMap = new Map<string, number>();
+
+  for (const s of steps) {
+    if (!s.after || s.after.length === 0) {
+      levelMap.set(s.nodeId, 0);
+    }
+  }
+
+  // Multi-pass relaxation to resolve dependencies
+  for (let pass = 0; pass < steps.length + 1; pass++) {
+    let changed = false;
+    for (const s of steps) {
+      const deps = s.after || [];
+      if (deps.length === 0) continue;
+      let maxParentLevel = 0;
+      let allFound = true;
+      for (const p of deps) {
+        if (levelMap.has(p)) {
+          maxParentLevel = Math.max(maxParentLevel, levelMap.get(p)!);
+        } else {
+          allFound = false;
+        }
+      }
+      const newLevel = maxParentLevel + 1;
+      if (!levelMap.has(s.nodeId) || levelMap.get(s.nodeId)! < newLevel) {
+        levelMap.set(s.nodeId, newLevel);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  // Fallback for any disconnected nodes
+  for (const s of steps) {
+    if (!levelMap.has(s.nodeId)) {
+      levelMap.set(s.nodeId, 0);
+    }
+  }
+
+  // 2. Identify collapsible parallel groups
+  // If > 4 parallel sibling nodes share identical single parent and single child,
+  // or share identical dependencies, they form a candidate cluster.
+  const clusterMap = new Map<string, string[]>(); // clusterId -> nodeIds
+  const nodeClusterMap = new Map<string, string>(); // nodeId -> clusterId
+
+  const siblingsByDeps = new Map<string, string[]>();
+  for (const s of steps) {
+    const depKey = (s.after || []).slice().sort().join(",");
+    const list = siblingsByDeps.get(depKey) || [];
+    list.push(s.nodeId);
+    siblingsByDeps.set(depKey, list);
+  }
+
+  for (const [depKey, nodeIds] of siblingsByDeps.entries()) {
+    if (nodeIds.length >= 4) {
+      const clusterId = `cluster-${depKey || "root"}-${levelMap.get(nodeIds[0])}`;
+      clusterMap.set(clusterId, nodeIds);
+      for (const nid of nodeIds) {
+        nodeClusterMap.set(nid, clusterId);
+      }
+    }
+  }
+
+  // 3. Layout geometry constants
+  const NODE_WIDTH = 220;
+  const NODE_HEIGHT = 70;
+  const COL_GAP = 80;
+  const ROW_GAP = 24;
+  const PADDING = 40;
+
+  // 4. Build visible nodes list (collapsing clustered nodes if collapsedClusterIds has clusterId)
+  const visibleNodes: GraphNode[] = [];
+  const processedClusters = new Set<string>();
+
+  for (const s of steps) {
+    const clusterId = nodeClusterMap.get(s.nodeId);
+    if (clusterId && collapsedClusterIds.has(clusterId)) {
+      if (!processedClusters.has(clusterId)) {
+        processedClusters.add(clusterId);
+        const clusterNodes = clusterMap.get(clusterId)!;
+        const firstStep = stepMap.get(clusterNodes[0])!;
+        const allSkipped = clusterNodes.every(
+          (nid) => stepMap.get(nid)?.status === "SKIPPED",
+        );
+        const allSucceeded = clusterNodes.every(
+          (nid) => stepMap.get(nid)?.status === "SUCCEEDED",
+        );
+        const anyFailed = clusterNodes.some(
+          (nid) => stepMap.get(nid)?.status === "FAILED",
+        );
+        const anyRunning = clusterNodes.some(
+          (nid) => stepMap.get(nid)?.status === "RUNNING",
+        );
+        let clusterStatus: StepStatus = "READY";
+        if (anyFailed) clusterStatus = "FAILED";
+        else if (anyRunning) clusterStatus = "RUNNING";
+        else if (allSucceeded) clusterStatus = "SUCCEEDED";
+        else if (allSkipped) clusterStatus = "SKIPPED";
+
+        visibleNodes.push({
+          id: clusterId,
+          nodeId: `${clusterNodes.length} parallel steps (collapsed)`,
+          kind: "cluster",
+          status: clusterStatus,
+          after: firstStep.after || [],
+          attemptsCount: 0,
+          currentEpoch: 0,
+          level: levelMap.get(clusterNodes[0]) || 0,
+          x: 0,
+          y: 0,
+          width: NODE_WIDTH,
+          height: NODE_HEIGHT,
+          clusterId,
+          isCollapsedPlaceholder: true,
+          collapsedCount: clusterNodes.length,
+          collapsedNodeIds: clusterNodes,
+        });
+      }
+      continue;
+    }
+
+    visibleNodes.push({
+      id: s.id,
+      nodeId: s.nodeId,
+      kind: s.kind || "task",
+      status: s.status,
+      waitReason: s.waitReason,
+      after: s.after || [],
+      attemptsCount: s.attempts ? s.attempts.length : 0,
+      output: s.output,
+      currentEpoch: s.currentEpoch || 0,
+      completionSource: s.completionSource,
+      level: levelMap.get(s.nodeId) || 0,
+      x: 0,
+      y: 0,
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
+      clusterId,
+    });
+  }
+
+  // 5. Position nodes by column (level) and row
+  const nodesByLevel = new Map<number, GraphNode[]>();
+  let maxLevel = 0;
+  for (const n of visibleNodes) {
+    const list = nodesByLevel.get(n.level) || [];
+    list.push(n);
+    nodesByLevel.set(n.level, list);
+    if (n.level > maxLevel) maxLevel = n.level;
+  }
+
+  let maxX = 0;
+  let maxY = 0;
+
+  for (let lvl = 0; lvl <= maxLevel; lvl++) {
+    const colNodes = nodesByLevel.get(lvl) || [];
+    const colX = PADDING + lvl * (NODE_WIDTH + COL_GAP);
+    colNodes.forEach((node, rowIdx) => {
+      const rowY = PADDING + rowIdx * (NODE_HEIGHT + ROW_GAP);
+      node.x = colX;
+      node.y = rowY;
+      maxX = Math.max(maxX, colX + NODE_WIDTH);
+      maxY = Math.max(maxY, rowY + NODE_HEIGHT);
+    });
+  }
+
+  // 6. Connect edges
+  const edges: GraphEdge[] = [];
+  const visibleMap = new Map<string, GraphNode>();
+  for (const n of visibleNodes) {
+    if (n.isCollapsedPlaceholder && n.collapsedNodeIds) {
+      for (const nid of n.collapsedNodeIds) {
+        visibleMap.set(nid, n);
+      }
+    }
+    visibleMap.set(n.nodeId, n);
+  }
+
+  const edgeSet = new Set<string>();
+  for (const n of visibleNodes) {
+    const deps = n.after || [];
+    for (const parentId of deps) {
+      const parentNode = visibleMap.get(parentId);
+      if (!parentNode) continue;
+      if (parentNode === n) continue; // avoid self-loop if inside same collapsed cluster
+
+      const edgeKey = `${parentNode.nodeId}->${n.nodeId}`;
+      if (edgeSet.has(edgeKey)) continue;
+      edgeSet.add(edgeKey);
+
+      edges.push({
+        fromNodeId: parentNode.nodeId,
+        toNodeId: n.nodeId,
+        fromX: parentNode.x + parentNode.width,
+        fromY: parentNode.y + parentNode.height / 2,
+        toX: n.x,
+        toY: n.y + n.height / 2,
+        isSkipped: n.status === "SKIPPED" || parentNode.status === "SKIPPED",
+      });
+    }
+  }
+
+  return {
+    nodes: visibleNodes,
+    edges,
+    width: Math.max(760, maxX + PADDING),
+    height: Math.max(380, maxY + PADDING),
+    levels: maxLevel + 1,
+  };
+}
+
+export interface MinimapLayout {
+  scale: number;
+  width: number;
+  height: number;
+  viewport: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  nodes: Array<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    status: StepStatus;
+  }>;
+}
+
+export function computeMinimap(
+  layout: GraphLayout,
+  viewportWidth: number,
+  viewportHeight: number,
+  scrollLeft: number,
+  scrollTop: number,
+  minimapWidth = 160,
+  minimapHeight = 100,
+): MinimapLayout {
+  const scale = Math.min(
+    minimapWidth / Math.max(layout.width, 1),
+    minimapHeight / Math.max(layout.height, 1),
+  );
+  const vpX = Math.max(0, scrollLeft * scale);
+  const vpY = Math.max(0, scrollTop * scale);
+  const vpW = Math.min(minimapWidth, Math.max(12, viewportWidth * scale));
+  const vpH = Math.min(minimapHeight, Math.max(12, viewportHeight * scale));
+
+  const nodes = layout.nodes.map((n) => ({
+    x: n.x * scale,
+    y: n.y * scale,
+    width: Math.max(4, n.width * scale),
+    height: Math.max(3, n.height * scale),
+    status: n.status,
+  }));
+
+  return {
+    scale,
+    width: minimapWidth,
+    height: minimapHeight,
+    viewport: { x: vpX, y: vpY, width: vpW, height: vpH },
+    nodes,
+  };
+}
+
+export function filterEventsForStep(
+  events: RunEvent[],
+  step: { id: string; nodeId: string; attempts?: Array<{ id: string }> },
+): RunEvent[] {
+  const attemptIds = new Set(step.attempts?.map((a) => a.id) ?? []);
+  return events.filter((e) => {
+    const p = e.payload as Record<string, unknown> | undefined;
+    if (!p) return false;
+    if (p.stepId === step.id || p.nodeId === step.nodeId) return true;
+    if (typeof p.attemptId === "string" && attemptIds.has(p.attemptId))
+      return true;
+    return false;
+  });
+}
+
+export function virtualizeItems<T>(
+  items: T[],
+  startIndex: number,
+  pageSize = 50,
+): { items: T[]; total: number; hasMore: number; offset: number } {
+  const clampedStart = Math.max(0, Math.min(startIndex, items.length));
+  const sliced = items.slice(clampedStart, clampedStart + pageSize);
+  return {
+    items: sliced,
+    total: items.length,
+    hasMore: Math.max(0, items.length - (clampedStart + pageSize)),
+    offset: clampedStart,
+  };
+}
+
+export function getBoundedEvents(
+  events: RunEvent[],
+  offset: number,
+  limit = 50,
+): { events: RunEvent[]; total: number; hasMore: boolean; offset: number } {
+  const total = events.length;
+  const start = Math.max(0, Math.min(offset, total));
+  const end = Math.min(start + limit, total);
+  return {
+    events: events.slice(start, end),
+    total,
+    hasMore: end < total,
+    offset: start,
+  };
+}
+
 export interface InspectorListener {
   onSnapshotUpdated?: (snapshot: RunSnapshot) => void;
   onFreshnessChanged?: (freshness: StreamFreshness) => void;
-  onLogsUpdated?: (logs: TaskLogsResponse | null, error?: string) => void;
+  onLogsUpdated?: (
+    logs: TaskLogsResponse | null,
+    error?: string,
+    stepId?: string,
+  ) => void;
   onEventsUpdated?: (
     events: RunEvent[],
     hasMore: boolean,
@@ -135,6 +640,8 @@ export class RunInspector {
   private listeners: InspectorListener[] = [];
   private logs: TaskLogsResponse | null = null;
   private logsError: string | null = null;
+  private stepLogs: Map<string, TaskLogsResponse> = new Map();
+  private stepLogsError: Map<string, string> = new Map();
   private events: RunEvent[] = [];
   private eventsHasMore = false;
   private eventsNextCursor: number | null = null;
@@ -270,10 +777,16 @@ export class RunInspector {
     try {
       const res = await apiFetch(url);
       if (res.status === 403) {
-        this.logsError =
+        const errMsg =
           "Diagnostic task logs require payload:read capability (redacted by tenant policy).";
-        this.logs = null;
-        this.notifyLogs();
+        if (stepId) {
+          this.stepLogsError.set(stepId, errMsg);
+          this.notifyLogs(null, errMsg, stepId);
+        } else {
+          this.logsError = errMsg;
+          this.logs = null;
+          this.notifyLogs(null, errMsg);
+        }
         return null;
       }
       if (!res.ok) {
@@ -282,25 +795,55 @@ export class RunInspector {
         );
       }
       const data = (await res.json()) as TaskLogsResponse;
-      if (append && this.logs) {
-        this.logs = {
-          ...data,
-          items: [...this.logs.items, ...data.items],
-        };
+      if (stepId) {
+        const existing = this.stepLogs.get(stepId);
+        let finalData: TaskLogsResponse;
+        if (append && existing) {
+          finalData = {
+            ...data,
+            items: [...existing.items, ...data.items],
+          };
+        } else {
+          finalData = data;
+        }
+        this.stepLogs.set(stepId, finalData);
+        this.stepLogsError.delete(stepId);
+        this.notifyLogs(finalData, undefined, stepId);
+        return finalData;
       } else {
-        this.logs = data;
+        if (append && this.logs) {
+          this.logs = {
+            ...data,
+            items: [...this.logs.items, ...data.items],
+          };
+        } else {
+          this.logs = data;
+        }
+        this.logsError = null;
+        this.notifyLogs(this.logs, undefined);
+        return this.logs;
       }
-      this.logsError = null;
-      this.notifyLogs();
-      return data;
     } catch (err: unknown) {
-      this.logsError = err instanceof Error ? err.message : String(err);
-      if (!append) {
-        this.logs = null;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (stepId) {
+        this.stepLogsError.set(stepId, errMsg);
+        if (!append) {
+          this.stepLogs.delete(stepId);
+        }
+        this.notifyLogs(null, errMsg, stepId);
+      } else {
+        this.logsError = errMsg;
+        if (!append) {
+          this.logs = null;
+        }
+        this.notifyLogs(null, errMsg);
       }
-      this.notifyLogs();
       return null;
     }
+  }
+
+  public getStepLogs(stepId: string): TaskLogsResponse | null {
+    return this.stepLogs.get(stepId) ?? null;
   }
 
   private startStream(): void {
@@ -473,10 +1016,43 @@ export class RunInspector {
         break;
 
       case "step.succeeded":
-        if (typeof payload.stepId === "string") {
-          const s = this.snapshot.steps.find((st) => st.id === payload.stepId);
+      case "step_succeeded":
+        if (
+          typeof payload.stepId === "string" ||
+          typeof payload.nodeId === "string"
+        ) {
+          const s = this.snapshot.steps.find(
+            (st) =>
+              st.id === payload.stepId ||
+              (payload.nodeId && st.nodeId === payload.nodeId),
+          );
           if (s) {
             s.status = "SUCCEEDED";
+            if (payload.output !== undefined) {
+              s.output = payload.output;
+            }
+          }
+        }
+        break;
+
+      case "step.skipped":
+      case "step_skipped":
+        if (
+          typeof payload.stepId === "string" ||
+          typeof payload.nodeId === "string"
+        ) {
+          const s = this.snapshot.steps.find(
+            (st) =>
+              st.id === payload.stepId ||
+              (payload.nodeId && st.nodeId === payload.nodeId),
+          );
+          if (s) {
+            s.status = "SKIPPED";
+            if (typeof payload.reason === "string") {
+              s.waitReason = payload.reason;
+            } else if (typeof payload.waitReason === "string") {
+              s.waitReason = payload.waitReason;
+            }
           }
         }
         break;
@@ -571,10 +1147,14 @@ export class RunInspector {
     }
   }
 
-  private notifyLogs(): void {
+  private notifyLogs(
+    logs: TaskLogsResponse | null = this.logs,
+    error?: string,
+    stepId?: string,
+  ): void {
     for (const l of this.listeners) {
       if (l.onLogsUpdated) {
-        l.onLogsUpdated(this.logs, this.logsError ?? undefined);
+        l.onLogsUpdated(logs, error ?? this.logsError ?? undefined, stepId);
       }
     }
   }
