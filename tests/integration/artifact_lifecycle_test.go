@@ -297,6 +297,12 @@ func TestArtifactCapsQuotaAndShape(t *testing.T) {
 	const digest = "bundle-artifact-caps-22"
 	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, artifactManifest())
 	runID, stepID := seedExecutionRun(t, tc, orgID, envID, deploymentID, "node-a")
+	defer func() {
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, _ = tx.Exec(context.Background(), `UPDATE runs SET status='CANCELLED' WHERE id=$1::uuid`, runID)
+			return nil
+		})
+	}()
 	advertiseDigest(t, tc, orgID, session.SessionID, digest)
 	a := claimExecution(t, server, session, digest, "artifact-caps-claim")
 	startNode(t, server, session, a.AttemptID, a.OwnershipEpoch)
@@ -347,6 +353,12 @@ func TestArtifactQuotaAdmissionIsSerialized(t *testing.T) {
 	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, artifactManifest())
 	first, firstIDs := claimStartedArtifactAttempt(t, tc, server, orgID, envID, digest, deploymentID, "quota-race-a")
 	second, secondIDs := claimStartedArtifactAttempt(t, tc, server, orgID, envID, digest, deploymentID, "quota-race-b")
+	defer func() {
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, _ = tx.Exec(context.Background(), `UPDATE runs SET status='CANCELLED' WHERE id IN ($1::uuid, $2::uuid)`, firstIDs.runID, secondIDs.runID)
+			return nil
+		})
+	}()
 
 	// Leave exactly 100 bytes available. Two concurrent 100-byte reservations
 	// must result in one success and one quota rejection.
@@ -683,6 +695,12 @@ func TestArtifactCorruptBlocksConsumer(t *testing.T) {
 	const digest = "bundle-artifact-consumer-22"
 	deploymentID := seedRetryDeployment(t, tc, orgID, envID, digest, consumerManifest())
 	runID, stepA := seedExecutionRun(t, tc, orgID, envID, deploymentID, "a")
+	defer func() {
+		_ = tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+			_, _ = tx.Exec(ctx, `UPDATE runs SET status='CANCELLED' WHERE id=$1::uuid`, runID)
+			return nil
+		})
+	}()
 	var stepB string
 	if err := tc.pool.WithTenantTx(ctx, orgID, func(ctx context.Context, tx storage.Tx) error {
 		return tx.QueryRow(ctx, `INSERT INTO run_steps

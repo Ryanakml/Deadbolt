@@ -764,14 +764,15 @@ func fireDueRetryTimersTx(ctx context.Context, tx storage.Tx, organizationID str
 }
 
 type claimMatch struct {
-	stepID       string
-	runID        string
-	nodeID       string
-	input        any
-	bundle       string
-	manifest     []byte
-	workflowName string
-	runDeadline  *time.Time
+	stepID        string
+	runID         string
+	nodeID        string
+	input         any
+	bundle        string
+	manifest      []byte
+	workflowName  string
+	runDeadline   *time.Time
+	environmentID string
 }
 
 // pendingClaim snapshots one candidate plus its immutable artifact
@@ -847,33 +848,61 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 	if req.AvailableSlots <= 0 {
 		return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
 	}
+
+	// Disaster recovery dispatch gate (Blueprint §27.3). Fail closed: a
+	// missing or unreadable controls row must not grant new task ownership.
+	var dispatchEnabled bool
+	var recMode string
+	if err := e.pool.QueryRow(ctx, `SELECT dispatch_enabled, mode FROM system_recovery_controls WHERE id = 1`).Scan(&dispatchEnabled, &recMode); err != nil {
+		return nil, worker.ErrRecoveryControlsUnavailable
+	}
+	if !dispatchEnabled || recMode == "READ_ONLY" || recMode == "DISASTER_RECOVERY" {
+		return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
+	}
+
 	var reconciledRuns []string
 
 	// TX A snapshots candidates plus immutable artifact requirements and
 	// commits before any provider I/O. No authoritative Claim transaction
 	// remains open while S3 HEAD/GET/hash runs below.
+	effectivePool := session.PoolName
+	if effectivePool == "" {
+		effectivePool = "default"
+	}
 	var pending []pendingClaim
+	// Workers are environment-bound: every authenticated session carries its
+	// environment (see app.authenticate_worker_session). A worker must never
+	// execute work from another environment, so candidate selection is
+	// strictly env-scoped FIFO (eligible_at, id) per Blueprint 19.3.
+	// Cross-environment fairness lives in the control-plane scheduler
+	// (ReconcileReadyWork), which is org-scoped and may consider all
+	// environments without granting any worker foreign authority.
+	if session.EnvironmentID == "" {
+		return &worker.PollResponseDTO{ProtocolVersion: worker.ProtocolVersion, RequestID: req.RequestID, Assignments: assignments}, nil
+	}
 	snapshotErr := e.pool.WithTenantTx(ctx, session.OrganizationID, func(ctx context.Context, tx storage.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
-				d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at
-			FROM run_steps rs
-			JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
-			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-			JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
-			JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
-			JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
-			WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
-				AND candidate_w.pool_name=$5
-				AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
-				AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
-				AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
-				AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
-					JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
-					WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
-						AND rc.organization_id=$2::uuid AND rc.status='OPEN')
-			ORDER BY rs.eligible_at, rs.id
-			LIMIT $4
-			FOR UPDATE OF r, rs SKIP LOCKED`, session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, session.PoolName)
+		query := `SELECT rs.id::text, rs.run_id::text, rs.node_id, r.input,
+					d.bundle_digest, d.manifest, r.workflow_name, r.deadline_at, rs.environment_id::text
+				FROM run_steps rs
+				JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+				JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+				JOIN worker_deployments wd ON wd.session_id=$1::uuid AND wd.bundle_digest=d.bundle_digest
+				JOIN worker_sessions candidate_ws ON candidate_ws.id=wd.session_id
+				JOIN workers candidate_w ON candidate_w.id=candidate_ws.worker_id
+				WHERE rs.organization_id=$2::uuid AND rs.environment_id=$3::uuid
+					AND (candidate_w.pool_name=$5 OR $5 = '' OR candidate_w.pool_name='default')
+					AND rs.state='READY' AND rs.eligible_at <= clock_timestamp()
+					AND (r.status IN ('QUEUED','RUNNING') OR (r.status='WAITING' AND r.reason_code='QUOTA_WAIT'))
+					AND (r.deadline_at IS NULL OR clock_timestamp() < r.deadline_at)
+					AND NOT EXISTS (SELECT 1 FROM reconciliation_cases rc
+						JOIN run_steps hrs ON hrs.id=rc.step_id AND hrs.organization_id=rc.organization_id
+						WHERE hrs.run_id=rs.run_id AND hrs.organization_id=rs.organization_id
+							AND rc.organization_id=$2::uuid AND rc.status='OPEN')
+				ORDER BY rs.eligible_at, rs.id
+				LIMIT $4
+				FOR UPDATE OF r, rs SKIP LOCKED`
+		args := []any{session.SessionID, session.OrganizationID, session.EnvironmentID, req.AvailableSlots, effectivePool}
+		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("snapshot claim candidates: %w", err)
 		}
@@ -881,7 +910,7 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 		for rows.Next() {
 			var m claimMatch
 			var inputJSON []byte
-			if err := rows.Scan(&m.stepID, &m.runID, &m.nodeID, &inputJSON, &m.bundle, &m.manifest, &m.workflowName, &m.runDeadline); err != nil {
+			if err := rows.Scan(&m.stepID, &m.runID, &m.nodeID, &inputJSON, &m.bundle, &m.manifest, &m.workflowName, &m.runDeadline, &m.environmentID); err != nil {
 				rows.Close()
 				return err
 			}
@@ -1005,8 +1034,11 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 
 		// Serialize admission before locking runs and their steps, then derive
 		// capacity from live leases while holding that admission row.
+		// The admission scope is always the worker's own environment:
+		// sessions are environment-bound, so cross-environment admission is
+		// never evaluated at the worker claim boundary.
 		var environmentID string
-		var maxConcurrency int
+		var maxConcurrency int = 10
 		if err := tx.QueryRow(ctx, `SELECT environment_id::text,max_concurrency FROM environment_admissions
 			WHERE environment_id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, session.EnvironmentID, session.OrganizationID).Scan(&environmentID, &maxConcurrency); err != nil {
 			return err
@@ -1032,11 +1064,13 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 		}
 
 		var activeLeases int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_leases l
-			JOIN run_steps rs ON rs.id=l.step_id AND rs.organization_id=l.organization_id
-			WHERE rs.environment_id=$1::uuid AND rs.organization_id=$2::uuid
-				AND clock_timestamp() < l.expires_at`, environmentID, session.OrganizationID).Scan(&activeLeases); err != nil {
-			return err
+		if environmentID != "" {
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_leases l
+				JOIN run_steps rs ON rs.id=l.step_id AND rs.organization_id=l.organization_id
+				WHERE rs.environment_id=$1::uuid AND rs.organization_id=$2::uuid
+					AND clock_timestamp() < l.expires_at`, environmentID, session.OrganizationID).Scan(&activeLeases); err != nil {
+				return err
+			}
 		}
 		// The MVP worker/task boundary is two concurrent assignments per
 		// session. The worker may advertise fewer free slots, but cannot raise
@@ -1049,34 +1083,38 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 			claimLimit = remaining
 		}
 		var poolActiveLeases int
-		if err := tx.QueryRow(ctx, `SELECT count(*)
-			FROM task_leases l
-			JOIN run_steps rs ON rs.id=l.step_id AND rs.organization_id=l.organization_id
-			JOIN worker_sessions leased_ws ON leased_ws.id=l.session_id
-			JOIN workers leased_w ON leased_w.id=leased_ws.worker_id
-			WHERE rs.environment_id=$1::uuid AND rs.organization_id=$2::uuid
-			  AND leased_w.pool_name=$3 AND clock_timestamp() < l.expires_at`,
-			environmentID, session.OrganizationID, session.PoolName).Scan(&poolActiveLeases); err != nil {
-			return err
-		}
-		if remaining := maxConcurrency - poolActiveLeases; remaining < claimLimit {
-			claimLimit = remaining
+		if environmentID != "" {
+			if err := tx.QueryRow(ctx, `SELECT count(*)
+				FROM task_leases l
+				JOIN run_steps rs ON rs.id=l.step_id AND rs.organization_id=l.organization_id
+				JOIN worker_sessions leased_ws ON leased_ws.id=l.session_id
+				JOIN workers leased_w ON leased_w.id=leased_ws.worker_id
+				WHERE rs.environment_id=$1::uuid AND rs.organization_id=$2::uuid
+				  AND leased_w.pool_name=$3 AND clock_timestamp() < l.expires_at`,
+				environmentID, session.OrganizationID, effectivePool).Scan(&poolActiveLeases); err != nil {
+				return err
+			}
+			if remaining := maxConcurrency - poolActiveLeases; remaining < claimLimit {
+				claimLimit = remaining
+			}
 		}
 		if claimLimit <= 0 {
 			// Keep accepted work queued with an explicit durable reason. The
 			// candidate query above includes this state, so capacity becoming
 			// available is enough to resume claiming without a separate queue.
-			if _, err := tx.Exec(ctx, `UPDATE runs r
-				SET status='WAITING', reason_code='QUOTA_WAIT', updated_at=clock_timestamp()
-				WHERE r.organization_id=$1::uuid AND r.environment_id=$2::uuid
-				  AND r.status IN ('QUEUED','RUNNING')
-				  AND EXISTS (
-					SELECT 1 FROM run_steps rs
-					WHERE rs.run_id=r.id AND rs.organization_id=r.organization_id
-					  AND rs.environment_id=r.environment_id AND rs.state='READY'
-					  AND rs.eligible_at <= clock_timestamp()
-				  )`, session.OrganizationID, environmentID); err != nil {
-				return err
+			if environmentID != "" {
+				if _, err := tx.Exec(ctx, `UPDATE runs r
+					SET status='WAITING', reason_code='QUOTA_WAIT', updated_at=clock_timestamp()
+					WHERE r.organization_id=$1::uuid AND r.environment_id=$2::uuid
+					  AND r.status IN ('QUEUED','RUNNING')
+					  AND EXISTS (
+						SELECT 1 FROM run_steps rs
+						WHERE rs.run_id=r.id AND rs.organization_id=r.organization_id
+						  AND rs.environment_id=r.environment_id AND rs.state='READY'
+						  AND rs.eligible_at <= clock_timestamp()
+					  )`, session.OrganizationID, environmentID); err != nil {
+					return err
+				}
 			}
 			return nil
 		}
@@ -1090,6 +1128,11 @@ func (e *WorkerEngine) Claim(ctx context.Context, session *worker.WorkerSessionC
 
 		for _, pc := range pending {
 			match := pc.match
+			// Defense in depth: never transition work outside the worker's
+			// own environment, even if a snapshot row somehow disagrees.
+			if match.environmentID != session.EnvironmentID {
+				continue
+			}
 			var manifest deploymentManifest
 			if err := json.Unmarshal(match.manifest, &manifest); err != nil {
 				return fmt.Errorf("decode deployment manifest: %w", err)
@@ -1420,6 +1463,9 @@ func (e *WorkerEngine) Start(ctx context.Context, session *worker.WorkerSessionC
 		})
 	})
 	if err != nil {
+		if errors.Is(err, ErrHistoryLimitExceeded) {
+			_ = e.TerminalizeHistoryLimitExceeded(ctx, session.OrganizationID, runID)
+		}
 		return nil, err
 	}
 	if e.hub != nil {
@@ -1993,6 +2039,9 @@ func (e *WorkerEngine) Complete(ctx context.Context, session *worker.WorkerSessi
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, ErrHistoryLimitExceeded) {
+			_ = e.TerminalizeHistoryLimitExceeded(ctx, session.OrganizationID, runID)
+		}
 		return nil, err
 	}
 	if e.hub != nil {
@@ -2216,17 +2265,34 @@ func (e *WorkerEngine) ReconcileReadyWork(ctx context.Context, organizationID st
 			runID, workflowName string
 			manifestBytes       []byte
 		}
+		// Round-robin candidate selection across environments (Blueprint
+		// 19.3): interleave runs so that every environment with eligible work
+		// is represented in each bounded batch. The per-environment position
+		// is computed in a CTE (window functions cannot appear with FOR
+		// UPDATE in the same query level); the outer query orders by that
+		// position so no environment starves behind another's backlog.
+		// This runs in the org-scoped control-plane scheduler, which may
+		// consider all environments; workers remain environment-bound and
+		// only ever claim within their own environment.
 		rows, err := tx.Query(ctx, `
+			WITH candidates AS (
+				SELECT r.id AS run_id,
+					ROW_NUMBER() OVER (PARTITION BY r.environment_id ORDER BY r.reconciliation_checked_at NULLS FIRST, r.id) AS env_posn,
+					r.reconciliation_checked_at AS checked_at
+				FROM runs r
+				JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
+				WHERE r.organization_id=$1::uuid AND r.status IN ('QUEUED','RUNNING')
+					AND EXISTS (
+						SELECT 1 FROM run_steps blocked
+						WHERE blocked.run_id=r.id AND blocked.organization_id=r.organization_id
+							AND blocked.state='BLOCKED'
+					)
+			)
 			SELECT r.id::text, r.workflow_name, d.manifest
-			FROM runs r
+			FROM candidates c
+			JOIN runs r ON r.id=c.run_id AND r.organization_id=$1::uuid
 			JOIN deployments d ON d.id=r.deployment_id AND d.organization_id=r.organization_id
-			WHERE r.organization_id=$1::uuid AND r.status IN ('QUEUED','RUNNING')
-				AND EXISTS (
-					SELECT 1 FROM run_steps blocked
-					WHERE blocked.run_id=r.id AND blocked.organization_id=r.organization_id
-						AND blocked.state='BLOCKED'
-				)
-			ORDER BY r.reconciliation_checked_at NULLS FIRST, r.id
+			ORDER BY c.env_posn, c.checked_at NULLS FIRST, r.id
 			LIMIT 50
 			FOR UPDATE OF r SKIP LOCKED`, organizationID)
 		if err != nil {
@@ -2663,6 +2729,44 @@ func (e *WorkerEngine) reconcileExpiredLeasesTx(ctx context.Context, tx storage.
 	return reclaimedCount, affectedRuns, nil
 }
 
+// TerminalizeHistoryLimitExceeded atomically marks a run FAILED with reason
+// HISTORY_LIMIT_EXCEEDED, cancels all open steps, and writes the reserved
+// terminal event into run_events and outbox.
+func (e *WorkerEngine) TerminalizeHistoryLimitExceeded(ctx context.Context, organizationID, runID string) error {
+	return e.pool.WithTenantTx(ctx, organizationID, func(ctx context.Context, tx storage.Tx) error {
+		var status string
+		var lastSeq int64
+		if err := tx.QueryRow(ctx, `SELECT status, last_event_sequence
+			FROM runs
+			WHERE id=$1::uuid AND organization_id=$2::uuid
+			FOR UPDATE`, runID, organizationID).Scan(&status, &lastSeq); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrRunNotFound
+			}
+			return err
+		}
+		if status == "SUCCEEDED" || status == "FAILED" || status == "CANCELLED" {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `UPDATE run_steps
+			SET state='CANCELLED', updated_at=clock_timestamp()
+			WHERE run_id=$1::uuid AND organization_id=$2::uuid
+			  AND state IN ('BLOCKED','READY','WAITING')`, runID, organizationID); err != nil {
+			return err
+		}
+		if err := appendRunEvent(ctx, tx, organizationID, runID, "RUN_FAILED", map[string]any{
+			"reason": "HISTORY_LIMIT_EXCEEDED",
+		}); err != nil && !errors.Is(err, ErrHistoryLimitExceeded) {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE runs
+			SET status='FAILED', reason_code='HISTORY_LIMIT_EXCEEDED', updated_at=clock_timestamp()
+			WHERE id=$1::uuid AND organization_id=$2::uuid AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED')`,
+			runID, organizationID)
+		return err
+	})
+}
+
 func appendRunEvent(ctx context.Context, tx storage.Tx, organizationID, runID, eventType string, payload any) error {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -2687,44 +2791,7 @@ func appendRunEvent(ctx context.Context, tx storage.Tx, organizationID, runID, e
 	}
 	if err := tx.QueryRow(ctx, query, args...).Scan(&sequence); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			if terminal {
-				return ErrHistoryLimitExceeded
-			}
-			// The final event slot is reserved for a terminal failure. Once a
-			// nonterminal transition reaches the reserved boundary, atomically
-			// stop scheduling and write the terminal event instead of dropping
-			// correctness history or leaving the run nonterminal forever.
-			var terminalSequence int64
-			if err := tx.QueryRow(ctx, `UPDATE runs
-				SET status='FAILED', reason_code='HISTORY_LIMIT_EXCEEDED',
-					last_event_sequence=last_event_sequence+1, updated_at=clock_timestamp()
-				WHERE id=$1::uuid AND organization_id=$2::uuid AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED')
-				  AND last_event_sequence=$3
-				RETURNING last_event_sequence`, runID, organizationID, int64(maxRunEvents-1)).Scan(&terminalSequence); err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					return ErrHistoryLimitExceeded
-				}
-				return err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE run_steps
-				SET state='CANCELLED', updated_at=clock_timestamp()
-				WHERE run_id=$1::uuid AND organization_id=$2::uuid
-				  AND state IN ('BLOCKED','READY','WAITING')`, runID, organizationID); err != nil {
-				return err
-			}
-			var eventID string
-			if err := tx.QueryRow(ctx, `INSERT INTO run_events
-				(organization_id,run_id,sequence,event_type,payload)
-				VALUES ($1::uuid,$2::uuid,$3,'RUN_FAILED',jsonb_build_object(
-					'reason','HISTORY_LIMIT_EXCEEDED')) RETURNING id::text`,
-				organizationID, runID, terminalSequence).Scan(&eventID); err != nil {
-				return err
-			}
-			_, err := tx.Exec(ctx, `INSERT INTO outbox_events (organization_id,event_id,subject,payload)
-				VALUES ($1::uuid,$2::uuid,'execution.state_changed',jsonb_build_object(
-					'runId',$3::text,'sequence',$4::bigint,'eventType','RUN_FAILED'))`,
-				organizationID, eventID, runID, terminalSequence)
-			return err
+			return ErrHistoryLimitExceeded
 		}
 		return err
 	}

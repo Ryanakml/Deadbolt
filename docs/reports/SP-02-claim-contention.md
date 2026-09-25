@@ -146,3 +146,71 @@ pnpm check:parity
 - **Automated Tests:** All 8 integration tests and 2 SP-02 contention benchmark suites pass cleanly with Go race detector (`-race`).
 - **CI Hardening:** GitHub Actions workflow (`.github/workflows/contracts.yml`) equipped with PostgreSQL 16 service container and `TEST_DATABASE_URL` configuration.
 - **INV-06 Traceability:** Schema provides persistence tables (`run_events`, `outbox_events`, `task_attempts`, `task_leases`); runtime atomic commit orchestration scheduled for M1 execution engine.
+
+---
+
+## 8. M2 remeasurement (Issue #23)
+
+Scope: Issue #23 (M2 admission caps, fairness, worker drain). The M0
+prototype above is preserved as historical evidence and is not overwritten.
+
+### 8.1 Setup
+
+- Code: PR #73 head `f60d6de` (measurement test), engine `3dd8973`
+  (env-scoped worker Claim, scheduler round-robin in ReconcileReadyWork),
+  migration `00023_admission_rate_and_limits`, schema version 23.
+- Fixture (`TestM2ClaimContentionMeasurement`,
+  `tests/integration/m2_measurement_test.go`): 2 environments
+  (staging + development) at the MVP live-lease cap 10 each, 25 READY
+  single-node runs per environment (50 total), 2 environment-bound workers
+  (slots = 2, one per env), plus a concurrent reconciler loop (20 sweeps of
+  `ReconcileExpiredLeases` + `ReconcileReadyWork`). Workers run the full
+  claim/start/complete lifecycle so leases free up exactly as in production.
+- Machine (local measurement): darwin/arm64, go1.27.1, PostgreSQL 14.19
+  (Homebrew). Hosted CI uses PostgreSQL 16 on ubuntu-24.04; CI numbers are
+  recorded when the hosted run completes (see PR #73 checks).
+
+### 8.2 Command
+
+```sh
+go test ./tests/integration/ -run 'TestM2ClaimContentionMeasurement' -count=1 -v
+```
+
+### 8.3 Measured results (local, 2026-09-23)
+
+- Claimed: 50/50 (env A 25, env B 25); terminal: 50/50 SUCCEEDED.
+- Claim RPCs: 28; errors: 0 (includes 0 deadlocks / serialization failures).
+- Throughput: 39.9 claims/s; wall: 1.25 s.
+- Claim latency: p50 12.75 ms, p95 40.39 ms, max 122.72 ms.
+- Ownership: steps with duplicate attempts 0; live leases after drain 0
+  (no leaked leases; per-env cap 10 respected throughout).
+- Scheduler candidate plan (new round-robin CTE): WindowAgg over
+  `environment_id, reconciliation_checked_at, id` with index scans on
+  `runs_organization_id_id_key` and `idx_run_steps_reconciliation_blocked`;
+  239 shared buffers hit, execution 0.377 ms at this scale.
+- Claim snapshot plan: indexed nested loop, 36 shared buffers hit.
+
+### 8.4 Fairness and admission behavior (measured, same implementation)
+
+- `TestSchedulerFairnessRoundRobinAcrossEnvironments`: 60 Env-A + 3 Env-B
+  repairable runs with B pinned behind A under naive ordering; one
+  `ReconcileReadyWork` pass repairs all 3 Env-B runs (interleave), second
+  pass drains all 63. On the pre-fix ordering the same test fails with Env B
+  starved. FIFO within each environment (`eligible_at`/`checked_at`, id) is
+  preserved and covered by `TestClaimFifoOrderingWithinEnvironment`.
+- `TestCreateRunTokenBucketRefillAndAdmission429`: burst 10 admitted, 11th
+  429 `CREATE_RUN_RATE_LIMITED` + `Retry-After: 1`; 1 s refill admits 5;
+  15 concurrent callers admit exactly 10 / throttle 5.
+- `TestClaimConcurrencyCapsAndQuotaWait`: slots clamp to `DefaultSlots` 2,
+  overflow parks work as `WAITING`/`QUOTA_WAIT`, reclaim resumes to RUNNING.
+- `TestHistoryLimitBoundaryAndAtomicTerminalization`: non-terminal append at
+  9999 rejected `HISTORY_LIMIT_EXCEEDED`, terminal `RUN_FAILED` commits as
+  event 10000 exactly once under a 10-way race.
+
+### 8.5 Decision
+
+No lock-order or index change required at the measured scale: zero
+deadlocks, zero duplicate ownership, sub-millisecond scheduler plans, and
+bounded buffers. The M0 advisory-lock spike path is superseded by the engine
+Claim/lease design; the M0 section above remains for history. Re-measure on
+CI hardware at higher run volumes before M6 if contention signals appear.
