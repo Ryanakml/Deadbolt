@@ -911,7 +911,7 @@ paths:
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
       x-required-capability: approvals:decide
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response
@@ -966,7 +966,7 @@ paths:
                 - decision
                 - expectedRevision
               additionalProperties: false
-      x-minimum-capability: V1
+      x-minimum-capability: M4
   /schedules:
     get:
       operationId: listSchedule

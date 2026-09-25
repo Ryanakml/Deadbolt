@@ -6,6 +6,7 @@ import {
   TaskLogsResponse,
   ResolveReconciliationRequest,
   ResolveReconciliationResponse,
+  Approval,
 } from "./types.js";
 
 export interface ListRunsResponse {
@@ -337,6 +338,31 @@ export class DashboardApiClient {
       );
     }
     return res.json() as Promise<ResolveReconciliationResponse>;
+  }
+
+  public async decideApproval(
+    approvalId: string,
+    decision: "approved" | "rejected",
+    expectedRevision: number,
+    comment: string,
+  ): Promise<Approval> {
+    const res = await apiFetch(
+      `${this.baseUrl}/v1/approvals/${encodeURIComponent(approvalId)}/decision`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": readCsrfToken(),
+        },
+        body: JSON.stringify({ decision, expectedRevision, comment }),
+      },
+    );
+    if (!res.ok) {
+      throw new Error(
+        `Failed to decide approval (HTTP ${res.status}): ${res.statusText}`,
+      );
+    }
+    return res.json() as Promise<Approval>;
   }
 
   // cancelRun requests durable cancellation. The caller binds the revision
