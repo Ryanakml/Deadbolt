@@ -51,8 +51,7 @@ chrome.on("error", (error) => {
 });
 chrome.on("exit", (code, signal) => {
   if (code !== 0) {
-    chromeStartupError =
-      `Chrome exited with code ${code} (${signal ?? "no signal"})${chromeStartupError ? `: ${chromeStartupError}` : ""}`;
+    chromeStartupError = `Chrome exited with code ${code} (${signal ?? "no signal"})${chromeStartupError ? `: ${chromeStartupError}` : ""}`;
   }
 });
 
