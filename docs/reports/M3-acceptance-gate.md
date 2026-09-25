@@ -28,9 +28,9 @@ Source-of-truth hierarchy:
 - **Baseline Git SHA:** `c40cb0424578508e7df8d933ca4aa91a45749f76` (PR #80 merged)
 - **Local Gate Script:** `scripts/m3-gate.sh`
 - **Local Automated Gate Result:** **`PASS=8 FAIL=0 NOT_VERIFIED=0`** (All 8 test groups passed with zero failures and zero unverified local dependencies)
-- **Exact release candidate verified in staging:** `9f2a490f60155ef4aacccc0d047cd5bb6ce3809e`
-- **Immutable control-plane artifact:** `ghcr.io/ryanakml/deadbolt/control-plane@sha256:f51cd75de28f9fa524bd19373b84733fa785cb7cdc57e47e082a1f0063edd994`
-- **Hosted staging evidence:** [Staging Immutable Deploy #36091194038](https://github.com/Ryanakml/Deadbolt/actions/runs/36091194038) — **PASS**. The deployment independently checked `/version` for the exact commit and image digest, then the browser acceptance checked responsive mobile/tablet/desktop layout, explicit dark/light selection, and keyboard theme-toggle activation.
+- **Exact release candidate verified in staging:** `dd58cce81615f2bceb8d304ced686f2968781f19`
+- **Immutable control-plane artifact:** `ghcr.io/ryanakml/deadbolt/control-plane@sha256:35fa548add848ce3761eaf0eb34c98c74331f57519caab21ddaae832e8d8c121`
+- **Hosted staging evidence:** [Staging Immutable Deploy #36094169671](https://github.com/Ryanakml/Deadbolt/actions/runs/36094169671) — **PASS**. The deployment independently checked `/version` for the exact commit and image digest, then the browser acceptance checked responsive mobile/tablet/desktop layout, explicit dark/light selection, and keyboard theme-toggle activation.
 - **Cumulative Local Test Count:**
   - `m3-gate-new`: 12 passed, 0 skipped, 0 failed
   - `m3-property`: 10 passed, 0 skipped, 0 failed
@@ -42,10 +42,10 @@ Source-of-truth hierarchy:
   - `cumulative-regressions`: 7 passed, 1 skipped (hosted staging fixture skips as pending), 0 failed
 - **Status Accounting:**
   - `LOCAL_AUTOMATED_GATE = PASS`
-  - `HOSTED_CI = PENDING` ([Foundation contracts #36091187024](https://github.com/Ryanakml/Deadbolt/actions/runs/36091187024) is running for this candidate)
-  - `DEPLOYED = YES` (exact candidate and immutable image were deployed by hosted workflow #36091194038)
+  - `HOSTED_CI = PASS` ([Foundation contracts #36092790929](https://github.com/Ryanakml/Deadbolt/actions/runs/36092790929) completed successfully for this candidate)
+  - `DEPLOYED = YES` (exact candidate and immutable image were deployed by hosted workflow #36094169671)
   - `HOSTED_ACCEPTANCE = HOSTED_VERIFIED` (exact-artifact provenance, responsive layout, explicit dark/light theme behavior, and keyboard activation passed)
-  - `OVERALL_M3_GATE = PENDING_HOSTED_CI` (the exact-artifact acceptance blocker is closed; the required Foundation run remains authoritative until it completes)
+  - `OVERALL_M3_GATE = PASS` (local gate, Foundation contracts, and exact-artifact staging acceptance all passed for this release candidate)
 
 Evidence from earlier SHAs is historical only and is not used as M3 acceptance evidence.
 
@@ -346,7 +346,7 @@ The Run Inspector and Dashboard were audited across API endpoints (`GET /v1/runs
 
 1. **Hosted Staging Deployment:**
    - Local verification against real PostgreSQL, real worker agents, and real Node child processes is complete and passing.
-   - Hosted verification for the exact release candidate is complete: workflow #36091194038 deployed the immutable artifact, checked `/version` provenance, and ran browser acceptance against the staging edge.
+   - Hosted verification for the exact release candidate is complete: workflow #36094169671 deployed the immutable artifact, checked `/version` provenance, and ran browser acceptance against the staging edge.
 
 2. **Rollback Posture:**
    - Milestone 3 is strictly additive:
@@ -358,18 +358,18 @@ The Run Inspector and Dashboard were audited across API endpoints (`GET /v1/runs
 
 ## 10. Milestone Acceptance Status Matrix
 
-| Gate Dimension                     | Local Gate                   | Staging / Hosted CI       | Acceptance Verdict    |
-| :--------------------------------- | :--------------------------- | :------------------------ | :-------------------- |
-| **Linear Composition (A → B → C)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Parallel DAG & Diamond Join**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Structured Choice & Merge**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Nested Structured Merges**       | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Schema Output Mapping (F-28)**   | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Fail-Fast Settlement (F-15)**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Control Races & Pausing (F-13)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Property-Based Invariants**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Real Two-Worker Concurrency**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Run Inspector & UI Parity**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
-| **Hosted Staging Deployment**      | `N/A`                        | `DEPLOYED: YES`           | **HOSTED_VERIFIED**   |
-| **Hosted Acceptance Walkthrough**  | `N/A`                        | `HOSTED_ACCEPTANCE: PASS` | **HOSTED_VERIFIED**   |
-| **OVERALL M3 ACCEPTANCE GATE**     | `LOCAL_AUTOMATED_GATE: PASS` | `HOSTED_CI: PENDING`      | **PENDING_HOSTED_CI** |
+| Gate Dimension                     | Local Gate                   | Staging / Hosted CI       | Acceptance Verdict        |
+| :--------------------------------- | :--------------------------- | :------------------------ | :------------------------ |
+| **Linear Composition (A → B → C)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Parallel DAG & Diamond Join**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Structured Choice & Merge**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Nested Structured Merges**       | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Schema Output Mapping (F-28)**   | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Fail-Fast Settlement (F-15)**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Control Races & Pausing (F-13)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Property-Based Invariants**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Real Two-Worker Concurrency**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Run Inspector & UI Parity**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI: PASS`         | **ACCEPTED**              |
+| **Hosted Staging Deployment**      | `N/A`                        | `DEPLOYED: YES`           | **HOSTED_VERIFIED**       |
+| **Hosted Acceptance Walkthrough**  | `N/A`                        | `HOSTED_ACCEPTANCE: PASS` | **HOSTED_VERIFIED**       |
+| **OVERALL M3 ACCEPTANCE GATE**     | `LOCAL_AUTOMATED_GATE: PASS` | `HOSTED_CI: PASS`         | **OVERALL_M3_GATE: PASS** |
