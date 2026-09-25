@@ -26,7 +26,7 @@ services:
     volumes:
       - deadbolt_postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deadbolt_system"]
+      test: ["CMD-SHELL", "pg_isready -U deadbolt_system -d deadbolt"]
       interval: 3s
       timeout: 3s
       retries: 15
@@ -53,7 +53,7 @@ services:
       start_period: 10s
 
   minio:
-    image: quay.io/minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: cgr.dev/chainguard/minio:latest@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     container_name: deadbolt-minio
     profiles: ["core"]
     restart: unless-stopped
@@ -68,11 +68,6 @@ services:
       - "127.0.0.1:9001:9001"
     volumes:
       - deadbolt_minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
 
   control-plane:
     build:
@@ -107,7 +102,10 @@ services:
       nats:
         condition: service_healthy
       minio:
-        condition: service_healthy
+        # The pinned Chainguard image is intentionally minimal and does not
+        # contain curl for an in-container healthcheck. Readiness is checked
+        # from the host in CI and the application retries artifact setup.
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/livez"]
       interval: 5s

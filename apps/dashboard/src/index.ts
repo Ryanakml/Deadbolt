@@ -50,6 +50,7 @@ import {
   markGlobalError,
   markStreamError,
 } from "./stream.js";
+import { applyDashboardTheme, resolveInitialTheme } from "./theme.js";
 import {
   RunSnapshot,
   RunStep,
@@ -119,10 +120,24 @@ function initDashboard(): void {
   }
 
   if (themeToggle) {
+    const themeStorage =
+      typeof localStorage !== "undefined" ? localStorage : null;
+    const storedTheme = themeStorage?.getItem("theme") ?? null;
+    const prefersDark =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches;
+    applyDashboardTheme(
+      document.documentElement,
+      themeToggle,
+      resolveInitialTheme(storedTheme, prefersDark),
+    );
+
     themeToggle.addEventListener("click", () => {
-      const isDark = document.documentElement.classList.toggle("dark");
-      localStorage.setItem("theme", isDark ? "dark" : "light");
-      themeToggle.setAttribute("aria-pressed", isDark ? "true" : "false");
+      const theme = document.documentElement.classList.contains("dark")
+        ? "light"
+        : "dark";
+      applyDashboardTheme(document.documentElement, themeToggle, theme);
+      themeStorage?.setItem("theme", theme);
     });
   }
 

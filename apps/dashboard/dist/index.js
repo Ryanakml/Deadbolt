@@ -10,6 +10,7 @@ import { sessionCanControlRuns, visibleRunControls } from "./permissions.js";
 import { RunInspector } from "./inspector.js";
 import { shouldShowWorkerWait, terminalStepEmptyText, openCaseForStep, reconciliationHoldText, terminationBannerText, RESOLVE_ACTIONS, getStatusPresentation, computeGraphLayout, computeMinimap, filterEventsForStep, virtualizeItems, getBoundedEvents, } from "./inspector.js";
 import { clearStreamErrorOnLive, createStreamErrorBanner, markGlobalError, markStreamError, } from "./stream.js";
+import { applyDashboardTheme, resolveInitialTheme } from "./theme.js";
 // DOM Bootstrap for browser runtime
 if (typeof document !== "undefined") {
     document.addEventListener("DOMContentLoaded", () => {
@@ -54,10 +55,17 @@ function initDashboard() {
         });
     }
     if (themeToggle) {
+        const themeStorage = typeof localStorage !== "undefined" ? localStorage : null;
+        const storedTheme = themeStorage?.getItem("theme") ?? null;
+        const prefersDark = typeof window.matchMedia === "function" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches;
+        applyDashboardTheme(document.documentElement, themeToggle, resolveInitialTheme(storedTheme, prefersDark));
         themeToggle.addEventListener("click", () => {
-            const isDark = document.documentElement.classList.toggle("dark");
-            localStorage.setItem("theme", isDark ? "dark" : "light");
-            themeToggle.setAttribute("aria-pressed", isDark ? "true" : "false");
+            const theme = document.documentElement.classList.contains("dark")
+                ? "light"
+                : "dark";
+            applyDashboardTheme(document.documentElement, themeToggle, theme);
+            themeStorage?.setItem("theme", theme);
         });
     }
     if (runsNavBtn) {

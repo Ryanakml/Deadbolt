@@ -55,7 +55,7 @@ services:
       - ../../scripts/bootstrap-db-roles.sql:/docker-entrypoint-initdb.d/02-bootstrap-roles.sql:ro
       - ../../scripts/archive-wal.sh:/usr/local/bin/archive-wal.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deadbolt_admin"]
+      test: ["CMD-SHELL", "pg_isready -U deadbolt_admin -d deadbolt_staging"]
       interval: 3s
       timeout: 3s
       retries: 15
