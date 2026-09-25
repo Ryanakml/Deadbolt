@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,7 +20,8 @@ if (!baseURL || !expectedCommit || !expectedDigest || !chromePath) {
 const sleep = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 const profileDirectory = mkdtempSync(join(tmpdir(), "deadbolt-m3-hosted-"));
-const debuggingPort = 9400 + Math.floor(Math.random() * 300);
+const devToolsActivePort = join(profileDirectory, "DevToolsActivePort");
+let chromeStartupError;
 const chrome = spawn(
   chromePath,
   [
@@ -30,15 +31,30 @@ const chrome = spawn(
     "--disable-gpu",
     "--disable-software-rasterizer",
     "--disable-dev-shm-usage",
-    `--remote-debugging-port=${debuggingPort}`,
+    // Let Chrome allocate an available loopback port. A random fixed port can
+    // collide with a concurrent runner process, making the acceptance check
+    // flaky before it reaches the deployed application.
+    "--remote-debugging-port=0",
     "--remote-debugging-address=127.0.0.1",
     `--user-data-dir=${profileDirectory}`,
     "--no-first-run",
     "--no-default-browser-check",
     "about:blank",
   ],
-  { stdio: "ignore" },
+  { stdio: ["ignore", "ignore", "pipe"] },
 );
+chrome.stderr.on("data", (data) => {
+  chromeStartupError = `${chromeStartupError ?? ""}${data}`;
+});
+chrome.on("error", (error) => {
+  chromeStartupError = error.message;
+});
+chrome.on("exit", (code, signal) => {
+  if (code !== 0) {
+    chromeStartupError =
+      `Chrome exited with code ${code} (${signal ?? "no signal"})${chromeStartupError ? `: ${chromeStartupError}` : ""}`;
+  }
+});
 
 function cleanup() {
   try {
@@ -97,6 +113,28 @@ async function fetchJSON(url, options) {
   throw lastError;
 }
 
+async function waitForChromeDebugger() {
+  for (let attempt = 0; attempt < 90; attempt++) {
+    if (existsSync(devToolsActivePort)) {
+      const [port] = readFileSync(devToolsActivePort, "utf8")
+        .trim()
+        .split("\n");
+      if (/^\d+$/.test(port)) {
+        return fetchJSON(`http://127.0.0.1:${port}/json/version`);
+      }
+    }
+    if (chromeStartupError) {
+      throw new Error(
+        `Chrome did not start its debugger: ${chromeStartupError}`,
+      );
+    }
+    await sleep(200);
+  }
+  throw new Error(
+    `Chrome did not create DevToolsActivePort${chromeStartupError ? `: ${chromeStartupError}` : ""}`,
+  );
+}
+
 async function evaluate(client, expression) {
   const result = await client.send("Runtime.evaluate", {
     expression,
@@ -108,9 +146,8 @@ async function evaluate(client, expression) {
 }
 
 try {
-  const browser = await fetchJSON(
-    `http://127.0.0.1:${debuggingPort}/json/version`,
-  );
+  const browser = await waitForChromeDebugger();
+  const debuggingPort = new URL(browser.webSocketDebuggerUrl).port;
   const target = await fetchJSON(
     `http://127.0.0.1:${debuggingPort}/json/new?about:blank`,
     { method: "PUT" },
