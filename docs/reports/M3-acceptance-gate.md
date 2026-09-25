@@ -358,18 +358,18 @@ The Run Inspector and Dashboard were audited across API endpoints (`GET /v1/runs
 
 ## 10. Milestone Acceptance Status Matrix
 
-| Gate Dimension                     | Local Gate                   | Staging / Hosted CI               | Acceptance Verdict            |
-| :--------------------------------- | :--------------------------- | :-------------------------------- | :---------------------------- |
-| **Linear Composition (A → B → C)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Parallel DAG & Diamond Join**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Structured Choice & Merge**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Nested Structured Merges**       | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Schema Output Mapping (F-28)**   | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Fail-Fast Settlement (F-15)**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Control Races & Pausing (F-13)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Property-Based Invariants**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Real Two-Worker Concurrency**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Run Inspector & UI Parity**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`               | **ACCEPTED (LOCAL)**          |
-| **Hosted Staging Deployment**      | `N/A`                        | `DEPLOYED: YES`                   | **HOSTED_VERIFIED**           |
-| **Hosted Acceptance Walkthrough**  | `N/A`                        | `HOSTED_ACCEPTANCE: PASS`         | **HOSTED_VERIFIED**           |
-| **OVERALL M3 ACCEPTANCE GATE**     | `LOCAL_AUTOMATED_GATE: PASS` | `HOSTED_CI: PENDING`              | **PENDING_HOSTED_CI**         |
+| Gate Dimension                     | Local Gate                   | Staging / Hosted CI       | Acceptance Verdict    |
+| :--------------------------------- | :--------------------------- | :------------------------ | :-------------------- |
+| **Linear Composition (A → B → C)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Parallel DAG & Diamond Join**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Structured Choice & Merge**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Nested Structured Merges**       | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Schema Output Mapping (F-28)**   | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Fail-Fast Settlement (F-15)**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Control Races & Pausing (F-13)** | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Property-Based Invariants**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Real Two-Worker Concurrency**    | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Run Inspector & UI Parity**      | `AUTOMATED_LOCAL_VERIFIED`   | `HOSTED_CI_PENDING`       | **ACCEPTED (LOCAL)**  |
+| **Hosted Staging Deployment**      | `N/A`                        | `DEPLOYED: YES`           | **HOSTED_VERIFIED**   |
+| **Hosted Acceptance Walkthrough**  | `N/A`                        | `HOSTED_ACCEPTANCE: PASS` | **HOSTED_VERIFIED**   |
+| **OVERALL M3 ACCEPTANCE GATE**     | `LOCAL_AUTOMATED_GATE: PASS` | `HOSTED_CI: PENDING`      | **PENDING_HOSTED_CI** |
