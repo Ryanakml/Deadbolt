@@ -22,6 +22,7 @@ const sleep = (milliseconds) =>
 const profileDirectory = mkdtempSync(join(tmpdir(), "deadbolt-m3-hosted-"));
 const devToolsActivePort = join(profileDirectory, "DevToolsActivePort");
 let chromeStartupError;
+let chromeStderr = "";
 const chrome = spawn(
   chromePath,
   [
@@ -44,14 +45,14 @@ const chrome = spawn(
   { stdio: ["ignore", "ignore", "pipe"] },
 );
 chrome.stderr.on("data", (data) => {
-  chromeStartupError = `${chromeStartupError ?? ""}${data}`;
+  chromeStderr += data;
 });
 chrome.on("error", (error) => {
   chromeStartupError = error.message;
 });
 chrome.on("exit", (code, signal) => {
   if (code !== 0) {
-    chromeStartupError = `Chrome exited with code ${code} (${signal ?? "no signal"})${chromeStartupError ? `: ${chromeStartupError}` : ""}`;
+    chromeStartupError = `Chrome exited with code ${code} (${signal ?? "no signal"})${chromeStderr ? `: ${chromeStderr}` : ""}`;
   }
 });
 
@@ -130,7 +131,7 @@ async function waitForChromeDebugger() {
     await sleep(200);
   }
   throw new Error(
-    `Chrome did not create DevToolsActivePort${chromeStartupError ? `: ${chromeStartupError}` : ""}`,
+    `Chrome did not create DevToolsActivePort${chromeStartupError ? `: ${chromeStartupError}` : chromeStderr ? `: ${chromeStderr}` : ""}`,
   );
 }
 
