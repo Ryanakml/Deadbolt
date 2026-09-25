@@ -691,7 +691,14 @@ func (a *Agent) heartbeatLoop(ctx context.Context, attemptID string, epoch int64
 						OwnershipEpoch:  epoch,
 						ProcessStopped:  stopped,
 					}
-					if _, err := a.stopAck(ctx, stopAck); errors.Is(err, ErrWorkerRevoked) {
+					// Stop receipt is a control-plane durability boundary, not part of
+					// the runner lifecycle. The child can exit (or the attempt context
+					// can be cancelled) while a heartbeat response is in flight; retain
+					// the request context long enough to record the acknowledgement.
+					ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+					_, err := a.stopAck(ackCtx, stopAck)
+					cancelAck()
+					if errors.Is(err, ErrWorkerRevoked) {
 						a.handleWorkerRevoked()
 					}
 					return
