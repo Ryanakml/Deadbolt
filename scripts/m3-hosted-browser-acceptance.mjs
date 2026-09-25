@@ -26,7 +26,9 @@ const chrome = spawn(
   [
     "--headless=new",
     "--no-sandbox",
+    "--disable-setuid-sandbox",
     "--disable-gpu",
+    "--disable-software-rasterizer",
     "--disable-dev-shm-usage",
     `--remote-debugging-port=${debuggingPort}`,
     "--remote-debugging-address=127.0.0.1",
@@ -79,7 +81,10 @@ class CDPClient {
 
 async function fetchJSON(url, options) {
   let lastError;
-  for (let attempt = 0; attempt < 30; attempt++) {
+  // Fresh GitHub runners can take more than the usual six seconds to start
+  // Chrome and its crashpad helper. Keep the readiness wait bounded but do
+  // not misreport slow browser startup as a product acceptance failure.
+  for (let attempt = 0; attempt < 90; attempt++) {
     try {
       const response = await fetch(url, options);
       if (response.ok) return response.json();

@@ -349,6 +349,62 @@ func TestStopAckReportsUnconfirmedWhenGroupSurvives(t *testing.T) {
 	}
 }
 
+func TestStopAckConfirmsWhenAttemptAlreadyExited(t *testing.T) {
+	var mu sync.Mutex
+	var stopAcks []StopAckRequestDTO
+	acked := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/worker/v1/heartbeat":
+			_ = json.NewEncoder(w).Encode(HeartbeatResponseDTO{
+				ProtocolVersion: ProtocolVersion,
+				RequestID:       "hb",
+				Stops:           []StopCommandDTO{{AttemptID: "attempt", OwnershipEpoch: 1, Reason: "LEASE_NOT_FOUND", GraceTimeoutMs: 10000}},
+			})
+		case "/worker/v1/stop-ack":
+			var ack StopAckRequestDTO
+			_ = json.NewDecoder(r.Body).Decode(&ack)
+			mu.Lock()
+			stopAcks = append(stopAcks, ack)
+			mu.Unlock()
+			select {
+			case acked <- struct{}{}:
+			default:
+			}
+			_ = json.NewEncoder(w).Encode(AckResponseDTO{ProtocolVersion: ProtocolVersion, RequestID: ack.RequestID, Accepted: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	agent, err := NewAgent(AgentConfig{ControlPlaneURL: server.URL, HeartbeatInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.workerID, agent.sessionID, agent.sessionTok = "worker", "session", "token"
+	agent.expiresAt = time.Now().Add(time.Hour)
+	hbDone := make(chan struct{})
+	go func() {
+		agent.heartbeatLoop(context.Background(), "attempt", 1, NewLeaseTracker(time.Now().Add(time.Minute), 0, 0), hbDone)
+		close(hbDone)
+	}()
+	select {
+	case <-acked:
+	case <-time.After(time.Second):
+		t.Fatal("stop ACK was never posted for an already-exited attempt")
+	}
+	select {
+	case <-hbDone:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat loop did not exit after stop")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(stopAcks) != 1 || !stopAcks[0].ProcessStopped {
+		t.Fatalf("exited attempt must acknowledge confirmed stop: %+v", stopAcks)
+	}
+}
+
 func TestMaybePublishArtifactDecision(t *testing.T) {
 	agent, err := NewAgent(AgentConfig{ControlPlaneURL: "http://127.0.0.1:9"})
 	if err != nil {
