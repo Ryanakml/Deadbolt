@@ -24,13 +24,14 @@ Source-of-truth hierarchy:
 ## 1. Executive Summary & Acceptance Verdict
 
 - **Milestone:** M3 — Advanced Workflows, Composition, and Inspection
-- **Branch:** `feat/issue-31-m3-gate`
+- **Branch:** `main` (via PR #81 from `feat/issue-31-m3-gate`)
 - **Baseline Git SHA:** `c40cb0424578508e7df8d933ca4aa91a45749f76` (PR #80 merged)
 - **Local Gate Script:** `scripts/m3-gate.sh`
 - **Local Automated Gate Result:** **`PASS=8 FAIL=0 NOT_VERIFIED=0`** (All 8 test groups passed with zero failures and zero unverified local dependencies)
-- **Exact release candidate verified in staging:** `dd58cce81615f2bceb8d304ced686f2968781f19`
-- **Immutable control-plane artifact:** `ghcr.io/ryanakml/deadbolt/control-plane@sha256:35fa548add848ce3761eaf0eb34c98c74331f57519caab21ddaae832e8d8c121`
-- **Hosted staging evidence:** [Staging Immutable Deploy #36094169671](https://github.com/Ryanakml/Deadbolt/actions/runs/36094169671) — **PASS**. The deployment independently checked `/version` for the exact commit and image digest, then the browser acceptance checked responsive mobile/tablet/desktop layout, explicit dark/light selection, and keyboard theme-toggle activation.
+- **Exact release candidate verified in staging:** `b7664f2fab937b470ba22b7a4164e58b7d426f58` (merge PR #81)
+- **Immutable control-plane artifact:** `ghcr.io/ryanakml/deadbolt/control-plane@sha256:4d9e61e652969c3119e5bca246c448ae04b0a8f883f53016d22e49ec25934ebc`
+- **Immutable postgres artifact:** `ghcr.io/ryanakml/deadbolt/postgres@sha256:1e1d4b2426b6d5cbc5448e6dedd1cbb77f1aa2eb5caeab09f8e39c0a04434035`
+- **Hosted staging evidence:** [Staging Immutable Deploy #36113009161](https://github.com/Ryanakml/Deadbolt/actions/runs/36113009161) — **PASS**. `/version` returned exact commit `b7664f2` with image digest `sha256:4d9e…25934ebc` (`runtime_mode: hosted`, active slot `blue` port 8088); edge smoke + tenant-route 401 passed; hosted browser acceptance `result: PASS, failures: []` on `https://deadbolt.cubix.codes/dashboard/` (Chrome 153, responsive mobile/tablet/desktop, dark/light applied, keyboard theme-toggle activation).
 - **Cumulative Local Test Count:**
   - `m3-gate-new`: 12 passed, 0 skipped, 0 failed
   - `m3-property`: 10 passed, 0 skipped, 0 failed
@@ -42,10 +43,11 @@ Source-of-truth hierarchy:
   - `cumulative-regressions`: 7 passed, 1 skipped (hosted staging fixture skips as pending), 0 failed
 - **Status Accounting:**
   - `LOCAL_AUTOMATED_GATE = PASS`
-  - `HOSTED_CI = PASS` ([Foundation contracts #36092790929](https://github.com/Ryanakml/Deadbolt/actions/runs/36092790929) completed successfully for this candidate)
-  - `DEPLOYED = YES` (exact candidate and immutable image were deployed by hosted workflow #36094169671)
+  - `HOSTED_CI = PASS` ([Foundation contracts #36113009122](https://github.com/Ryanakml/Deadbolt/actions/runs/36113009122) completed successfully for this candidate)
+  - `DEPLOYED = YES` (exact candidate and immutable image were deployed by hosted workflow #36113009161)
   - `HOSTED_ACCEPTANCE = HOSTED_VERIFIED` (exact-artifact provenance, responsive layout, explicit dark/light theme behavior, and keyboard activation passed)
-  - `OVERALL_M3_GATE = PASS` (local gate, Foundation contracts, and exact-artifact staging acceptance all passed for this release candidate)
+  - `STAGING_FUNCTIONAL = PASS` (real Linux workers executed linear, parallel, choice/merge, and pause/resume runs against the deployed artifact; see §8b)
+  - `OVERALL_M3_GATE = PASS` (local gate, Foundation contracts, exact-artifact staging acceptance, and staging functional runs all passed for this release candidate)
 
 Evidence from earlier SHAs is historical only and is not used as M3 acceptance evidence.
 
@@ -342,11 +344,163 @@ The Run Inspector and Dashboard were audited across API endpoints (`GET /v1/runs
 
 ---
 
+## 8b. Hosted Staging Functional Acceptance (Real Workers, Real Runs)
+
+Beyond the automated browser shell check, the deployed staging artifact was exercised with real
+customer-hosted workers and real workflow runs over the public edge. Nothing below is simulated:
+handlers executed in real Node.js child processes on Linux workers, and every state claim was read
+back from the staging PostgreSQL authority.
+
+### 8b.1 Environment and identity
+
+| Item                  | Value                                                                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Control plane         | `https://deadbolt.cubix.codes` (`b7664f2`, `control-plane@sha256:4d9e…25934ebc`)                                                            |
+| Organization          | `Deadbolt Acceptance` (`674b13a3-2cb8-4ea1-9ac8-94c5504c5a27`)                                                                              |
+| Project / environment | `m3-acceptance` / `staging` (`e7f31ae0-…` / `2a31b238-a4ae-4880-8783-bede429794ca`)                                                         |
+| Workers               | `8bbb294d-…` (session `df8941a7…`) and `a79a4fd4-…` (session `a39d5e15…`), pool `m3-acceptance`, 2 slots each                               |
+| Worker placement      | Linux x86_64 `node:24-bookworm-slim` containers on the shared EC2 host, running the cross-compiled `runtime` agent and the Node task runner |
+| Worker session state  | Both `ACTIVE`, advertising all three M3 bundle digests                                                                                      |
+
+Both workers are outbound-HTTPS only agents. They hold no PostgreSQL or NATS credentials and
+cannot mutate execution state directly; every result below was accepted by the engine's
+epoch/lease check.
+
+### 8b.2 Deployments registered and activated
+
+| Workflow              | Deployment                             | Bundle digest (SHA-256) |
+| --------------------- | -------------------------------------- | ----------------------- |
+| `m3-linear-abc`       | `0d9d684c-9f08-4a20-858d-d64a7930ed31` | `7d7f899c1c54f63f…`     |
+| `m3-parallel-diamond` | `60a33f8e-644b-40c3-afb4-406c9fce09fb` | `a94e61b9fe6b7d7…`      |
+| `m3-choice-merge`     | `ce4c1812-4b55-4ccc-ba3e-56793b9d4712` | `97d8371899cf071e…`     |
+
+Each moved `REGISTERED → AVAILABLE → ACTIVE` only after a compatible worker advertised the exact
+bundle digest. Activation returned channel revision 2 per workflow; a second activation using a
+stale `expectedRevision` was rejected with `409` rather than silently overwriting the pointer.
+
+### 8b.3 Linear composition — A → B → C
+
+- Run: `f391ef5e-8b39-4c6c-b134-a540423f4de3`
+- Terminal: `SUCCEEDED`, `lastEventSequence = 13`
+- Committed output: `{"documentId":"doc-linux-010","saved":true,"vectorCount":3}`
+- Attempts: `parse` attempt 1 `SUCCEEDED` (session `a39d5e15…`), `embed` attempt 1 `SUCCEEDED`
+  (session `df8941a7…`), `save` attempt 1 `SUCCEEDED` (session `df8941a7…`)
+
+Two distinct worker sessions participated in one linear run, and each step executed exactly once.
+
+### 8b.4 Parallel DAG and diamond join (REQ-DAG-02)
+
+- Run: `018985ac-0469-4b96-9455-704f245bdc93`
+- Terminal: `SUCCEEDED`, all four steps `SUCCEEDED` at epoch 1
+- Committed output: `{"documentId":"doc-par-020","indexed":true,"thumbnailKey":"thumb/doc-par-020","title":"acceptance-doc"}`
+
+Attempt windows read directly from `task_attempts`:
+
+| Node        | Attempt | Status      | Worker session | Started            | Completed          |
+| ----------- | ------- | ----------- | -------------- | ------------------ | ------------------ |
+| `parse`     | 1       | `SUCCEEDED` | `a39d5e15…`    | 16:02:49.526478+00 | 16:02:49.572353+00 |
+| `thumbnail` | 1       | `SUCCEEDED` | `df8941a7…`    | 16:02:49.643851+00 | 16:02:51.205583+00 |
+| `metadata`  | 1       | `SUCCEEDED` | `df8941a7…`    | 16:02:49.652982+00 | 16:02:49.711413+00 |
+| `index`     | 1       | `SUCCEEDED` | `df8941a7…`    | 16:02:51.311923+00 | 16:02:51.358364+00 |
+
+`metadata` started at `.652982`, while `thumbnail` was still executing until `51.205583`: the two
+siblings were genuinely in flight together, on two different worker sessions. The `index` join step
+did not start until `51.311923`, after both dependencies committed — the diamond join did not
+release early.
+
+### 8b.5 Structured choice, skipped propagation, and merge (F-16)
+
+| Run                                    | Input       | Selected branch | Skipped step                                           | Terminal    | Committed output                                                         |
+| -------------------------------------- | ----------- | --------------- | ------------------------------------------------------ | ----------- | ------------------------------------------------------------------------ |
+| `3b820f41-50bd-4f5e-b794-708cc99f9621` | `amount=75` | `high`          | `auto` — `SKIPPED`, `waitReason=BRANCH_NOT_SELECTED`   | `SUCCEEDED` | `{"amount":75,"applied":true,"branch":"high","decision":"needs-review"}` |
+| `ac255840-8722-4d2d-ad9d-d0d3dcd72bb8` | `amount=10` | `low`           | `manual` — `SKIPPED`, `waitReason=BRANCH_NOT_SELECTED` | `SUCCEEDED` | `{"amount":10,"applied":true,"branch":"low","decision":"auto-approved"}` |
+
+Both branches were exercised. In each case the unselected branch committed as an explicit
+`SKIPPED` terminal state with a durable reason rather than remaining `BLOCKED`, the merge resolved
+from the selected branch only, and the downstream node consumed the merge's tagged
+`{branch, value}` output. This is the "no stuck join" property of §16.2 observed on the deployed
+artifact.
+
+### 8b.6 Control races: pause, stale revision, resume (F-13, CTL-01, CTL-02, CTL-03)
+
+- Run: `e1b43824-f0b9-45c9-bb1d-86da4cf99b6d` (`m3-parallel-diamond`)
+- `POST /v1/runs/{id}/pause` with `expectedRevision: 1` → `PAUSING`, revision `2`, reason `PAUSE_REQUESTED`
+- Run settled to `PAUSED` with `metadata`, `thumbnail`, and `index` all still `BLOCKED` — pause
+  blocked new claims rather than revoking or fabricating state
+- Second `pause` with the now-stale `expectedRevision: 1` → **HTTP 409**,
+  `{"code":"REVISION_CONFLICT","message":"Run changed since it was read; refresh before acting"}`
+- `POST /v1/runs/{id}/resume` with `expectedRevision: 2` → `WAITING` / `RETRY_BACKOFF`, revision `3`.
+  Resume recomputed state from durable truth rather than blindly forcing `RUNNING`
+- Retry timer fired, `parse` attempt 2 claimed at epoch 2 and `SUCCEEDED`; attempt 1 remains
+  recorded as `LOST` / `START_DEADLINE_EXCEEDED`. One logical step, two attempts, no history rewrite
+- Run finished `SUCCEEDED` at `lastEventSequence = 24` with committed output
+  `{"documentId":"doc-pause-031","indexed":true,"thumbnailKey":"thumb/doc-pause-031","title":"acceptance-doc"}`
+
+Committed event history for that run (monotonic per-run sequence, read back from the API):
+
+```text
+ 1 run.created
+ 2 attempt.claimed      epoch=1
+ 3 run.pausing          activeAttempts=1 reason=PAUSE_REQUESTED
+ 4 attempt.lost         epoch=1 reason=START_DEADLINE_EXCEEDED
+ 5 step.waiting         node=parse attemptNumber=2 reason=RETRY_BACKOFF
+ 6 run.paused           reason=PAUSE_REQUESTED
+ 7 run.resumed          reason=RETRY_BACKOFF
+ 8 step.ready           node=parse reason=RETRY_DUE
+ 9 attempt.claimed      epoch=2
+10 attempt.started      epoch=2
+11 attempt.completed    epoch=2
+12 step.ready           node=metadata
+13 step.ready           node=thumbnail
+14 attempt.claimed      epoch=1   (metadata)
+15 attempt.claimed      epoch=1   (thumbnail)
+16 attempt.started      epoch=1
+17 attempt.started      epoch=1
+18 attempt.completed    epoch=1
+19 attempt.completed    epoch=1
+20 step.ready           node=index
+21 attempt.claimed      epoch=1
+22 attempt.started      epoch=1
+23 attempt.completed    epoch=1
+24 run.completed
+```
+
+### 8b.7 Negative tenant check on the deployed artifact
+
+With the same environment-scoped machine key, `GET /api/v1/runs/00000000-0000-0000-0000-000000000000`
+returned HTTP `404` and `GET /api/v1/organizations` returned `403 MACHINE_LIST_FORBIDDEN`. A
+cross-organization or cross-environment read discloses nothing, and a machine key cannot enumerate
+organizations.
+
+### 8b.8 Honest defects observed during this acceptance
+
+1. **Worker architecture enforcement is strict and correct, but easy to trip.** The first two runs
+   failed with `WORKER_PREFLIGHT_FAILED` / `ARCHITECTURE_MISMATCH` because the agent ran on
+   macOS/arm64 while the manifest is contractually `targetOS: linux`. This is the blueprint behaving
+   as designed (`contracts/manifest/deployment.schema.json` pins `targetOS` to `linux`), not a
+   product defect. It is recorded because it is the exact failure a developer will hit first, and
+   the current error text does not yet name the remedy.
+2. **Handler resolution depends on a per-task module with a default export.** A single shared
+   `tasks/handlers.js` referenced by several task definitions fails at run time with
+   `HANDLER_NOT_FOUND`, because the agent passes the manifest `entrypoint` through as the runner's
+   `taskName`. `runtime init` scaffolds the working shape, but the failure mode is not documented
+   at the point of failure.
+3. **`runtime runs inspect` has no `--env` flag**, so a machine key scoped to one environment cannot
+   be inspected with an explicit environment override the way `worker list` and `runs create` can.
+4. **Stale keychain context silently overrides `DEADBOLT_ENV`.** `Config.EnvID` is loaded from the
+   OS keychain and takes precedence over the environment variable, so a previously bootstrapped
+   environment produced `ENVIRONMENT_MISMATCH` until an explicit `--env <uuid>` was passed.
+
+None of these affect the M3 capability gate, and none were worked around by changing product code.
+They are recorded as M5 developer-experience inputs (§29.3 REQ-DX-01) rather than silently closed.
+
+---
+
 ## 9. Residual Risks, Rollback Posture, & Deferrals
 
 1. **Hosted Staging Deployment:**
    - Local verification against real PostgreSQL, real worker agents, and real Node child processes is complete and passing.
-   - Hosted verification for the exact release candidate is complete: workflow #36094169671 deployed the immutable artifact, checked `/version` provenance, and ran browser acceptance against the staging edge.
+   - Hosted verification for the exact release candidate is complete: workflow #36113009161 deployed `b7664f2` (`control-plane@sha256:4d9e…25934ebc`, `postgres@sha256:1e1d…04434035`), checked `/version` provenance (commit + digest match, `runtime_mode: hosted`), ran edge + tenant-route smoke (401) and hosted browser acceptance (`result: PASS`) against `https://deadbolt.cubix.codes/dashboard/`.
 
 2. **Rollback Posture:**
    - Milestone 3 is strictly additive:
@@ -373,3 +527,23 @@ The Run Inspector and Dashboard were audited across API endpoints (`GET /v1/runs
 | **Hosted Staging Deployment**      | `N/A`                        | `DEPLOYED: YES`           | **HOSTED_VERIFIED**       |
 | **Hosted Acceptance Walkthrough**  | `N/A`                        | `HOSTED_ACCEPTANCE: PASS` | **HOSTED_VERIFIED**       |
 | **OVERALL M3 ACCEPTANCE GATE**     | `LOCAL_AUTOMATED_GATE: PASS` | `HOSTED_CI: PASS`         | **OVERALL_M3_GATE: PASS** |
+
+### 10b. Staging functional evidence index
+
+Every row below was produced against the deployed `b7664f2` artifact through the public edge, with
+Linux workers executing real Node.js handlers. Reproduce with the commands in §8b.
+
+| Capability                           | Evidence                                                                                            |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| Linear A → B → C end to end          | run `f391ef5e-8b39-4c6c-b134-a540423f4de3`, `SUCCEEDED`, output committed                           |
+| Parallel fan-out with real overlap   | run `018985ac-0469-4b96-9455-704f245bdc93`, sibling attempt windows overlap, join waited            |
+| Choice selects one branch            | run `3b820f41-50bd-4f5e-b794-708cc99f9621` (`high`), `ac255840-8722-4d2d-ad9d-d0d3dcd72bb8` (`low`) |
+| Skipped branch is durable truth      | `SKIPPED` + `BRANCH_NOT_SELECTED` on the unselected step in both runs                               |
+| Merge does not stall                 | `join` step `SUCCEEDED` in both runs despite one input branch never executing                       |
+| Pause blocks new claims (F-13)       | run `e1b43824-f0b9-45c9-bb1d-86da4cf99b6d` paused with downstream steps still `BLOCKED`             |
+| Stale revision rejected (CTL-03)     | `409 REVISION_CONFLICT` on second `pause` with stale `expectedRevision`                             |
+| Resume recomputes from durable state | resume returned `WAITING` / `RETRY_BACKOFF`, then the run finished `SUCCEEDED`                      |
+| Attempt history is 1:N under a step  | `parse` shows attempt 1 `LOST` and attempt 2 `SUCCEEDED` under one logical node                     |
+| Events committed with state          | 24 monotonic `run_events` rows, ending `run.completed`, matching the terminal snapshot              |
+| Cross-tenant / cross-env negative    | foreign run id `404`; machine key organization enumeration `403 MACHINE_LIST_FORBIDDEN`             |
+| Deployment immutability + activation | three deployments `REGISTERED → AVAILABLE → ACTIVE`; stale activation revision rejected             |
