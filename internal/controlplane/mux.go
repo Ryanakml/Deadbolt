@@ -107,6 +107,17 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("POST /api/v1/runs/{id}/resume", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.ResumeRun))))
 		mux.Handle("POST /v1/runs/{id}/resume", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapRunsControl, executionHandler.ResumeRun))))
 
+		// Approval control nodes (Blueprint §16.3, §20.1). A decision requires
+		// an identifiable human holding approvals:decide; the handler refuses
+		// machine callers even when the key carries the capability, because
+		// §24.2 withholds approval machine keys in V1.
+		mux.Handle("POST /api/v1/approvals/{id}/decision", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleDecideApproval))))
+		mux.Handle("POST /v1/approvals/{id}/decision", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleDecideApproval))))
+		mux.Handle("GET /api/v1/approvals", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleListApprovals))))
+		mux.Handle("GET /v1/approvals", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleListApprovals))))
+		mux.Handle("GET /api/v1/approvals/{id}", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleGetApproval))))
+		mux.Handle("GET /v1/approvals/{id}", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleGetApproval))))
+
 		// Scoped artifacts: worker sessions (dbs_ bearers) authenticate
 		// through the worker chain with attempt-ownership checks inside the
 		// handler; all other callers use the tenant chain with the route

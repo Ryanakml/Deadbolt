@@ -115,6 +115,16 @@ type workflowNode struct {
 	Input  any           `json:"input"`
 	Choice *choiceConfig `json:"choice"`
 	Merge  *mergeConfig  `json:"merge"`
+	// Approval is the durable human-decision contract of an approval control
+	// node (Blueprint §16.3). It is never dispatched to a worker.
+	Approval *approvalNodeConfig `json:"approval"`
+}
+
+type approvalNodeConfig struct {
+	Payload            any    `json:"payload"`
+	OutputSchema       any    `json:"outputSchema"`
+	RequiredPermission string `json:"requiredPermission"`
+	ExpiresInMs        int64  `json:"expiresInMs"`
 }
 
 type workflowManifest struct {
@@ -2140,6 +2150,23 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 							}
 						}
 					}
+				}
+				continue
+			}
+
+			// Approval control node (Blueprint §16.3). It sits after the
+			// dependency gate and before the task fallthrough so an approval
+			// is never promoted to READY: a control node must not be
+			// claimable, must not create an attempt, and must not hold a lease
+			// or a runner while it waits for a person.
+			if nodeType == "approval" {
+				created, err := openApprovalTx(ctx, tx, organizationID, runID, node, st)
+				if err != nil {
+					return transitions, false, err
+				}
+				if created {
+					changed = true
+					transitions++
 				}
 				continue
 			}

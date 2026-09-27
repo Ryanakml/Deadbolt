@@ -16,6 +16,8 @@ export interface ValidationResult {
   valid: boolean;
   errors: ValidationError[];
 }
+const APPROVAL_DECISION_CAPABILITY = "approvals:decide";
+
 const check = (fn: () => void): ValidationResult => {
   try {
     fn();
@@ -170,11 +172,59 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     if (byId.has(id)) fail("DUPLICATE_NODE_ID");
     byId.set(id, n);
     const ntype = String(n.type);
-    if (ntype !== "task" && ntype !== "choice" && ntype !== "merge") {
+    // The released language is task / choice / merge / approval. `delay` and
+    // any other type stay UNSUPPORTED_CAPABILITY until their milestone ships;
+    // a contract field for a future capability never implies the feature is on.
+    if (
+      ntype !== "task" &&
+      ntype !== "choice" &&
+      ntype !== "merge" &&
+      ntype !== "approval"
+    ) {
       fail("UNSUPPORTED_CAPABILITY");
     }
     if (ntype === "task") {
       if (!tasks.has(String(n.task))) fail("MISSING_TASK_REF");
+    }
+    if (ntype === "approval") {
+      // Blueprint §16.3: an approval stores a payload, the decision schema,
+      // the required permission, and an expiry. A config-less approval could
+      // never be decided against a declared contract, so it fails closed here
+      // rather than at run time.
+      const approval = n.approval;
+      if (
+        typeof approval !== "object" ||
+        approval === null ||
+        Array.isArray(approval) ||
+        Object.keys(approval as ObjectValue).length === 0
+      ) {
+        fail("INVALID_MANIFEST");
+      }
+      // `approvals:decide` is the only permission that may gate an approval
+      // decision (§24.2). Accepting another would let a workflow require a
+      // grant no approval actor can ever hold.
+      const permission = (approval as ObjectValue).requiredPermission;
+      if (
+        permission !== undefined &&
+        permission !== APPROVAL_DECISION_CAPABILITY
+      ) {
+        fail("INVALID_MANIFEST");
+      }
+      const expires = (approval as ObjectValue).expiresInMs;
+      if (
+        expires !== undefined &&
+        !(typeof expires === "number" && expires > 0)
+      ) {
+        fail("INVALID_MANIFEST");
+      }
+      const outputSchema = (approval as ObjectValue).outputSchema;
+      if (outputSchema !== undefined) {
+        try {
+          validateSchema(outputSchema, schemas["payload-schema.schema.json"]);
+        } catch {
+          fail("INVALID_MANIFEST");
+        }
+      }
     }
   }
   for (const n of nodes)

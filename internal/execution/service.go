@@ -680,12 +680,13 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			}
 		}
 
+		stepIDs := make([]string, len(steps))
+		for i, st := range steps {
+			stepIDs[i] = st.ID
+		}
+
 		reconciliationCases := make([]ReconciliationCaseDTO, 0)
-		if len(steps) > 0 {
-			stepIDs := make([]string, len(steps))
-			for i, st := range steps {
-				stepIDs[i] = st.ID
-			}
+		if len(stepIDs) > 0 {
 			caseRows, err := tx.Query(ctx, `
 				SELECT id::text, step_id::text, attempt_id::text, reason, evidence,
 					status, resolution, actor_id::text, revision, resolved_at, created_at
@@ -722,6 +723,42 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			}
 		}
 
+		// Approval decisions belong to the same consistent snapshot as steps and
+		// cases so the Inspector never renders a stale action against a step
+		// that has already moved (Blueprint §23.2).
+		approvals := []ApprovalDTO{}
+		if len(stepIDs) > 0 {
+			approvalRows, err := tx.Query(ctx, `SELECT a.id::text, rs.run_id::text, rs.id::text, rs.node_id,
+					r.workflow_name, a.status, a.required_permission, a.payload, a.revision,
+					a.expires_at, a.decided_at, a.decision_comment, a.decision_reason, a.actor_id::text
+				FROM approvals a
+				JOIN run_steps rs ON rs.id=a.step_id AND rs.organization_id=a.organization_id
+				JOIN runs r ON r.id=rs.run_id AND r.organization_id=rs.organization_id
+				WHERE a.organization_id=$1::uuid AND a.step_id = ANY($2::uuid[])
+				ORDER BY a.created_at ASC, a.id ASC`, orgID, stepIDs)
+			if err != nil {
+				return fmt.Errorf("query approvals: %w", err)
+			}
+			for approvalRows.Next() {
+				var a ApprovalDTO
+				var rawPayload []byte
+				if err := approvalRows.Scan(&a.ID, &a.RunID, &a.StepID, &a.NodeID, &a.WorkflowName,
+					&a.Status, &a.RequiredPermission, &rawPayload, &a.Revision, &a.ExpiresAt,
+					&a.DecidedAt, &a.DecisionComment, &a.DecisionReason, &a.ActorID); err != nil {
+					approvalRows.Close()
+					return err
+				}
+				if len(rawPayload) > 0 && string(rawPayload) != "null" {
+					_ = json.Unmarshal(rawPayload, &a.Payload)
+				}
+				approvals = append(approvals, a)
+			}
+			approvalRows.Close()
+			if err := approvalRows.Err(); err != nil {
+				return err
+			}
+		}
+
 		if run.Status == contracts.RunStatusFAILED && runError == nil {
 			if run.ReasonCode != nil {
 				runError = map[string]any{
@@ -748,6 +785,7 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			LastEventSequence:       lastEventSeq,
 			Steps:                   steps,
 			ReconciliationCases:     reconciliationCases,
+			Approvals:               approvals,
 			Output:                  output,
 			Error:                   runError,
 			WaitingReason:           waitingReason,

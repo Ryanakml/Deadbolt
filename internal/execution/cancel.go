@@ -170,6 +170,17 @@ func (e *WorkerEngine) cancelRunTx(
 		WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, runID, orgID); err != nil {
 		return nil, err
 	}
+	// Blueprint §16.3: a pending approval is cancelled with the run, so a late
+	// decision is rejected on a terminal record rather than resurrecting a
+	// cancelled run (§9 INV-09).
+	if _, err := tx.Exec(ctx, `UPDATE approvals SET status='CANCELLED', revision=revision+1
+		WHERE organization_id=$2::uuid AND status='PENDING'
+		  AND step_id IN (
+			SELECT id FROM run_steps
+			WHERE run_id=$1::uuid AND organization_id=$2::uuid
+		  )`, runID, orgID); err != nil {
+		return nil, err
+	}
 	var actorID *string
 	if audit.ActorID != nil && strings.TrimSpace(*audit.ActorID) != "" {
 		actorID = audit.ActorID

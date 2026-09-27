@@ -911,7 +911,7 @@ paths:
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
       x-required-capability: approvals:decide
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response

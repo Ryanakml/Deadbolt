@@ -304,6 +304,14 @@ func run() error {
 					if _, err := workerEngine.ReconcileExpiredLeases(ctx, orgID); err != nil {
 						return err
 					}
+					// Blueprint §16.3: expiry of a pending human decision is
+					// settled on the same bounded pass as lease recovery. The
+					// decision endpoint compares database time itself, so this
+					// sweep is progression only, never the authority that
+					// makes an expired approval invalid.
+					if _, err := workerEngine.SweepExpiredApprovals(ctx, orgID); err != nil {
+						return err
+					}
 				}
 				return nil
 			})
