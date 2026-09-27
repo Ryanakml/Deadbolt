@@ -2160,7 +2160,7 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 			// claimable, must not create an attempt, and must not hold a lease
 			// or a runner while it waits for a person.
 			if nodeType == "approval" {
-				created, err := openApprovalTx(ctx, tx, organizationID, runID, node, st)
+				created, err := openApprovalTx(ctx, tx, organizationID, runID, node, st, runInput, outputsMap)
 				if err != nil {
 					return transitions, false, err
 				}

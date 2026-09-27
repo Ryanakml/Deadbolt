@@ -97,6 +97,8 @@ func openApprovalTx(
 	organizationID, runID string,
 	node workflowNode,
 	st *dagEvalStep,
+	runInput any,
+	outputsMap map[string]any,
 ) (bool, error) {
 	if node.Approval == nil {
 		// Validator rejects a config-less approval at registration; fail closed
@@ -107,11 +109,22 @@ func openApprovalTx(
 		return false, fmt.Errorf("approval node %s has no config", node.ID)
 	}
 
+	// The payload is the request a person actually reads, so it is resolved the
+	// same way a task input is. Storing raw reference descriptors would show an
+	// approver `{"$ref":"run.input","pointer":"/documentId"}` instead of the
+	// document they are being asked to approve.
 	payload := node.Approval.Payload
 	if payload == nil {
 		payload = map[string]any{}
 	}
-	payloadBytes, err := json.Marshal(payload)
+	resolved, mapErr := contracts.MapInput(payload, runInput, outputsMap)
+	if mapErr != nil {
+		if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INPUT_MAPPING_ERROR", nil); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	payloadBytes, err := json.Marshal(resolved)
 	if err != nil {
 		return false, err
 	}

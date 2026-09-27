@@ -524,6 +524,18 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
             },
             required: ["selected", "branch"],
           };
+        } else if (node.type === "approval") {
+          // An approval's decision output is described by the node's own
+          // outputSchema, not by a task definition. Without this branch a
+          // workflow could never read the decision, which is the entire reason
+          // to place an approval in a graph.
+          const apr = object(node.approval ?? {});
+          source = (apr.outputSchema as JSONValue) ?? {
+            type: "object",
+            properties: {},
+            required: [],
+            additionalProperties: true,
+          };
         } else {
           source = tasks.get(String(node.task))!.outputSchema;
         }

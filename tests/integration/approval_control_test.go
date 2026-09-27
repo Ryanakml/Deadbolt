@@ -56,9 +56,21 @@ func approvalWorkflowManifest() []byte {
 		"required":             []any{"n"},
 		"additionalProperties": false,
 	}
+	// The publish node consumes the committed decision, which is the only
+	// reason to place an approval in a graph: the human answer has to be
+	// readable by the rest of the workflow.
+	publishInputSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"n":        map[string]any{"type": "integer"},
+			"decision": map[string]any{"type": "string"},
+		},
+		"required":             []any{"n", "decision"},
+		"additionalProperties": false,
+	}
 	tasks := []map[string]any{
 		{"name": "t-build", "inputSchema": numSchema, "outputSchema": numSchema, "recovery": "safe", "entrypoint": "tasks/build.js"},
-		{"name": "t-publish", "inputSchema": numSchema, "outputSchema": numSchema, "recovery": "safe", "entrypoint": "tasks/publish.js"},
+		{"name": "t-publish", "inputSchema": publishInputSchema, "outputSchema": numSchema, "recovery": "safe", "entrypoint": "tasks/publish.js"},
 	}
 	workflows := []map[string]any{{
 		"manifestVersion": 1, "name": "wf-approval",
@@ -75,7 +87,10 @@ func approvalWorkflowManifest() []byte {
 				},
 			},
 			{"id": "publish", "type": "task", "task": "t-publish", "after": []any{"gate"},
-				"input": map[string]any{"n": map[string]any{"literal": float64(11)}}},
+				"input": map[string]any{
+					"n":        map[string]any{"literal": float64(11)},
+					"decision": map[string]any{"$ref": "step.output", "stepId": "gate", "pointer": "/decision"},
+				}},
 		},
 		"output": map[string]any{"n": map[string]any{"$ref": "step.output", "stepId": "publish", "pointer": "/n"}},
 	}}
@@ -710,4 +725,45 @@ func execRow(t *testing.T, f *approvalGateFixture, query, arg string, out *int) 
 func jsonBody(v any) *bytes.Reader {
 	b, _ := json.Marshal(v)
 	return bytes.NewReader(b)
+}
+
+// 12. A downstream node must be able to read the approval decision. The
+// validator resolves a step.output reference to an approval through the node's
+// own outputSchema, because an approval has no task definition to look up.
+func TestApproval_DownstreamCanConsumeDecisionOutput(t *testing.T) {
+	f := setupApprovalGate(t)
+	sess, _ := enrollExecutionWorker(t, f.tc, f.server, f.orgID, f.envID, "m4-w12")
+	m3AssociateWorkerDeployment(t, f.tc, f.orgID, sess.SessionID, approvalBundleDigest)
+
+	run := f.newRun(t, "m4-approval-consume-001")
+	f.claimBuild(t, sess)
+	approval := f.pendingApproval(t, run.ID)
+	if _, err := f.engine.DecideApproval(context.Background(), f.orgID, approval.ID,
+		execution.DecideApprovalRequest{Decision: contracts.ApprovalDecisionRejected, ExpectedRevision: approval.Revision},
+		approvalHumanAudit(f.operator)); err != nil {
+		t.Fatalf("reject failed: %v", err)
+	}
+
+	// The publish node consumes gate's decision, proving the reference resolved
+	// and the committed output matched the declared decision schema. Input is
+	// resolved at claim time, so the assertion reads what the worker receives.
+	asgns := parallelClaim(t, f.engine, sess, f.orgID, f.envID, 1, "m4-claim-consume")
+	if len(asgns) != 1 {
+		t.Fatalf("expected the downstream node to be claimable, got %d", len(asgns))
+	}
+	if node := m3NodeForStep(t, f.tc, f.orgID, asgns[0].StepID); node != "publish" {
+		t.Fatalf("expected the downstream publish node, got %q", node)
+	}
+	resolved, ok := asgns[0].Input.(map[string]any)
+	if !ok {
+		t.Fatalf("assignment input must be an object, got %T", asgns[0].Input)
+	}
+	if resolved["decision"] != contracts.ApprovalDecisionRejected {
+		t.Fatalf("downstream input must carry the committed decision %q, got %v",
+			contracts.ApprovalDecisionRejected, resolved["decision"])
+	}
+	// The node only mapped /decision, so nothing else may leak into its input.
+	if _, present := resolved["actorId"]; present {
+		t.Fatalf("downstream input must carry only what the node mapped, got %v", resolved)
+	}
 }
