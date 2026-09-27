@@ -459,7 +459,10 @@ func TestM2_TwoWorkerABCRecoveryKillDuringB(t *testing.T) {
 	// B becomes observably in-flight on Agent 1: DB attempt RUNNING, B-start
 	// marker written by the real child, and Agent 1's second child launched.
 	// No blind race: Agent 1 is killed only after this is observed.
-	b1desc := m2WaitFor(t, 60*time.Second, "B RUNNING on agent 1", func() (string, bool) {
+	// The budget matches the sibling real-agent waits (see 15f01b5): under
+	// -race on a shared runner the two real Node children and the database
+	// round trips routinely need more than a minute to become observable.
+	b1desc := m2WaitFor(t, 120*time.Second, "B RUNNING on agent 1", func() (string, bool) {
 		b := m2NodeAttempts(t, tc, orgID, run.ID, "node-b")
 		calls := m2ReadCalls(markerDir)
 		state := fmt.Sprintf("attempts=%v calls=%v agent1children=%d", b, calls, w1Starts.Load())

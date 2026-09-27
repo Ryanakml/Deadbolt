@@ -12,7 +12,9 @@ concurrency:
 jobs:
   contracts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The package budget above is 30m; the job also builds images and boots
+    # Compose, so it needs headroom beyond the test budget itself.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine
@@ -74,7 +76,12 @@ jobs:
       - run: test -z "$(gofmt -l contracts internal tests)"
       - run: pnpm typecheck
       - run: pnpm test
-      - run: go test -race ./...
+      # The integration package runs real PostgreSQL, real worker agents, and
+      # real Node child processes under -race. It already measured 557s on the
+      # runner before M4, so it was sitting just under go test's implicit 10
+      # minute default and any added test tipped it over into a hard kill.
+      # The budget is now stated instead of inherited.
+      - run: go test -race -timeout 30m ./...
       - run: go vet ./...
       - run: pnpm check:contracts
       - run: pnpm check:parity
