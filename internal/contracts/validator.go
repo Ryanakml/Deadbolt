@@ -625,32 +625,32 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 								"required": []any{"branch", "value"},
 							}
 						}
-				} else if byID[id]["type"] == "choice" {
-					source = map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"selected": map[string]any{"type": "string"},
-							"branch":   map[string]any{"type": "string"},
-						},
-						"required": []any{"selected", "branch"},
-					}
-				} else if byID[id]["type"] == "approval" {
-					// An approval's decision output is described by the node's
-					// own outputSchema, not by a task definition. Without this
-					// branch a workflow could never read the decision, which
-					// is the entire reason to place an approval in a graph.
-					apr := obj(byID[id]["approval"])
-					if apr != nil && apr["outputSchema"] != nil {
-						source = apr["outputSchema"]
-					} else {
+					} else if byID[id]["type"] == "choice" {
 						source = map[string]any{
-							"type":                 "object",
-							"properties":           map[string]any{},
-							"required":             []any{},
-							"additionalProperties": true,
+							"type": "object",
+							"properties": map[string]any{
+								"selected": map[string]any{"type": "string"},
+								"branch":   map[string]any{"type": "string"},
+							},
+							"required": []any{"selected", "branch"},
 						}
-					}
-				} else {
+					} else if byID[id]["type"] == "approval" {
+						// An approval's decision output is described by the node's
+						// own outputSchema, not by a task definition. Without this
+						// branch a workflow could never read the decision, which
+						// is the entire reason to place an approval in a graph.
+						apr := obj(byID[id]["approval"])
+						if apr != nil && apr["outputSchema"] != nil {
+							source = apr["outputSchema"]
+						} else {
+							source = map[string]any{
+								"type":                 "object",
+								"properties":           map[string]any{},
+								"required":             []any{},
+								"additionalProperties": true,
+							}
+						}
+					} else {
 						source = tasks[str(byID[id]["task"])]["outputSchema"]
 					}
 					if isOutput {
