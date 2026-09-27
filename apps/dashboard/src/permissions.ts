@@ -15,6 +15,39 @@ import type { RunStatus } from "./types.js";
 //   - developer / operator / admin / owner: hold runs:control.
 export const RUNS_CONTROL_CAPABILITY = "runs:control";
 
+// Approval decisions are a different capability from run control: §24.2 grants
+// approvals:decide to operator, admin, and owner, and explicitly withholds it
+// from developer. A developer who can pause a run still cannot approve one, so
+// the Inspector must not reuse the runs:control predicate here.
+export const APPROVALS_DECIDE_CAPABILITY = "approvals:decide";
+
+const APPROVALS_DECIDE_ROLES = new Set(["operator", "admin", "owner"]);
+
+// roleCanDecideApprovals reports whether a canonical role grants
+// approvals:decide.
+export function roleCanDecideApprovals(
+  role: string | null | undefined,
+): boolean {
+  if (!role) return false;
+  return APPROVALS_DECIDE_ROLES.has(role.trim().toLowerCase());
+}
+
+// sessionCanDecideApprovals mirrors roleCanDecideApprovals against the BFF
+// session membership for the given organization.
+export function sessionCanDecideApprovals(
+  session: AuthSession | null | undefined,
+  orgId: string | null | undefined,
+): boolean {
+  if (!session || !orgId) return false;
+  const memberships = session.memberships ?? [];
+  for (const m of memberships) {
+    if (!m || m.OrganizationID !== orgId) continue;
+    if (String(m.Status ?? "").toUpperCase() !== "ACTIVE") continue;
+    return roleCanDecideApprovals(m.Role);
+  }
+  return false;
+}
+
 const RUNS_CONTROL_ROLES = new Set(["developer", "operator", "admin", "owner"]);
 
 // roleCanControlRuns reports whether a canonical role grants runs:control.

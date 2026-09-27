@@ -191,6 +191,45 @@ export class DashboardApiClient {
         }
         return res.json();
     }
+    // listApprovals returns the approvals inbox for the selected environment so an
+    // operator can see every pending decision without hunting for it per run.
+    async listApprovals(environmentId, status) {
+        const q = new URLSearchParams({ environment: environmentId });
+        if (status)
+            q.set("status", status);
+        const res = await apiFetch(`${this.baseUrl}/v1/approvals?${q.toString()}`);
+        if (!res.ok) {
+            throw new Error(`Failed to list approvals (HTTP ${res.status}): ${res.statusText}`);
+        }
+        const body = (await res.json());
+        return body.items ?? [];
+    }
+    // decideApproval commits one human approve/reject decision.
+    //
+    // Both outcomes are successful: the node's job was to collect a valid
+    // decision, and a rejection is a business result rather than a failure. The
+    // caller binds expectedRevision, so a 409 means someone else already acted
+    // and the dialog must refresh instead of retrying blindly. Repeating the same
+    // decision is idempotent.
+    async decideApproval(approvalId, decision, expectedRevision, comment, idempotencyKey) {
+        const res = await apiFetch(`${this.baseUrl}/v1/approvals/${encodeURIComponent(approvalId)}/decision`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify({
+                decision,
+                expectedRevision,
+                ...(comment ? { comment } : {}),
+            }),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to decide approval (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
     // cancelRun requests durable cancellation. The caller binds the revision
     // read from the snapshot; a 409 means the run changed and the dialog must
     // refresh instead of retrying blindly. Cancelling never rolls back
