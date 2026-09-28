@@ -15,6 +15,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/gateway"
 	"github.com/Ryanakml/Deadbolt/internal/outbox"
 	"github.com/Ryanakml/Deadbolt/internal/recovery"
+	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 	"github.com/Ryanakml/Deadbolt/internal/worker"
@@ -117,6 +118,32 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("GET /v1/approvals", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleListApprovals))))
 		mux.Handle("GET /api/v1/approvals/{id}", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleGetApproval))))
 		mux.Handle("GET /v1/approvals/{id}", tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapApprovalsDecide, executionHandler.HandleGetApproval))))
+
+		// Recurring schedules (Blueprint §17, Issue #34). Every route requires
+		// schedules:write, which §20.1 declares and the OpenAPI pins with
+		// x-required-capability. A schedule is a standing grant to create runs
+		// without an operator present, so the capability sits with the roles
+		// that already hold runs:reconcile rather than with developers.
+		scheduleSvc := scheduling.NewService(storagePool)
+		scheduleHandler := scheduling.NewHTTPHandler(scheduleSvc, tenantHandler)
+		sched := func(h http.HandlerFunc) http.Handler {
+			return tenantHandler.WithRequestID(tenantHandler.RequireAuth(tenantHandler.RequireOrgScope(tenant.CapSchedulesWrite, h)))
+		}
+		mux.Handle("GET /api/v1/schedules", sched(scheduleHandler.List))
+		mux.Handle("GET /v1/schedules", sched(scheduleHandler.List))
+		mux.Handle("POST /api/v1/schedules", sched(scheduleHandler.Create))
+		mux.Handle("POST /v1/schedules", sched(scheduleHandler.Create))
+		mux.Handle("PATCH /api/v1/schedules/{id}", sched(scheduleHandler.Update))
+		mux.Handle("PATCH /v1/schedules/{id}", sched(scheduleHandler.Update))
+		mux.Handle("DELETE /api/v1/schedules/{id}", sched(scheduleHandler.Delete))
+		mux.Handle("DELETE /v1/schedules/{id}", sched(scheduleHandler.Delete))
+		// Pause and resume are separate verbs on the wire even though the
+		// Schedule schema carries `paused`, so a state transition cannot be
+		// confused with a configuration edit.
+		mux.Handle("POST /api/v1/schedules/{id}/pause", sched(scheduleHandler.Pause))
+		mux.Handle("POST /v1/schedules/{id}/pause", sched(scheduleHandler.Pause))
+		mux.Handle("POST /api/v1/schedules/{id}/resume", sched(scheduleHandler.Resume))
+		mux.Handle("POST /v1/schedules/{id}/resume", sched(scheduleHandler.Resume))
 
 		// Scoped artifacts: worker sessions (dbs_ bearers) authenticate
 		// through the worker chain with attempt-ownership checks inside the
