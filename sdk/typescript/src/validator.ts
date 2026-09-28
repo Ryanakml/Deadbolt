@@ -172,14 +172,15 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     if (byId.has(id)) fail("DUPLICATE_NODE_ID");
     byId.set(id, n);
     const ntype = String(n.type);
-    // The released language is task / choice / merge / approval. `delay` and
-    // any other type stay UNSUPPORTED_CAPABILITY until their milestone ships;
-    // a contract field for a future capability never implies the feature is on.
+    // The released language is task / choice / merge / approval / delay. Any
+    // other type stays UNSUPPORTED_CAPABILITY until its milestone ships; a
+    // contract field for a future capability never implies the feature is on.
     if (
       ntype !== "task" &&
       ntype !== "choice" &&
       ntype !== "merge" &&
-      ntype !== "approval"
+      ntype !== "approval" &&
+      ntype !== "delay"
     ) {
       fail("UNSUPPORTED_CAPABILITY");
     }
@@ -224,6 +225,17 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
         } catch {
           fail("INVALID_MANIFEST");
         }
+      }
+    }
+    if (ntype === "delay") {
+      const delayMs = n.delayMs;
+      if (
+        typeof delayMs !== "number" ||
+        !Number.isSafeInteger(delayMs) ||
+        delayMs < 1 ||
+        delayMs > 30 * 24 * 60 * 60 * 1000
+      ) {
+        fail("INVALID_DELAY");
       }
     }
   }

@@ -307,7 +307,7 @@ func (s *Service) CreateRun(
 			}
 		}
 
-		// 4. Create Run with the MVP lifetime default: 24h from acceptance.
+		// 4. Create Run with the V1 lifetime default: 7d from acceptance.
 		var runID string
 		var createdAt time.Time
 		var deadlineAt *time.Time
@@ -335,7 +335,7 @@ func (s *Service) CreateRun(
 			if kind == "" {
 				kind = "task"
 			}
-			if kind == "choice" || kind == "merge" {
+			if kind == "choice" || kind == "merge" || kind == "delay" {
 				hasControlNode = true
 			}
 			initState := "BLOCKED"
@@ -539,7 +539,7 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 		}
 
 		rows, err := tx.Query(ctx, `SELECT id::text, node_id, state, current_epoch, completion_source,
-			kind, wait_reason, output
+				kind, wait_reason, eligible_at, output
 			FROM run_steps
 			WHERE run_id = $1::uuid AND organization_id = $2::uuid
 			ORDER BY created_at ASC, id ASC`, runID, orgID)
@@ -553,9 +553,10 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 			var st RunStepDTO
 			var stateStr string
 			var kindStr, waitReasonStr *string
+			var eligibleAt *time.Time
 			var rawStepOutput []byte
 			if err := rows.Scan(&st.ID, &st.NodeID, &stateStr, &st.CurrentEpoch, &st.CompletionSource,
-				&kindStr, &waitReasonStr, &rawStepOutput); err != nil {
+				&kindStr, &waitReasonStr, &eligibleAt, &rawStepOutput); err != nil {
 				return err
 			}
 			st.Status = contracts.StepStatus(stateStr)
@@ -565,6 +566,10 @@ func (s *Service) GetRun(ctx context.Context, orgID, runID string) (*RunSnapshot
 				st.Kind = &k
 			}
 			st.WaitReason = waitReasonStr
+			if eligibleAt != nil {
+				dueAt := eligibleAt.UTC().Format(time.RFC3339Nano)
+				st.DueAt = &dueAt
+			}
 			if afterList, ok := nodeAfterMap[st.NodeID]; ok {
 				st.After = afterList
 			} else {

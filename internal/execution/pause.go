@@ -466,6 +466,12 @@ func (e *WorkerEngine) resumeRunTx(
 			AND state='PENDING' AND kind='RETRY_BACKOFF'`, runID, orgID).Scan(&pendingTimers); err != nil {
 		return nil, err
 	}
+	var pendingDelayTimers int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM timers
+		WHERE run_id=$1::uuid AND organization_id=$2::uuid
+			AND state='PENDING' AND kind='DELAY'`, runID, orgID).Scan(&pendingDelayTimers); err != nil {
+		return nil, err
+	}
 
 	var targetStatus string
 	var targetReason *string
@@ -487,6 +493,10 @@ func (e *WorkerEngine) resumeRunTx(
 	} else if pendingTimers > 0 {
 		targetStatus = "WAITING"
 		r := "RETRY_BACKOFF"
+		targetReason = &r
+	} else if pendingDelayTimers > 0 {
+		targetStatus = "WAITING"
+		r := "DELAY"
 		targetReason = &r
 	} else {
 		targetStatus = "WAITING"

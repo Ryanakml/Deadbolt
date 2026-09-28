@@ -851,7 +851,8 @@ function initDashboard(): void {
             <div class="meta-item"><label>Epoch</label><div>${selectedStep.currentEpoch}</div></div>
             <div class="meta-item"><label>Dependencies</label><div>${selectedStep.after && selectedStep.after.length > 0 ? selectedStep.after.map(escapeHtml).join(", ") : "None (Root)"}</div></div>
             <div class="meta-item"><label>Attempts</label><div>${selectedStep.attempts.length}</div></div>
-            ${selectedStep.waitReason ? `<div class="meta-item"><label>Wait Reason</label><div><code class="wait-reason-tag">${escapeHtml(selectedStep.waitReason)}</code></div></div>` : ""}
+                ${selectedStep.waitReason ? `<div class="meta-item"><label>Wait Reason</label><div><code class="wait-reason-tag">${escapeHtml(selectedStep.waitReason)}</code></div></div>` : ""}
+            ${selectedStep.dueAt ? `<div class="meta-item"><label>Due At</label><div>${new Date(selectedStep.dueAt).toLocaleString()}</div></div>` : ""}
             ${selectedStep.completionSource ? `<div class="meta-item"><label>Completion Source</label><div>${escapeHtml(selectedStep.completionSource)}</div></div>` : ""}
           </div>
         `;

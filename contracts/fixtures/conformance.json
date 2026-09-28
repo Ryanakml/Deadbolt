@@ -3418,13 +3418,7 @@
         {
           "id": "a",
           "type": "delay",
-          "task": "noop",
-          "input": {
-            "x": {
-              "$ref": "run.input",
-              "pointer": "/x"
-            }
-          }
+          "delayMs": 1000
         },
         {
           "id": "b",
@@ -3433,8 +3427,7 @@
           "after": ["a"],
           "input": {
             "x": {
-              "$ref": "step.output",
-              "stepId": "a",
+              "$ref": "run.input",
               "pointer": "/x"
             }
           }
@@ -3480,7 +3473,7 @@
       }
     ],
     "expected": {
-      "error": "UNSUPPORTED_CAPABILITY"
+      "value": true
     }
   },
   {

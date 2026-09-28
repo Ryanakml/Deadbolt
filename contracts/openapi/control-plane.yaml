@@ -2368,6 +2368,9 @@ components:
           $ref: "#/components/schemas/StepStatus"
         waitReason:
           type: string
+        dueAt:
+          type: string
+          format: date-time
         after:
           type: array
           items:
