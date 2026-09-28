@@ -170,11 +170,27 @@ function workflow(manifest: JSONValue, definitions: JSONValue[]): void {
     if (byId.has(id)) fail("DUPLICATE_NODE_ID");
     byId.set(id, n);
     const ntype = String(n.type);
-    if (ntype !== "task" && ntype !== "choice" && ntype !== "merge") {
+    if (
+      ntype !== "task" &&
+      ntype !== "choice" &&
+      ntype !== "merge" &&
+      ntype !== "delay"
+    ) {
       fail("UNSUPPORTED_CAPABILITY");
     }
     if (ntype === "task") {
       if (!tasks.has(String(n.task))) fail("MISSING_TASK_REF");
+    }
+    if (ntype === "delay") {
+      const delayMs = n.delayMs;
+      if (
+        typeof delayMs !== "number" ||
+        !Number.isSafeInteger(delayMs) ||
+        delayMs < 1 ||
+        delayMs > 30 * 24 * 60 * 60 * 1000
+      ) {
+        fail("INVALID_DELAY");
+      }
     }
   }
   for (const n of nodes)

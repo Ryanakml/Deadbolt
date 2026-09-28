@@ -1731,8 +1731,8 @@ func TestControlPlaneProductionMuxWiring(t *testing.T) {
 	defer tc.cleanup()
 
 	// Assert schema migration version matches expected
-	if migrator.LatestSchemaVersion != 26 {
-		t.Fatalf("expected migrator.LatestSchemaVersion to be 26, got %d", migrator.LatestSchemaVersion)
+	if migrator.LatestSchemaVersion != 27 {
+		t.Fatalf("expected migrator.LatestSchemaVersion to be 27, got %d", migrator.LatestSchemaVersion)
 	}
 
 	ctx := context.Background()

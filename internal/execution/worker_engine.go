@@ -108,13 +108,14 @@ type mergeConfig struct {
 }
 
 type workflowNode struct {
-	ID     string        `json:"id"`
-	Type   string        `json:"type"`
-	Task   string        `json:"task"`
-	After  []string      `json:"after"`
-	Input  any           `json:"input"`
-	Choice *choiceConfig `json:"choice"`
-	Merge  *mergeConfig  `json:"merge"`
+	ID      string        `json:"id"`
+	Type    string        `json:"type"`
+	Task    string        `json:"task"`
+	After   []string      `json:"after"`
+	Input   any           `json:"input"`
+	DelayMs *int64        `json:"delayMs"`
+	Choice  *choiceConfig `json:"choice"`
+	Merge   *mergeConfig  `json:"merge"`
 }
 
 type workflowManifest struct {
@@ -424,6 +425,74 @@ func recomputeRunStatusForRetryTx(ctx context.Context, tx storage.Tx, organizati
 	return nil
 }
 
+// recomputeRunStatusForDelayTx applies the same priority rules to a user
+// delay: ready/running work keeps the run claimable, otherwise a pending
+// delay parks it durably. It never reopens a terminal or cancelling run.
+func recomputeRunStatusForDelayTx(ctx context.Context, tx storage.Tx, organizationID, runID string) error {
+	var readyOrRunning int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM run_steps
+		WHERE run_id=$1::uuid AND organization_id=$2::uuid
+			AND state IN ('READY','RUNNING')`, runID, organizationID).Scan(&readyOrRunning); err != nil {
+		return err
+	}
+	if readyOrRunning > 0 {
+		_, err := tx.Exec(ctx, `UPDATE runs SET status=CASE
+			WHEN EXISTS (SELECT 1 FROM run_steps WHERE run_id=$1::uuid AND organization_id=$2::uuid AND state='RUNNING') THEN 'RUNNING'
+			ELSE 'QUEUED' END, reason_code=NULL, updated_at=clock_timestamp()
+			WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING','WAITING')`, runID, organizationID)
+		return err
+	}
+	_, err := tx.Exec(ctx, `UPDATE runs SET status='WAITING', reason_code='DELAY', updated_at=clock_timestamp()
+		WHERE id=$1::uuid AND organization_id=$2::uuid AND status IN ('QUEUED','RUNNING')
+			AND EXISTS (SELECT 1 FROM timers WHERE run_id=$1::uuid AND organization_id=$2::uuid AND kind='DELAY' AND state='PENDING')`, runID, organizationID)
+	return err
+}
+
+// scheduleDelayTx chooses and persists the absolute due_at exactly once.
+// The step remains WAITING/DELAY and never becomes READY or claimable while
+// the timer is pending.
+func scheduleDelayTx(ctx context.Context, tx storage.Tx, organizationID, environmentID, runID, stepID string, delayMs int64) (time.Time, bool, error) {
+	if delayMs < 1 || delayMs > MaxRunLifetimeMs {
+		return time.Time{}, false, fmt.Errorf("invalid delay duration %dms", delayMs)
+	}
+	var dueAt time.Time
+	if environmentID == "" {
+		if err := tx.QueryRow(ctx, `SELECT environment_id::text FROM runs WHERE id=$1::uuid AND organization_id=$2::uuid`, runID, organizationID).Scan(&environmentID); err != nil {
+			return time.Time{}, false, err
+		}
+	}
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() + ($1::bigint * INTERVAL '1 millisecond')`, delayMs).Scan(&dueAt); err != nil {
+		return time.Time{}, false, err
+	}
+	var inserted bool
+	if err := tx.QueryRow(ctx, `INSERT INTO timers
+		(organization_id, environment_id, kind, reference_id, run_id, step_id, due_at, reason)
+		VALUES ($1::uuid,$2::uuid,'DELAY',$3::uuid,$4::uuid,$3::uuid,$5,'DELAY')
+		ON CONFLICT (organization_id, kind, reference_id) WHERE state='PENDING' DO NOTHING
+		RETURNING due_at`, organizationID, environmentID, stepID, runID, dueAt).Scan(&dueAt); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, false, err
+		}
+		if err := tx.QueryRow(ctx, `SELECT due_at FROM timers
+			WHERE organization_id=$1::uuid AND kind='DELAY' AND reference_id=$2::uuid AND state='PENDING'`, organizationID, stepID).Scan(&dueAt); err != nil {
+			return time.Time{}, false, err
+		}
+	} else {
+		inserted = true
+	}
+	tag, err := tx.Exec(ctx, `UPDATE run_steps SET state='WAITING', wait_reason='DELAY', eligible_at=$1, updated_at=clock_timestamp()
+		WHERE id=$2::uuid AND organization_id=$3::uuid AND state='BLOCKED'`, dueAt, stepID, organizationID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if tag.RowsAffected() > 0 {
+		if err := recomputeRunStatusForDelayTx(ctx, tx, organizationID, runID); err != nil {
+			return time.Time{}, false, err
+		}
+	}
+	return dueAt, inserted, nil
+}
+
 // scheduleRetryOrHoldTx persists a retry intent (WAITING/RETRY_BACKOFF +
 // PENDING timer with a once-chosen due_at) or routes to reconciliation /
 // terminal failure when guards forbid retry. It returns "retry", "hold", or
@@ -716,6 +785,112 @@ func (e *WorkerEngine) FireDueRetryTimers(ctx context.Context, organizationID st
 	if e.hub != nil {
 		for _, rID := range affected {
 			e.hub.Publish(rID)
+		}
+	}
+	return fired, nil
+}
+
+// FireDueDelayTimers settles due user delays atomically. The timer transition,
+// step success, downstream evaluation, and terminal settlement share one
+// transaction, so duplicate schedulers can produce only one logical action.
+func (e *WorkerEngine) FireDueDelayTimers(ctx context.Context, organizationID string) (int, error) {
+	var fired int
+	var affected []string
+	err := e.pool.WithTenantTx(ctx, organizationID, func(ctx context.Context, tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT t.id::text, t.run_id::text, t.step_id::text, t.due_at
+			FROM timers t JOIN runs r ON r.id=t.run_id AND r.organization_id=t.organization_id
+			JOIN run_steps rs ON rs.id=t.step_id AND rs.organization_id=t.organization_id
+			WHERE t.organization_id=$1::uuid AND t.kind='DELAY' AND t.state='PENDING'
+				AND t.due_at <= clock_timestamp()
+			ORDER BY t.due_at, t.id LIMIT 50`, organizationID)
+		if err != nil {
+			return err
+		}
+		type candidate struct {
+			timerID, runID, stepID string
+			dueAt                  time.Time
+		}
+		candidates := make([]candidate, 0)
+		for rows.Next() {
+			var c candidate
+			if err := rows.Scan(&c.timerID, &c.runID, &c.stepID, &c.dueAt); err != nil {
+				rows.Close()
+				return err
+			}
+			candidates = append(candidates, c)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		var dbNow time.Time
+		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+			return err
+		}
+		affectedSet := map[string]bool{}
+		for _, c := range candidates {
+			var runStatus, runReason string
+			var runDeadline *time.Time
+			if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,''), deadline_at FROM runs
+				WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.runID, organizationID).Scan(&runStatus, &runReason, &runDeadline); err != nil {
+				continue
+			}
+			if runStatus == "PAUSED" || runStatus == "PAUSING" || runStatus == "CANCELLING" || runStatus == "SUCCEEDED" || runStatus == "FAILED" || runStatus == "CANCELLED" || (runStatus == "WAITING" && runReason != "DELAY") {
+				continue
+			}
+			if runDeadline != nil && !dbNow.Before(*runDeadline) {
+				continue
+			}
+			var stepState, waitReason string
+			if err := tx.QueryRow(ctx, `SELECT state, COALESCE(wait_reason,'') FROM run_steps WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.stepID, organizationID).Scan(&stepState, &waitReason); err != nil {
+				continue
+			}
+			if stepState != "WAITING" || waitReason != "DELAY" {
+				continue
+			}
+			var timerState string
+			if err := tx.QueryRow(ctx, `SELECT state FROM timers WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, c.timerID, organizationID).Scan(&timerState); err != nil {
+				continue
+			}
+			if timerState != "PENDING" {
+				continue
+			}
+			tag, err := tx.Exec(ctx, `UPDATE timers SET state='FIRED', fired_at=clock_timestamp(), updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND state='PENDING'`, c.timerID, organizationID)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				continue
+			}
+			if _, err := tx.Exec(ctx, `UPDATE run_steps SET state='SUCCEEDED', wait_reason=NULL, output='{}'::jsonb, completion_source='TIMER', updated_at=clock_timestamp()
+				WHERE id=$1::uuid AND organization_id=$2::uuid AND state='WAITING' AND wait_reason='DELAY'`, c.stepID, organizationID); err != nil {
+				return err
+			}
+			if err := appendRunEvent(ctx, tx, organizationID, c.runID, "STEP_SUCCEEDED", map[string]any{"stepId": c.stepID, "reason": "DELAY_DUE", "dueAt": c.dueAt.UTC().Format(time.RFC3339Nano)}); err != nil {
+				return err
+			}
+			if err := advanceAfterStepSuccessTx(ctx, tx, organizationID, c.runID, map[string]any{}); err != nil {
+				return err
+			}
+			if err := recomputeRunStatusForDelayTx(ctx, tx, organizationID, c.runID); err != nil {
+				return err
+			}
+			fired++
+			affectedSet[c.runID] = true
+		}
+		for runID := range affectedSet {
+			affected = append(affected, runID)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if e.hub != nil {
+		for _, runID := range affected {
+			e.hub.Publish(runID)
 		}
 	}
 	return fired, nil
@@ -2139,6 +2314,30 @@ func evaluateBlockedDAGTx(ctx context.Context, tx storage.Tx, organizationID, ru
 								return transitions, false, err
 							}
 						}
+					}
+				}
+				continue
+			}
+
+			if nodeType == "delay" {
+				if node.DelayMs == nil || *node.DelayMs < 1 || *node.DelayMs > MaxRunLifetimeMs {
+					if err := failRunForStepTx(ctx, tx, organizationID, runID, st.id, "INVALID_DELAY", nil); err != nil {
+						return transitions, false, err
+					}
+					return transitions, true, nil
+				}
+				dueAt, inserted, err := scheduleDelayTx(ctx, tx, organizationID, "", runID, st.id, *node.DelayMs)
+				if err != nil {
+					return transitions, false, err
+				}
+				st.state = "WAITING"
+				if inserted {
+					transitions++
+					changed = true
+					if err := appendRunEvent(ctx, tx, organizationID, runID, "STEP_WAITING", map[string]any{
+						"stepId": st.id, "nodeId": node.ID, "reason": "DELAY", "dueAt": dueAt.UTC().Format(time.RFC3339Nano),
+					}); err != nil {
+						return transitions, false, err
 					}
 				}
 				continue

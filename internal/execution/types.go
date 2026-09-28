@@ -35,6 +35,7 @@ type RunStepDTO struct {
 	Kind             *string              `json:"kind,omitempty"`
 	Status           contracts.StepStatus `json:"status"`
 	WaitReason       *string              `json:"waitReason,omitempty"`
+	DueAt            *string              `json:"dueAt,omitempty"`
 	After            []string             `json:"after,omitempty"`
 	CurrentEpoch     int64                `json:"currentEpoch"`
 	CompletionSource *string              `json:"completionSource,omitempty"`

@@ -35,7 +35,8 @@ const (
 	MaxAttemptTimeoutMs = 3600000
 	// RunLifetimeMs is the MVP run-deadline default and maximum: 24 hours
 	// from create-run acceptance (Blueprint §15.2).
-	RunLifetimeMs = int64(24 * 60 * 60 * 1000)
+	RunLifetimeMs    = int64(7 * 24 * 60 * 60 * 1000)
+	MaxRunLifetimeMs = int64(30 * 24 * 60 * 60 * 1000)
 	// CancelGraceMs bounds cancellation settlement: CANCELLING settles to
 	// CANCELLED after all stop ACKs or when this grace expires (§15.2).
 	CancelGraceMs = int64(10 * 1000)

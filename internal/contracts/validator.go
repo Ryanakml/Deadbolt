@@ -1,6 +1,9 @@
 package contracts
 
-import "strconv"
+import (
+	"math"
+	"strconv"
+)
 
 func ValidateTask(task any) error {
 	if err := checkJSON(task, 0); err != nil {
@@ -189,12 +192,18 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		}
 		byID[id] = n
 		ntype := str(n["type"])
-		if ntype != "task" && ntype != "choice" && ntype != "merge" {
+		if ntype != "task" && ntype != "choice" && ntype != "merge" && ntype != "delay" {
 			return failure("UNSUPPORTED_CAPABILITY")
 		}
 		if ntype == "task" {
 			if tasks[str(n["task"])] == nil {
 				return failure("MISSING_TASK_REF")
+			}
+		}
+		if ntype == "delay" {
+			delayMs, ok := n["delayMs"].(float64)
+			if !ok || delayMs < 1 || delayMs > float64(30*24*60*60*1000) || delayMs != math.Trunc(delayMs) {
+				return failure("INVALID_DELAY")
 			}
 		}
 	}

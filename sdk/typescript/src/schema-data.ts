@@ -87,7 +87,7 @@ export const schemas: Record<string, JSONValue> = {
                 },
                 "initialDelayMs": {
                   "type": "integer",
-                  "minimum": 0,
+                  "minimum": 1,
                   "maximum": 9007199254740991,
                   "default": 1000
                 },
@@ -434,6 +434,59 @@ export const schemas: Record<string, JSONValue> = {
                         ]
                       }
                     }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "type": {
+                          "const": "delay"
+                        }
+                      }
+                    },
+                    "then": {
+                      "required": [
+                        "delayMs"
+                      ],
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "task"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "choice"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "merge"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "approval"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "input"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "sideEffect"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "branch"
+                            ]
+                          }
+                        ]
+                      }
+                    }
                   }
                 ]
               }
@@ -516,7 +569,7 @@ export const schemas: Record<string, JSONValue> = {
               "additionalProperties": false
             }
           },
-          "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Approval and delay nodes are reserved for V1."
+          "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Delay nodes are supported in V1; approval nodes remain reserved."
         }
       }
     },
@@ -897,7 +950,7 @@ export const schemas: Record<string, JSONValue> = {
             },
             "delayMs": {
               "type": "integer",
-              "minimum": 0,
+              "minimum": 1,
               "maximum": 9007199254740991
             }
           },
@@ -1020,6 +1073,59 @@ export const schemas: Record<string, JSONValue> = {
                   ]
                 }
               }
+            },
+            {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "delay"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "delayMs"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "task"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "choice"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "merge"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "approval"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "input"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "sideEffect"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "branch"
+                      ]
+                    }
+                  ]
+                }
+              }
             }
           ]
         }
@@ -1102,7 +1208,7 @@ export const schemas: Record<string, JSONValue> = {
         "additionalProperties": false
       }
     },
-    "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Approval and delay nodes are reserved for V1."
+    "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Delay nodes are supported in V1; approval nodes remain reserved."
   },
   "worker/protocol.schema.json": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

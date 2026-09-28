@@ -301,6 +301,9 @@ func run() error {
 			retentionService := execution.NewService(storage.NewPool(pool), nil)
 			reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
 				if workerEngine != nil {
+					if _, err := workerEngine.FireDueDelayTimers(ctx, orgID); err != nil {
+						return err
+					}
 					if _, err := workerEngine.ReconcileExpiredLeases(ctx, orgID); err != nil {
 						return err
 					}
