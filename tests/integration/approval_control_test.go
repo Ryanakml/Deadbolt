@@ -286,6 +286,17 @@ func TestApproval_ApproveSucceedsStepAndContinuesWorkflow(t *testing.T) {
 		t.Fatalf("gate output must carry the comment, got %v", gateOutput["comment"])
 	}
 
+	// A decided run must stop claiming to be waiting on a person. §10.2 rule 6
+	// says claimable work means RUNNING, and a RUNNING run carries no wait
+	// reason, so a live run must not still be labelled APPROVAL.
+	mid := m2GetSnapshot(t, f.server.URL, run.ID, f.apiKey.PlaintextKey, f.orgID)
+	if string(mid.Status) != "RUNNING" {
+		t.Fatalf("a run with claimable work must be RUNNING, got %s", mid.Status)
+	}
+	if mid.ReasonCode != nil {
+		t.Fatalf("a RUNNING run must carry no wait reason, got %q", *mid.ReasonCode)
+	}
+
 	// Downstream work is now eligible and the run finishes normally.
 	asgns := parallelClaim(t, f.engine, sess, f.orgID, f.envID, 1, "m4-claim-publish")
 	if len(asgns) != 1 || m3NodeForStep(t, f.tc, f.orgID, asgns[0].StepID) != "publish" {

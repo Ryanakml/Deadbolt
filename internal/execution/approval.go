@@ -227,10 +227,9 @@ func recomputeRunStatusAfterControlTx(ctx context.Context, tx storage.Tx, organi
 
 	var nonterminal, liveAttempts, readyTasks int
 	if err := tx.QueryRow(ctx, `SELECT
-			count(*) FILTER (WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED','SKIPPED')),
-			count(*) FILTER (WHERE state='RUNNING')
+			count(*) FILTER (WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED','SKIPPED'))
 		FROM run_steps WHERE run_id=$1::uuid AND organization_id=$2::uuid`,
-		runID, organizationID).Scan(&nonterminal, &liveAttempts); err != nil {
+		runID, organizationID).Scan(&nonterminal); err != nil {
 		return err
 	}
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_attempts a
@@ -252,19 +251,33 @@ func recomputeRunStatusAfterControlTx(ctx context.Context, tx storage.Tx, organi
 		return nil
 	}
 
-	target, nextReason := "WAITING", durableWaitReasonForRunTx(ctx, tx, organizationID, runID)
+	// §10.2 rule 6 outranks rule 7: claimable work means RUNNING, and a RUNNING
+	// run carries no wait reason. Only a run that is genuinely waiting gets an
+	// APPROVAL default, so a live run is never labelled as waiting on a person.
+	target := "WAITING"
 	if liveAttempts > 0 || readyTasks > 0 {
-		target, nextReason = "RUNNING", ""
+		target = "RUNNING"
 	}
-	if nextReason == "" {
-		nextReason = "APPROVAL"
+	nextReason := ""
+	if target == "WAITING" {
+		nextReason = durableWaitReasonForRunTx(ctx, tx, organizationID, runID)
+		if nextReason == "" {
+			nextReason = "APPROVAL"
+		}
 	}
 	if target == status && reason == nextReason {
 		return nil
 	}
+	// A run with no wait reason stores NULL, not an empty string: the snapshot
+	// exposes reasonCode as a nullable pointer, and an empty string would show
+	// the operator a blank reason on a run that is actively running.
+	var next any
+	if nextReason != "" {
+		next = nextReason
+	}
 	_, err := tx.Exec(ctx, `UPDATE runs
 		SET status=$1, reason_code=$2, updated_at=clock_timestamp()
-		WHERE id=$3::uuid AND organization_id=$4::uuid`, target, nextReason, runID, organizationID)
+		WHERE id=$3::uuid AND organization_id=$4::uuid`, target, next, runID, organizationID)
 	return err
 }
 
@@ -425,11 +438,10 @@ func (e *WorkerEngine) decideApprovalTx(
 		return nil, nil, err
 	}
 
-	var runStatus, runReason string
-	var runRevision int64
-	if err := tx.QueryRow(ctx, `SELECT status, COALESCE(reason_code,''), revision FROM runs
+	var runStatus string
+	if err := tx.QueryRow(ctx, `SELECT status FROM runs
 		WHERE id=$1::uuid AND organization_id=$2::uuid FOR UPDATE`, runID, orgID).
-		Scan(&runStatus, &runReason, &runRevision); err != nil {
+		Scan(&runStatus); err != nil {
 		return nil, nil, err
 	}
 	switch runStatus {
