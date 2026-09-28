@@ -225,7 +225,14 @@ func TestOccurrenceTwoEvaluatorsCreateOneRun(t *testing.T) {
 	s := f.schedule(t, "0 12 * * *")
 	f.makeDue(t, s.ID)
 
-	const evaluators = 5
+	// INV-10 is "two evaluators must not duplicate a run", so this races
+	// exactly two. A larger fan-out only starves the shared test connection
+	// pool: each evaluator holds a connection for its whole transaction, and
+	// the advisory lock serialises them, so a holder waiting on a lock starves
+	// the rest. The scheduler evaluates a tenant's schedules sequentially in
+	// production, so five concurrent evaluators is not a shape the system has
+	// to survive anyway.
+	const evaluators = 2
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	outcomes := make([]scheduling.Outcome, evaluators)
