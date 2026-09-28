@@ -45,6 +45,7 @@ export interface RunStep {
   kind?: string;
   status: StepStatus;
   waitReason?: string | null;
+  dueAt?: string | null;
   after?: string[];
   currentEpoch: number;
   completionSource?: string | null;

@@ -67,6 +67,8 @@ export interface RunStep {
   readonly id: string;
   readonly nodeId: string;
   readonly status: StepStatus;
+  readonly waitReason?: string;
+  readonly dueAt?: string;
   readonly currentEpoch?: number;
   readonly attempts?: readonly unknown[];
 }

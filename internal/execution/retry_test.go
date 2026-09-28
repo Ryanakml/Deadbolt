@@ -248,8 +248,11 @@ func TestNormalizeAttemptTimeoutDefaultAndMax(t *testing.T) {
 	if MaxAttemptTimeoutMs != 3600000 {
 		t.Fatalf("attempt max must be exactly 1h in ms, got %d", MaxAttemptTimeoutMs)
 	}
-	if RunLifetimeMs != int64(24*60*60*1000) {
-		t.Fatalf("MVP run lifetime must be exactly 24h in ms, got %d", RunLifetimeMs)
+	if RunLifetimeMs != int64(7*24*60*60*1000) {
+		t.Fatalf("V1 run lifetime must be exactly 7d in ms, got %d", RunLifetimeMs)
+	}
+	if MaxRunLifetimeMs != int64(30*24*60*60*1000) {
+		t.Fatalf("V1 maximum run lifetime must be exactly 30d in ms, got %d", MaxRunLifetimeMs)
 	}
 	if CancelGraceMs != 10000 {
 		t.Fatalf("cancel grace must be exactly 10s in ms, got %d", CancelGraceMs)

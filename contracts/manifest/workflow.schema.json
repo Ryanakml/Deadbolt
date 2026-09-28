@@ -148,7 +148,7 @@
           },
           "delayMs": {
             "type": "integer",
-            "minimum": 0,
+            "minimum": 1,
             "maximum": 9007199254740991
           }
         },
@@ -266,6 +266,34 @@
                 ]
               }
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "delay"
+                }
+              }
+            },
+            "then": {
+              "required": ["delayMs"],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": ["task"]
+                  },
+                  {
+                    "required": ["choice"]
+                  },
+                  {
+                    "required": ["merge"]
+                  },
+                  {
+                    "required": ["approval"]
+                  }
+                ]
+              }
+            }
           }
         ]
       }
@@ -336,5 +364,5 @@
       "additionalProperties": false
     }
   },
-  "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Approval and delay nodes are reserved for V1."
+  "description": "Versioned language contract. Choice and merge control nodes support structured declarative branching and join semantics. Delay nodes are supported in V1; approval nodes remain reserved."
 }

@@ -1,6 +1,9 @@
 package contracts
 
-import "strconv"
+import (
+	"math"
+	"strconv"
+)
 
 func ValidateTask(task any) error {
 	if err := checkJSON(task, 0); err != nil {
@@ -190,10 +193,10 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		byID[id] = n
 		ntype := str(n["type"])
 		// Blueprint §6.3: the released language is task / choice / merge /
-		// approval. `delay` and any other type stay UNSUPPORTED_CAPABILITY
-		// until their own milestone ships; contract fields for future
-		// capabilities never imply the feature is enabled.
-		if ntype != "task" && ntype != "choice" && ntype != "merge" && ntype != "approval" {
+		// approval / delay. Any other type stays UNSUPPORTED_CAPABILITY until
+		// its own milestone ships; contract fields for future capabilities
+		// never imply the feature is enabled.
+		if ntype != "task" && ntype != "choice" && ntype != "merge" && ntype != "approval" && ntype != "delay" {
 			return failure("UNSUPPORTED_CAPABILITY")
 		}
 		if ntype == "task" {
@@ -227,6 +230,12 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 				if err := ValidateSchema(sch); err != nil {
 					return err
 				}
+			}
+		}
+		if ntype == "delay" {
+			delayMs, ok := n["delayMs"].(float64)
+			if !ok || delayMs < 1 || delayMs > float64(30*24*60*60*1000) || delayMs != math.Trunc(delayMs) {
+				return failure("INVALID_DELAY")
 			}
 		}
 	}

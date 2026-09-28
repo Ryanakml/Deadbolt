@@ -662,9 +662,9 @@ func TestClaimTimeoutClampedToOneHour(t *testing.T) {
 	}
 }
 
-// TestCreateRunDefaultsDeadline24h proves the MVP lifetime default is set at
-// acceptance: every run carries a ~24h deadline for all later enforcement.
-func TestCreateRunDefaultsDeadline24h(t *testing.T) {
+// TestCreateRunDefaultsDeadline7d proves the V1 lifetime default is set at
+// acceptance: every run carries a ~7d deadline for all later enforcement.
+func TestCreateRunDefaultsDeadline7d(t *testing.T) {
 	tc, server, orgID, envID, adminKey := setupRunLifecycleTest(t)
 	defer tc.cleanup()
 	defer server.Close()
@@ -692,14 +692,14 @@ func TestCreateRunDefaultsDeadline24h(t *testing.T) {
 	before := time.Now()
 	run := createM1Run(t, server, adminKey, orgID, workflowName, envID, "deadline-default-run", "v")
 	if run.DeadlineAt == nil {
-		t.Fatalf("created run must carry the 24h deadline default")
+		t.Fatalf("created run must carry the 7d deadline default")
 	}
 	deadline, err := time.Parse(time.RFC3339, *run.DeadlineAt)
 	if err != nil {
 		t.Fatalf("unparseable deadline %q: %v", *run.DeadlineAt, err)
 	}
-	if dt := deadline.Sub(before); dt < 23*time.Hour || dt > 25*time.Hour {
-		t.Fatalf("deadline must be ~24h after acceptance, got %s", dt)
+	if dt := deadline.Sub(before); dt < 167*time.Hour || dt > 169*time.Hour {
+		t.Fatalf("deadline must be ~7d after acceptance, got %s", dt)
 	}
 }
 

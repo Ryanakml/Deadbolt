@@ -160,6 +160,20 @@ export function mergeNode(
   };
 }
 
+/** A durable user wait. The control plane persists due_at; no worker is held. */
+export function delayNode(
+  id: string,
+  delayMs: number,
+  after?: string[],
+): WorkflowNode {
+  return {
+    id,
+    type: "delay",
+    delayMs,
+    ...(after && after.length > 0 ? { after } : {}),
+  };
+}
+
 export function expr(op: string, ...args: JSONValue[]): ObjectValue {
   return { op, args };
 }
