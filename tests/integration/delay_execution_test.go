@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/execution"
+	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func seedDelayDeployment(t *testing.T, tc *tenantTestContext, orgID, envID, digest string) string {
@@ -161,5 +163,150 @@ func TestDelayDeadlineCannotReopen(t *testing.T) {
 	}
 	if status != "FAILED" || reason != "RUN_DEADLINE_EXCEEDED" || pending != 0 {
 		t.Fatalf("deadline settlement invalid: status=%s reason=%s pending=%d", status, reason, pending)
+	}
+}
+
+// TestDelayDueWhilePausedPreservesDeadline proves the paused-due race:
+// a due delay remains pending while PAUSED, keeps its original due_at, and
+// fires exactly once only after resume.
+func TestDelayDueWhilePausedPreservesDeadline(t *testing.T) {
+	tc, server, orgID, envID, _ := setupRunLifecycleTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	deploymentID := seedDelayDeployment(t, tc, orgID, envID, "delay-issue-33-paused")
+	engine := execution.NewWorkerEngine(tc.pool)
+	run, _, err := execution.NewService(tc.pool, tc.service).CreateRun(
+		context.Background(), orgID, envID, "delay-flow", "delay-issue-33-3", &deploymentID,
+		map[string]any{}, &tenant.AuditContext{ActorType: tenant.IdentityTypeMachine},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stepID string
+	var dueAt time.Time
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT id::text FROM run_steps WHERE run_id=$1::uuid`, run.ID).Scan(&stepID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT due_at FROM timers WHERE run_id=$1::uuid AND kind='DELAY' AND state='PENDING'`, run.ID).Scan(&dueAt)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := engine.PauseRun(context.Background(), orgID, run.ID, execution.PauseRunRequest{ExpectedRevision: run.Revision}, &tenant.AuditContext{ActorType: tenant.IdentityTypeHuman}); err != nil {
+		t.Fatalf("pause delay run: %v", err)
+	}
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE timers SET due_at=clock_timestamp()-INTERVAL '1 second' WHERE run_id=$1::uuid AND kind='DELAY' AND state='PENDING'`, run.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fired, err := engine.FireDueDelayTimers(context.Background(), orgID); err != nil || fired != 0 {
+		t.Fatalf("paused delay must not fire, got %d/%v", fired, err)
+	}
+
+	var pausedStatus, timerState string
+	var pausedDueAt time.Time
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid`, run.ID).Scan(&pausedStatus); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT state,due_at FROM timers WHERE run_id=$1::uuid AND kind='DELAY'`, run.ID).Scan(&timerState, &pausedDueAt)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if pausedStatus != "PAUSED" || timerState != "PENDING" {
+		t.Fatalf("paused delay state invalid: run=%s timer=%s", pausedStatus, timerState)
+	}
+	if !pausedDueAt.Before(dueAt) {
+		t.Fatalf("test did not move timer due: original=%s paused=%s", dueAt, pausedDueAt)
+	}
+
+	if _, err := engine.ResumeRun(context.Background(), orgID, run.ID, execution.ResumeRunRequest{ExpectedRevision: run.Revision + 1}, &tenant.AuditContext{ActorType: tenant.IdentityTypeHuman}); err != nil {
+		t.Fatalf("resume delay run: %v", err)
+	}
+	if fired, err := engine.FireDueDelayTimers(context.Background(), orgID); err != nil || fired != 1 {
+		t.Fatalf("resumed due delay must fire once, got %d/%v", fired, err)
+	}
+	if fired, err := engine.FireDueDelayTimers(context.Background(), orgID); err != nil || fired != 0 {
+		t.Fatalf("resumed delay duplicate fire must be a no-op, got %d/%v", fired, err)
+	}
+
+	var stepState, finalStatus string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT state FROM run_steps WHERE id=$1::uuid`, stepID).Scan(&stepState); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid`, run.ID).Scan(&finalStatus)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stepState != "SUCCEEDED" || finalStatus != "SUCCEEDED" {
+		t.Fatalf("resumed delay did not complete: step=%s run=%s", stepState, finalStatus)
+	}
+}
+
+// TestDelaySchedulerRestartUsesPersistedTimer exercises the scheduler
+// lifecycle boundary: one scheduler instance is stopped, a due timestamp is
+// left in PostgreSQL, and a newly created scheduler instance settles it once.
+func TestDelaySchedulerRestartUsesPersistedTimer(t *testing.T) {
+	tc, server, orgID, envID, _ := setupRunLifecycleTest(t)
+	defer tc.cleanup()
+	defer server.Close()
+
+	deploymentID := seedDelayDeployment(t, tc, orgID, envID, "delay-issue-33-scheduler-restart")
+	systemPool, err := pgxpool.New(context.Background(), tc.systemURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer systemPool.Close()
+	run, _, err := execution.NewService(tc.pool, tc.service).CreateRun(
+		context.Background(), orgID, envID, "delay-flow", "delay-issue-33-4", &deploymentID,
+		map[string]any{}, &tenant.AuditContext{ActorType: tenant.IdentityTypeMachine},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := scheduling.NewReconciler(systemPool, time.Hour, nil)
+	first.SetTenantSweep(func(ctx context.Context, tenantID string) error {
+		_, err := execution.NewWorkerEngine(tc.pool).FireDueDelayTimers(ctx, tenantID)
+		return err
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := first.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel() // Simulate the scheduler/control-plane process stopping.
+
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE timers SET due_at=clock_timestamp()-INTERVAL '1 second' WHERE run_id=$1::uuid AND kind='DELAY' AND state='PENDING'`, run.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := scheduling.NewReconciler(systemPool, time.Hour, nil)
+	second.SetTenantSweep(func(ctx context.Context, tenantID string) error {
+		_, err := execution.NewWorkerEngine(tc.pool).FireDueDelayTimers(ctx, tenantID)
+		return err
+	})
+	if err := second.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fired, err := execution.NewWorkerEngine(tc.pool).FireDueDelayTimers(context.Background(), orgID); err != nil || fired != 0 {
+		t.Fatalf("recreated scheduler must settle delay exactly once, got duplicate=%d/%v", fired, err)
+	}
+
+	var status string
+	if err := tc.pool.WithTenantTx(context.Background(), orgID, func(ctx context.Context, tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1::uuid`, run.ID).Scan(&status)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if status != "SUCCEEDED" {
+		t.Fatalf("recreated scheduler did not settle delay run: %s", status)
 	}
 }

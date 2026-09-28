@@ -52,6 +52,9 @@ durable user delay from worker unavailability or reconciliation.
 ## Validation evidence
 
 The integration coverage exercises durable persistence, zero task attempts,
-duplicate firing, deadline expiry, and the terminal-state guard against late
-activation. Controlled-time tests move the persisted timer due timestamp in the
-database; no process sleep is required.
+duplicate firing, deadline expiry, pause-while-due behavior, scheduler
+recreation against the same PostgreSQL state, and the terminal-state guard
+against late activation. Controlled-time tests move the persisted timer due
+timestamp in the database; no process sleep is required. The scheduler
+recreation test stops the first scheduler lifecycle, leaves the timer in the
+database, and verifies a newly created scheduler settles it exactly once.
