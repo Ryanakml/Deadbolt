@@ -28,6 +28,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
+	"github.com/Ryanakml/Deadbolt/internal/tenant"
 )
 
 var (
@@ -299,6 +300,13 @@ func run() error {
 		// the runtime pool so each write remains constrained by WithTenantTx(orgID) and RLS.
 		if pool != nil {
 			retentionService := execution.NewService(storage.NewPool(pool), nil)
+			// The scheduler resolves environments itself, so it needs a tenant
+			// service of its own rather than the nil one the retention path uses.
+			scheduleEngine := scheduling.NewEngine(
+				storage.NewPool(pool),
+				execution.NewService(storage.NewPool(pool), tenant.NewService(storage.NewPool(pool))),
+				tenant.NewService(storage.NewPool(pool)),
+			)
 			reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
 				if workerEngine != nil {
 					if _, err := workerEngine.FireDueDelayTimers(ctx, orgID); err != nil {
@@ -315,6 +323,13 @@ func run() error {
 					if _, err := workerEngine.SweepExpiredApprovals(ctx, orgID); err != nil {
 						return err
 					}
+				}
+				// Blueprint §17: recurring occurrences are evaluated on the same
+				// bounded pass. A schedule that is not due is a no-op, and the
+				// unique (schedule, revision, due_at) identity means a
+				// duplicated pass can never create a second run for a slot.
+				if _, err := scheduleEngine.EvaluateDue(ctx, orgID); err != nil {
+					return err
 				}
 				return nil
 			})
