@@ -328,8 +328,15 @@ func run() error {
 				// bounded pass. A schedule that is not due is a no-op, and the
 				// unique (schedule, revision, due_at) identity means a
 				// duplicated pass can never create a second run for a slot.
+				//
+				// Deliberately not returned as an error. The reconciler aborts
+				// the whole tenant sweep on the first hook failure, so
+				// propagating here would let one broken schedule stop delay
+				// timers, lease recovery, and approval expiry for every tenant
+				// behind it. A schedule that cannot be evaluated stays due and
+				// is retried on the next pass.
 				if _, err := scheduleEngine.EvaluateDue(ctx, orgID); err != nil {
-					return err
+					logger.Printf("[SCHEDULER] Schedule evaluation for %s failed: %v", orgID, err)
 				}
 				return nil
 			})
