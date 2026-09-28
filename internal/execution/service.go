@@ -307,7 +307,7 @@ func (s *Service) CreateRun(
 			}
 		}
 
-		// 4. Create Run with the MVP lifetime default: 24h from acceptance.
+		// 4. Create Run with the V1 lifetime default: 7d from acceptance.
 		var runID string
 		var createdAt time.Time
 		var deadlineAt *time.Time
