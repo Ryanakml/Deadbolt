@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,6 +55,7 @@ type Engine struct {
 	pool    *storage.Pool
 	runs    *execution.Service
 	tenants *tenant.Service
+	logger  *log.Logger
 }
 
 // NewEngine constructs the occurrence engine. It reuses the execution
@@ -61,6 +63,18 @@ type Engine struct {
 // operator-initiated one.
 func NewEngine(pool *storage.Pool, runs *execution.Service, tenants *tenant.Service) *Engine {
 	return &Engine{pool: pool, runs: runs, tenants: tenants}
+}
+
+// SetLogger attaches a logger. A schedule that cannot be evaluated is
+// surfaced through it rather than passing in silence, which is how a
+// permanently broken schedule would otherwise look identical to a healthy
+// one that simply was not due.
+func (e *Engine) SetLogger(l *log.Logger) { e.logger = l }
+
+func (e *Engine) logf(format string, args ...any) {
+	if e.logger != nil {
+		e.logger.Printf(format, args...)
+	}
 }
 
 // EvaluateDue processes every due schedule in an organization and returns
@@ -98,8 +112,10 @@ func (e *Engine) EvaluateDue(ctx context.Context, orgID string) (int, error) {
 	for _, c := range candidates {
 		outcome, err := e.evaluateOne(ctx, orgID, c.envID, c.scheduleID)
 		if err != nil {
-			// One broken schedule must not stop the others. Report it and keep
-			// going; the schedule stays due and will be retried next pass.
+			// One broken schedule must not stop the others, but it must not
+			// disappear either: an unlogged failure here is indistinguishable
+			// from a schedule that was never due.
+			e.logf("[SCHEDULER] Schedule %s in environment %s failed evaluation: %v", c.scheduleID, c.envID, err)
 			acted++
 			continue
 		}
@@ -262,6 +278,27 @@ func (e *Engine) evaluateLocked(ctx context.Context, tx storage.Tx, orgID, envID
 		}
 		if errors.Is(err, execution.ErrNoActiveDeployment) {
 			return e.markErrorPaused(ctx, tx, orgID, schedule, "NO_ACTIVE_DEPLOYMENT")
+		}
+		// §17 marks a schedule that cannot produce a run as error and paused
+		// until an operator fixes it. That covers more than a missing
+		// deployment: a workflow whose input schema requires caller-supplied
+		// fields can never be satisfied by a schedule, since §17 gives a
+		// schedule no input payload, so retrying it every pass would spin
+		// forever. Only conditions that are permanent for this definition are
+		// paused; anything else is returned so the caller sees it and the
+		// transaction rolls back rather than committing a silent no-op.
+		var reason string
+		switch {
+		case errors.Is(err, execution.ErrSchemaViolation):
+			reason = "WORKFLOW_REQUIRES_INPUT"
+		case errors.Is(err, execution.ErrWorkflowNotFound):
+			reason = "WORKFLOW_NOT_FOUND"
+		case errors.Is(err, execution.ErrDeploymentNotFound):
+			reason = "PINNED_DEPLOYMENT_INVALID"
+		}
+		if reason != "" {
+			e.logf("[SCHEDULER] Schedule %s cannot create a run (%s): %v", schedule.ID, reason, err)
+			return e.markErrorPaused(ctx, tx, orgID, schedule, reason)
 		}
 		return OutcomeNotDue, err
 	}

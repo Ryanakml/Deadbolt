@@ -307,6 +307,7 @@ func run() error {
 				execution.NewService(storage.NewPool(pool), tenant.NewService(storage.NewPool(pool))),
 				tenant.NewService(storage.NewPool(pool)),
 			)
+			scheduleEngine.SetLogger(logger)
 			reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
 				if workerEngine != nil {
 					if _, err := workerEngine.FireDueDelayTimers(ctx, orgID); err != nil {
