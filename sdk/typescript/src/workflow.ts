@@ -96,6 +96,31 @@ export interface MergeNodeConfig {
   outputSchema: JSONValue;
 }
 
+/**
+ * ApprovalNodeConfig declares one durable human decision.
+ *
+ * An approval is a control node, not a task: it is never dispatched to a
+ * worker, never holds a lease, and never blocks a process while it waits. The
+ * node stores the request, then a person decides it later.
+ */
+export interface ApprovalNodeConfig {
+  /** Human-readable request shown to the approver. */
+  payload?: JSONValue;
+  /** Schema the committed decision output is validated against. */
+  outputSchema?: JSONValue;
+  /**
+   * Optional. `approvals:decide` is the only permission that may gate an
+   * approval decision, and omitting this is equivalent to declaring it.
+   */
+  requiredPermission?: "approvals:decide";
+  /**
+   * Optional wait in milliseconds. Defaults to 24h, which is also the maximum
+   * meaningful value: the wait is always clamped to the remaining run lifetime,
+   * and an expired approval fails the run with `APPROVAL_EXPIRED`.
+   */
+  expiresInMs?: number;
+}
+
 export interface WorkflowNode {
   id: string;
   type: WorkflowNodeType;
@@ -137,6 +162,27 @@ export function mergeNode(
 
 export function expr(op: string, ...args: JSONValue[]): ObjectValue {
   return { op, args };
+}
+
+/**
+ * approvalNode declares a durable human decision.
+ *
+ * Both `approved` and `rejected` are successful step outcomes: the node's job
+ * was to collect a valid decision, and whether that decision is good for the
+ * business is a later choice's problem. Route the business consequence with a
+ * `choice` on `/decision` rather than by treating a rejection as a failure.
+ */
+export function approvalNode(
+  id: string,
+  config: ApprovalNodeConfig,
+  after?: string[],
+): WorkflowNode {
+  return {
+    id,
+    type: "approval",
+    approval: config as unknown as Record<string, JSONValue>,
+    ...(after && after.length > 0 ? { after } : {}),
+  };
 }
 
 export interface WorkflowConfig<TInput = unknown, TOutput = unknown> {

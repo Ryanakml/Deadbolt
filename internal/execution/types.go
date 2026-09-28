@@ -55,13 +55,17 @@ type AttemptSummaryDTO struct {
 
 type RunSnapshotDTO struct {
 	RunDTO
-	LastEventSequence       int64                   `json:"lastEventSequence"`
-	Steps                   []RunStepDTO            `json:"steps"`
-	ReconciliationCases     []ReconciliationCaseDTO `json:"reconciliationCases"`
-	Output                  any                     `json:"output,omitempty"`
-	Error                   any                     `json:"error,omitempty"`
-	WaitingReason           *string                 `json:"waitingReason,omitempty"`
-	ActiveCompatibleWorkers int                     `json:"activeCompatibleWorkers"`
+	LastEventSequence   int64                   `json:"lastEventSequence"`
+	Steps               []RunStepDTO            `json:"steps"`
+	ReconciliationCases []ReconciliationCaseDTO `json:"reconciliationCases"`
+	// Approvals carries the run's pending and decided human decisions so the
+	// Inspector can offer the action without a second request. It is empty for
+	// workflows without approval nodes, never null.
+	Approvals               []ApprovalDTO `json:"approvals"`
+	Output                  any           `json:"output,omitempty"`
+	Error                   any           `json:"error,omitempty"`
+	WaitingReason           *string       `json:"waitingReason,omitempty"`
+	ActiveCompatibleWorkers int           `json:"activeCompatibleWorkers"`
 }
 
 // ReconciliationCaseDTO is one unknown-outcome hold. Evidence carries the

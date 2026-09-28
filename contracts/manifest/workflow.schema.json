@@ -238,6 +238,34 @@
                 ]
               }
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "approval"
+                }
+              }
+            },
+            "then": {
+              "required": ["approval"],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": ["task"]
+                  },
+                  {
+                    "required": ["choice"]
+                  },
+                  {
+                    "required": ["merge"]
+                  },
+                  {
+                    "required": ["delayMs"]
+                  }
+                ]
+              }
+            }
           }
         ]
       }

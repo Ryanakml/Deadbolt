@@ -43,10 +43,36 @@ export interface RunSnapshot extends Run {
     lastEventSequence: number;
     steps: RunStep[];
     reconciliationCases?: ReconciliationCase[];
+    approvals?: Approval[];
     output?: unknown;
     error?: unknown;
     waitingReason?: string | null;
     activeCompatibleWorkers?: number;
+}
+/**
+ * Approval is a durable human decision attached to a control node.
+ *
+ * It is never a task: there is no attempt, no lease, and no runner behind it.
+ * A PENDING approval is waiting on a person, and `expiresAt` is the hard bound
+ * after which the run fails with APPROVAL_EXPIRED.
+ */
+export type ApprovalStatus = "PENDING" | "APPROVED" | "REJECTED" | "EXPIRED" | "CANCELLED";
+export interface Approval {
+    id: string;
+    runId: string;
+    stepId: string;
+    nodeId: string;
+    workflowName: string;
+    status: ApprovalStatus;
+    requiredPermission: string;
+    payload?: unknown;
+    revision: number;
+    expiresAt?: string | null;
+    decidedAt?: string | null;
+    decisionComment?: string | null;
+    decisionReason?: string | null;
+    actorId?: string | null;
+    createdAt?: string;
 }
 export interface ReconciliationCase {
     id: string;

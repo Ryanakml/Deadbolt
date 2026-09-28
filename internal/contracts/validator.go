@@ -189,12 +189,44 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 		}
 		byID[id] = n
 		ntype := str(n["type"])
-		if ntype != "task" && ntype != "choice" && ntype != "merge" {
+		// Blueprint §6.3: the released language is task / choice / merge /
+		// approval. `delay` and any other type stay UNSUPPORTED_CAPABILITY
+		// until their own milestone ships; contract fields for future
+		// capabilities never imply the feature is enabled.
+		if ntype != "task" && ntype != "choice" && ntype != "merge" && ntype != "approval" {
 			return failure("UNSUPPORTED_CAPABILITY")
 		}
 		if ntype == "task" {
 			if tasks[str(n["task"])] == nil {
 				return failure("MISSING_TASK_REF")
+			}
+		}
+		if ntype == "approval" {
+			// Blueprint §16.3: an approval node stores a payload, the decision
+			// schema, the required permission, and an expiry. An approval with
+			// no config could never be decided against a declared contract, so
+			// it fails closed at registration rather than at run time.
+			cfg := obj(n["approval"])
+			if len(cfg) == 0 {
+				return failure("INVALID_MANIFEST")
+			}
+			// The only permission that may gate an approval decision is
+			// `approvals:decide` (§24.2). Accepting an arbitrary capability
+			// here would let a workflow gate itself on an unrelated grant and
+			// persist a requirement no approval actor can ever satisfy.
+			if perm := str(cfg["requiredPermission"]); perm != "" && perm != ApprovalDecisionCapability {
+				return failure("INVALID_MANIFEST")
+			}
+			if exp := cfg["expiresInMs"]; exp != nil {
+				ms, ok := exp.(float64)
+				if !ok || ms <= 0 {
+					return failure("INVALID_MANIFEST")
+				}
+			}
+			if sch := cfg["outputSchema"]; sch != nil {
+				if err := ValidateSchema(sch); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -601,6 +633,22 @@ func ValidateWorkflow(manifest any, definitions []any) error {
 								"branch":   map[string]any{"type": "string"},
 							},
 							"required": []any{"selected", "branch"},
+						}
+					} else if byID[id]["type"] == "approval" {
+						// An approval's decision output is described by the node's
+						// own outputSchema, not by a task definition. Without this
+						// branch a workflow could never read the decision, which
+						// is the entire reason to place an approval in a graph.
+						apr := obj(byID[id]["approval"])
+						if apr != nil && apr["outputSchema"] != nil {
+							source = apr["outputSchema"]
+						} else {
+							source = map[string]any{
+								"type":                 "object",
+								"properties":           map[string]any{},
+								"required":             []any{},
+								"additionalProperties": true,
+							}
 						}
 					} else {
 						source = tasks[str(byID[id]["task"])]["outputSchema"]

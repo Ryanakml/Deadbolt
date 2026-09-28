@@ -434,6 +434,44 @@ export const schemas: Record<string, JSONValue> = {
                         ]
                       }
                     }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "type": {
+                          "const": "approval"
+                        }
+                      }
+                    },
+                    "then": {
+                      "required": [
+                        "approval"
+                      ],
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "task"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "choice"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "merge"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "delayMs"
+                            ]
+                          }
+                        ]
+                      }
+                    }
                   }
                 ]
               }
@@ -1010,6 +1048,44 @@ export const schemas: Record<string, JSONValue> = {
                     {
                       "required": [
                         "approval"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "delayMs"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "approval"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "approval"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "task"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "choice"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "merge"
                       ]
                     },
                     {

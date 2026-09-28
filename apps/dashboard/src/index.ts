@@ -21,7 +21,11 @@ import {
 } from "./api.js";
 import type { CatalogEnvironment } from "./api.js";
 import { resolveOrgState } from "./auth.js";
-import { sessionCanControlRuns, visibleRunControls } from "./permissions.js";
+import {
+  sessionCanControlRuns,
+  sessionCanDecideApprovals,
+  visibleRunControls,
+} from "./permissions.js";
 import { RunInspector } from "./inspector.js";
 import {
   shouldShowWorkerWait,
@@ -61,6 +65,7 @@ import {
   ResolveAction,
   StepTab,
   InspectorViewMode,
+  Approval,
 } from "./types.js";
 
 // DOM Bootstrap for browser runtime
@@ -81,6 +86,7 @@ function initDashboard(): void {
   // in enterApp; the backend remains the security authority. Mutation CTAs
   // render only when state AND this flag both allow them (§23.2).
   let canControlRuns = false;
+  let canDecideApprovals = false;
   // Scoped banner state: only a transient stream error may be cleared on
   // SSE reconnect. Bootstrap/API errors stay visible.
   const streamBanner = createStreamErrorBanner();
@@ -222,6 +228,9 @@ function initDashboard(): void {
     // session membership decides runs:control, never button clicks or HTTP
     // failures.
     canControlRuns = sessionCanControlRuns(session, orgId);
+    // Approvals are a separate capability: §24.2 withholds approvals:decide
+    // from developer, so it must not be inferred from runs:control.
+    canDecideApprovals = sessionCanDecideApprovals(session, orgId);
     await loadEnvironmentCatalog(orgId);
     if (runIdParam) {
       inspectRun(runIdParam);
@@ -1068,6 +1077,8 @@ function initDashboard(): void {
             : "";
         })()}
 
+        ${renderApprovalsPanel(api, snap)}
+
         <div class="meta-grid">
           <div class="meta-item"><label>Revision</label><div>${snap.revision}</div></div>
           <div class="meta-item"><label>Last Event Seq</label><div>${snap.lastEventSequence}</div></div>
@@ -1442,6 +1453,11 @@ function initDashboard(): void {
 
       // Restore focus to active element if still present in new DOM
       restoreFocus(container, focusDescriptor);
+
+      // Wire human approval decisions. The CTA renders only for a PENDING
+      // approval when this identity holds approvals:decide; the backend stays
+      // the authority and 409s refresh in-dialog.
+      wireApprovalActions(api, snap, container);
 
       // Wire durable pause/resume controls. The backend stays authoritative:
       // expectedRevision is captured at open time and 409s refresh in-dialog.
@@ -1877,6 +1893,204 @@ function initDashboard(): void {
 
   function closeResolveDialog(): void {
     document.getElementById("resolve-dialog-overlay")?.remove();
+  }
+
+  // openApprovalDialog records one human approve/reject decision for a
+  // durable approval (Blueprint §16.3, §23.2).
+  //
+  // Two things the wording must not blur:
+  //   - Approve and reject are both successful outcomes. The node collected a
+  //     valid decision; whether that decision is good for the business is a
+  //     later choice's job, so rejecting does not fail the run.
+  //   - An approval can expire. The deadline is database time, so the dialog
+  //     states it rather than implying the operator can decide at will.
+  function openApprovalDialog(
+    api: DashboardApiClient,
+    approval: Approval,
+    invoker: HTMLElement | null,
+  ): void {
+    document.getElementById("approval-dialog-overlay")?.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "approval-dialog-overlay";
+    let currentRevision = approval.revision;
+    const payloadText =
+      approval.payload === undefined || approval.payload === null
+        ? ""
+        : escapeHtml(JSON.stringify(approval.payload, null, 2));
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="approval-dialog-title">
+        <h3 id="approval-dialog-title">${approval.status === "PENDING" ? "Decide approval" : "Approval already decided"} — ${escapeHtml(approval.workflowName)}</h3>
+        <p class="text-muted">Node <strong>${escapeHtml(approval.nodeId)}</strong> is waiting on this decision.
+        Approving and rejecting are both successful step outcomes: the workflow continues either way
+        and a following branch decides what the answer means.</p>
+        ${payloadText ? `<pre class="hold-payload">${payloadText}</pre>` : ""}
+        <div class="hold-meta">
+          Approval status ${escapeHtml(approval.status)} · revision ${currentRevision}
+          ${approval.expiresAt ? `· expires ${escapeHtml(approval.expiresAt)}` : ""}
+        </div>
+        <label class="dialog-label" for="approval-comment">Comment (optional, recorded with the decision)</label>
+        <textarea id="approval-comment" rows="3" aria-describedby="approval-dialog-title"></textarea>
+        <div id="approval-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="approval-dismiss">Close</button>
+          <button id="approval-reject">Reject</button>
+          <button id="approval-approve">Approve</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const errorBox = overlay.querySelector("#approval-error") as HTMLElement;
+    const commentBox = overlay.querySelector(
+      "#approval-comment",
+    ) as HTMLTextAreaElement;
+    const approveBtn = overlay.querySelector(
+      "#approval-approve",
+    ) as HTMLButtonElement;
+    const rejectBtn = overlay.querySelector(
+      "#approval-reject",
+    ) as HTMLButtonElement;
+    const close = (): void => {
+      document.getElementById("approval-dialog-overlay")?.remove();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#approval-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    approveBtn.focus();
+
+    // A decided approval is terminal. Render the state honestly instead of
+    // offering an action that the backend will reject.
+    if (approval.status !== "PENDING") {
+      approveBtn.setAttribute("disabled", "true");
+      rejectBtn.setAttribute("disabled", "true");
+      errorBox.textContent = `This approval is already ${approval.status}. Decisions are final.`;
+      errorBox.style.display = "block";
+    }
+
+    const submit = (decision: "approved" | "rejected"): void => {
+      approveBtn.setAttribute("disabled", "true");
+      rejectBtn.setAttribute("disabled", "true");
+      // One command identity per decision attempt, reused on ambiguous retry.
+      const idempotencyKey = newIdempotencyKey();
+      api
+        .decideApproval(
+          approval.id,
+          decision,
+          currentRevision,
+          commentBox.value.trim() || undefined,
+          idempotencyKey,
+        )
+        .then(() => {
+          close();
+          void activeInspector
+            ?.fetchSnapshot()
+            .catch((err: unknown) =>
+              renderError(err instanceof Error ? err : new Error(String(err))),
+            );
+        })
+        .catch((err: unknown) => {
+          approveBtn.removeAttribute("disabled");
+          rejectBtn.removeAttribute("disabled");
+          if (isConflict(err)) {
+            errorBox.textContent =
+              "Someone else already acted on this approval, or it expired (409). The run was reloaded — review the current state before deciding again.";
+            errorBox.style.display = "block";
+            void activeInspector
+              ?.fetchSnapshot()
+              .then((latest) => {
+                const current = latest?.approvals?.find(
+                  (a: Approval) => a.id === approval.id,
+                );
+                if (current) {
+                  currentRevision = current.revision;
+                  if (current.status !== "PENDING") {
+                    approveBtn.setAttribute("disabled", "true");
+                    rejectBtn.setAttribute("disabled", "true");
+                    errorBox.textContent = `This approval is now ${current.status}. Decisions are final.`;
+                  }
+                }
+              })
+              .catch(() => undefined);
+            return;
+          }
+          errorBox.textContent =
+            err instanceof Error ? err.message : String(err);
+          errorBox.style.display = "block";
+        });
+    };
+
+    approveBtn.addEventListener("click", () => submit("approved"));
+    rejectBtn.addEventListener("click", () => submit("rejected"));
+  }
+
+  // renderApprovalsPanel lists the run's approvals with the decision CTA.
+  // The CTA renders only for a PENDING approval when the active identity holds
+  // approvals:decide; the backend remains the authority.
+  function renderApprovalsPanel(
+    api: DashboardApiClient,
+    snap: RunSnapshot,
+  ): string {
+    const approvals = snap.approvals ?? [];
+    if (approvals.length === 0) return "";
+    const rows = approvals
+      .map((a) => {
+        const decidable = a.status === "PENDING" && canDecideApprovals;
+        const detail = a.decidedAt
+          ? `decided ${a.decidedAt}${
+              a.actorId ? ` by ${escapeHtml(a.actorId)}` : ""
+            }${a.decisionComment ? ` — ${escapeHtml(a.decisionComment)}` : ""}`
+          : a.expiresAt
+            ? `expires ${escapeHtml(a.expiresAt)}`
+            : "no expiry";
+        const action = decidable
+          ? `<button class="secondary" data-approval-open="${escapeHtml(a.id)}">Decide</button>`
+          : "";
+        return `
+        <div class="hold-item" data-approval-item="${escapeHtml(a.id)}">
+          <div>
+            <strong>${escapeHtml(a.nodeId)}</strong>
+            <span class="badge">${escapeHtml(a.status)}</span>
+            <div class="text-muted">${detail}</div>
+          </div>
+          ${action}
+        </div>`;
+      })
+      .join("");
+    return `
+      <section class="hold-panel" aria-labelledby="approvals-panel-title">
+        <h3 id="approvals-panel-title">Approvals</h3>
+        <p class="text-muted">Human decisions this run is waiting on or has recorded.
+        An approval is a control node: it holds no worker, lease, or attempt.</p>
+        ${rows}
+      </section>`;
+  }
+
+  // wireApprovalActions binds the Decide buttons produced by the panel.
+  function wireApprovalActions(
+    api: DashboardApiClient,
+    snap: RunSnapshot,
+    root: ParentNode,
+  ): void {
+    for (const btn of Array.from(
+      root.querySelectorAll("[data-approval-open]"),
+    )) {
+      btn.addEventListener("click", (e) => {
+        const id = (e.currentTarget as HTMLElement).getAttribute(
+          "data-approval-open",
+        );
+        const approval = (snap.approvals ?? []).find((a) => a.id === id);
+        if (!approval) return;
+        openApprovalDialog(api, approval, e.currentTarget as HTMLElement);
+      });
+    }
   }
 
   // openCancelDialog confirms durable cancellation. Cancelling stops

@@ -1,6 +1,9 @@
 import type { AuthSession } from "./api.js";
 import type { RunStatus } from "./types.js";
 export declare const RUNS_CONTROL_CAPABILITY = "runs:control";
+export declare const APPROVALS_DECIDE_CAPABILITY = "approvals:decide";
+export declare function roleCanDecideApprovals(role: string | null | undefined): boolean;
+export declare function sessionCanDecideApprovals(session: AuthSession | null | undefined, orgId: string | null | undefined): boolean;
 export declare function roleCanControlRuns(role: string | null | undefined): boolean;
 export declare function sessionCanControlRuns(session: AuthSession | null | undefined, orgId: string | null | undefined): boolean;
 export interface RunControlVisibility {
