@@ -38,6 +38,7 @@ var roleCapabilities = map[string]map[string]struct{}{
 		CapWorkersDrain:               {},
 		CapApprovalsDecide:            {},
 		CapRunsReconcile:              {},
+		CapSchedulesWrite:             {},
 	},
 	RoleAdmin: {
 		CapRunsRead:                   {},
@@ -58,6 +59,7 @@ var roleCapabilities = map[string]map[string]struct{}{
 		CapAdminKey:                   {},
 		CapAdminProject:               {},
 		CapOrgUpdate:                  {},
+		CapSchedulesWrite:             {},
 	},
 	RoleOwner: {
 		CapRunsRead:                   {},
@@ -79,6 +81,7 @@ var roleCapabilities = map[string]map[string]struct{}{
 		CapAdminProject:               {},
 		CapOrgUpdate:                  {},
 		CapOrgDelete:                  {},
+		CapSchedulesWrite:             {},
 	},
 }
 

@@ -982,7 +982,7 @@ paths:
             Select a verified member environment for browser sessions. Must
             match authoritative environment scope for an API key.
       x-required-capability: schedules:write
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response
@@ -1033,7 +1033,7 @@ paths:
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
       x-required-capability: schedules:write
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response
@@ -1082,7 +1082,7 @@ paths:
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
       x-required-capability: schedules:write
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response
@@ -1138,7 +1138,7 @@ paths:
           schema: *a1
           description: Required for browser-session mutations with validated Origin.
       x-required-capability: schedules:write
-      x-implemented: false
+      x-implemented: true
       responses:
         "200":
           description: Committed response

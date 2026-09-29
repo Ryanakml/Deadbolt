@@ -28,6 +28,7 @@ import (
 	"github.com/Ryanakml/Deadbolt/internal/scheduling"
 	"github.com/Ryanakml/Deadbolt/internal/storage"
 	"github.com/Ryanakml/Deadbolt/internal/storage/migrator"
+	"github.com/Ryanakml/Deadbolt/internal/tenant"
 )
 
 var (
@@ -299,6 +300,14 @@ func run() error {
 		// the runtime pool so each write remains constrained by WithTenantTx(orgID) and RLS.
 		if pool != nil {
 			retentionService := execution.NewService(storage.NewPool(pool), nil)
+			// The scheduler resolves environments itself, so it needs a tenant
+			// service of its own rather than the nil one the retention path uses.
+			scheduleEngine := scheduling.NewEngine(
+				storage.NewPool(pool),
+				execution.NewService(storage.NewPool(pool), tenant.NewService(storage.NewPool(pool))),
+				tenant.NewService(storage.NewPool(pool)),
+			)
+			scheduleEngine.SetLogger(logger)
 			reconciler.SetTenantSweep(func(ctx context.Context, orgID string) error {
 				if workerEngine != nil {
 					if _, err := workerEngine.FireDueDelayTimers(ctx, orgID); err != nil {
@@ -315,6 +324,20 @@ func run() error {
 					if _, err := workerEngine.SweepExpiredApprovals(ctx, orgID); err != nil {
 						return err
 					}
+				}
+				// Blueprint §17: recurring occurrences are evaluated on the same
+				// bounded pass. A schedule that is not due is a no-op, and the
+				// unique (schedule, revision, due_at) identity means a
+				// duplicated pass can never create a second run for a slot.
+				//
+				// Deliberately not returned as an error. The reconciler aborts
+				// the whole tenant sweep on the first hook failure, so
+				// propagating here would let one broken schedule stop delay
+				// timers, lease recovery, and approval expiry for every tenant
+				// behind it. A schedule that cannot be evaluated stays due and
+				// is retried on the next pass.
+				if _, err := scheduleEngine.EvaluateDue(ctx, orgID); err != nil {
+					logger.Printf("[SCHEDULER] Schedule evaluation for %s failed: %v", orgID, err)
 				}
 				return nil
 			})
