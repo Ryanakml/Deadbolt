@@ -3,8 +3,14 @@
 Evidence and acceptance verification for Issue #35: **[M4] Show schedule
 revisions, waits, and missed occurrence reasons** (PR #86).
 
-Staging artifact for the journeys below: recorded in §5 when the run
-lands. Until then every staging row is NOT YET.
+Staging artifact: commit `d2c2994d09fc2f3a5c8451e74904bc7d3f2e1b60`,
+image `ghcr.io/ryanakml/deadbolt/control-plane@sha256:ee1ea63d72adc9a24b6d7502b0d74516cdf157a63339011ba80010db2c27ea23`,
+`runtime_mode: hosted` (verified via slot `/version` during the run).
+Org `Deadbolt Acceptance` (`674b13a3-…`); isolated fixture project
+`sched-ui-accept` (`70392567-…`), env (`614a97bb-…`), deployment
+(`c2d3d582-…`, manifest copied from the staging `sched-occ-flow`
+deployment). Shared staging env untouched. Runnable command:
+`scripts/schedule-ui-staging-journeys.sh` (exit code 0).
 
 ---
 
@@ -57,14 +63,19 @@ lands. Until then every staging row is NOT YET.
 
 ## 4. Browser journeys (staging, real APIs)
 
+Journeys drive the exact calls the dashboard makes, against the deployed
+artifact; the production sweeper did the acting. Fixture schedule
+`8857598c-8e81-4238-85e6-2f48a6136cfc` (left paused, journey keys revoked).
+
 | Journey | Steps | Result |
 | --- | --- | --- |
-| Two-editor conflict | Open one schedule in two edit dialogs (two sessions); save A, save B with stale revision → B sees in-dialog conflict, refreshes, saves cleanly | NOT YET |
-| Downtime history | Force a schedule behind, let the sweeper coalesce, open History → one STARTED with `skipped_count`, slot advanced | NOT YET |
-| Permission states | Operator sees New/Edit/Pause/Delete; developer key sees notice + no CTAs; direct API with developer key → 403 | NOT YET |
+| Two-editor conflict | Save edit A (rev 1→2), save stale edit B → `409 REVISION_CONFLICT`; refresh shows A's cron at rev 2 intact | PASS |
+| Downtime history | Per-minute cron planted 9–10 min behind → occurrences endpoint shows STARTED with `skipped_count=9` and exactly one run | PASS |
+| Permission states | Developer key → 403 on list, create, occurrences; anonymous → 401; operator full round trip | PASS |
+| Pause/resume | Pause clears `nextDueAt` (second pause → 409), resume re-arms a fresh due time | PASS |
 
 ## 5. Staging artifact
 
-- Commit: TBD
-- Image digest: TBD
-- `/version` through the edge: TBD
+- Commit: `d2c2994d09fc2f3a5c8451e74904bc7d3f2e1b60`
+- Image digest: `ghcr.io/ryanakml/deadbolt/control-plane@sha256:ee1ea63d72adc9a24b6d7502b0d74516cdf157a63339011ba80010db2c27ea23`
+- `/version` through the slot: `{"version":"0.1.0","commit":"d2c2994…","runtime_mode":"hosted"}` (slot green, port 8089)
