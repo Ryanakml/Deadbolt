@@ -40,14 +40,23 @@ is ever held for an approval or a delay (both settle without attempts).
 
 ## 3. Staging evidence
 
-| Check                                   | Result                                                                    |
-| --------------------------------------- | ------------------------------------------------------------------------- |
-| Combined restart on staging             | NOT YET                                                                   |
-| Two evaluators against staging          | YES (prior: #34 acceptance raced two evaluators on the deployed artifact) |
-| DST/coalesce/overlap fixtures           | YES (prior: #34 staging + integration fixtures)                           |
-| Browser approve/reject/expired journeys | NOT YET                                                                   |
-| Schedule journeys                       | YES (prior: #35 staging journeys, 5/5 exit 0)                             |
-| Deployed artifact for this gate         | NOT YET                                                                   |
+Artifact: commit `cda91c15467207d4fea274bde21f223b998303a3` (main
+post-#86), image
+`ghcr.io/ryanakml/deadbolt/control-plane@sha256:e4732baad05a9d94d611493ea458861602cb2886576825cb2853ef0a90cbd333`,
+`runtime_mode: hosted` (slot blue). Isolated fixtures in project
+`m4-gate-accept` (`94fdbb74-…`); shared staging env untouched. Runnable:
+`scripts/m4-gate-staging-journeys.sh` (exit code 0). The restart below is
+a real `docker restart` of the active control-plane container mid-run —
+same image back, all waits settled by the new process.
+
+| Check                                   | Result                                                                                                                                                                                                                                                                  |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Combined restart on staging             | PASS — two PENDING approvals + one due schedule planted pre-restart; new process decides approval A once (opposing 409, machine key 403 `APPROVAL_HUMAN_ONLY`), fires the released delay exactly once, converges the schedule (2 occurrences, 1 run, `skipped_count=9`) |
+| Two evaluators against staging          | YES (prior: #34 acceptance raced two evaluators on the deployed artifact)                                                                                                                                                                                               |
+| DST/coalesce/overlap fixtures           | YES (prior: #34 staging + integration fixtures)                                                                                                                                                                                                                         |
+| Browser approve/reject/expired journeys | PASS — approve 200, opposing 409, expired 409 `APPROVAL_EXPIRED` then swept to EXPIRED with run FAILED (runs `a546737b-…`, `fef941d2-…`; approvals `3c303e93-…`, `65884b8d-…`)                                                                                          |
+| Schedule journeys                       | YES (prior: #35 staging journeys, 5/5 exit 0; plus journey 4 above on schedule `6312ddec-…`, left paused with journey keys/session revoked)                                                                                                                             |
+| Deployed artifact for this gate         | YES — `cda91c1`, image `e4732baa…`, hosted                                                                                                                                                                                                                              |
 
 ## 4. Requirement / failure traceability
 
