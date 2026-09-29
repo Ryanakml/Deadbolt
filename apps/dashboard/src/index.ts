@@ -610,8 +610,7 @@ function initDashboard(): void {
       renderEnvironmentEmptyState();
       return;
     }
-    listContainer.innerHTML =
-      '<div class="loading">Loading schedules...</div>';
+    listContainer.innerHTML = '<div class="loading">Loading schedules...</div>';
 
     try {
       const items = await client.listSchedules(envId);
@@ -718,47 +717,73 @@ function initDashboard(): void {
       return byId.get(id);
     };
     for (const btn of Array.from(
-      (root as unknown as HTMLElement).querySelectorAll?.(".schedule-edit-btn") ??
-        [],
-    )) {
-      btn.addEventListener("click", (e) => {
-        const s = findSchedule(e.currentTarget as unknown as Element);
-        if (s) openScheduleEditDialog(client, envId, s, e.currentTarget as HTMLElement);
-      });
-    }
-    for (const btn of Array.from(
-      (root as unknown as HTMLElement).querySelectorAll?.(".schedule-pause-btn") ??
-        [],
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-edit-btn",
+      ) ?? [],
     )) {
       btn.addEventListener("click", (e) => {
         const s = findSchedule(e.currentTarget as unknown as Element);
         if (s)
-          openSchedulePauseDialog(client, envId, s, e.currentTarget as HTMLElement);
+          openScheduleEditDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
       });
     }
     for (const btn of Array.from(
-      (root as unknown as HTMLElement).querySelectorAll?.(".schedule-resume-btn") ??
-        [],
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-pause-btn",
+      ) ?? [],
     )) {
       btn.addEventListener("click", (e) => {
         const s = findSchedule(e.currentTarget as unknown as Element);
         if (s)
-          openScheduleResumeDialog(client, envId, s, e.currentTarget as HTMLElement);
+          openSchedulePauseDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
       });
     }
     for (const btn of Array.from(
-      (root as unknown as HTMLElement).querySelectorAll?.(".schedule-delete-btn") ??
-        [],
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-resume-btn",
+      ) ?? [],
     )) {
       btn.addEventListener("click", (e) => {
         const s = findSchedule(e.currentTarget as unknown as Element);
         if (s)
-          openScheduleDeleteDialog(client, envId, s, e.currentTarget as HTMLElement);
+          openScheduleResumeDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
       });
     }
     for (const btn of Array.from(
-      (root as unknown as HTMLElement).querySelectorAll?.(".schedule-history-btn") ??
-        [],
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-delete-btn",
+      ) ?? [],
+    )) {
+      btn.addEventListener("click", (e) => {
+        const s = findSchedule(e.currentTarget as unknown as Element);
+        if (s)
+          openScheduleDeleteDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
+      });
+    }
+    for (const btn of Array.from(
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-history-btn",
+      ) ?? [],
     )) {
       btn.addEventListener("click", (e) => {
         const el = e.currentTarget as HTMLElement;
@@ -791,11 +816,7 @@ function initDashboard(): void {
     container.innerHTML = '<div class="loading">Loading history...</div>';
     button.textContent = "Hide history";
     try {
-      const resp = await client.listScheduleOccurrences(
-        schedule.id,
-        envId,
-        25,
-      );
+      const resp = await client.listScheduleOccurrences(schedule.id, envId, 25);
       if (resp.items.length === 0) {
         container.innerHTML =
           '<div class="text-muted">No occurrences recorded yet.</div>';

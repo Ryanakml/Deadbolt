@@ -490,9 +490,7 @@ export class DashboardApiClient {
   // notice instead of schedule CTAs.
   public async listSchedules(environmentId: string): Promise<Schedule[]> {
     const q = new URLSearchParams({ environment: environmentId });
-    const res = await apiFetch(
-      `${this.baseUrl}/v1/schedules?${q.toString()}`,
-    );
+    const res = await apiFetch(`${this.baseUrl}/v1/schedules?${q.toString()}`);
     if (!res.ok) {
       throw new Error(
         `Failed to list schedules (HTTP ${res.status}): ${res.statusText}`,
@@ -516,18 +514,15 @@ export class DashboardApiClient {
     idempotencyKey?: string,
   ): Promise<Schedule> {
     const q = new URLSearchParams({ environment: environmentId });
-    const res = await apiFetch(
-      `${this.baseUrl}/v1/schedules?${q.toString()}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRF-Token": readCsrfToken(),
-          "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
-        },
-        body: JSON.stringify(body),
+    const res = await apiFetch(`${this.baseUrl}/v1/schedules?${q.toString()}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": readCsrfToken(),
+        "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
       },
-    );
+      body: JSON.stringify(body),
+    });
     if (!res.ok) {
       throw new Error(
         `Failed to create schedule (HTTP ${res.status}): ${res.statusText}`,

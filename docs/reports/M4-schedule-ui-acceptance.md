@@ -19,19 +19,19 @@ deployment). Shared staging env untouched. Runnable command:
 - Backend: scoped `GET /v1/schedules/{id}/occurrences` (keyset,
   newest-first, `schedules:write`), `nextDueAt`/`lastOccurrenceAt` on the
   Schedule DTO, OpenAPI `ScheduleOccurrence` + `listScheduleOccurrences`
-  + declared pause/resume ops.
+  - declared pause/resume ops.
 - Dashboard: Schedules nav + panel + create/edit/pause/resume/delete
   dialogs + expandable occurrence history; countdown from persisted
   `nextDueAt`; `schedules:write` predicate (operator/admin/owner).
 
 ## 2. Automated proof (local)
 
-| Suite | Result |
-| --- | --- |
-| Go integration (`TestOccurrenceHTTP*`, `TestScheduleHTTP*`) | PASS — started/skipped reason agreement, keyset pages, 403/404/400 scope matrix, cross-tenant 404, persisted due-time exposure |
-| Dashboard node (`apps/dashboard/tests/schedules*.test.js`) | PASS — client wire incl CSRF + Idempotency-Key + expectedRevision, permission predicates (developer denied), dialog 409 in-place refresh, no-CTA case, verbatim skipped reasons |
-| Dashboard suite total | 92 pass, 0 fail; `tsc --noEmit` clean |
-| `check:contracts` | PASS (OpenAPI + generated schema consistency) |
+| Suite                                                       | Result                                                                                                                                                                          |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Go integration (`TestOccurrenceHTTP*`, `TestScheduleHTTP*`) | PASS — started/skipped reason agreement, keyset pages, 403/404/400 scope matrix, cross-tenant 404, persisted due-time exposure                                                  |
+| Dashboard node (`apps/dashboard/tests/schedules*.test.js`)  | PASS — client wire incl CSRF + Idempotency-Key + expectedRevision, permission predicates (developer denied), dialog 409 in-place refresh, no-CTA case, verbatim skipped reasons |
+| Dashboard suite total                                       | 92 pass, 0 fail; `tsc --noEmit` clean                                                                                                                                           |
+| `check:contracts`                                           | PASS (OpenAPI + generated schema consistency)                                                                                                                                   |
 
 ## 3. UI invariants and where each is proven
 
@@ -67,12 +67,12 @@ Journeys drive the exact calls the dashboard makes, against the deployed
 artifact; the production sweeper did the acting. Fixture schedule
 `8857598c-8e81-4238-85e6-2f48a6136cfc` (left paused, journey keys revoked).
 
-| Journey | Steps | Result |
-| --- | --- | --- |
-| Two-editor conflict | Save edit A (rev 1→2), save stale edit B → `409 REVISION_CONFLICT`; refresh shows A's cron at rev 2 intact | PASS |
-| Downtime history | Per-minute cron planted 9–10 min behind → occurrences endpoint shows STARTED with `skipped_count=9` and exactly one run | PASS |
-| Permission states | Developer key → 403 on list, create, occurrences; anonymous → 401; operator full round trip | PASS |
-| Pause/resume | Pause clears `nextDueAt` (second pause → 409), resume re-arms a fresh due time | PASS |
+| Journey             | Steps                                                                                                                   | Result |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------ |
+| Two-editor conflict | Save edit A (rev 1→2), save stale edit B → `409 REVISION_CONFLICT`; refresh shows A's cron at rev 2 intact              | PASS   |
+| Downtime history    | Per-minute cron planted 9–10 min behind → occurrences endpoint shows STARTED with `skipped_count=9` and exactly one run | PASS   |
+| Permission states   | Developer key → 403 on list, create, occurrences; anonymous → 401; operator full round trip                             | PASS   |
+| Pause/resume        | Pause clears `nextDueAt` (second pause → 409), resume re-arms a fresh due time                                          | PASS   |
 
 ## 5. Staging artifact
 

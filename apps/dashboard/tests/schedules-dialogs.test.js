@@ -141,9 +141,7 @@ function installDom() {
           if (sel.startsWith("#")) {
             const id = sel.slice(1);
             if (node._html.includes(`id="${id}"`)) {
-              const m = node._html.match(
-                new RegExp(`<[^>]*id="${id}"[^>]*>`),
-              );
+              const m = node._html.match(new RegExp(`<[^>]*id="${id}"[^>]*>`));
               out.push(node._child(`#${id}`, m ? m[0] : undefined));
             }
           } else if (sel.startsWith(".")) {
@@ -259,7 +257,8 @@ function installFetch(server) {
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
     const method = (init.method || "GET").toUpperCase();
-    if (url.includes("/api/auth/session")) return jsonResponse(server.session());
+    if (url.includes("/api/auth/session"))
+      return jsonResponse(server.session());
     if (url.includes("/v1/projects/") && url.includes("/environments")) {
       return jsonResponse({ environments: [{ id: "env-1", name: "staging" }] });
     }
@@ -357,7 +356,9 @@ describe("schedules browser behavior", () => {
     assert.ok(list.innerHTML.includes("skip-overlap"));
     assert.ok(list.innerHTML.includes("coalesce-one"));
     assert.ok(list.innerHTML.includes("next due"));
-    assert.ok(!list.innerHTML.includes("paused") || list.innerHTML.includes("ACTIVE"));
+    assert.ok(
+      !list.innerHTML.includes("paused") || list.innerHTML.includes("ACTIVE"),
+    );
 
     const newBtn = globalThis.document.getElementById("schedules-new-btn");
     assert.equal(newBtn.classList.contains("hidden"), false);
@@ -390,10 +391,7 @@ describe("schedules browser behavior", () => {
       cron: "0 * * * *",
       timezone: "UTC",
     });
-    assert.ok(
-      state.listCalls >= 2,
-      "list must refresh after create",
-    );
+    assert.ok(state.listCalls >= 2, "list must refresh after create");
     assert.ok(
       !dom.overlayPresent("schedule-create-dialog-overlay"),
       "dialog closes on success",
@@ -471,7 +469,9 @@ describe("schedules browser behavior", () => {
             scheduleFixture({
               paused: state.paused,
               revision: state.revision,
-              nextDueAt: state.paused ? null : new Date(Date.now() + 60000).toISOString(),
+              nextDueAt: state.paused
+                ? null
+                : new Date(Date.now() + 60000).toISOString(),
             }),
           ],
           nextCursor: null,

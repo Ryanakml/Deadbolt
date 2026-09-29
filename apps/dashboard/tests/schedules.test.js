@@ -301,7 +301,10 @@ describe("schedules:write permission gating", () => {
       false,
     );
     assert.equal(
-      sessionCanManageSchedules(sessionWithRole("operator", "SUSPENDED"), "org-1"),
+      sessionCanManageSchedules(
+        sessionWithRole("operator", "SUSPENDED"),
+        "org-1",
+      ),
       false,
     );
     assert.equal(

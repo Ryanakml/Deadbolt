@@ -493,8 +493,7 @@ function initDashboard() {
             renderEnvironmentEmptyState();
             return;
         }
-        listContainer.innerHTML =
-            '<div class="loading">Loading schedules...</div>';
+        listContainer.innerHTML = '<div class="loading">Loading schedules...</div>';
         try {
             const items = await client.listSchedules(envId);
             if (items.length === 0) {
@@ -599,40 +598,35 @@ function initDashboard() {
                 return undefined;
             return byId.get(id);
         };
-        for (const btn of Array.from(root.querySelectorAll?.(".schedule-edit-btn") ??
-            [])) {
+        for (const btn of Array.from(root.querySelectorAll?.(".schedule-edit-btn") ?? [])) {
             btn.addEventListener("click", (e) => {
                 const s = findSchedule(e.currentTarget);
                 if (s)
                     openScheduleEditDialog(client, envId, s, e.currentTarget);
             });
         }
-        for (const btn of Array.from(root.querySelectorAll?.(".schedule-pause-btn") ??
-            [])) {
+        for (const btn of Array.from(root.querySelectorAll?.(".schedule-pause-btn") ?? [])) {
             btn.addEventListener("click", (e) => {
                 const s = findSchedule(e.currentTarget);
                 if (s)
                     openSchedulePauseDialog(client, envId, s, e.currentTarget);
             });
         }
-        for (const btn of Array.from(root.querySelectorAll?.(".schedule-resume-btn") ??
-            [])) {
+        for (const btn of Array.from(root.querySelectorAll?.(".schedule-resume-btn") ?? [])) {
             btn.addEventListener("click", (e) => {
                 const s = findSchedule(e.currentTarget);
                 if (s)
                     openScheduleResumeDialog(client, envId, s, e.currentTarget);
             });
         }
-        for (const btn of Array.from(root.querySelectorAll?.(".schedule-delete-btn") ??
-            [])) {
+        for (const btn of Array.from(root.querySelectorAll?.(".schedule-delete-btn") ?? [])) {
             btn.addEventListener("click", (e) => {
                 const s = findSchedule(e.currentTarget);
                 if (s)
                     openScheduleDeleteDialog(client, envId, s, e.currentTarget);
             });
         }
-        for (const btn of Array.from(root.querySelectorAll?.(".schedule-history-btn") ??
-            [])) {
+        for (const btn of Array.from(root.querySelectorAll?.(".schedule-history-btn") ?? [])) {
             btn.addEventListener("click", (e) => {
                 const el = e.currentTarget;
                 const s = findSchedule(el);
