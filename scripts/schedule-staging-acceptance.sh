@@ -110,7 +110,7 @@ info "coalesce occurrences=$OCC_COUNT runs=$RUN_COUNT first_status=$OCC_STATUS f
 [[ "$OCC_STATUS" == "STARTED" ]] || fail "first coalesced occurrence status = $OCC_STATUS, want STARTED"
 [[ "$SKIPPED" -ge 5 ]] || fail "skipped_count = $SKIPPED, want the coalesced remainder recorded (>=5)"
 [[ "$NEXT_DUE" == "t" ]] || fail "last_occurrence_at was not recorded"
-pass "coalesce-one misfire proven on staging (schedule $S1, 1 occurrence, 1 run, skipped_count=$SKIPPED)"
+pass "coalesce-one misfire proven on staging (schedule $S1, first $OCC_STATUS, skipped_count=$SKIPPED, runs=$RUN_COUNT total over $OCC_COUNT occurrences)"
 q "UPDATE schedules SET paused=true, next_due_at=NULL WHERE id='$S1'::uuid" >/dev/null
 
 # 4. TEST 2 — SKIPPED_QUOTA: saturate the env cap with PAUSED filler runs
