@@ -1,0 +1,54 @@
+name: Schedule staging acceptance
+
+# One-off acceptance for PR #85 (Issue #34): exercise the three schedule
+# behaviours that the integration suite proves but staging had not yet
+# exercised (coalesce-one misfire, SKIPPED_QUOTA, revision change) against
+# the deployed PR head. The staging host runs scripts/schedule-staging-
+# acceptance.sh over SSH; the production sweeper does all the acting.
+#
+# This workflow is intentionally temporary: it is deleted before the PR
+# merges, leaving the script as the recorded runnable command.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schedule-staging-acceptance
+  cancel-in-progress: false
+
+jobs:
+  accept:
+    name: Exercise schedules on staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run staging acceptance over SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEADBOLT_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEADBOLT_DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_KEY: ${{ secrets.DEADBOLT_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEADBOLT_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_HOST" || { echo "DEADBOLT_DEPLOY_HOST is not configured"; exit 1; }
+          test -n "$DEPLOY_KEY" || { echo "DEADBOLT_DEPLOY_SSH_KEY is not configured"; exit 1; }
+          test -n "$KNOWN_HOSTS" || { echo "DEADBOLT_DEPLOY_KNOWN_HOSTS is required"; exit 1; }
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          chmod +x scripts/schedule-staging-acceptance.sh
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            scripts/schedule-staging-acceptance.sh "$DEPLOY_USER@$DEPLOY_HOST:/tmp/schedule-staging-acceptance.sh"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            "$DEPLOY_USER@$DEPLOY_HOST" "chmod +x /tmp/schedule-staging-acceptance.sh && /tmp/schedule-staging-acceptance.sh"
