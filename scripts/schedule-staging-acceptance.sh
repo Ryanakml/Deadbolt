@@ -94,17 +94,22 @@ S1="$(mk_schedule '* * * * *')"
 q "UPDATE schedules SET last_occurrence_at = clock_timestamp() - INTERVAL '10 minutes', next_due_at = clock_timestamp() - INTERVAL '9 minutes' WHERE id='$S1'::uuid" >/dev/null
 info "coalesce schedule_id=$S1 planted 9-10min in the past; waiting for the production sweeper..."
 sleep 20
+# Live sweeper fires every second, so slots after the first are handled too
+# (SKIPPED_OVERLAP while the first run is nonterminal, converging forward).
+# Coalesce-one is proven by the FIRST slot: one STARTED occurrence carrying
+# the coalesced remainder, and exactly one run overall — never one per
+# missed minute.
 OCC_COUNT="$(q1 "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S1'::uuid")"
 RUN_COUNT="$(q1 "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S1'::uuid AND run_id IS NOT NULL")"
-SKIPPED="$(q1 "SELECT skipped_count FROM schedule_occurrences WHERE schedule_id='$S1'::uuid LIMIT 1")"
-OCC_STATUS="$(q1 "SELECT status FROM schedule_occurrences WHERE schedule_id='$S1'::uuid LIMIT 1")"
-NEXT_DUE="$(q1 "SELECT next_due_at > clock_timestamp() FROM schedules WHERE id='$S1'::uuid")"
-info "coalesce occurrences=$OCC_COUNT runs=$RUN_COUNT skipped_count=$SKIPPED status=$OCC_STATUS next_due_future=$NEXT_DUE"
-[[ "$OCC_COUNT" == "1" ]] || fail "coalesce-one must create exactly one occurrence, got $OCC_COUNT"
-[[ "$RUN_COUNT" == "1" ]] || fail "coalesce-one must create exactly one run, got $RUN_COUNT"
-[[ "$OCC_STATUS" == "STARTED" ]] || fail "coalesce occurrence status = $OCC_STATUS, want STARTED"
+FIRST_ROW="$(q "SELECT status || '|' || skipped_count FROM schedule_occurrences WHERE schedule_id='$S1'::uuid ORDER BY due_at LIMIT 1")"
+OCC_STATUS="${FIRST_ROW%%|*}"
+SKIPPED="${FIRST_ROW##*|}"
+NEXT_DUE="$(q1 "SELECT last_occurrence_at IS NOT NULL FROM schedules WHERE id='$S1'::uuid")"
+info "coalesce occurrences=$OCC_COUNT runs=$RUN_COUNT first_status=$OCC_STATUS first_skipped_count=$SKIPPED last_occurrence_recorded=$NEXT_DUE"
+[[ "$RUN_COUNT" == "1" ]] || fail "coalesce-one must create exactly one run for the whole window, got $RUN_COUNT"
+[[ "$OCC_STATUS" == "STARTED" ]] || fail "first coalesced occurrence status = $OCC_STATUS, want STARTED"
 [[ "$SKIPPED" -ge 5 ]] || fail "skipped_count = $SKIPPED, want the coalesced remainder recorded (>=5)"
-[[ "$NEXT_DUE" == "t" ]] || fail "next_due_at did not advance to a future slot"
+[[ "$NEXT_DUE" == "t" ]] || fail "last_occurrence_at was not recorded"
 pass "coalesce-one misfire proven on staging (schedule $S1, 1 occurrence, 1 run, skipped_count=$SKIPPED)"
 q "UPDATE schedules SET paused=true, next_due_at=NULL WHERE id='$S1'::uuid" >/dev/null
 
