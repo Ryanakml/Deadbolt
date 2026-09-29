@@ -1,4 +1,4 @@
-import { Run, Worker, RunSnapshot, RunEventsResponse, TaskLogsResponse, ResolveReconciliationRequest, ResolveReconciliationResponse, Approval } from "./types.js";
+import { Run, Worker, RunSnapshot, RunEventsResponse, TaskLogsResponse, ResolveReconciliationRequest, ResolveReconciliationResponse, Approval, Schedule, ScheduleOccurrence } from "./types.js";
 export interface ListRunsResponse {
     items: Run[];
     nextCursor?: string | null;
@@ -77,6 +77,29 @@ export declare class DashboardApiClient {
     cancelRun(runId: string, expectedRevision: number, idempotencyKey?: string): Promise<Run>;
     pauseRun(runId: string, expectedRevision: number, idempotencyKey?: string): Promise<Run>;
     resumeRun(runId: string, expectedRevision: number, idempotencyKey?: string): Promise<Run>;
+    listSchedules(environmentId: string): Promise<Schedule[]>;
+    createSchedule(environmentId: string, body: {
+        workflow: string;
+        cron: string;
+        timezone: string;
+        deploymentId?: string;
+    }, idempotencyKey?: string): Promise<Schedule>;
+    updateSchedule(scheduleId: string, environmentId: string, expectedRevision: number, configuration: {
+        workflow: string;
+        cron: string;
+        timezone: string;
+        deploymentId?: string;
+    }, idempotencyKey?: string): Promise<Schedule>;
+    deleteSchedule(scheduleId: string, environmentId: string, idempotencyKey?: string): Promise<{
+        deleted: boolean;
+        id: string;
+    }>;
+    pauseSchedule(scheduleId: string, environmentId: string, expectedRevision: number, idempotencyKey?: string): Promise<Schedule>;
+    resumeSchedule(scheduleId: string, environmentId: string, expectedRevision: number, idempotencyKey?: string): Promise<Schedule>;
+    listScheduleOccurrences(scheduleId: string, environmentId: string, limit?: number, cursor?: string): Promise<{
+        items: ScheduleOccurrence[];
+        nextCursor?: string | null;
+    }>;
     listProjects(): Promise<ProjectSummary[]>;
     listProjectEnvironments(projectId: string): Promise<EnvironmentSummary[]>;
     loadEnvironmentCatalog(): Promise<CatalogEnvironment[]>;

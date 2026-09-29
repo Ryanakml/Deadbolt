@@ -282,6 +282,129 @@ export class DashboardApiClient {
         }
         return res.json();
     }
+    // listSchedules returns the schedule definitions for the selected
+    // environment. The backend requires the schedules:write capability; a 403
+    // means the identity lacks it and the dashboard renders a capability
+    // notice instead of schedule CTAs.
+    async listSchedules(environmentId) {
+        const q = new URLSearchParams({ environment: environmentId });
+        const res = await apiFetch(`${this.baseUrl}/v1/schedules?${q.toString()}`);
+        if (!res.ok) {
+            throw new Error(`Failed to list schedules (HTTP ${res.status}): ${res.statusText}`);
+        }
+        const body = (await res.json());
+        return body.items ?? [];
+    }
+    // createSchedule creates one schedule definition in the selected
+    // environment. The caller passes the dialog's Idempotency-Key so an
+    // ambiguous resubmit reuses the same command identity.
+    async createSchedule(environmentId, body, idempotencyKey) {
+        const q = new URLSearchParams({ environment: environmentId });
+        const res = await apiFetch(`${this.baseUrl}/v1/schedules?${q.toString()}`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to create schedule (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
+    // updateSchedule replaces the configuration of one schedule definition.
+    // The caller binds expectedRevision read from the list; a 409 means the
+    // schedule changed and the dialog must refresh instead of retrying
+    // blindly.
+    async updateSchedule(scheduleId, environmentId, expectedRevision, configuration, idempotencyKey) {
+        const q = new URLSearchParams({ environment: environmentId });
+        const res = await apiFetch(`${this.baseUrl}/v1/schedules/${encodeURIComponent(scheduleId)}?${q.toString()}`, {
+            method: "PATCH",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify({ expectedRevision, configuration }),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to update schedule (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
+    // deleteSchedule removes one schedule definition. The server needs no body;
+    // an empty object is sent with the standard mutation headers so CSRF and
+    // idempotency handling stay uniform with the other schedule mutations.
+    async deleteSchedule(scheduleId, environmentId, idempotencyKey) {
+        const q = new URLSearchParams({ environment: environmentId });
+        const res = await apiFetch(`${this.baseUrl}/v1/schedules/${encodeURIComponent(scheduleId)}?${q.toString()}`, {
+            method: "DELETE",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify({}),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to delete schedule (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
+    // pauseSchedule pauses one schedule definition. A 409 with code
+    // INVALID_SCHEDULE_STATE means the schedule is already paused; a 409 with
+    // REVISION_CONFLICT means the revision moved. Both refresh in-dialog.
+    async pauseSchedule(scheduleId, environmentId, expectedRevision, idempotencyKey) {
+        const q = new URLSearchParams({ environment: environmentId });
+        const res = await apiFetch(`${this.baseUrl}/v1/schedules/${encodeURIComponent(scheduleId)}/pause?${q.toString()}`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify({ expectedRevision }),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to pause schedule (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
+    // resumeSchedule resumes a paused schedule definition.
+    async resumeSchedule(scheduleId, environmentId, expectedRevision, idempotencyKey) {
+        const q = new URLSearchParams({ environment: environmentId });
+        const res = await apiFetch(`${this.baseUrl}/v1/schedules/${encodeURIComponent(scheduleId)}/resume?${q.toString()}`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-CSRF-Token": readCsrfToken(),
+                "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+            },
+            body: JSON.stringify({ expectedRevision }),
+        });
+        if (!res.ok) {
+            throw new Error(`Failed to resume schedule (HTTP ${res.status}): ${res.statusText}`);
+        }
+        return res.json();
+    }
+    // listScheduleOccurrences returns the decided slots of one schedule, newest
+    // first, with keyset pagination. The dashboard renders skipped reasons
+    // verbatim and never invents history client-side.
+    async listScheduleOccurrences(scheduleId, environmentId, limit, cursor) {
+        const q = new URLSearchParams({ environment: environmentId });
+        if (limit)
+            q.set("limit", String(limit));
+        if (cursor)
+            q.set("cursor", cursor);
+        const res = await apiFetch(`${this.baseUrl}/v1/schedules/${encodeURIComponent(scheduleId)}/occurrences?${q.toString()}`);
+        if (!res.ok) {
+            throw new Error(`Failed to list schedule occurrences (HTTP ${res.status}): ${res.statusText}`);
+        }
+        const body = (await res.json());
+        return { items: body.items ?? [], nextCursor: body.nextCursor ?? null };
+    }
     // listProjects discovers the active organization's projects through the
     // existing public tenant API using the BFF session cookie.
     async listProjects() {

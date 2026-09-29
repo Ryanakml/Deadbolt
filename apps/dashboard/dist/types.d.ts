@@ -108,6 +108,32 @@ export interface Worker {
     status: "ACTIVE" | "DRAINING" | "REVOKED";
     deploymentDigests: string[];
 }
+export interface Schedule {
+    id: string;
+    workflow: string;
+    environment: string;
+    cron: string;
+    timezone: string;
+    deploymentId: string | null;
+    overlapPolicy: "skip-overlap";
+    misfirePolicy: "coalesce-one";
+    paused: boolean;
+    revision: number;
+    nextDueAt: string | null;
+    lastOccurrenceAt: string | null;
+}
+export type ScheduleOccurrenceStatus = "PENDING" | "STARTED" | "SKIPPED";
+export type ScheduleSkippedReason = "SKIPPED_OVERLAP" | "SKIPPED_QUOTA" | "SKIPPED_MISFIRE";
+export interface ScheduleOccurrence {
+    id: string;
+    scheduleId: string;
+    dueAt: string;
+    revision: number;
+    status: ScheduleOccurrenceStatus;
+    skippedReason: ScheduleSkippedReason | null;
+    skippedCount: number;
+    runId: string | null;
+}
 export interface RunEvent {
     id: string;
     runId: string;

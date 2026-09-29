@@ -17,6 +17,9 @@
           <button id="nav-workers" class="nav-btn" type="button">
             Workers
           </button>
+          <button id="nav-schedules" class="nav-btn" type="button">
+            Schedules
+          </button>
         </nav>
       </div>
       <div class="header-right">
@@ -97,6 +100,27 @@
               </tr>
             </tbody>
           </table>
+        </div>
+      </section>
+
+      <!-- Schedules List View -->
+      <section
+        id="schedules-view"
+        class="view-panel hidden"
+        aria-labelledby="schedules-heading"
+      >
+        <div class="panel-header">
+          <h2 id="schedules-heading">Schedules</h2>
+          <button
+            id="schedules-new-btn"
+            class="primary-btn hidden"
+            type="button"
+          >
+            New schedule
+          </button>
+        </div>
+        <div id="schedules-list" class="schedule-list">
+          <div class="loading">Loading schedules...</div>
         </div>
       </section>
 
