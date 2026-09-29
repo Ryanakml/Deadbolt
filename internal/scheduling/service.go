@@ -43,6 +43,7 @@ var (
 	ErrScheduleNotPaused     = errors.New("SCHEDULE_NOT_PAUSED")
 	ErrRevisionConflict      = errors.New("REVISION_CONFLICT")
 	ErrNoActiveDeployment    = errors.New("NO_ACTIVE_DEPLOYMENT")
+	ErrInvalidCursor         = errors.New("INVALID_CURSOR")
 )
 
 // Schedule is a recurring schedule definition as stored in the database.

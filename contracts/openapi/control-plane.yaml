@@ -1178,6 +1178,169 @@ paths:
             schema:
               $ref: "#/components/schemas/RevisionCommand"
       x-minimum-capability: V1
+  /schedules/{id}/occurrences:
+    get:
+      operationId: listScheduleOccurrences
+      summary: listScheduleOccurrences
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      x-required-capability: schedules:write
+      x-implemented: true
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ScheduleOccurrence"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+                required:
+                  - items
+                  - nextCursor
+                additionalProperties: false
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      x-minimum-capability: V1
+  /schedules/{id}/pause:
+    post:
+      operationId: pauseSchedule
+      summary: pauseSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: schedules:write
+      x-implemented: true
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionCommand"
+      x-minimum-capability: V1
+  /schedules/{id}/resume:
+    post:
+      operationId: resumeSchedule
+      summary: resumeSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: *a1
+        - *a2
+        - name: X-CSRF-Token
+          in: header
+          schema: *a1
+          description: Required for browser-session mutations with validated Origin.
+      x-required-capability: schedules:write
+      x-implemented: true
+      responses:
+        "200":
+          description: Committed response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+      security: *a4
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionCommand"
+      x-minimum-capability: V1
   /webhook-endpoints:
     get:
       operationId: listWebhookEndpoint
@@ -2560,6 +2723,17 @@ components:
         paused:
           type: boolean
         revision: *a3
+        nextDueAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: Persisted pending slot the UI countdown renders from; null while paused.
+        lastOccurrenceAt:
+          type:
+            - string
+            - "null"
+          format: date-time
       required:
         - workflow
         - environment
@@ -2568,6 +2742,39 @@ components:
         - overlapPolicy
         - misfirePolicy
         - paused
+      additionalProperties: false
+    ScheduleOccurrence:
+      type: object
+      properties:
+        id: *a1
+        scheduleId: *a1
+        dueAt:
+          type: string
+          format: date-time
+        revision: *a3
+        status:
+          type: string
+          enum:
+            - PENDING
+            - STARTED
+            - SKIPPED
+        skippedReason:
+          type:
+            - string
+            - "null"
+          description: SKIPPED_OVERLAP, SKIPPED_QUOTA, or SKIPPED_MISFIRE; null unless status is SKIPPED.
+        skippedCount: *a3
+        runId:
+          type:
+            - string
+            - "null"
+      required:
+        - id
+        - scheduleId
+        - dueAt
+        - revision
+        - status
+        - skippedCount
       additionalProperties: false
     WebhookEndpoint:
       type: object
