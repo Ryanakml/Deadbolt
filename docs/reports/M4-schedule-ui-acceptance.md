@@ -61,11 +61,16 @@ deployment). Shared staging env untouched. Runnable command:
 7. **SSE untouched.** No schedule stream was added; run-stream freshness,
    reconnect, and resync paths are unchanged (`stream.test.js` green).
 
-## 4. Browser journeys (staging, real APIs)
+## 4. Staging journeys (real APIs + served UI)
 
 Journeys drive the exact calls the dashboard makes, against the deployed
-artifact; the production sweeper did the acting. Fixture schedule
-`8857598c-8e81-4238-85e6-2f48a6136cfc` (left paused, journey keys revoked).
+artifact; the production sweeper did the acting. Browser-DOM behaviour
+(focus, Escape, in-dialog conflict, no-CTA gating) is proven by the node
+smoke tests booting the real `dist/index.js`; the staging slot was
+verified to serve the new UI (`GET /dashboard/` 200 containing
+`nav-schedules`/`schedules-view` from image `ee1ea63d…`). Fixture
+schedule `8857598c-8e81-4238-85e6-2f48a6136cfc` (left paused, journey
+keys revoked).
 
 | Journey             | Steps                                                                                                                   | Result |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------ |
