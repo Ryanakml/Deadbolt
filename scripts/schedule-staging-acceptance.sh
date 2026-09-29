@@ -44,6 +44,11 @@ PSQL="docker exec -i deadbolt-staging-postgres psql -U deadbolt_admin -d deadbol
 q() {
   PGPASSWORD="$DEADBOLT_DB_ADMIN_PASSWORD" $PSQL -c "$1"
 }
+# q1 captures a single value. INSERT/UPDATE/DELETE print a trailing command
+# tag (e.g. "INSERT 0 1") after any RETURNING rows, so take the first line.
+q1() {
+  q "$1" | head -n 1 | tr -d '[:space:]'
+}
 
 # 0. Deployed artifact identity: the staging slot must serve this PR head.
 ACTIVE_SLOT="$(cat /opt/deadbolt/releases/active_slot 2>/dev/null | tr -d '[:space:]' || echo green)"
@@ -56,11 +61,11 @@ echo "$VERSION_JSON" | grep -q '"runtime_mode":"hosted"' \
   || fail "staging runtime_mode is not hosted"
 
 # 1. Resolve org and a source deployment for the schedulable workflow shape.
-ORG_ID="$(q "SELECT id::text FROM organizations WHERE name='Deadbolt Acceptance' LIMIT 1")"
+ORG_ID="$(q1 "SELECT id::text FROM organizations WHERE name='Deadbolt Acceptance' LIMIT 1")"
 [[ -n "$ORG_ID" ]] || fail "org 'Deadbolt Acceptance' not found on staging"
 info "org_id=$ORG_ID"
 
-SRC_ROW="$(q "SELECT c.environment_id::text || '|' || c.active_deployment_id::text FROM workflow_channels c WHERE c.organization_id='$ORG_ID'::uuid AND c.workflow_name='$WORKFLOW' LIMIT 1")"
+SRC_ROW="$(q1 "SELECT c.environment_id::text || '|' || c.active_deployment_id::text FROM workflow_channels c WHERE c.organization_id='$ORG_ID'::uuid AND c.workflow_name='$WORKFLOW' LIMIT 1")"
 [[ -n "$SRC_ROW" ]] || fail "no active channel for workflow '$WORKFLOW' on staging (previous acceptance planted it)"
 SRC_ENV_ID="${SRC_ROW%%|*}"
 SRC_DEPLOY_ID="${SRC_ROW##*|}"
@@ -71,17 +76,17 @@ MANIFEST="$(PGPASSWORD="$DEADBOLT_DB_ADMIN_PASSWORD" docker exec -i deadbolt-sta
 
 # 2. Fresh fixture project + staging env + admissions + deployment + channel.
 q "DELETE FROM projects WHERE organization_id='$ORG_ID'::uuid AND name='$PROJECT_NAME'" >/dev/null
-PROJ_ID="$(q "INSERT INTO projects (organization_id, name) VALUES ('$ORG_ID'::uuid, '$PROJECT_NAME') RETURNING id::text")"
-ENV_ID="$(q "INSERT INTO environments (organization_id, project_id, name) VALUES ('$ORG_ID'::uuid, '$PROJ_ID'::uuid, 'staging') RETURNING id::text")"
+PROJ_ID="$(q1 "INSERT INTO projects (organization_id, name) VALUES ('$ORG_ID'::uuid, '$PROJECT_NAME') RETURNING id::text")"
+ENV_ID="$(q1 "INSERT INTO environments (organization_id, project_id, name) VALUES ('$ORG_ID'::uuid, '$PROJ_ID'::uuid, 'staging') RETURNING id::text")"
 q "INSERT INTO environment_admissions (environment_id, organization_id, max_concurrency) VALUES ('$ENV_ID'::uuid, '$ORG_ID'::uuid, 10)" >/dev/null
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ESCAPED_MANIFEST="${MANIFEST//\'/\'\'}"
-NEW_DEPLOY_ID="$(PGPASSWORD="$DEADBOLT_DB_ADMIN_PASSWORD" docker exec -i deadbolt-staging-postgres psql -U deadbolt_admin -d deadbolt_staging -v ON_ERROR_STOP=1 -At -c "INSERT INTO deployments (organization_id, environment_id, manifest_hash, bundle_digest, manifest, protocol_version, runtime_version, status) VALUES ('$ORG_ID'::uuid, '$ENV_ID'::uuid, 'sched-accept-manifest-$STAMP', 'schedacceptbundle$STAMP', '$ESCAPED_MANIFEST'::jsonb, 1, '1.0', 'ACTIVE') RETURNING id::text")"
+NEW_DEPLOY_ID="$(PGPASSWORD="$DEADBOLT_DB_ADMIN_PASSWORD" docker exec -i deadbolt-staging-postgres psql -U deadbolt_admin -d deadbolt_staging -v ON_ERROR_STOP=1 -At -c "INSERT INTO deployments (organization_id, environment_id, manifest_hash, bundle_digest, manifest, protocol_version, runtime_version, status) VALUES ('$ORG_ID'::uuid, '$ENV_ID'::uuid, 'sched-accept-manifest-$STAMP', 'schedacceptbundle$STAMP', '$ESCAPED_MANIFEST'::jsonb, 1, '1.0', 'ACTIVE') RETURNING id::text" | head -n 1 | tr -d '[:space:]')"
 q "INSERT INTO workflow_channels (organization_id, environment_id, workflow_name, active_deployment_id, revision) VALUES ('$ORG_ID'::uuid, '$ENV_ID'::uuid, '$WORKFLOW', '$NEW_DEPLOY_ID'::uuid, 1)" >/dev/null
 info "proj_id=$PROJ_ID env_id=$ENV_ID deploy_id=$NEW_DEPLOY_ID"
 
 mk_schedule() { # $1=cron
-  q "INSERT INTO schedules (organization_id, environment_id, workflow_name, cron_expression, timezone) VALUES ('$ORG_ID'::uuid, '$ENV_ID'::uuid, '$WORKFLOW', '$1', 'UTC') RETURNING id::text"
+  q1 "INSERT INTO schedules (organization_id, environment_id, workflow_name, cron_expression, timezone) VALUES ('$ORG_ID'::uuid, '$ENV_ID'::uuid, '$WORKFLOW', '$1', 'UTC') RETURNING id::text"
 }
 
 # 3. TEST 1 — coalesce-one: every-minute schedule "missed" ten slots.
@@ -89,11 +94,11 @@ S1="$(mk_schedule '* * * * *')"
 q "UPDATE schedules SET last_occurrence_at = clock_timestamp() - INTERVAL '10 minutes', next_due_at = clock_timestamp() - INTERVAL '9 minutes' WHERE id='$S1'::uuid" >/dev/null
 info "coalesce schedule_id=$S1 planted 9-10min in the past; waiting for the production sweeper..."
 sleep 20
-OCC_COUNT="$(q "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S1'::uuid")"
-RUN_COUNT="$(q "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S1'::uuid AND run_id IS NOT NULL")"
-SKIPPED="$(q "SELECT skipped_count FROM schedule_occurrences WHERE schedule_id='$S1'::uuid LIMIT 1")"
-OCC_STATUS="$(q "SELECT status FROM schedule_occurrences WHERE schedule_id='$S1'::uuid LIMIT 1")"
-NEXT_DUE="$(q "SELECT next_due_at > clock_timestamp() FROM schedules WHERE id='$S1'::uuid")"
+OCC_COUNT="$(q1 "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S1'::uuid")"
+RUN_COUNT="$(q1 "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S1'::uuid AND run_id IS NOT NULL")"
+SKIPPED="$(q1 "SELECT skipped_count FROM schedule_occurrences WHERE schedule_id='$S1'::uuid LIMIT 1")"
+OCC_STATUS="$(q1 "SELECT status FROM schedule_occurrences WHERE schedule_id='$S1'::uuid LIMIT 1")"
+NEXT_DUE="$(q1 "SELECT next_due_at > clock_timestamp() FROM schedules WHERE id='$S1'::uuid")"
 info "coalesce occurrences=$OCC_COUNT runs=$RUN_COUNT skipped_count=$SKIPPED status=$OCC_STATUS next_due_future=$NEXT_DUE"
 [[ "$OCC_COUNT" == "1" ]] || fail "coalesce-one must create exactly one occurrence, got $OCC_COUNT"
 [[ "$RUN_COUNT" == "1" ]] || fail "coalesce-one must create exactly one run, got $RUN_COUNT"
@@ -108,16 +113,16 @@ q "UPDATE schedules SET paused=true, next_due_at=NULL WHERE id='$S1'::uuid" >/de
 # dispatcher, so the filler is inert).
 S2="$(mk_schedule '0 12 * * *')"
 q "INSERT INTO runs (organization_id, environment_id, deployment_id, workflow_name, idempotency_key, status, revision, input, last_event_sequence, created_at, updated_at) SELECT '$ORG_ID'::uuid, '$ENV_ID'::uuid, '$NEW_DEPLOY_ID'::uuid, 'filler', 'sched-accept-filler-'||g, 'PAUSED', 1, '{}'::jsonb, 1, clock_timestamp(), clock_timestamp() FROM generate_series(1, 120) g" >/dev/null
-NONTERM="$(q "SELECT count(*) FROM runs WHERE environment_id='$ENV_ID'::uuid AND status IN ('QUEUED','RUNNING','WAITING','PAUSING','PAUSED','CANCELLING')")"
+NONTERM="$(q1 "SELECT count(*) FROM runs WHERE environment_id='$ENV_ID'::uuid AND status IN ('QUEUED','RUNNING','WAITING','PAUSING','PAUSED','CANCELLING')")"
 info "quota schedule_id=$S2 planted; nonterminal runs in fixture env=$NONTERM"
 [[ "$NONTERM" -ge 100 ]] || fail "filler did not saturate the 100-run cap (got $NONTERM)"
 q "UPDATE schedules SET next_due_at = clock_timestamp() - INTERVAL '1 minute' WHERE id='$S2'::uuid" >/dev/null
 sleep 20
-Q_STATUS="$(q "SELECT status FROM schedule_occurrences WHERE schedule_id='$S2'::uuid LIMIT 1")"
-Q_REASON="$(q "SELECT skipped_reason FROM schedule_occurrences WHERE schedule_id='$S2'::uuid LIMIT 1")"
-Q_RUNS="$(q "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S2'::uuid AND run_id IS NOT NULL")"
-Q_ALERTS="$(q "SELECT count(*) FROM audit_events WHERE organization_id='$ORG_ID'::uuid AND action='schedule.occurrence_skipped' AND target_id='$S2'::uuid")"
-Q_NEXT="$(q "SELECT next_due_at > clock_timestamp() FROM schedules WHERE id='$S2'::uuid")"
+Q_STATUS="$(q1 "SELECT status FROM schedule_occurrences WHERE schedule_id='$S2'::uuid LIMIT 1")"
+Q_REASON="$(q1 "SELECT skipped_reason FROM schedule_occurrences WHERE schedule_id='$S2'::uuid LIMIT 1")"
+Q_RUNS="$(q1 "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S2'::uuid AND run_id IS NOT NULL")"
+Q_ALERTS="$(q1 "SELECT count(*) FROM audit_events WHERE organization_id='$ORG_ID'::uuid AND action='schedule.occurrence_skipped' AND target_id='$S2'::uuid")"
+Q_NEXT="$(q1 "SELECT next_due_at > clock_timestamp() FROM schedules WHERE id='$S2'::uuid")"
 info "quota status=$Q_STATUS reason=$Q_REASON runs=$Q_RUNS alerts=$Q_ALERTS next_due_future=$Q_NEXT"
 [[ "$Q_STATUS" == "SKIPPED" ]] || fail "quota occurrence status = $Q_STATUS, want SKIPPED"
 [[ "$Q_REASON" == "SKIPPED_QUOTA" ]] || fail "skipped_reason = $Q_REASON, want SKIPPED_QUOTA"
@@ -127,20 +132,20 @@ info "quota status=$Q_STATUS reason=$Q_REASON runs=$Q_RUNS alerts=$Q_ALERTS next
 pass "SKIPPED_QUOTA proven on staging (schedule $S2, SKIPPED/SKIPPED_QUOTA, no run, $Q_ALERTS alert)"
 q "UPDATE schedules SET paused=true, next_due_at=NULL WHERE id='$S2'::uuid" >/dev/null
 q "DELETE FROM runs WHERE environment_id='$ENV_ID'::uuid AND workflow_name='filler'" >/dev/null
-NONTERM_AFTER="$(q "SELECT count(*) FROM runs WHERE environment_id='$ENV_ID'::uuid AND status IN ('QUEUED','RUNNING','WAITING','PAUSING','PAUSED','CANCELLING')")"
+NONTERM_AFTER="$(q1 "SELECT count(*) FROM runs WHERE environment_id='$ENV_ID'::uuid AND status IN ('QUEUED','RUNNING','WAITING','PAUSING','PAUSED','CANCELLING')")"
 info "filler removed; nonterminal runs in fixture env now=$NONTERM_AFTER"
 
 # 5. TEST 3 — revision change affects only future occurrences.
 S3="$(mk_schedule '0 12 * * *')"
 q "UPDATE schedules SET next_due_at = clock_timestamp() - INTERVAL '1 minute' WHERE id='$S3'::uuid" >/dev/null
 sleep 20
-REV1="$(q "SELECT revision FROM schedule_occurrences WHERE schedule_id='$S3'::uuid ORDER BY due_at LIMIT 1")"
+REV1="$(q1 "SELECT revision FROM schedule_occurrences WHERE schedule_id='$S3'::uuid ORDER BY due_at LIMIT 1")"
 [[ -n "$REV1" ]] || fail "revision test produced no first occurrence"
 info "revision schedule_id=$S3 first occurrence revision=$REV1"
 q "UPDATE schedules SET cron_expression='30 6 * * *', revision=revision+1, next_due_at = clock_timestamp() - INTERVAL '1 minute', updated_at=clock_timestamp() WHERE id='$S3'::uuid" >/dev/null
 sleep 20
 REVS="$(q "SELECT revision FROM schedule_occurrences WHERE schedule_id='$S3'::uuid ORDER BY due_at")"
-REV_COUNT="$(q "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S3'::uuid")"
+REV_COUNT="$(q1 "SELECT count(*) FROM schedule_occurrences WHERE schedule_id='$S3'::uuid")"
 FIRST_REV="$(echo "$REVS" | head -n 1)"
 LAST_REV="$(echo "$REVS" | tail -n 1)"
 info "revision occurrences=$REV_COUNT revisions: first=$FIRST_REV last=$LAST_REV"
