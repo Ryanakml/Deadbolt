@@ -24,6 +24,7 @@ import { resolveOrgState } from "./auth.js";
 import {
   sessionCanControlRuns,
   sessionCanDecideApprovals,
+  sessionCanManageSchedules,
   visibleRunControls,
 } from "./permissions.js";
 import { RunInspector } from "./inspector.js";
@@ -66,6 +67,8 @@ import {
   StepTab,
   InspectorViewMode,
   Approval,
+  Schedule,
+  ScheduleOccurrence,
 } from "./types.js";
 
 // DOM Bootstrap for browser runtime
@@ -87,6 +90,16 @@ function initDashboard(): void {
   // render only when state AND this flag both allow them (§23.2).
   let canControlRuns = false;
   let canDecideApprovals = false;
+  // Whether the active session may manage schedules (schedules:write).
+  // Derived once from the BFF session membership in enterApp; the backend
+  // remains the security authority. Schedule mutation CTAs render only when
+  // this flag allows them. It must not be inferred from runs:control:
+  // developer holds runs:control but never schedules:write.
+  let canManageSchedules = false;
+  // Active view id so the environment selector can refresh the schedules
+  // list only when the schedules view is showing. Unconditional refreshes
+  // would issue protected requests the current view never asked for.
+  let activeViewId = "runs-view";
   // Scoped banner state: only a transient stream error may be cleared on
   // SSE reconnect. Bootstrap/API errors stay visible.
   const streamBanner = createStreamErrorBanner();
@@ -117,11 +130,17 @@ function initDashboard(): void {
   const workersNavBtn = document.getElementById(
     "nav-workers",
   ) as HTMLButtonElement | null;
+  const schedulesNavBtn = document.getElementById(
+    "nav-schedules",
+  ) as HTMLButtonElement | null;
 
   if (envSelect) {
     envSelect.addEventListener("change", () => {
       selectEnvironment(envSelection, envSelect.value || null);
       loadRunsList(api, getSelectedEnvironmentId(envSelection));
+      if (activeViewId === "schedules-view") {
+        loadSchedulesList(api, getSelectedEnvironmentId(envSelection));
+      }
     });
   }
 
@@ -158,6 +177,24 @@ function initDashboard(): void {
     workersNavBtn.addEventListener("click", () => {
       showView("workers-view");
       loadWorkersList(api, getSelectedEnvironmentId(envSelection));
+    });
+  }
+
+  if (schedulesNavBtn) {
+    schedulesNavBtn.addEventListener("click", () => {
+      showView("schedules-view");
+      loadSchedulesList(api, getSelectedEnvironmentId(envSelection));
+    });
+  }
+
+  const schedulesNewBtn = document.getElementById(
+    "schedules-new-btn",
+  ) as HTMLButtonElement | null;
+  if (schedulesNewBtn) {
+    schedulesNewBtn.addEventListener("click", (e) => {
+      const envId = getSelectedEnvironmentId(envSelection);
+      if (!envId) return;
+      openScheduleCreateDialog(api, envId, e.currentTarget as HTMLElement);
     });
   }
 
@@ -231,6 +268,10 @@ function initDashboard(): void {
     // Approvals are a separate capability: §24.2 withholds approvals:decide
     // from developer, so it must not be inferred from runs:control.
     canDecideApprovals = sessionCanDecideApprovals(session, orgId);
+    // Schedules are a separate capability: schedules:write is granted to
+    // operator, admin, and owner and withheld from developer, so it must not
+    // be inferred from runs:control either.
+    canManageSchedules = sessionCanManageSchedules(session, orgId);
     await loadEnvironmentCatalog(orgId);
     if (runIdParam) {
       inspectRun(runIdParam);
@@ -291,6 +332,11 @@ function initDashboard(): void {
     if (workersBody) {
       workersBody.innerHTML =
         '<tr><td colspan="4" class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</td></tr>';
+    }
+    const schedulesList = document.getElementById("schedules-list");
+    if (schedulesList) {
+      schedulesList.innerHTML =
+        '<div class="empty-state">No environments yet. Create a project environment with `runtime bootstrap`, then reload.</div>';
     }
   }
 
@@ -403,11 +449,16 @@ function initDashboard(): void {
     // Drop mutation authority with the session so a signed-out or expired
     // identity can never retain visible mutation affordances.
     canControlRuns = false;
+    canDecideApprovals = false;
+    canManageSchedules = false;
+    activeViewId = "runs-view";
     clearEnvironmentState();
     for (const id of ["runs-table-body", "workers-table-body"]) {
       const el = document.getElementById(id);
       if (el) el.innerHTML = "";
     }
+    const schedList = document.getElementById("schedules-list");
+    if (schedList) schedList.innerHTML = "";
     const insp = document.getElementById("inspector-content");
     if (insp) insp.innerHTML = "";
     const label = document.getElementById("session-label");
@@ -427,6 +478,7 @@ function initDashboard(): void {
       activeInspector.destroy();
       activeInspector = null;
     }
+    activeViewId = viewId;
     const views = document.querySelectorAll(".view-panel");
     views.forEach((v) => v.classList.add("hidden"));
     const target = document.getElementById(viewId);
@@ -536,6 +588,780 @@ function initDashboard(): void {
       }
       listContainer.innerHTML = `<tr><td colspan="4" class="error-state">Failed to load workers: ${escapeHtml(err instanceof Error ? err.message : String(err))}</td></tr>`;
     }
+  }
+
+  async function loadSchedulesList(
+    client: DashboardApiClient,
+    envId: string | null,
+  ): Promise<void> {
+    const listContainer = document.getElementById("schedules-list");
+    const newBtn = document.getElementById(
+      "schedules-new-btn",
+    ) as HTMLButtonElement | null;
+    if (newBtn) {
+      if (canManageSchedules) {
+        newBtn.classList.remove("hidden");
+      } else {
+        newBtn.classList.add("hidden");
+      }
+    }
+    if (!listContainer) return;
+    if (!envId) {
+      renderEnvironmentEmptyState();
+      return;
+    }
+    listContainer.innerHTML = '<div class="loading">Loading schedules...</div>';
+
+    try {
+      const items = await client.listSchedules(envId);
+      if (items.length === 0) {
+        listContainer.innerHTML =
+          '<div class="empty-state">No schedules found in this environment.</div>';
+        return;
+      }
+
+      const cards = items
+        .map((schedule) => {
+          const pin =
+            schedule.deploymentId && schedule.deploymentId.length > 0
+              ? `<code>${escapeHtml(schedule.deploymentId.slice(0, 8))}...</code>`
+              : "active-at-fire";
+          const nextDue = formatScheduleNextDue(schedule);
+          const pausedBadge = schedule.paused
+            ? '<span class="badge status-paused">PAUSED</span>'
+            : '<span class="badge status-active">ACTIVE</span>';
+          const actions = canManageSchedules
+            ? `<div class="schedule-actions">
+                <button id="schedule-edit-${escapeHtml(schedule.id)}" class="secondary-btn schedule-edit-btn" data-schedule-edit="${escapeHtml(schedule.id)}" data-schedule-id="${escapeHtml(schedule.id)}">Edit</button>
+                ${schedule.paused ? `<button id="schedule-resume-${escapeHtml(schedule.id)}" class="primary-btn schedule-resume-btn" data-schedule-resume="${escapeHtml(schedule.id)}" data-schedule-id="${escapeHtml(schedule.id)}">Resume</button>` : `<button id="schedule-pause-${escapeHtml(schedule.id)}" class="secondary-btn schedule-pause-btn" data-schedule-pause="${escapeHtml(schedule.id)}" data-schedule-id="${escapeHtml(schedule.id)}">Pause</button>`}
+                <button id="schedule-delete-${escapeHtml(schedule.id)}" class="danger-btn schedule-delete-btn" data-schedule-delete="${escapeHtml(schedule.id)}" data-schedule-id="${escapeHtml(schedule.id)}">Delete</button>
+              </div>`
+            : "";
+          return `
+          <div class="hold-item schedule-item" data-schedule-item="${escapeHtml(schedule.id)}">
+            <div class="schedule-main">
+              <strong>${escapeHtml(schedule.workflow)}</strong>
+              ${pausedBadge}
+              <div class="text-muted schedule-meta">cron ${escapeHtml(schedule.cron)} · ${escapeHtml(schedule.timezone)} · revision ${schedule.revision}</div>
+              <div class="text-muted schedule-meta">pin ${pin} · ${escapeHtml(schedule.overlapPolicy)} · ${escapeHtml(schedule.misfirePolicy)}</div>
+              <div class="text-muted schedule-next-due">next due ${escapeHtml(nextDue)}</div>
+              <div id="schedule-occurrences-${escapeHtml(schedule.id)}" class="schedule-occurrences" style="display:none"></div>
+            </div>
+            <div class="schedule-cta-row">
+              <button id="schedule-history-${escapeHtml(schedule.id)}" class="link-btn schedule-history-btn" data-schedule-history="${escapeHtml(schedule.id)}" data-schedule-id="${escapeHtml(schedule.id)}">History</button>
+              ${actions}
+            </div>
+          </div>`;
+        })
+        .join("");
+      listContainer.innerHTML = cards;
+
+      wireScheduleItemButtons(client, envId, listContainer, items);
+    } catch (err: unknown) {
+      if (isUnauthorized(err)) {
+        handleUnauthorized();
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("HTTP 403")) {
+        listContainer.innerHTML =
+          '<div class="empty-state">Schedules require the schedules:write capability (operator role or above)</div>';
+        if (newBtn) newBtn.classList.add("hidden");
+        return;
+      }
+      listContainer.innerHTML = `<div class="error-state">Failed to load schedules: ${escapeHtml(msg)}</div>`;
+      if (newBtn) newBtn.classList.add("hidden");
+    }
+  }
+
+  // formatScheduleNextDue renders the persisted pending slot as a countdown
+  // at render time. A null slot (paused) renders as "paused" without
+  // recomputing cron client-side.
+  function formatScheduleNextDue(schedule: Schedule): string {
+    if (schedule.paused || !schedule.nextDueAt) return "paused";
+    const dueMs = new Date(schedule.nextDueAt).getTime();
+    if (!Number.isFinite(dueMs)) return "paused";
+    const diffMs = dueMs - Date.now();
+    const abs = new Date(schedule.nextDueAt).toLocaleString();
+    if (diffMs <= 0) return `due now (${abs})`;
+    const totalS = Math.floor(diffMs / 1000);
+    const days = Math.floor(totalS / 86400);
+    const hours = Math.floor((totalS % 86400) / 3600);
+    const mins = Math.floor((totalS % 3600) / 60);
+    const secs = totalS % 60;
+    const parts: string[] = [];
+    if (days > 0) parts.push(`${days}d`);
+    if (hours > 0 || days > 0) parts.push(`${hours}h`);
+    if (mins > 0 || hours > 0 || days > 0) parts.push(`${mins}m`);
+    parts.push(`${secs}s`);
+    return `in ${parts.join(" ")} (${abs})`;
+  }
+
+  function wireScheduleItemButtons(
+    client: DashboardApiClient,
+    envId: string,
+    root: ParentNode,
+    items: Schedule[],
+  ): void {
+    const byId = new Map(items.map((s) => [s.id, s]));
+    const findSchedule = (el: Element | null): Schedule | undefined => {
+      if (!el) return undefined;
+      const id =
+        (el as HTMLElement).getAttribute?.("data-schedule-id") ??
+        (el as HTMLElement).getAttribute?.("data-schedule-edit") ??
+        (el as HTMLElement).getAttribute?.("data-schedule-pause") ??
+        (el as HTMLElement).getAttribute?.("data-schedule-resume") ??
+        (el as HTMLElement).getAttribute?.("data-schedule-delete") ??
+        (el as HTMLElement).getAttribute?.("data-schedule-history");
+      if (!id) return undefined;
+      return byId.get(id);
+    };
+    for (const btn of Array.from(
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-edit-btn",
+      ) ?? [],
+    )) {
+      btn.addEventListener("click", (e) => {
+        const s = findSchedule(e.currentTarget as unknown as Element);
+        if (s)
+          openScheduleEditDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
+      });
+    }
+    for (const btn of Array.from(
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-pause-btn",
+      ) ?? [],
+    )) {
+      btn.addEventListener("click", (e) => {
+        const s = findSchedule(e.currentTarget as unknown as Element);
+        if (s)
+          openSchedulePauseDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
+      });
+    }
+    for (const btn of Array.from(
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-resume-btn",
+      ) ?? [],
+    )) {
+      btn.addEventListener("click", (e) => {
+        const s = findSchedule(e.currentTarget as unknown as Element);
+        if (s)
+          openScheduleResumeDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
+      });
+    }
+    for (const btn of Array.from(
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-delete-btn",
+      ) ?? [],
+    )) {
+      btn.addEventListener("click", (e) => {
+        const s = findSchedule(e.currentTarget as unknown as Element);
+        if (s)
+          openScheduleDeleteDialog(
+            client,
+            envId,
+            s,
+            e.currentTarget as HTMLElement,
+          );
+      });
+    }
+    for (const btn of Array.from(
+      (root as unknown as HTMLElement).querySelectorAll?.(
+        ".schedule-history-btn",
+      ) ?? [],
+    )) {
+      btn.addEventListener("click", (e) => {
+        const el = e.currentTarget as HTMLElement;
+        const s = findSchedule(el);
+        if (!s) return;
+        void toggleScheduleOccurrences(client, envId, s, el);
+      });
+    }
+  }
+
+  async function toggleScheduleOccurrences(
+    client: DashboardApiClient,
+    envId: string,
+    schedule: Schedule,
+    button: HTMLElement,
+  ): Promise<void> {
+    const container = document.getElementById(
+      `schedule-occurrences-${schedule.id}`,
+    );
+    if (!container) return;
+    const expanded =
+      container.style.display !== "none" && container.innerHTML.length > 0;
+    if (expanded) {
+      container.innerHTML = "";
+      container.style.display = "none";
+      button.textContent = "History";
+      return;
+    }
+    container.style.display = "block";
+    container.innerHTML = '<div class="loading">Loading history...</div>';
+    button.textContent = "Hide history";
+    try {
+      const resp = await client.listScheduleOccurrences(schedule.id, envId, 25);
+      if (resp.items.length === 0) {
+        container.innerHTML =
+          '<div class="text-muted">No occurrences recorded yet.</div>';
+        return;
+      }
+      const rows = resp.items
+        .map((o: ScheduleOccurrence) => {
+          const reason = o.skippedReason
+            ? `<div class="text-muted schedule-skipped-reason">${escapeHtml(o.skippedReason)}</div>`
+            : "";
+          const run =
+            o.runId && o.runId.length > 0
+              ? `<a class="link-btn schedule-run-link" href="?runId=${escapeHtml(o.runId)}">${escapeHtml(o.runId)}</a>`
+              : '<span class="text-muted">-</span>';
+          return `
+          <div class="schedule-occurrence" data-occurrence-item="${escapeHtml(o.id)}">
+            <div>${escapeHtml(o.dueAt)} · revision ${o.revision}</div>
+            <div><span class="badge status-${o.status.toLowerCase()}">${escapeHtml(o.status)}</span>${o.skippedCount > 0 ? ` <span class="text-muted">skipped ${o.skippedCount}</span>` : ""}</div>
+            ${reason}
+            <div>run ${run}</div>
+          </div>`;
+        })
+        .join("");
+      container.innerHTML = rows;
+    } catch (err: unknown) {
+      if (isUnauthorized(err)) {
+        handleUnauthorized();
+        return;
+      }
+      container.innerHTML = `<div class="error-state">Failed to load history: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    }
+  }
+
+  function refreshSchedules(envId: string | null): void {
+    if (!envId) return;
+    void loadSchedulesList(api, envId);
+  }
+
+  // openScheduleCreateDialog creates one schedule definition. The dialog
+  // mints one Idempotency-Key for its lifetime so an ambiguous resubmit
+  // reuses the identity instead of forking definitions.
+  function openScheduleCreateDialog(
+    client: DashboardApiClient,
+    envId: string,
+    invoker: HTMLElement | null,
+  ): void {
+    document.getElementById("schedule-create-dialog-overlay")?.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "schedule-create-dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="schedule-create-dialog-title">
+        <h3 id="schedule-create-dialog-title">New schedule</h3>
+        <p class="text-muted">Schedules create runs without an operator present. Overlap is skip-overlap and misfire is coalesce-one.</p>
+        <label>Workflow (required)
+          <input id="schedule-create-workflow" type="text" autocomplete="off" />
+        </label>
+        <label>Cron (required)
+          <input id="schedule-create-cron" type="text" placeholder="*/5 * * * *" autocomplete="off" />
+        </label>
+        <label>Timezone (required)
+          <input id="schedule-create-timezone" type="text" placeholder="UTC" autocomplete="off" />
+        </label>
+        <label>Deployment ID (optional, blank means active-at-fire)
+          <input id="schedule-create-deployment" type="text" autocomplete="off" />
+        </label>
+        <div id="schedule-create-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="schedule-create-dismiss">Cancel</button>
+          <button id="schedule-create-submit">Create schedule</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const idempotencyKey = newIdempotencyKey();
+    const errorBox = overlay.querySelector(
+      "#schedule-create-error",
+    ) as HTMLElement;
+    const workflowInput = overlay.querySelector(
+      "#schedule-create-workflow",
+    ) as HTMLInputElement;
+    const cronInput = overlay.querySelector(
+      "#schedule-create-cron",
+    ) as HTMLInputElement;
+    const timezoneInput = overlay.querySelector(
+      "#schedule-create-timezone",
+    ) as HTMLInputElement;
+    const deploymentInput = overlay.querySelector(
+      "#schedule-create-deployment",
+    ) as HTMLInputElement;
+    const submitBtn = overlay.querySelector(
+      "#schedule-create-submit",
+    ) as HTMLButtonElement;
+    const showError = (msg: string): void => {
+      errorBox.textContent = msg;
+      errorBox.style.display = "block";
+    };
+    const close = (): void => {
+      document.getElementById("schedule-create-dialog-overlay")?.remove();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#schedule-create-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    workflowInput.focus();
+
+    submitBtn.addEventListener("click", () => {
+      const workflow = workflowInput.value.trim();
+      const cron = cronInput.value.trim();
+      const timezone = timezoneInput.value.trim();
+      if (!workflow) {
+        showError("Workflow is required.");
+        return;
+      }
+      if (!cron) {
+        showError("Cron expression is required.");
+        return;
+      }
+      if (!timezone) {
+        showError("Timezone is required.");
+        return;
+      }
+      const deployment = deploymentInput.value.trim();
+      submitBtn.setAttribute("disabled", "true");
+      const body: {
+        workflow: string;
+        cron: string;
+        timezone: string;
+        deploymentId?: string;
+      } = { workflow, cron, timezone };
+      if (deployment) body.deploymentId = deployment;
+      client
+        .createSchedule(envId, body, idempotencyKey)
+        .then(() => {
+          close();
+          refreshSchedules(envId);
+        })
+        .catch((err: unknown) => {
+          submitBtn.removeAttribute("disabled");
+          if (isConflict(err)) {
+            showError(
+              "This schedule changed since you opened it (409). The latest state was reloaded — review it before acting.",
+            );
+            refreshSchedules(envId);
+            return;
+          }
+          showError(err instanceof Error ? err.message : String(err));
+        });
+    });
+  }
+
+  // openScheduleEditDialog replaces the configuration of one schedule. The
+  // caller binds expectedRevision; a 409 updates the revision in-dialog and
+  // refreshes instead of retrying blindly.
+  function openScheduleEditDialog(
+    client: DashboardApiClient,
+    envId: string,
+    schedule: Schedule,
+    invoker: HTMLElement | null,
+  ): void {
+    document.getElementById("schedule-edit-dialog-overlay")?.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "schedule-edit-dialog-overlay";
+    let currentRevision = schedule.revision;
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="schedule-edit-dialog-title">
+        <h3 id="schedule-edit-dialog-title">Edit schedule — ${escapeHtml(schedule.workflow)}</h3>
+        <div class="hold-meta">Schedule revision ${currentRevision}</div>
+        <label>Workflow (required)
+          <input id="schedule-edit-workflow" type="text" autocomplete="off" />
+        </label>
+        <label>Cron (required)
+          <input id="schedule-edit-cron" type="text" autocomplete="off" />
+        </label>
+        <label>Timezone (required)
+          <input id="schedule-edit-timezone" type="text" autocomplete="off" />
+        </label>
+        <label>Deployment ID (optional, blank means active-at-fire)
+          <input id="schedule-edit-deployment" type="text" autocomplete="off" />
+        </label>
+        <div id="schedule-edit-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="schedule-edit-dismiss">Cancel</button>
+          <button id="schedule-edit-submit">Save changes</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const idempotencyKey = newIdempotencyKey();
+    const errorBox = overlay.querySelector(
+      "#schedule-edit-error",
+    ) as HTMLElement;
+    const metaBox = overlay.querySelector(".hold-meta") as HTMLElement;
+    const workflowInput = overlay.querySelector(
+      "#schedule-edit-workflow",
+    ) as HTMLInputElement;
+    const cronInput = overlay.querySelector(
+      "#schedule-edit-cron",
+    ) as HTMLInputElement;
+    const timezoneInput = overlay.querySelector(
+      "#schedule-edit-timezone",
+    ) as HTMLInputElement;
+    const deploymentInput = overlay.querySelector(
+      "#schedule-edit-deployment",
+    ) as HTMLInputElement;
+    workflowInput.value = schedule.workflow;
+    cronInput.value = schedule.cron;
+    timezoneInput.value = schedule.timezone;
+    deploymentInput.value = schedule.deploymentId ?? "";
+    const submitBtn = overlay.querySelector(
+      "#schedule-edit-submit",
+    ) as HTMLButtonElement;
+    const showError = (msg: string): void => {
+      errorBox.textContent = msg;
+      errorBox.style.display = "block";
+    };
+    const close = (): void => {
+      document.getElementById("schedule-edit-dialog-overlay")?.remove();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#schedule-edit-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    workflowInput.focus();
+
+    submitBtn.addEventListener("click", () => {
+      const workflow = workflowInput.value.trim();
+      const cron = cronInput.value.trim();
+      const timezone = timezoneInput.value.trim();
+      if (!workflow) {
+        showError("Workflow is required.");
+        return;
+      }
+      if (!cron) {
+        showError("Cron expression is required.");
+        return;
+      }
+      if (!timezone) {
+        showError("Timezone is required.");
+        return;
+      }
+      const deployment = deploymentInput.value.trim();
+      submitBtn.setAttribute("disabled", "true");
+      const configuration: {
+        workflow: string;
+        cron: string;
+        timezone: string;
+        deploymentId?: string;
+      } = { workflow, cron, timezone };
+      if (deployment) configuration.deploymentId = deployment;
+      client
+        .updateSchedule(
+          schedule.id,
+          envId,
+          currentRevision,
+          configuration,
+          idempotencyKey,
+        )
+        .then(() => {
+          close();
+          refreshSchedules(envId);
+        })
+        .catch((err: unknown) => {
+          submitBtn.removeAttribute("disabled");
+          if (isConflict(err)) {
+            showError(
+              "This schedule changed since you opened it (409). The latest state was reloaded — review it before acting.",
+            );
+            void client
+              .listSchedules(envId)
+              .then((items) => {
+                const fresh = items.find((s) => s.id === schedule.id);
+                if (fresh) {
+                  currentRevision = fresh.revision;
+                  metaBox.textContent = `Schedule revision ${currentRevision}`;
+                }
+              })
+              .catch(() => undefined);
+            refreshSchedules(envId);
+            return;
+          }
+          showError(err instanceof Error ? err.message : String(err));
+        });
+    });
+  }
+
+  // openSchedulePauseDialog confirms pausing one schedule. A 409 with
+  // INVALID_SCHEDULE_STATE means it is already paused; the dialog stays open
+  // with the latest revision instead of retrying blindly.
+  function openSchedulePauseDialog(
+    client: DashboardApiClient,
+    envId: string,
+    schedule: Schedule,
+    invoker: HTMLElement | null,
+  ): void {
+    document.getElementById("schedule-pause-dialog-overlay")?.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "schedule-pause-dialog-overlay";
+    let currentRevision = schedule.revision;
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="schedule-pause-dialog-title">
+        <h3 id="schedule-pause-dialog-title">Pause schedule — ${escapeHtml(schedule.workflow)}</h3>
+        <p class="text-muted">Pausing stops future occurrences from starting. Already-started runs are unaffected.</p>
+        <div class="hold-meta">Schedule revision ${currentRevision}</div>
+        <div id="schedule-pause-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="schedule-pause-dismiss">Keep active</button>
+          <button id="schedule-pause-confirm">Confirm pause</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const idempotencyKey = newIdempotencyKey();
+    const errorBox = overlay.querySelector(
+      "#schedule-pause-error",
+    ) as HTMLElement;
+    const metaBox = overlay.querySelector(".hold-meta") as HTMLElement;
+    const confirmBtn = overlay.querySelector(
+      "#schedule-pause-confirm",
+    ) as HTMLButtonElement;
+    const showError = (msg: string): void => {
+      errorBox.textContent = msg;
+      errorBox.style.display = "block";
+    };
+    const close = (): void => {
+      document.getElementById("schedule-pause-dialog-overlay")?.remove();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#schedule-pause-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    confirmBtn.focus();
+
+    confirmBtn.addEventListener("click", () => {
+      confirmBtn.setAttribute("disabled", "true");
+      client
+        .pauseSchedule(schedule.id, envId, currentRevision, idempotencyKey)
+        .then(() => {
+          close();
+          refreshSchedules(envId);
+        })
+        .catch((err: unknown) => {
+          confirmBtn.removeAttribute("disabled");
+          if (isConflict(err)) {
+            showError(
+              "This schedule changed since you opened it (409). The latest state was reloaded — review it before acting.",
+            );
+            void client
+              .listSchedules(envId)
+              .then((items) => {
+                const fresh = items.find((s) => s.id === schedule.id);
+                if (fresh) {
+                  currentRevision = fresh.revision;
+                  metaBox.textContent = `Schedule revision ${currentRevision}${fresh.paused ? " (paused)" : ""}`;
+                  if (fresh.paused) {
+                    confirmBtn.setAttribute("disabled", "true");
+                    errorBox.textContent = `Schedule is already paused (revision ${currentRevision}).`;
+                  }
+                }
+              })
+              .catch(() => undefined);
+            refreshSchedules(envId);
+            return;
+          }
+          showError(err instanceof Error ? err.message : String(err));
+        });
+    });
+  }
+
+  // openScheduleResumeDialog confirms resuming a paused schedule.
+  function openScheduleResumeDialog(
+    client: DashboardApiClient,
+    envId: string,
+    schedule: Schedule,
+    invoker: HTMLElement | null,
+  ): void {
+    document.getElementById("schedule-resume-dialog-overlay")?.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "schedule-resume-dialog-overlay";
+    let currentRevision = schedule.revision;
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="schedule-resume-dialog-title">
+        <h3 id="schedule-resume-dialog-title">Resume schedule — ${escapeHtml(schedule.workflow)}</h3>
+        <p class="text-muted">Resuming recomputes the next due slot from durable state. Missed slots coalesce into one.</p>
+        <div class="hold-meta">Schedule revision ${currentRevision}</div>
+        <div id="schedule-resume-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="schedule-resume-dismiss">Cancel</button>
+          <button id="schedule-resume-confirm">Confirm resume</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const idempotencyKey = newIdempotencyKey();
+    const errorBox = overlay.querySelector(
+      "#schedule-resume-error",
+    ) as HTMLElement;
+    const metaBox = overlay.querySelector(".hold-meta") as HTMLElement;
+    const confirmBtn = overlay.querySelector(
+      "#schedule-resume-confirm",
+    ) as HTMLButtonElement;
+    const showError = (msg: string): void => {
+      errorBox.textContent = msg;
+      errorBox.style.display = "block";
+    };
+    const close = (): void => {
+      document.getElementById("schedule-resume-dialog-overlay")?.remove();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#schedule-resume-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    confirmBtn.focus();
+
+    confirmBtn.addEventListener("click", () => {
+      confirmBtn.setAttribute("disabled", "true");
+      client
+        .resumeSchedule(schedule.id, envId, currentRevision, idempotencyKey)
+        .then(() => {
+          close();
+          refreshSchedules(envId);
+        })
+        .catch((err: unknown) => {
+          confirmBtn.removeAttribute("disabled");
+          if (isConflict(err)) {
+            showError(
+              "This schedule changed since you opened it (409). The latest state was reloaded — review it before acting.",
+            );
+            void client
+              .listSchedules(envId)
+              .then((items) => {
+                const fresh = items.find((s) => s.id === schedule.id);
+                if (fresh) {
+                  currentRevision = fresh.revision;
+                  metaBox.textContent = `Schedule revision ${currentRevision}${fresh.paused ? " (paused)" : ""}`;
+                  if (!fresh.paused) {
+                    confirmBtn.setAttribute("disabled", "true");
+                    errorBox.textContent = `Schedule is already active (revision ${currentRevision}).`;
+                  }
+                }
+              })
+              .catch(() => undefined);
+            refreshSchedules(envId);
+            return;
+          }
+          showError(err instanceof Error ? err.message : String(err));
+        });
+    });
+  }
+
+  // openScheduleDeleteDialog confirms deleting one schedule definition.
+  function openScheduleDeleteDialog(
+    client: DashboardApiClient,
+    envId: string,
+    schedule: Schedule,
+    invoker: HTMLElement | null,
+  ): void {
+    document.getElementById("schedule-delete-dialog-overlay")?.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.id = "schedule-delete-dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="schedule-delete-dialog-title">
+        <h3 id="schedule-delete-dialog-title">Delete schedule — ${escapeHtml(schedule.workflow)}</h3>
+        <p class="text-muted">Deleting stops all future occurrences. Already-started runs are unaffected. This cannot be undone.</p>
+        <div class="hold-meta">Schedule revision ${schedule.revision}</div>
+        <div id="schedule-delete-error" class="dialog-error" role="alert" style="display:none"></div>
+        <div class="dialog-actions">
+          <button id="schedule-delete-dismiss">Keep schedule</button>
+          <button id="schedule-delete-confirm">Confirm delete</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const idempotencyKey = newIdempotencyKey();
+    const errorBox = overlay.querySelector(
+      "#schedule-delete-error",
+    ) as HTMLElement;
+    const confirmBtn = overlay.querySelector(
+      "#schedule-delete-confirm",
+    ) as HTMLButtonElement;
+    const showError = (msg: string): void => {
+      errorBox.textContent = msg;
+      errorBox.style.display = "block";
+    };
+    const close = (): void => {
+      document.getElementById("schedule-delete-dialog-overlay")?.remove();
+      invoker?.focus();
+    };
+    (
+      overlay.querySelector("#schedule-delete-dismiss") as HTMLButtonElement
+    ).addEventListener("click", close);
+    overlay.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Escape") close();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+    confirmBtn.focus();
+
+    confirmBtn.addEventListener("click", () => {
+      confirmBtn.setAttribute("disabled", "true");
+      client
+        .deleteSchedule(schedule.id, envId, idempotencyKey)
+        .then(() => {
+          close();
+          refreshSchedules(envId);
+        })
+        .catch((err: unknown) => {
+          confirmBtn.removeAttribute("disabled");
+          showError(err instanceof Error ? err.message : String(err));
+        });
+    });
   }
 
   function inspectRun(runId: string): void {

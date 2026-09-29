@@ -14,36 +14,44 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/Ryanakml/Deadbolt/internal/tenant"
 )
 
-// scheduleDTO is the wire representation of a schedule.
+// scheduleDTO is the wire representation of a schedule. NextDueAt is the
+// persisted pending slot the UI countdown renders from — never recomputed
+// client-side — and nil while paused.
 type scheduleDTO struct {
-	ID            string  `json:"id"`
-	Workflow      string  `json:"workflow"`
-	Environment   string  `json:"environment"`
-	Cron          string  `json:"cron"`
-	Timezone      string  `json:"timezone"`
-	DeploymentID  *string `json:"deploymentId"`
-	OverlapPolicy string  `json:"overlapPolicy"`
-	MisfirePolicy string  `json:"misfirePolicy"`
-	Paused        bool    `json:"paused"`
-	Revision      int64   `json:"revision"`
+	ID               string     `json:"id"`
+	Workflow         string     `json:"workflow"`
+	Environment      string     `json:"environment"`
+	Cron             string     `json:"cron"`
+	Timezone         string     `json:"timezone"`
+	DeploymentID     *string    `json:"deploymentId"`
+	OverlapPolicy    string     `json:"overlapPolicy"`
+	MisfirePolicy    string     `json:"misfirePolicy"`
+	Paused           bool       `json:"paused"`
+	Revision         int64      `json:"revision"`
+	NextDueAt        *time.Time `json:"nextDueAt"`
+	LastOccurrenceAt *time.Time `json:"lastOccurrenceAt"`
 }
 
 func toDTO(s *Schedule) *scheduleDTO {
 	return &scheduleDTO{
-		ID:            s.ID,
-		Workflow:      s.WorkflowName,
-		Environment:   s.EnvironmentID,
-		Cron:          s.CronExpression,
-		Timezone:      s.Timezone,
-		DeploymentID:  s.DeploymentID,
-		OverlapPolicy: s.OverlapPolicy,
-		MisfirePolicy: s.MisfirePolicy,
-		Paused:        s.Paused,
-		Revision:      s.Revision,
+		ID:               s.ID,
+		Workflow:         s.WorkflowName,
+		Environment:      s.EnvironmentID,
+		Cron:             s.CronExpression,
+		Timezone:         s.Timezone,
+		DeploymentID:     s.DeploymentID,
+		OverlapPolicy:    s.OverlapPolicy,
+		MisfirePolicy:    s.MisfirePolicy,
+		Paused:           s.Paused,
+		Revision:         s.Revision,
+		NextDueAt:        s.NextDueAt,
+		LastOccurrenceAt: s.LastOccurrence,
 	}
 }
 
@@ -107,6 +115,8 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		writeJSONError(w, r, http.StatusUnprocessableEntity, "PINNED_DEPLOYMENT_INVALID", err.Error())
 	case errors.Is(err, ErrScheduleAlreadyPaused), errors.Is(err, ErrScheduleNotPaused):
 		writeJSONError(w, r, http.StatusConflict, "INVALID_SCHEDULE_STATE", err.Error())
+	case errors.Is(err, ErrInvalidCursor):
+		writeJSONError(w, r, http.StatusBadRequest, "INVALID_CURSOR", "Occurrence cursor is invalid")
 	default:
 		writeJSONError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to process schedule request")
 	}
@@ -281,6 +291,66 @@ func (h *HTTPHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": scheduleID})
+}
+
+// occurrenceDTO is the wire representation of one decided slot.
+type occurrenceDTO struct {
+	ID            string    `json:"id"`
+	ScheduleID    string    `json:"scheduleId"`
+	DueAt         time.Time `json:"dueAt"`
+	Revision      int64     `json:"revision"`
+	Status        string    `json:"status"`
+	SkippedReason *string   `json:"skippedReason"`
+	SkippedCount  int       `json:"skippedCount"`
+	RunID         *string   `json:"runId"`
+}
+
+func toOccurrenceDTO(o *Occurrence) *occurrenceDTO {
+	return &occurrenceDTO{
+		ID:            o.ID,
+		ScheduleID:    o.ScheduleID,
+		DueAt:         o.DueAt,
+		Revision:      o.Revision,
+		Status:        o.Status,
+		SkippedReason: o.SkippedReason,
+		SkippedCount:  o.SkippedCount,
+		RunID:         o.RunID,
+	}
+}
+
+// ListOccurrences handles GET /v1/schedules/{id}/occurrences.
+func (h *HTTPHandler) ListOccurrences(w http.ResponseWriter, r *http.Request) {
+	caller, ok := tenant.CallerFromContext(r.Context())
+	if !ok || caller == nil {
+		writeJSONError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
+	envID := r.URL.Query().Get("environment")
+	if envID == "" {
+		writeJSONError(w, r, http.StatusBadRequest, "MISSING_ENVIRONMENT", "environment query parameter is required")
+		return
+	}
+	scheduleID := r.PathValue("id")
+	var cursor *string
+	if c := r.URL.Query().Get("cursor"); c != "" {
+		cursor = &c
+	}
+	limit := DefaultOccurrenceLimit
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	page, err := h.service.ListOccurrences(r.Context(), caller.OrganizationID, envID, scheduleID, cursor, limit)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	items := make([]*occurrenceDTO, 0, len(page.Items))
+	for i := range page.Items {
+		items = append(items, toOccurrenceDTO(&page.Items[i]))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "nextCursor": page.NextCursor})
 }
 
 // auditFromCaller converts the authenticated identity into the audit

@@ -163,6 +163,48 @@ export interface Worker {
   deploymentDigests: string[];
 }
 
+// Schedule is a durable recurring definition (Blueprint §17, Issue #35).
+//
+// The wire shape is fixed by contracts/openapi/control-plane.yaml: `workflow`,
+// `environment`, and `cron` rather than database column names. Overlap and
+// misfire policies are fixed (§17) so the dashboard renders them as labels
+// rather than offering a choice. NextDueAt is the persisted pending slot the
+// UI countdown renders from — never recomputed client-side — and null while
+// paused.
+export interface Schedule {
+  id: string;
+  workflow: string;
+  environment: string;
+  cron: string;
+  timezone: string;
+  deploymentId: string | null;
+  overlapPolicy: "skip-overlap";
+  misfirePolicy: "coalesce-one";
+  paused: boolean;
+  revision: number;
+  nextDueAt: string | null;
+  lastOccurrenceAt: string | null;
+}
+
+// ScheduleOccurrence is one decided slot of a schedule, newest first.
+export type ScheduleOccurrenceStatus = "PENDING" | "STARTED" | "SKIPPED";
+
+export type ScheduleSkippedReason =
+  | "SKIPPED_OVERLAP"
+  | "SKIPPED_QUOTA"
+  | "SKIPPED_MISFIRE";
+
+export interface ScheduleOccurrence {
+  id: string;
+  scheduleId: string;
+  dueAt: string;
+  revision: number;
+  status: ScheduleOccurrenceStatus;
+  skippedReason: ScheduleSkippedReason | null;
+  skippedCount: number;
+  runId: string | null;
+}
+
 export interface RunEvent {
   id: string;
   runId: string;

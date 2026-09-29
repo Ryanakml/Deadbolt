@@ -137,6 +137,10 @@ func BuildMuxWithComponents(cfg auth.Config, pool *pgxpool.Pool, healthChecker *
 		mux.Handle("PATCH /v1/schedules/{id}", sched(scheduleHandler.Update))
 		mux.Handle("DELETE /api/v1/schedules/{id}", sched(scheduleHandler.Delete))
 		mux.Handle("DELETE /v1/schedules/{id}", sched(scheduleHandler.Delete))
+		// Occurrence history (Issue #35): what the engine decided per slot,
+		// newest first, under the same capability as the definitions.
+		mux.Handle("GET /api/v1/schedules/{id}/occurrences", sched(scheduleHandler.ListOccurrences))
+		mux.Handle("GET /v1/schedules/{id}/occurrences", sched(scheduleHandler.ListOccurrences))
 		// Pause and resume are separate verbs on the wire even though the
 		// Schedule schema carries `paused`, so a state transition cannot be
 		// confused with a configuration edit.

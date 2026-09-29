@@ -21,6 +21,40 @@ export const RUNS_CONTROL_CAPABILITY = "runs:control";
 // the Inspector must not reuse the runs:control predicate here.
 export const APPROVALS_DECIDE_CAPABILITY = "approvals:decide";
 
+// Schedules are a standing grant to create runs without an operator present,
+// so schedules:write sits with the roles that already hold runs:reconcile
+// (operator, admin, owner) rather than with developers. The dashboard must
+// not reuse the runs:control predicate here: a developer who can pause a run
+// still cannot manage schedules.
+export const SCHEDULES_WRITE_CAPABILITY = "schedules:write";
+
+const SCHEDULES_MANAGE_ROLES = new Set(["operator", "admin", "owner"]);
+
+// roleCanManageSchedules reports whether a canonical role grants
+// schedules:write.
+export function roleCanManageSchedules(
+  role: string | null | undefined,
+): boolean {
+  if (!role) return false;
+  return SCHEDULES_MANAGE_ROLES.has(role.trim().toLowerCase());
+}
+
+// sessionCanManageSchedules mirrors roleCanManageSchedules against the BFF
+// session membership for the given organization.
+export function sessionCanManageSchedules(
+  session: AuthSession | null | undefined,
+  orgId: string | null | undefined,
+): boolean {
+  if (!session || !orgId) return false;
+  const memberships = session.memberships ?? [];
+  for (const m of memberships) {
+    if (!m || m.OrganizationID !== orgId) continue;
+    if (String(m.Status ?? "").toUpperCase() !== "ACTIVE") continue;
+    return roleCanManageSchedules(m.Role);
+  }
+  return false;
+}
+
 const APPROVALS_DECIDE_ROLES = new Set(["operator", "admin", "owner"]);
 
 // roleCanDecideApprovals reports whether a canonical role grants
