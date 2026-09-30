@@ -40,23 +40,27 @@ is ever held for an approval or a delay (both settle without attempts).
 
 ## 3. Staging evidence
 
-Artifact: commit `cda91c15467207d4fea274bde21f223b998303a3` (main
-post-#86), image
-`ghcr.io/ryanakml/deadbolt/control-plane@sha256:e4732baad05a9d94d611493ea458861602cb2886576825cb2853ef0a90cbd333`,
-`runtime_mode: hosted` (slot blue). Isolated fixtures in project
-`m4-gate-accept` (`94fdbb74-…`); shared staging env untouched. Runnable:
-`scripts/m4-gate-staging-journeys.sh` (exit code 0). The restart below is
+Artifact: commit `d040e05bfb9786a24992e34d5420143d43f650af` (PR #87
+head; tests/harness/docs only — zero production-code delta vs
+`cda91c1`, so the restart/API evidence below carries over
+behaviorally), image
+`ghcr.io/ryanakml/deadbolt/control-plane@sha256:619b334ab710535233bbd6bb14f6ec2ef9622edd12862d62fdb2bc13dd5f75ad`,
+`runtime_mode: hosted` (slot green). Isolated fixtures in project
+`m4-gate-accept` (`94fdbb74-…`), environment `5742f463-…`, deployment
+`d11747d4-…`; shared staging env untouched. Runnable:
+`scripts/m4-gate-staging-journeys.sh` (exit code 0 on `cda91c1`;
+re-runnable on any head with no production delta). The restart below is
 a real `docker restart` of the active control-plane container mid-run —
 same image back, all waits settled by the new process.
 
-| Check                                   | Result                                                                                                                                                                                                                                                                  |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Combined restart on staging             | PASS — two PENDING approvals + one due schedule planted pre-restart; new process decides approval A once (opposing 409, machine key 403 `APPROVAL_HUMAN_ONLY`), fires the released delay exactly once, converges the schedule (2 occurrences, 1 run, `skipped_count=9`) |
-| Two evaluators against staging          | YES (prior: #34 acceptance raced two evaluators on the deployed artifact)                                                                                                                                                                                               |
-| DST/coalesce/overlap fixtures           | YES (prior: #34 staging + integration fixtures)                                                                                                                                                                                                                         |
-| Browser approve/reject/expired journeys | PASS — approve 200, opposing 409, expired 409 `APPROVAL_EXPIRED` then swept to EXPIRED with run FAILED (runs `a546737b-…`, `fef941d2-…`; approvals `3c303e93-…`, `65884b8d-…`)                                                                                          |
-| Schedule journeys                       | YES (prior: #35 staging journeys, 5/5 exit 0; plus journey 4 above on schedule `6312ddec-…`, left paused with journey keys/session revoked)                                                                                                                             |
-| Deployed artifact for this gate         | YES — `cda91c1`, image `e4732baa…`, hosted                                                                                                                                                                                                                              |
+| Check                                   | Result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Combined restart on staging             | PASS — two PENDING approvals + one due schedule planted pre-restart; new process decides approval A once (opposing 409, machine key 403 `APPROVAL_HUMAN_ONLY`), fires the released delay exactly once, converges the schedule (2 occurrences, 1 run, `skipped_count=9`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Two evaluators against staging          | YES (prior: #34 acceptance raced two evaluators on the deployed artifact)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| DST/coalesce/overlap fixtures           | YES (prior: #34 staging + integration fixtures)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Browser approve/reject/expired journeys | PASS — decided through the real dashboard on `d040e05` (session `brian.sbg69@…`, env `m4-gate-accept / staging`): APPROVED run `6af57696-…` (approval `031fbf39-…`, actor `059270b1-…`, comment recorded, rev 1→2, decided 2026-09-30 12:42:08 UTC, gate SUCCEEDED, 0 attempts); REJECTED run `924a7161-…` (approval `3262553e-…`, same actor, comment recorded, decided 12:43:20 UTC, rev 2, gate still SUCCEEDED — business branch, not a failure); EXPIRED run `fef941d2-…` (approval `65884b8d-…`, gate FAILED `APPROVAL_EXPIRED`, run FAILED, no Decide CTA). Decided approvals render no Decide CTA (terminal, honest); opposing-decision 409 + machine-key 403 `APPROVAL_HUMAN_ONLY` proven at API level by the journeys script |
+| Schedule journeys                       | YES (prior: #35 staging journeys, 5/5 exit 0) + browser History on `d040e05`: schedule `6312ddec-…` (`m4j-tick`, `* * * * *`, UTC, rev 1, PAUSED, `next due paused`) expands to `STARTED skipped 9` run `5084829c-…` plus `SKIPPED SKIPPED_OVERLAP`; left paused with journey keys/session revoked                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Deployed artifact for this gate         | YES — `d040e05`, image `619b334a…`, hosted (slot green)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 ## 4. Requirement / failure traceability
 
@@ -69,5 +73,14 @@ same image back, all waits settled by the new process.
 
 - Host-failure resilience (two processes on one host prove worker-process
   failure only — same scope note as the M2 gate).
-- Visual browser proof beyond the node DOM suite (recorded risk accepted
-  in #35; functional journeys are API-driven against staging).
+- End-to-end run SUCCEEDED on the staging fixture: after both browser
+  decisions the released delay fired and `hold` SUCCEEDED, but the
+  staging `m4j-wait` fixture's downstream `done` task maps the gate
+  decision output into `t-done` (which requires `{"n"}`), so both runs
+  end `FAILED INPUT_MAPPING_ERROR` — a pre-existing staging-manifest
+  wart (the script's own run `a546737b-…` shows the same), not a product
+  regression. Full combined SUCCEEDED is proven by the Go gate test
+  above, which uses a schema-correct fixture.
+- Keyboard/tablet/mobile, light/dark, and SSE reconnect stay covered by
+  the node DOM suite and #35 acceptance; this gate re-proves them only
+  where the journeys above click through them.
