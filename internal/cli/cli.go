@@ -20,7 +20,12 @@ func Run(args []string) error {
 	case "init":
 		return HandleInit(cmdArgs)
 	case "dev":
+		if len(cmdArgs) > 0 && (cmdArgs[0] == "restart" || cmdArgs[0] == "reset") {
+			return HandleDevLifecycle(cmdArgs)
+		}
 		return RunDev(cmdArgs)
+	case "watch":
+		return RunWatch(cmdArgs)
 	case "doctor":
 		return HandleDoctor(cmdArgs)
 	case "build":
@@ -61,6 +66,7 @@ Usage:
 The Developer Journey Commands:
   init          Scaffold a clean Deadbolt project and workflow
   dev           Start local development environment (Docker Compose + worker)
+	watch         Rebuild and register immutable deployments when files change
   doctor        Inspect environment prerequisites, connectivity, digests, and secrets
   build         Package deterministic task bundle and generate immutable manifest
   login         Authenticate with hosted Deadbolt or local dev control plane

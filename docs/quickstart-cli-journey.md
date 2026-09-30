@@ -118,6 +118,36 @@ the same project and environment instead of duplicating them.
 
 ---
 
+### Local stack lifecycle and immutable file watch
+
+Restart the local Compose stack while preserving its named volumes:
+
+```bash
+runtime dev restart
+```
+
+A destructive reset is explicit and reports its scope:
+
+```bash
+runtime dev reset --confirm-reset
+```
+
+Rebuild on source changes, registering each successful build as a new immutable
+deployment for new workflow runs:
+
+```bash
+runtime watch --dir . --workflow customer-onboarding --env development
+```
+
+The watcher ignores generated `bundles/` and `dist/` output. Existing runs keep
+their deployment pin and previously registered bundles remain available. Use
+`--no-activate` to register without moving the workflow active pointer.
+When resuming a watcher after it was stopped, pass the last observed channel
+revision with `--expected-revision`; each successful activation prints the next
+revision for the following update.
+
+---
+
 ## 3. Deterministic Bundle Assembly (`runtime build`)
 
 Compile your workflow code into an immutable `.tar` bundle archive and a validated deployment manifest:
@@ -257,6 +287,15 @@ runtime worker start --control-plane-url https://api.deadbolt.cloud --key-path ~
 runtime worker list --env staging
 ```
 
+Check whether online workers advertise a deployment version:
+
+```bash
+runtime worker list --env staging --deployment-digest <BUNDLE_SHA256>
+```
+
+The table marks workers as `COMPATIBLE` or `NO_COMPATIBLE_WORKER` without
+printing worker secrets or tokens.
+
 Expected output:
 
 ```text
@@ -368,7 +407,12 @@ Filter logs by specific step or attempt:
 ```bash
 runtime logs <RUN_ID> --step <STEP_ID>
 runtime logs <RUN_ID> --attempt <ATTEMPT_ID>
+runtime logs --run <RUN_ID> --json
 ```
+
+When retained logs are incomplete, the CLI reports dropped records and budget
+exhaustion. Expired retention is reported explicitly rather than as an empty
+successful stream.
 
 Example output:
 

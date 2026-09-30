@@ -530,6 +530,7 @@ func handleWorkerList(args []string) error {
 	cpURLFlag := fs.String("control-plane-url", "", "Control plane base URL")
 	cursorFlag := fs.String("cursor", "", "Pagination cursor")
 	limitFlag := fs.Int("limit", 25, "Maximum number of items")
+	deploymentFlag := fs.String("deployment-digest", "", "Deployment digest to check for compatible workers")
 	jsonFlag := fs.Bool("json", false, "Output as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -597,19 +598,57 @@ func handleWorkerList(args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "WORKER ID\tPOOL\tSTATUS\tDEPLOYMENTS")
+	if strings.TrimSpace(*deploymentFlag) != "" {
+		fmt.Fprintln(w, "WORKER ID\tPOOL\tSTATUS\tVERSION\tDEPLOYMENTS")
+	} else {
+		fmt.Fprintln(w, "WORKER ID\tPOOL\tSTATUS\tDEPLOYMENTS")
+	}
+	compatible := 0
 	for _, item := range result.Items {
 		deployments := strings.Join(item.DeploymentDigests, ", ")
 		if deployments == "" {
 			deployments = "(none)"
 		}
+		if digest := strings.TrimSpace(*deploymentFlag); digest != "" {
+			version := "NO_COMPATIBLE_WORKER"
+			if workerSupportsDeployment(item.Status, item.DeploymentDigests, digest) {
+				version = "COMPATIBLE"
+				compatible++
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", item.ID, item.Pool, item.Status, version, deployments)
+			continue
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", item.ID, item.Pool, item.Status, deployments)
 	}
 	w.Flush()
+	if digest := strings.TrimSpace(*deploymentFlag); digest != "" && compatible == 0 {
+		fmt.Printf("No compatible worker advertises deployment digest %s.\n", digest)
+	}
 
 	if result.NextCursor != nil && *result.NextCursor != "" {
 		fmt.Printf("\nNext cursor: %s\n", *result.NextCursor)
 	}
 
 	return nil
+}
+
+func workerIsOperational(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "ACTIVE", "ONLINE":
+		return true
+	default:
+		return false
+	}
+}
+
+func workerSupportsDeployment(status string, advertised []string, digest string) bool {
+	if !workerIsOperational(status) {
+		return false
+	}
+	for _, candidate := range advertised {
+		if candidate == digest {
+			return true
+		}
+	}
+	return false
 }
