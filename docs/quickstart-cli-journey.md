@@ -142,6 +142,9 @@ runtime watch --dir . --workflow customer-onboarding --env development
 The watcher ignores generated `bundles/` and `dist/` output. Existing runs keep
 their deployment pin and previously registered bundles remain available. Use
 `--no-activate` to register without moving the workflow active pointer.
+When resuming a watcher after it was stopped, pass the last observed channel
+revision with `--expected-revision`; each successful activation prints the next
+revision for the following update.
 
 ---
 

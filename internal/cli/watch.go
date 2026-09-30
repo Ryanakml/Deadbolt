@@ -31,6 +31,7 @@ func RunWatch(args []string) error {
 	intervalFlag := fsFlags.Duration("interval", time.Second, "Polling interval for file changes")
 	onceFlag := fsFlags.Bool("once", false, "Build and register once, then exit")
 	noActivateFlag := fsFlags.Bool("no-activate", false, "Register deployments without changing the workflow active pointer")
+	expectedRevisionFlag := fsFlags.Int64("expected-revision", 0, "Current workflow channel revision when resuming an existing watch")
 	cpURLFlag := fsFlags.String("control-plane-url", "", "Control plane base URL")
 	if err := fsFlags.Parse(args); err != nil {
 		return err
@@ -55,19 +56,22 @@ func RunWatch(args []string) error {
 	}
 
 	var previous string
+	expectedRevision := *expectedRevisionFlag
 	for {
 		fingerprint, err := watchFingerprint(root)
 		if err != nil {
 			return err
 		}
 		if previous == "" || fingerprint != previous {
-			if err := buildAndRegisterWatchDeployment(root, cfg, *workflowFlag, *envFlag, *bundleDirFlag, *outDirFlag, !*noActivateFlag); err != nil {
+			newRevision, err := buildAndRegisterWatchDeployment(root, cfg, *workflowFlag, *envFlag, *bundleDirFlag, *outDirFlag, !*noActivateFlag, expectedRevision)
+			if err != nil {
 				if *onceFlag {
 					return err
 				}
 				fmt.Fprintf(os.Stderr, "watch: deployment update failed: %v\n", err)
 			} else {
 				previous = fingerprint
+				expectedRevision = newRevision
 			}
 			if *onceFlag {
 				return nil
@@ -77,7 +81,7 @@ func RunWatch(args []string) error {
 	}
 }
 
-func buildAndRegisterWatchDeployment(root string, cfg Config, workflow, env, bundleDir, outDir string, activate bool) error {
+func buildAndRegisterWatchDeployment(root string, cfg Config, workflow, env, bundleDir, outDir string, activate bool, expectedRevision int64) (int64, error) {
 	result, err := BuildDeployment(BuildOptions{
 		ProjectDir:   root,
 		WorkflowPath: "",
@@ -85,60 +89,68 @@ func buildAndRegisterWatchDeployment(root string, cfg Config, workflow, env, bun
 		OutputDir:    outDir,
 	})
 	if err != nil {
-		return fmt.Errorf("build immutable deployment: %w", err)
+		return expectedRevision, fmt.Errorf("build immutable deployment: %w", err)
 	}
 	manifest, err := os.ReadFile(result.ManifestPath)
 	if err != nil {
-		return fmt.Errorf("read generated manifest: %w", err)
+		return expectedRevision, fmt.Errorf("read generated manifest: %w", err)
 	}
 	sel, err := resolveEnvSelection(cfg, env)
 	if err != nil {
-		return fmt.Errorf("resolve watch environment: %w", err)
+		return expectedRevision, fmt.Errorf("resolve watch environment: %w", err)
 	}
 	dep, _, err := RegisterDeployment(cfg, sel.EnvID, manifest)
 	if err != nil {
-		return fmt.Errorf("register immutable deployment: %w", err)
+		return expectedRevision, fmt.Errorf("register immutable deployment: %w", err)
 	}
 	fmt.Printf("Watch deployment registered: %s (bundle %s)\n", dep.ID, dep.BundleDigest)
 	if activate {
-		if err := activateDeployment(cfg, dep.ID, workflow, sel.EnvID); err != nil {
-			return err
+		newRevision, err := activateDeployment(cfg, dep.ID, workflow, sel.EnvID, expectedRevision)
+		if err != nil {
+			return expectedRevision, err
 		}
+		return newRevision, nil
 	}
-	return nil
+	return expectedRevision, nil
 }
 
-func activateDeployment(cfg Config, deploymentID, workflow, envID string) error {
-	return activateDeploymentWithRevision(cfg, deploymentID, workflow, envID, 0)
+func activateDeployment(cfg Config, deploymentID, workflow, envID string, expectedRevision int64) (int64, error) {
+	return activateDeploymentWithRevision(cfg, deploymentID, workflow, envID, expectedRevision)
 }
 
-func activateDeploymentWithRevision(cfg Config, deploymentID, workflow, envID string, expectedRevision int64) error {
+func activateDeploymentWithRevision(cfg Config, deploymentID, workflow, envID string, expectedRevision int64) (int64, error) {
 	payload, err := json.Marshal(map[string]any{
 		"deploymentId":      deploymentID,
 		"expectedRevision":  expectedRevision,
 		"allowSingleWorker": false,
 	})
 	if err != nil {
-		return fmt.Errorf("encode activation request: %w", err)
+		return 0, fmt.Errorf("encode activation request: %w", err)
 	}
 	path := fmt.Sprintf("/v1/workflows/%s/activate?environment=%s", url.PathEscape(workflow), url.QueryEscape(envID))
 	req, err := cfg.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("create activation request: %w", err)
+		return 0, fmt.Errorf("create activation request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", fmt.Sprintf("watch-activate-%s-%d", deploymentID, time.Now().UnixNano()))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("activate deployment: %w", err)
+		return 0, fmt.Errorf("activate deployment: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("activate deployment: %s", FormatAPIError(resp.StatusCode, body))
+		return 0, fmt.Errorf("activate deployment: %s", FormatAPIError(resp.StatusCode, body))
 	}
-	fmt.Printf("Watch deployment activated for new runs: workflow=%s deployment=%s\n", workflow, deploymentID)
-	return nil
+	var result struct {
+		Revision int64 `json:"revision"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, fmt.Errorf("parse activation response: %w", err)
+	}
+	fmt.Printf("Watch deployment activated for new runs: workflow=%s deployment=%s revision=%d\n", workflow, deploymentID, result.Revision)
+	return result.Revision, nil
 }
 
 func watchFingerprint(root string) (string, error) {

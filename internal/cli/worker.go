@@ -611,12 +611,9 @@ func handleWorkerList(args []string) error {
 		}
 		if digest := strings.TrimSpace(*deploymentFlag); digest != "" {
 			version := "NO_COMPATIBLE_WORKER"
-			for _, advertised := range item.DeploymentDigests {
-				if advertised == digest {
-					version = "COMPATIBLE"
-					compatible++
-					break
-				}
+			if workerSupportsDeployment(item.Status, item.DeploymentDigests, digest) {
+				version = "COMPATIBLE"
+				compatible++
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", item.ID, item.Pool, item.Status, version, deployments)
 			continue
@@ -633,4 +630,25 @@ func handleWorkerList(args []string) error {
 	}
 
 	return nil
+}
+
+func workerIsOperational(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "ACTIVE", "ONLINE":
+		return true
+	default:
+		return false
+	}
+}
+
+func workerSupportsDeployment(status string, advertised []string, digest string) bool {
+	if !workerIsOperational(status) {
+		return false
+	}
+	for _, candidate := range advertised {
+		if candidate == digest {
+			return true
+		}
+	}
+	return false
 }
