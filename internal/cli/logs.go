@@ -11,9 +11,10 @@ import (
 	"time"
 )
 
-// RunLogs handles "runtime logs <run_id> [--step <step_id>] [--attempt <attempt_id>] [--cursor <cursor>] [--limit <limit>] [--json]"
+// RunLogs handles "runtime logs <run_id> [--run <run_id>] [--step <step_id>] [--attempt <attempt_id>] [--cursor <cursor>] [--limit <limit>] [--json]"
 func RunLogs(args []string) error {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
+	runFlag := fs.String("run", "", "Workflow run ID")
 	stepFlag := fs.String("step", "", "Filter by Step ID")
 	attemptFlag := fs.String("attempt", "", "Filter by Attempt ID")
 	cursorFlag := fs.String("cursor", "", "Keyset cursor for pagination")
@@ -45,7 +46,10 @@ func RunLogs(args []string) error {
 		runID = fs.Arg(0)
 	}
 	if runID == "" {
-		fmt.Println("Usage: runtime logs <run_id> [--step <step_id>] [--attempt <attempt_id>] [--cursor <cursor>] [--limit <limit>] [--json]")
+		runID = strings.TrimSpace(*runFlag)
+	}
+	if runID == "" {
+		fmt.Println("Usage: runtime logs <run_id> [--run <run_id>] [--step <step_id>] [--attempt <attempt_id>] [--cursor <cursor>] [--limit <limit>] [--json]")
 		return fmt.Errorf("run ID is required")
 	}
 
@@ -103,9 +107,11 @@ func RunLogs(args []string) error {
 			Level     string `json:"level"`
 			Message   string `json:"message"`
 		} `json:"items"`
-		NextCursor *string `json:"nextCursor"`
-		Expired    bool    `json:"expired"`
-		Message    *string `json:"message"`
+		NextCursor      *string `json:"nextCursor"`
+		Expired         bool    `json:"expired"`
+		Message         *string `json:"message"`
+		DroppedCount    int     `json:"droppedCount"`
+		BudgetExhausted bool    `json:"budgetExhausted"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("failed to parse log response: %w", err)
@@ -117,7 +123,13 @@ func RunLogs(args []string) error {
 			msg = *result.Message
 		}
 		fmt.Printf("Notice: %s\n", msg)
+		if result.DroppedCount > 0 || result.BudgetExhausted {
+			fmt.Printf("Log completeness: dropped=%d budget_exhausted=%t\n", result.DroppedCount, result.BudgetExhausted)
+		}
 		return nil
+	}
+	if result.DroppedCount > 0 || result.BudgetExhausted {
+		fmt.Printf("Notice: log stream is bounded; dropped=%d budget_exhausted=%t\n", result.DroppedCount, result.BudgetExhausted)
 	}
 
 	if len(result.Items) == 0 {
